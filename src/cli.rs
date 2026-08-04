@@ -128,6 +128,19 @@ fn invalid_value(value: &OsString, opt: &str) -> Error {
         shown(value)
     ))
 }
+fn known_option(arg: &OsStr) -> bool {
+    [
+        "-e", "-E", "-r", "-R", "-z", "-q", "-t", "-C", "-2", "-T", "-S", "-d", "-f", "-a", "-n",
+    ]
+    .iter()
+    .any(|option| eq(arg, option))
+}
+fn invalid_option(arg: &OsStr, command: &str) -> Error {
+    Error(format!(
+        "Option '{}' is not valid for '{command}'",
+        name::render(arg)
+    ))
+}
 
 fn parse_u32(value: &OsString, opt: &str) -> Result<u32, Error> {
     let s = value.to_str().ok_or_else(|| invalid_value(value, opt))?;
@@ -241,10 +254,20 @@ fn create(
     mode: CreateMode,
     mut i: usize,
     preset: Option<OsString>,
+    options_done: bool,
 ) -> Result<Action, Error> {
     let mut options = Options::default();
     let mut sess = preset;
     let mut command = Vec::new();
+    if options_done {
+        command = args[i..].to_vec();
+        return Ok(Action::Create {
+            mode,
+            session: session(sess.ok_or_else(invalid_args)?)?,
+            command,
+            options,
+        });
+    }
     while i < args.len() {
         if eq(&args[i], "--") {
             i += 1;
@@ -258,6 +281,9 @@ fn create(
         if leading_dash(&args[i]) {
             if option(args, &mut i, &mut options, true)? {
                 continue;
+            }
+            if known_option(&args[i]) {
+                return Err(invalid_option(&args[i], "create"));
             }
             return Err(invalid_mode(&args[i]));
         }
@@ -290,7 +316,10 @@ fn attach(args: &[OsString], mut i: usize) -> Result<Action, Error> {
             }
             sess = Some(args[i].clone());
             i += 1;
-            continue;
+            if i != args.len() {
+                return Err(invalid_args());
+            }
+            break;
         }
         if leading_dash(&args[i]) {
             if create_only(&args[i]) {
@@ -301,6 +330,9 @@ fn attach(args: &[OsString], mut i: usize) -> Result<Action, Error> {
             }
             if option(args, &mut i, &mut options, false)? {
                 continue;
+            }
+            if known_option(&args[i]) {
+                return Err(invalid_option(&args[i], "attach"));
             }
             return Err(invalid_mode(&args[i]));
         }
@@ -317,8 +349,15 @@ fn attach(args: &[OsString], mut i: usize) -> Result<Action, Error> {
         options,
     })
 }
-fn one_session(args: &[OsString], i: usize) -> Result<OsString, Error> {
+fn one_session(args: &[OsString], i: usize, command: &str) -> Result<OsString, Error> {
     if args.len() == i + 1 {
+        if leading_dash(&args[i]) {
+            return Err(if known_option(&args[i]) {
+                invalid_option(&args[i], command)
+            } else {
+                invalid_mode(&args[i])
+            });
+        }
         session(args[i].clone())
     } else if args.len() == i + 2 && eq(&args[i], "--") {
         session(args[i + 1].clone())
@@ -346,7 +385,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             Err(invalid_args())
         };
     }
-    let modern = |mode| create(&args, mode, 2, None);
+    let modern = |mode| create(&args, mode, 2, None, false);
     if eq(first, "new") || eq(first, "n") {
         return modern(CreateMode::New);
     }
@@ -372,15 +411,24 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
         return attach(&args, 2);
     }
     if eq(first, "push") || eq(first, "p") || eq(first, "-p") {
-        return Ok(Action::Push(one_session(&args, 2)?));
+        return Ok(Action::Push(one_session(&args, 2, "push")?));
     }
     if eq(first, "list") || eq(first, "l") || eq(first, "ls") || eq(first, "-l") {
-        let all = args.len() == 3 && eq(&args[2], "-a");
-        return if args.len() == 2 || all {
-            Ok(Action::List { all })
-        } else {
-            Err(invalid_args())
-        };
+        let mut all = false;
+        for arg in &args[2..] {
+            if eq(arg, "-a") {
+                all = true;
+            } else if leading_dash(arg) {
+                return Err(if known_option(arg) {
+                    invalid_option(arg, "list")
+                } else {
+                    invalid_mode(arg)
+                });
+            } else {
+                return Err(invalid_args());
+            }
+        }
+        return Ok(Action::List { all });
     }
     if eq(first, "current") || eq(first, "-i") {
         return if args.len() == 2 {
@@ -392,6 +440,11 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
     if eq(first, "clear") {
         return match args.len() {
             2 => Ok(Action::Clear(None)),
+            3 if leading_dash(&args[2]) => Err(if known_option(&args[2]) {
+                invalid_option(&args[2], "clear")
+            } else {
+                invalid_mode(&args[2])
+            }),
             3 => Ok(Action::Clear(Some(session(args[2].clone())?))),
             4 if eq(&args[2], "--") => Ok(Action::Clear(Some(session(args[3].clone())?))),
             _ => Err(invalid_args()),
@@ -411,7 +464,13 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             } else if !literal && eq(a, "-q") && !legacy {
                 quiet = true
             } else if !literal && leading_dash(a) {
-                return Err(invalid_mode(a));
+                return Err(if legacy {
+                    invalid_args()
+                } else if known_option(a) {
+                    invalid_option(a, "kill")
+                } else {
+                    invalid_mode(a)
+                });
             } else if sess.replace(a.clone()).is_some() {
                 return Err(invalid_args());
             }
@@ -435,7 +494,11 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             } else if !literal && eq(a, "-q") {
                 quiet = true
             } else if !literal && leading_dash(a) {
-                return Err(invalid_mode(a));
+                return Err(if known_option(a) {
+                    invalid_option(a, "rm")
+                } else {
+                    invalid_mode(a)
+                });
             } else if sess.replace(a.clone()).is_some() {
                 return Err(invalid_args());
             }
@@ -471,7 +534,11 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
                 lines = parse_u32(v, "-n")?;
                 i += 1
             } else if leading_dash(&args[i]) {
-                return Err(invalid_mode(&args[i]));
+                return Err(if known_option(&args[i]) {
+                    invalid_option(&args[i], "tail")
+                } else {
+                    invalid_mode(&args[i])
+                });
             } else if sess.replace(args[i].clone()).is_some() {
                 return Err(invalid_args());
             } else {
@@ -486,12 +553,12 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
     }
     if eq(first, "--") {
         let s = args.get(2).ok_or_else(invalid_args)?.clone();
-        return create(&args, CreateMode::Bare, 3, Some(s));
+        return create(&args, CreateMode::Bare, 3, Some(s), true);
     }
     if leading_dash(first) {
         return Err(invalid_mode(first));
     }
-    create(&args, CreateMode::Bare, 2, Some(first.clone()))
+    create(&args, CreateMode::Bare, 2, Some(first.clone()), false)
 }
 
 pub fn help(program: &str, version: &str) -> String {
