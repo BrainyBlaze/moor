@@ -252,6 +252,7 @@ fn option(
 fn create(
     args: &[OsString],
     mode: CreateMode,
+    command_name: &str,
     mut i: usize,
     preset: Option<OsString>,
     options_done: bool,
@@ -283,7 +284,7 @@ fn create(
                 continue;
             }
             if known_option(&args[i]) {
-                return Err(invalid_option(&args[i], "create"));
+                return Err(invalid_option(&args[i], command_name));
             }
             return Err(invalid_mode(&args[i]));
         }
@@ -351,6 +352,9 @@ fn attach(args: &[OsString], mut i: usize) -> Result<Action, Error> {
 }
 fn one_session(args: &[OsString], i: usize, command: &str) -> Result<OsString, Error> {
     if args.len() == i + 1 {
+        if eq(&args[i], "--") {
+            return Err(invalid_args());
+        }
         if leading_dash(&args[i]) {
             return Err(if known_option(&args[i]) {
                 invalid_option(&args[i], command)
@@ -385,7 +389,8 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             Err(invalid_args())
         };
     }
-    let modern = |mode| create(&args, mode, 2, None, false);
+    let command_name = first.to_str().unwrap_or("create");
+    let modern = |mode| create(&args, mode, command_name, 2, None, false);
     if eq(first, "new") || eq(first, "n") {
         return modern(CreateMode::New);
     }
@@ -464,7 +469,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             } else if !literal && eq(a, "-q") && !legacy {
                 quiet = true
             } else if !literal && leading_dash(a) {
-                return Err(if legacy {
+                return Err(if legacy && known_option(a) {
                     invalid_args()
                 } else if known_option(a) {
                     invalid_option(a, "kill")
@@ -553,12 +558,19 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
     }
     if eq(first, "--") {
         let s = args.get(2).ok_or_else(invalid_args)?.clone();
-        return create(&args, CreateMode::Bare, 3, Some(s), true);
+        return create(&args, CreateMode::Bare, "bare", 3, Some(s), true);
     }
     if leading_dash(first) {
         return Err(invalid_mode(first));
     }
-    create(&args, CreateMode::Bare, 2, Some(first.clone()), false)
+    create(
+        &args,
+        CreateMode::Bare,
+        "bare",
+        2,
+        Some(first.clone()),
+        false,
+    )
 }
 
 pub fn help(program: &str, version: &str) -> String {

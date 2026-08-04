@@ -173,6 +173,70 @@ fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
 }
 
 #[test]
+fn remaining_argument_diagnostics_name_the_real_command() {
+    for (args, message) in [
+        (&["-k", "--bogus", "session"][..], "Invalid mode '--bogus'"),
+        (
+            &["start", "-f", "session"][..],
+            "Option '-f' is not valid for 'start'",
+        ),
+        (&["push", "--"][..], "Invalid number of arguments"),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8(out.stdout).unwrap().contains(message));
+    }
+}
+
+#[test]
+fn every_owned_option_is_accepted_in_each_legal_phase() {
+    let viewer: &[&[&str]] = &[
+        &["-e", "^A"],
+        &["-E"],
+        &["-r", "winch"],
+        &["-R", "move"],
+        &["-z"],
+        &["-q"],
+        &["-t"],
+    ];
+    let create: &[&[&str]] = &[
+        &["-C", "2m"],
+        &["-2", "stderr"],
+        &["-T", "session.events"],
+        &["-S", "module"],
+        &["-d", "."],
+    ];
+    for token in ["new", "n", "-c", "start", "s", "-n", "run", "-N", "-A"] {
+        for option in viewer.iter().chain(create) {
+            let mut before_session = vec![token];
+            before_session.extend_from_slice(option);
+            before_session.push("session");
+            assert_eq!(
+                run(&before_session).status.code(),
+                Some(125),
+                "{before_session:?}"
+            );
+            let mut after_session = vec![token, "session"];
+            after_session.extend_from_slice(option);
+            assert_eq!(
+                run(&after_session).status.code(),
+                Some(125),
+                "{after_session:?}"
+            );
+        }
+        assert_eq!(run(&["-q", token, "session"]).status.code(), Some(1));
+    }
+    for token in ["attach", "a", "-a"] {
+        for option in viewer {
+            let mut args = vec![token];
+            args.extend_from_slice(option);
+            args.push("session");
+            assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+        }
+    }
+}
+
+#[test]
 fn every_reserved_suffix_is_rejected_in_bare_and_path_forms() {
     for suffix in [".log", ".events", ".exit", ".instrument"] {
         for name in [format!("session{suffix}"), format!("dir/session{suffix}")] {
