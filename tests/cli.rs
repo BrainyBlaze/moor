@@ -206,6 +206,23 @@ fn known_options_after_fixed_operands_keep_ownership_diagnostics() {
 }
 
 #[test]
+fn excess_operands_after_terminator_are_always_literal() {
+    for args in [
+        &["push", "--", "-session", "-q"][..],
+        &["clear", "--", "-session", "-q"][..],
+        &["current", "--", "-q"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .contains("Invalid number of arguments")
+        );
+    }
+}
+
+#[test]
 fn every_owned_option_is_accepted_in_each_legal_phase() {
     let viewer: &[&[&str]] = &[
         &["-e", "^A"],

@@ -142,7 +142,11 @@ fn invalid_option(arg: &OsStr, command: &str) -> Error {
     ))
 }
 fn extra_error(args: &[OsString], command: &str) -> Error {
-    match args.iter().find(|arg| !eq(arg, "--") && leading_dash(arg)) {
+    let args = &args[..args
+        .iter()
+        .position(|arg| eq(arg, "--"))
+        .unwrap_or(args.len())];
+    match args.iter().find(|arg| leading_dash(arg)) {
         Some(arg) if known_option(arg) => invalid_option(arg, command),
         Some(arg) => invalid_mode(arg),
         None => invalid_args(),
