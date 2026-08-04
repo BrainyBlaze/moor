@@ -14,6 +14,8 @@ pub enum WireError {
     BadSequence,
     ReassemblyAborted,
     ReassemblyTimeout,
+    GenerationMismatch,
+    IdentityMismatch,
     ResourceExhausted,
 }
 
@@ -247,12 +249,91 @@ impl Codec {
     }
 }
 
-fn validate_payload(kind: u8, payload: &[u8]) -> Result<(), WireError> {
+pub(crate) fn validate_payload(kind: u8, payload: &[u8]) -> Result<(), WireError> {
     if Codec::exact(kind).is_some_and(|size| payload.len() != size) {
-        Err(WireError::Malformed)
-    } else {
-        Ok(())
+        return Err(WireError::Malformed);
     }
+    let nonzero = |bytes: &[u8]| bytes.iter().any(|byte| *byte != 0);
+    let valid = match kind {
+        0x15 => {
+            payload[0] <= 1
+                && payload[1] <= 1
+                && payload[2..4] == [0, 0]
+                && if payload[0] == 0 {
+                    !nonzero(&payload[4..])
+                } else {
+                    nonzero(&payload[4..8]) && nonzero(&payload[8..24]) && nonzero(&payload[24..40])
+                }
+        }
+        0x16 => {
+            let outcome = payload[0];
+            outcome <= 3
+                && payload[1] <= 7
+                && payload[2] <= 1
+                && payload[3] == 0
+                && match outcome {
+                    0 | 1 => payload[1] == 0 && nonzero(&payload[4..8]) && nonzero(&payload[8..24]),
+                    2 => payload[1] == 0 && nonzero(&payload[4..8]) && !nonzero(&payload[8..24]),
+                    3 => payload[1] != 0 && !nonzero(&payload[8..24]),
+                    _ => false,
+                }
+        }
+        0x17 | 0x18 => nonzero(&payload[..4]) && nonzero(&payload[4..20]),
+        0x19 => nonzero(&payload[..16]),
+        0x1a => {
+            payload[0] <= 2
+                && payload[1] <= 3
+                && payload[2..4] == [0, 0]
+                && match payload[0] {
+                    0 => payload[1] == 0 && nonzero(&payload[4..8]),
+                    1 => payload[1] == 0,
+                    2 => payload[1] != 0,
+                    _ => false,
+                }
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(WireError::Malformed)
+    }
+}
+
+pub fn lease_token_payload(epoch: u32, token: [u8; 16]) -> Result<[u8; 20], WireError> {
+    let mut out = [0; 20];
+    out[..4].copy_from_slice(&epoch.to_le_bytes());
+    out[4..].copy_from_slice(&token);
+    validate_payload(0x17, &out)?;
+    Ok(out)
+}
+pub fn log_clear_payload(
+    incarnation: [u8; 16],
+    observed_index: u64,
+) -> Result<[u8; 24], WireError> {
+    let mut out = [0; 24];
+    out[..16].copy_from_slice(&incarnation);
+    out[16..].copy_from_slice(&observed_index.to_le_bytes());
+    validate_payload(0x19, &out)?;
+    Ok(out)
+}
+pub fn log_clear_result_payload(
+    outcome: u8,
+    reason: u8,
+    epoch: u32,
+    prior: u64,
+    resulting: u64,
+    cleared_through: u64,
+) -> Result<[u8; 32], WireError> {
+    let mut out = [0; 32];
+    out[0] = outcome;
+    out[1] = reason;
+    out[4..8].copy_from_slice(&epoch.to_le_bytes());
+    out[8..16].copy_from_slice(&prior.to_le_bytes());
+    out[16..24].copy_from_slice(&resulting.to_le_bytes());
+    out[24..].copy_from_slice(&cleared_through.to_le_bytes());
+    validate_payload(0x1a, &out)?;
+    Ok(out)
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
@@ -342,7 +423,7 @@ impl StatusExtension {
             return false;
         }
         if logging {
-            self.log_index != 0
+            self.log_epoch != 0 && self.log_index != 0
         } else {
             self.health & 1 == 0
                 && self.log_epoch == 0

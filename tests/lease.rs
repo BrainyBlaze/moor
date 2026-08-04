@@ -1,7 +1,8 @@
 use moor::session::{
-    InputAdmission, LeaseMachine, LeaseOperation, LeaseRequest, LeaseRole, OwnedInput, Phase,
-    ResultOutcome, ResultReason, TokenSource, legal_in_phase,
+    ControllerConnection, InputAdmission, LeaseMachine, LeaseOperation, LeaseRequest, LeaseRole,
+    OwnedInput, Phase, ResultOutcome, ResultReason, TokenSource, legal_in_phase,
 };
+use moor::wire::WireError;
 
 struct Tokens(Vec<Option<[u8; 16]>>);
 impl TokenSource for Tokens {
@@ -136,6 +137,48 @@ fn owner_activity_refreshes_deadline() {
 }
 
 #[test]
+fn late_keepalive_cannot_revive_an_expired_lease() {
+    let mut machine = LeaseMachine::new(token(9));
+    let grant = machine.request(
+        1,
+        &fresh(LeaseRole::Viewer),
+        0,
+        &mut Tokens(vec![Some(token(1))]),
+    );
+    assert_eq!(
+        machine.keepalive(1, grant.epoch, grant.token, 10_000),
+        Err(ResultReason::NotHeld)
+    );
+}
+
+#[test]
+fn late_owner_touch_cannot_revive_an_expired_lease() {
+    let mut machine = LeaseMachine::new(token(9));
+    machine.request(
+        1,
+        &fresh(LeaseRole::Viewer),
+        0,
+        &mut Tokens(vec![Some(token(1))]),
+    );
+    assert_eq!(machine.touch_owner(1, 10_000), Err(ResultReason::NotHeld));
+}
+
+#[test]
+fn late_input_cannot_revive_an_expired_lease() {
+    let mut machine = LeaseMachine::new(token(9));
+    let grant = machine.request(
+        1,
+        &fresh(LeaseRole::Viewer),
+        0,
+        &mut Tokens(vec![Some(token(1))]),
+    );
+    assert_eq!(
+        machine.admit_input_at(1, &input(grant.epoch, 1, b"x"), 10_000),
+        InputAdmission::Refuse(ResultReason::NotHeld)
+    );
+}
+
+#[test]
 fn maximum_epoch_is_granted_once_and_token_failure_consumes_nothing() {
     let mut machine = LeaseMachine::with_allocated(token(9), u32::MAX - 1);
     let failed = machine.request(1, &fresh(LeaseRole::Viewer), 0, &mut Tokens(vec![None]));
@@ -171,4 +214,79 @@ fn phase_table_fences_state_changing_frames() {
     assert!(legal_in_phase(Phase::Observer, 0x15));
     assert!(legal_in_phase(Phase::Viewer, 0x0c));
     assert!(!legal_in_phase(Phase::Closing, 0x0f));
+}
+
+#[test]
+fn controller_identity_generation_and_phase_transitions_are_fenced() {
+    let identity = b"canonical identity".to_vec();
+    let mut connection = ControllerConnection::new(7, identity.clone());
+    assert_eq!(
+        connection.hello(8, &identity),
+        Err(WireError::GenerationMismatch)
+    );
+    assert_eq!(
+        connection.hello(0, b"other identity"),
+        Err(WireError::IdentityMismatch)
+    );
+    assert_eq!(connection.hello(0, &identity), Ok(7));
+    assert_eq!(connection.phase(), Some(Phase::Unattached));
+    assert_eq!(
+        connection.frame(0, 0x0d),
+        Err(WireError::GenerationMismatch)
+    );
+    connection.frame(7, 0x0d).unwrap();
+    assert_eq!(
+        connection.lease(LeaseOperation::Fresh, LeaseRole::Viewer, true),
+        Err(WireError::Malformed)
+    );
+    connection
+        .lease(LeaseOperation::Fresh, LeaseRole::InputOnly, true)
+        .unwrap();
+    assert_eq!(connection.phase(), Some(Phase::InputOnly));
+
+    let mut viewer = ControllerConnection::new(7, identity.clone());
+    viewer.hello(7, &identity).unwrap();
+    viewer
+        .lease(LeaseOperation::Resume, LeaseRole::Viewer, true)
+        .unwrap();
+    assert_eq!(viewer.phase(), Some(Phase::Resumed));
+    viewer.attach(false, true).unwrap();
+    assert_eq!(viewer.phase(), Some(Phase::Viewer));
+    viewer.released().unwrap();
+    assert_eq!(viewer.phase(), Some(Phase::Observer));
+
+    connection.released().unwrap();
+    assert_eq!(connection.phase(), Some(Phase::Unattached));
+
+    let mut impossible = ControllerConnection::new(7, identity.clone());
+    impossible.hello(7, &identity).unwrap();
+    assert_eq!(impossible.attach(false, true), Err(WireError::Malformed));
+}
+
+#[test]
+fn typed_lease_payloads_round_trip_exact_wire_bytes() {
+    let request = LeaseRequest {
+        operation: LeaseOperation::Resume,
+        role: LeaseRole::InputOnly,
+        epoch: 7,
+        incarnation: token(8),
+        token: token(9),
+    };
+    let encoded = request.encode_wire().unwrap();
+    assert_eq!(encoded.len(), 40);
+    assert_eq!(LeaseRequest::decode_wire(&encoded).unwrap(), request);
+
+    let result = moor::session::LeaseResult {
+        outcome: ResultOutcome::Granted,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 8,
+        token: token(10),
+    };
+    let encoded = result.encode_wire().unwrap();
+    assert_eq!(encoded.len(), 24);
+    assert_eq!(
+        moor::session::LeaseResult::decode_wire(&encoded).unwrap(),
+        result
+    );
 }

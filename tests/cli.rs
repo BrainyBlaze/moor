@@ -7,6 +7,12 @@ fn run(args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn parses(args: &[&str]) -> bool {
+    let mut argv = vec![std::ffi::OsString::from("moor")];
+    argv.extend(args.iter().map(std::ffi::OsString::from));
+    moor::cli::parse(argv).is_ok()
+}
+
 const HELP: &str = "Usage:\n  moor <session> [options] [command [argument...]]\n  moor new|start|run [options] <session> [options] [command [argument...]]\n  moor attach [options] <session>\n  moor push <session>\n  moor kill [-f] [-q] <session>\n  moor rm [-q] <session> | moor rm -a [-q]\n  moor list [-a]\n  moor current\n  moor tail [-f] [-n N] <session>\n  moor clear [<session>]\n\nAttach/create options:\n  -e <char>  detach byte (default ^\\)\n  -E         disable detach\n  -r <mode>  child redraw: none, ctrl_l, winch (default none)\n  -R <mode>  viewer reset: none, move (default none)\n  -z         pass ^Z to the child\n  -q         suppress informational messages\n  -t         viewer is not VT-compatible\n\nCreate-only options:\n  -C <size>  log cap (default 1m; 0 disables)\n  -2 <path>  redirect child standard error\n  -T <path>  event store directory\n  -S <path>  launch-time instrumentation object\n  -d <path>  child working directory\n";
 
 #[test]
@@ -62,13 +68,7 @@ fn valid_create_grammars_reach_runtime_dispatch() {
         &["start", "s", "-C", "1m", "--", "/bin/sh", "-c", "exit 0"][..],
         &["s", "-q", "/bin/true"][..],
     ] {
-        let out = run(args);
-        assert_eq!(out.status.code(), Some(125), "{args:?}");
-        assert!(out.stdout.is_empty());
-        assert_eq!(
-            String::from_utf8(out.stderr).unwrap(),
-            "moor: runtime not implemented\n"
-        );
+        assert!(parses(args), "{args:?}");
     }
 }
 
@@ -83,8 +83,7 @@ fn double_dash_introduces_dash_leading_session_for_every_shape() {
         &["kill", "--", "-kill"][..],
         &["rm", "--", "-rm"][..],
     ] {
-        let out = run(args);
-        assert_eq!(out.status.code(), Some(125), "{args:?}");
+        assert!(parses(args), "{args:?}");
     }
 }
 
@@ -123,8 +122,7 @@ fn command_specific_arity_and_legacy_rules_are_strict() {
 
 #[test]
 fn option_terminator_is_permanent_and_legacy_k_has_frozen_error() {
-    let out = run(&["--", "-session", "--child-option"]);
-    assert_eq!(out.status.code(), Some(125));
+    assert!(parses(&["--", "-session", "--child-option"]));
 
     let out = run(&["attach", "--", "-session", "-q"]);
     assert_eq!(out.status.code(), Some(1));
@@ -144,7 +142,7 @@ fn option_terminator_is_permanent_and_legacy_k_has_frozen_error() {
 
 #[test]
 fn repeated_flags_and_known_option_ownership_are_exact() {
-    assert_eq!(run(&["list", "-a", "-a"]).status.code(), Some(125));
+    assert!(parses(&["list", "-a", "-a"]));
     let out = run(&["tail", "-q", "session"]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
@@ -157,7 +155,7 @@ fn repeated_flags_and_known_option_ownership_are_exact() {
 fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
     for token in ["new", "n", "-c", "start", "s", "-n", "run", "-N", "-A"] {
         for args in [vec![token, "-q", "session"], vec![token, "session", "-q"]] {
-            assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+            assert!(parses(&args), "{args:?}");
         }
     }
     for token in [
@@ -168,7 +166,7 @@ fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
             "list" | "l" | "ls" | "-l" | "current" | "-i" => vec![token],
             _ => vec![token, "session"],
         };
-        assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+        assert!(parses(&args), "{args:?}");
     }
 }
 
@@ -245,18 +243,10 @@ fn every_owned_option_is_accepted_in_each_legal_phase() {
             let mut before_session = vec![token];
             before_session.extend_from_slice(option);
             before_session.push("session");
-            assert_eq!(
-                run(&before_session).status.code(),
-                Some(125),
-                "{before_session:?}"
-            );
+            assert!(parses(&before_session), "{before_session:?}");
             let mut after_session = vec![token, "session"];
             after_session.extend_from_slice(option);
-            assert_eq!(
-                run(&after_session).status.code(),
-                Some(125),
-                "{after_session:?}"
-            );
+            assert!(parses(&after_session), "{after_session:?}");
         }
         assert_eq!(run(&["-q", token, "session"]).status.code(), Some(1));
     }
@@ -265,7 +255,7 @@ fn every_owned_option_is_accepted_in_each_legal_phase() {
             let mut args = vec![token];
             args.extend_from_slice(option);
             args.push("session");
-            assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+            assert!(parses(&args), "{args:?}");
         }
     }
 }
