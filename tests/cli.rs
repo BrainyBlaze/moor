@@ -121,6 +121,66 @@ fn command_specific_arity_and_legacy_rules_are_strict() {
     }
 }
 
+#[test]
+fn option_terminator_is_permanent_and_legacy_k_has_frozen_error() {
+    let out = run(&["--", "-session", "--child-option"]);
+    assert_eq!(out.status.code(), Some(125));
+
+    let out = run(&["attach", "--", "-session", "-q"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("Invalid number of arguments")
+    );
+
+    let out = run(&["-k", "-f", "session"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "moor: Invalid number of arguments\nTry 'moor --help' for more information.\n"
+    );
+}
+
+#[test]
+fn repeated_flags_and_known_option_ownership_are_exact() {
+    assert_eq!(run(&["list", "-a", "-a"]).status.code(), Some(125));
+    let out = run(&["tail", "-q", "session"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "moor: Option '-q' is not valid for 'tail'\nTry 'moor --help' for more information.\n"
+    );
+}
+
+#[test]
+fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
+    for token in ["new", "n", "-c", "start", "s", "-n", "run", "-N", "-A"] {
+        for args in [vec![token, "-q", "session"], vec![token, "session", "-q"]] {
+            assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+        }
+    }
+    for token in [
+        "attach", "a", "-a", "push", "p", "-p", "kill", "k", "-k", "list", "l", "ls", "-l",
+        "current", "-i",
+    ] {
+        let args = match token {
+            "list" | "l" | "ls" | "-l" | "current" | "-i" => vec![token],
+            _ => vec![token, "session"],
+        };
+        assert_eq!(run(&args).status.code(), Some(125), "{args:?}");
+    }
+}
+
+#[test]
+fn every_reserved_suffix_is_rejected_in_bare_and_path_forms() {
+    for suffix in [".log", ".events", ".exit", ".instrument"] {
+        for name in [format!("session{suffix}"), format!("dir/session{suffix}")] {
+            assert_eq!(run(&[&name]).status.code(), Some(1), "{name}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn invoked_atch_name_drives_help_and_diagnostics() {

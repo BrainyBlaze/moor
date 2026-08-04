@@ -419,7 +419,7 @@ Every argument failure writes exactly two LF lines to standard output and nothin
 Try '<p> --help' for more information.
 ```
 
-The closed messages are `Invalid mode '<x>'`, `Invalid number of arguments`, `Option '<o>' requires an argument`, `Invalid value '<x>' for option '<o>'`, and `Option '<o>' is not valid for '<command>'`. Tokens and values use OB-29 rendering inside the shown ASCII quotes. Unknown leading-dash tokens use `Invalid mode`; missing/excess operands use `Invalid number of arguments`; the other three cases are literal. All exit 1.
+The closed messages are `Invalid mode '<x>'`, `Invalid number of arguments`, `Invalid session name '<x>'`, `Option '<o>' requires an argument`, `Invalid value '<x>' for option '<o>'`, and `Option '<o>' is not valid for '<command>'`. Tokens and values use OB-29 rendering inside the shown ASCII quotes. Unknown leading-dash tokens use `Invalid mode`; missing/excess operands use `Invalid number of arguments`; lexical session-name rejection uses `Invalid session name`; the other three cases are literal. All exit 1.
 
 Runtime session-state diagnostics retain the exact templates already frozen in §3/§13 and use standard output plus LF. Sink validation, working-directory failure, instrumentation failure, and child-exec failure use standard error; only child-exec failure uses the already frozen CRLF. `tail` gap/store diagnostics use standard error plus LF. Help/version/informational lines use standard output plus LF. No other stream or line-ending choice remains implicit.
 
