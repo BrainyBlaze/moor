@@ -85,8 +85,9 @@ fn correlation_capacity_and_u64_exhaustion_disconnect_once_and_never_wrap() {
     );
     assert!(!final_id.delegation_allocatable());
     let exhausted = final_id.recognize(1, b"\x1b[c", context.clone());
+    assert!(format!("{exhausted:?}").contains("ResourceExhausted"));
     assert!(matches!(
-        exhausted.first(),
+        exhausted.get(1),
         Some(QueryAction::Disconnect { conn: 7 })
     ));
     let later = final_id.recognize(2, b"\x1b[c", context);

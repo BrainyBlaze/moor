@@ -1,12 +1,31 @@
 use moor::wire::{
     Codec, Heartbeat, Profile, Query, StatusExtension, WireError, crc32c, decode_query,
-    validate_attach_flags, validate_status_flags,
+    lease_token_payload, log_clear_payload, log_clear_result_payload, validate_attach_flags,
+    validate_status_flags,
 };
 
 fn hex(s: &str) -> Vec<u8> {
     s.split_whitespace()
         .map(|b| u8::from_str_radix(b, 16).unwrap())
         .collect()
+}
+
+fn exact_payload(kind: u8, size: usize) -> Vec<u8> {
+    let mut payload = vec![0; size];
+    match kind {
+        0x16 => {
+            payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+            payload[8..].fill(1);
+        }
+        0x17 | 0x18 => {
+            payload[..4].copy_from_slice(&1u32.to_le_bytes());
+            payload[4..].fill(1);
+        }
+        0x19 => payload[..16].fill(1),
+        0x1a => payload[0] = 1,
+        _ => {}
+    }
+    payload
 }
 
 const V1: &str = "
@@ -87,7 +106,7 @@ fn lease_and_log_payloads_are_exact_and_never_fragmented() {
     ] {
         let mut bytes = Vec::new();
         Codec::new(Profile::Controller)
-            .encode(7, kind, &vec![0; size], &mut bytes)
+            .encode(7, kind, &exact_payload(kind, size), &mut bytes)
             .unwrap();
         let mut out = Vec::new();
         Codec::new(Profile::Controller)
@@ -104,6 +123,44 @@ fn lease_and_log_payloads_are_exact_and_never_fragmented() {
             Err(WireError::Malformed)
         );
     }
+}
+
+#[test]
+fn lease_and_log_payload_values_are_fail_closed() {
+    for (kind, payload) in [
+        (0x16, vec![0; 24]),
+        (0x17, vec![0; 20]),
+        (0x18, vec![0; 20]),
+        (0x1a, {
+            let mut value = vec![0; 32];
+            value[0] = 3;
+            value
+        }),
+    ] {
+        assert_eq!(
+            Codec::new(Profile::Controller).encode(7, kind, &payload, &mut Vec::new()),
+            Err(WireError::Malformed),
+            "kind {kind:#x}"
+        );
+    }
+    let mut request = vec![0; 40];
+    request[2] = 1;
+    assert_eq!(
+        Codec::new(Profile::Controller).encode(7, 0x15, &request, &mut Vec::new()),
+        Err(WireError::Malformed)
+    );
+}
+
+#[test]
+fn exact_lease_and_log_builders_emit_valid_payloads() {
+    assert_eq!(lease_token_payload(1, [2; 16]).unwrap().len(), 20);
+    assert_eq!(log_clear_payload([3; 16], 7).unwrap().len(), 24);
+    assert_eq!(
+        log_clear_result_payload(0, 0, 2, 7, 8, 99).unwrap().len(),
+        32
+    );
+    assert!(lease_token_payload(0, [0; 16]).is_err());
+    assert!(log_clear_result_payload(3, 0, 0, 0, 0, 0).is_err());
 }
 
 #[test]
@@ -158,6 +215,9 @@ fn status_and_heartbeat_extensions_round_trip_and_reject_reserved_bits() {
         StatusExtension::decode(&bytes, false),
         Err(WireError::Malformed)
     );
+    let mut zero_epoch = status.clone();
+    zero_epoch.log_epoch = 0;
+    assert_eq!(zero_epoch.encode(true), Err(WireError::Malformed));
 
     let heartbeat = Heartbeat {
         monotonic_ms: 42,

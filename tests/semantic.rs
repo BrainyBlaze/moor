@@ -1,7 +1,7 @@
 use moor::session::{
-    ApplicationInput, ApplicationReceipt, EventPosition, MissingReason, SemanticAckStatus,
-    SemanticAdmission, SemanticEvent, SemanticEventKind, SemanticHello, SemanticMachine,
-    SemanticMode, SemanticRefusal,
+    ApplicationInput, ApplicationReceipt, EventPosition, InputNoticeAck, MissingReason,
+    SemanticAckStatus, SemanticAdmission, SemanticEvent, SemanticEventKind, SemanticHello,
+    SemanticMachine, SemanticMode, SemanticRefusal, next_semantic_sequence,
 };
 
 fn id(n: u8) -> [u8; 16] {
@@ -15,6 +15,14 @@ fn hello(mode: SemanticMode) -> SemanticHello {
         mode,
         capabilities: 7,
         source: b"claude".to_vec(),
+    }
+}
+fn notice_ack(input: &ApplicationInput, prepared: bool) -> InputNoticeAck {
+    InputNoticeAck {
+        application_id: input.application_id,
+        lease_epoch: input.lease_epoch,
+        request_id: input.request_id,
+        prepared,
     }
 }
 
@@ -130,7 +138,9 @@ fn application_notice_precedes_write_and_correlation_resolves_only_after_commit(
             0x93, 0x8b, 0x98, 0x24,
         ]
     );
-    let permit = machine.accept_notice(10, ticket, true, 20).unwrap();
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 20)
+        .unwrap();
     machine.input_written(permit, 30).unwrap();
     assert_eq!(machine.pending_correlations(), 1);
 
@@ -174,7 +184,9 @@ fn correlation_mismatch_source_loss_deadline_and_expiry_emit_once() {
         terminal: b"x".to_vec(),
     };
     let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
-    let permit = machine.accept_notice(10, ticket, true, 1).unwrap();
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
     machine.input_written(permit, 2).unwrap();
     let bad = ApplicationReceipt {
         application_id: id(9),
@@ -290,4 +302,212 @@ fn unsupervised_zero_generation_and_heartbeat_degradation_are_explicit() {
     assert!(machine.poll(15_999).is_empty());
     machine.poll(16_000);
     assert_eq!(machine.semantic_flags() & 2, 2);
+}
+
+#[test]
+fn unwritable_event_storage_refuses_semantic_hello() {
+    let mut machine = SemanticMachine::new(id(1), 7);
+    machine.set_writable(false);
+    assert_eq!(
+        machine.hello(10, &hello(SemanticMode::Stateful)),
+        Err(SemanticRefusal::ResourceExhausted)
+    );
+}
+
+#[test]
+fn losing_event_storage_identifies_semantic_connections_to_close() {
+    let mut machine = SemanticMachine::new(id(1), 7);
+    machine.hello(10, &hello(SemanticMode::Stateful)).unwrap();
+    assert_eq!(format!("{:?}", machine.set_writable(false)), "[10]");
+}
+
+#[test]
+fn absent_event_storage_has_no_semantic_capability() {
+    let mut machine = SemanticMachine::new([0; 16], 7);
+    let mut request = hello(SemanticMode::Stateful);
+    request.token = [0; 16];
+    assert_eq!(
+        machine.hello(10, &request),
+        Err(SemanticRefusal::CapabilityAbsent)
+    );
+}
+
+#[test]
+fn degraded_source_recovers_only_after_a_durable_snapshot() {
+    let mut machine = exact_machine();
+    machine.poll(15_000);
+    assert_eq!(machine.semantic_flags() & 3, 2);
+    let snapshot = SemanticEvent {
+        id: id(11),
+        sequence: 2,
+        kind: SemanticEventKind::Snapshot,
+        exact_payload: b"{}".to_vec(),
+    };
+    let SemanticAdmission::Append(ticket) = machine.admit(10, &snapshot).unwrap() else {
+        unreachable!()
+    };
+    machine
+        .committed(
+            ticket,
+            EventPosition {
+                epoch: 0,
+                sequence: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(machine.semantic_flags() & 3, 1);
+}
+
+#[test]
+fn disconnected_source_cannot_publish_a_recovery_snapshot() {
+    let mut machine = exact_machine();
+    machine.source_lost(10, 1);
+    let snapshot = SemanticEvent {
+        id: id(11),
+        sequence: 2,
+        kind: SemanticEventKind::Snapshot,
+        exact_payload: b"{}".to_vec(),
+    };
+    assert_eq!(
+        machine.admit(10, &snapshot),
+        Err(SemanticRefusal::Superseded)
+    );
+}
+
+#[test]
+fn input_notice_ack_at_deadline_cannot_authorize_a_write() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    assert!(
+        machine
+            .accept_notice(10, ticket, &notice_ack(&input, true), 2_000)
+            .is_err()
+    );
+}
+
+#[test]
+fn producer_replacement_after_preparation_cancels_write_permission() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
+    machine
+        .hello_at(11, &hello(SemanticMode::Stateful), 1)
+        .unwrap();
+    assert_eq!(
+        machine.input_written(permit, 2),
+        Err(SemanticRefusal::SourceUnavailable)
+    );
+}
+
+#[test]
+fn producer_degradation_after_preparation_cancels_write_permission() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
+    machine.poll(15_000);
+    assert_eq!(
+        machine.input_written(permit, 15_000),
+        Err(SemanticRefusal::SourceUnavailable)
+    );
+}
+
+#[test]
+fn input_notice_ack_must_echo_the_complete_application_tuple() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    let mut ack = notice_ack(&input, true);
+    ack.request_id += 1;
+    assert!(machine.accept_notice(10, ticket, &ack, 1).is_err());
+}
+
+#[test]
+fn unanswered_input_notices_expire_at_two_seconds() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    machine.prepare_input(&input, 0).unwrap();
+    assert!(machine.expire_notices(1_999).is_empty());
+    assert_eq!(machine.expire_notices(2_000).len(), 1);
+    assert_eq!(machine.pending_correlations(), 0);
+}
+
+#[test]
+fn a_bound_application_id_reports_conflict_not_capacity_exhaustion() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    machine.prepare_input(&input, 0).unwrap();
+    let error = machine.prepare_input(&input, 1).unwrap_err();
+    assert_eq!(format!("{error:?}"), "ApplicationConflict");
+}
+
+#[test]
+fn status_pending_count_includes_only_completed_transport_writes() {
+    let mut machine = exact_machine();
+    let input = ApplicationInput {
+        application_id: id(9),
+        lease_epoch: 3,
+        request_id: 2,
+        source: b"claude".to_vec(),
+        terminal: b"x".to_vec(),
+    };
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    assert_eq!(machine.pending_correlations(), 0);
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
+    assert_eq!(machine.pending_correlations(), 0);
+    machine.input_written(permit, 2).unwrap();
+    assert_eq!(machine.pending_correlations(), 1);
+}
+
+#[test]
+fn semantic_source_sequence_exhaustion_never_wraps_or_becomes_bad_sequence() {
+    assert_eq!(next_semantic_sequence(u64::MAX - 1), Ok(u64::MAX));
+    assert_eq!(
+        next_semantic_sequence(u64::MAX),
+        Err(SemanticRefusal::ResourceExhausted)
+    );
 }
