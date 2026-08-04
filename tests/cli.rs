@@ -189,6 +189,23 @@ fn remaining_argument_diagnostics_name_the_real_command() {
 }
 
 #[test]
+fn known_options_after_fixed_operands_keep_ownership_diagnostics() {
+    for (args, command) in [
+        (&["current", "-q"][..], "current"),
+        (&["push", "session", "-q"][..], "push"),
+        (&["clear", "session", "-q"][..], "clear"),
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .contains(&format!("Option '-q' is not valid for '{command}'"))
+        );
+    }
+}
+
+#[test]
 fn every_owned_option_is_accepted_in_each_legal_phase() {
     let viewer: &[&[&str]] = &[
         &["-e", "^A"],
