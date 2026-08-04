@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[dependencies]
+sha2 = "0.10"
+
 [[bin]]
 name = "moor"
 path = "src/main.rs"
@@ -13,4 +16,3 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
-
