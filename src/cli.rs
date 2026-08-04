@@ -141,6 +141,13 @@ fn invalid_option(arg: &OsStr, command: &str) -> Error {
         name::render(arg)
     ))
 }
+fn extra_error(args: &[OsString], command: &str) -> Error {
+    match args.iter().find(|arg| !eq(arg, "--") && leading_dash(arg)) {
+        Some(arg) if known_option(arg) => invalid_option(arg, command),
+        Some(arg) => invalid_mode(arg),
+        None => invalid_args(),
+    }
+}
 
 fn parse_u32(value: &OsString, opt: &str) -> Result<u32, Error> {
     let s = value.to_str().ok_or_else(|| invalid_value(value, opt))?;
@@ -366,7 +373,7 @@ fn one_session(args: &[OsString], i: usize, command: &str) -> Result<OsString, E
     } else if args.len() == i + 2 && eq(&args[i], "--") {
         session(args[i + 1].clone())
     } else {
-        Err(invalid_args())
+        Err(extra_error(&args[i..], command))
     }
 }
 
@@ -439,7 +446,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
         return if args.len() == 2 {
             Ok(Action::Current)
         } else {
-            Err(invalid_args())
+            Err(extra_error(&args[2..], "current"))
         };
     }
     if eq(first, "clear") {
@@ -452,7 +459,7 @@ pub fn parse(args: Vec<OsString>) -> Result<Action, Error> {
             }),
             3 => Ok(Action::Clear(Some(session(args[2].clone())?))),
             4 if eq(&args[2], "--") => Ok(Action::Clear(Some(session(args[3].clone())?))),
-            _ => Err(invalid_args()),
+            _ => Err(extra_error(&args[2..], "clear")),
         };
     }
     if eq(first, "kill") || eq(first, "k") || eq(first, "-k") {
