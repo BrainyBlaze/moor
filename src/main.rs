@@ -1,6 +1,4 @@
-mod cli;
-mod name;
-
+use moor::{cli, name};
 use std::io::Write;
 
 fn main() {
