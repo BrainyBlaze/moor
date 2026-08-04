@@ -279,6 +279,50 @@ fn every_reserved_suffix_is_rejected_in_bare_and_path_forms() {
     }
 }
 
+#[test]
+fn parsed_action_preserves_defaults_repetition_paths_and_child_arguments() {
+    use moor::cli::{Action, CreateMode, Redraw};
+    use std::ffi::OsString;
+    let args = [
+        "moor", "start", "-C", "1k", "session", "-C", "2m", "-r", "winch", "-d", "work", "--",
+        "child", "-x",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let Action::Create {
+        mode,
+        session,
+        command,
+        options,
+    } = moor::cli::parse(args).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(mode, CreateMode::Start);
+    assert_eq!(session, "session");
+    assert_eq!(command, ["child", "-x"]);
+    assert_eq!(options.log_cap, 2 << 20);
+    assert_eq!(options.redraw, Redraw::Winch);
+    assert_eq!(options.detach, Some(0x1c));
+    assert_eq!(options.directory.unwrap(), std::path::PathBuf::from("work"));
+}
+
+#[cfg(unix)]
+#[test]
+fn invoked_dot_is_not_normalized_to_moor() {
+    use std::os::unix::process::CommandExt;
+    let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+        .arg0(".")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!(". {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn invoked_atch_name_drives_help_and_diagnostics() {
