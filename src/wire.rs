@@ -95,6 +95,11 @@ impl<'a> Reader<'a> {
         require(length <= 1 << 20, WireError::OversizedMessage)?;
         self.take(length)
     }
+    pub(crate) fn compact(&mut self) -> Result<&'a [u8], WireError> {
+        let length = self.u16()? as usize;
+        require(length <= 4096, WireError::OversizedMessage)?;
+        self.take(length)
+    }
     pub(crate) fn rest(&mut self) -> &'a [u8] {
         std::mem::take(&mut self.0)
     }
@@ -381,13 +386,13 @@ pub fn terminate_result_payload(
 ) -> Result<Vec<u8>, WireError> {
     let header = [outcome, containment, method];
     well_formed(valid_termination(header, diagnostic))?;
-    with_wide(header.to_vec(), diagnostic)
+    with_compact(header.to_vec(), diagnostic)
 }
 
 pub fn decode_terminate_result(payload: &[u8]) -> Result<(u8, u8, u8, &[u8]), WireError> {
     let mut input = Reader(payload);
     let [outcome, containment, method] = input.exact()?;
-    let diagnostic = input.wide()?;
+    let diagnostic = input.compact()?;
     validated(
         valid_termination([outcome, containment, method], diagnostic),
         input.finish((outcome, containment, method, diagnostic))?,
@@ -401,9 +406,22 @@ pub fn put_wide(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WireError> {
     Ok(())
 }
 
+pub fn put_compact(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WireError> {
+    require(bytes.len() <= 4096, WireError::OversizedMessage)?;
+    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn with_wide(mut out: Vec<u8>, bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     out.reserve(4 + bytes.len());
     put_wide(&mut out, bytes)?;
+    Ok(out)
+}
+
+fn with_compact(mut out: Vec<u8>, bytes: &[u8]) -> Result<Vec<u8>, WireError> {
+    out.reserve(2 + bytes.len());
+    put_compact(&mut out, bytes)?;
     Ok(out)
 }
 
@@ -422,19 +440,19 @@ pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> RuntimeReply {
             wire_rules!(frame 5; notice.receipt.application_id; notice.receipt.lease_epoch.to_le_bytes(); notice.receipt.request_id.to_le_bytes(); notice.byte_count.to_le_bytes(); notice.digest)
         }
         NoticeCancel(receipt) => {
-            wire_rules!(frame 10; receipt.application_id; receipt.lease_epoch.to_le_bytes(); receipt.request_id.to_le_bytes(); 21u32.to_le_bytes(); b"terminal write failed")
+            wire_rules!(frame 10; receipt.application_id; receipt.lease_epoch.to_le_bytes(); receipt.request_id.to_le_bytes(); 21u16.to_le_bytes(); b"terminal write failed")
         }
         SemanticAck(ack) => {
             let (epoch, sequence) = ack
                 .position
                 .map(|position| (position.epoch, position.sequence))
                 .unwrap_or_default();
-            wire_rules!(frame 7; ack.id; ack.sequence.to_le_bytes(); [ack.status as u8]; [0; 2]; epoch.to_le_bytes(); sequence.to_le_bytes(); [0; 4])
+            wire_rules!(frame 7; ack.id; ack.sequence.to_le_bytes(); [ack.status as u8]; [0; 2]; epoch.to_le_bytes(); sequence.to_le_bytes(); [0; 2])
         }
         SemanticRefused(event, error) => {
             let code = semantic_code(error);
             if let Some(event) = event {
-                wire_rules!(frame 7; event.id; event.sequence.to_le_bytes(); [2]; code.to_le_bytes(); [0; 12]; 22u32.to_le_bytes(); b"semantic event refused")
+                wire_rules!(frame 7; event.id; event.sequence.to_le_bytes(); [2]; code.to_le_bytes(); [0; 12]; 22u16.to_le_bytes(); b"semantic event refused")
             } else {
                 wire_rules!(frame 9, error_payload(code, b"semantic request refused"))
             }
@@ -457,12 +475,18 @@ fn semantic_code(error: SemanticRefusal) -> u16 {
 }
 
 pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> {
-    wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u32).to_le_bytes(); diagnostic)
+    wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u16).to_le_bytes(); diagnostic)
 }
 
 pub fn get_wide(bytes: &[u8], at: usize, exact_tail: bool) -> Option<&[u8]> {
     let mut input = Reader(bytes.get(at..)?);
     let value = input.wide().ok()?;
+    (!exact_tail || input.end().is_ok()).then_some(value)
+}
+
+pub fn get_compact(bytes: &[u8], at: usize, exact_tail: bool) -> Option<&[u8]> {
+    let mut input = Reader(bytes.get(at..)?);
+    let value = input.compact().ok()?;
     (!exact_tail || input.end().is_ok()).then_some(value)
 }
 
@@ -585,6 +609,7 @@ pub fn decode_viewer<'a>(
                 !stream.terminal
                     && stream.replay.is_none()
                     && bytes.len() == length
+                    && length <= 4096
                     && (!stream.non_vt || bytes.is_empty()),
             )?;
             stream.terminal = true;
@@ -739,7 +764,7 @@ pub fn decode_controller(
                 }
                 1 => {
                     let application_id = input.exact()?;
-                    let source = input.wide()?;
+                    let source = input.compact()?;
                     well_formed(nonzero(&application_id) && valid_source_id(source))?;
                     let terminal_at = payload.len() - input.rest().len();
                     Some(
@@ -781,7 +806,7 @@ pub fn decode_semantic(
         1 if scope == 0 => {
             let (token, producer, generation) = (input.exact()?, input.exact()?, input.u32()?);
             let mode = ordinal(input.byte()?, &[SemanticMode::Edge, SemanticMode::Stateful])?;
-            wire_rules!(policy SemanticHello; wire_rules!(value SemanticHello; token = token; producer = producer; generation = generation; mode = mode; capabilities = input.byte()?; source = input.wide()?.into()))
+            wire_rules!(policy SemanticHello; wire_rules!(value SemanticHello; token = token; producer = producer; generation = generation; mode = mode; capabilities = input.byte()?; source = input.compact()?.into()))
         }
         3 => {
             let (id, sequence) = (input.exact()?, input.u64()?);
@@ -794,10 +819,9 @@ pub fn decode_semantic(
         4 => {
             wire_rules!(read input; id = input.exact(); sequence = input.u64(); application_id = input.exact(); lease_epoch = input.u32(); request_id = input.u64(); status = input.byte());
             well_formed(status <= 1)?;
-            wire_rules!(read input; session = input.wide(); turn = input.wide());
-            well_formed(session.len() <= 4096 && turn.len() <= 4096)?;
-            let session = 33..33 + session.len();
-            let turn = session.end + 4..session.end + 4 + turn.len();
+            wire_rules!(read input; session = input.compact(); turn = input.compact());
+            let session = 31..31 + session.len();
+            let turn = session.end + 2..session.end + 2 + turn.len();
             wire_rules!(policy SemanticEvent; wire_rules!(value SemanticEvent; id = id; sequence = sequence; kind = SemanticEventKind::ApplicationReceipt; exact_payload = payload[24..].into()); Some(wire_rules!(value ReceiptProjection; receipt = wire_rules!(value ApplicationReceipt; application_id = application_id; lease_epoch = lease_epoch; request_id = request_id); status = status; provider_session = session; provider_turn = turn)))
         }
         6 => {

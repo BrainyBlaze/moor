@@ -375,7 +375,7 @@ fn invalid_keepalive_reports_lease_not_held_before_closing() {
         15
     );
     assert_eq!(
-        wire::get_wide(&error.payload, 2, true),
+        wire::get_compact(&error.payload, 2, true),
         Some(b"lease not held".as_slice())
     );
     assert!(peer.closed(&mut runtime));
@@ -657,7 +657,7 @@ fn event_lane_failure_reports_resource_exhausted_before_closing_semantic_peer() 
     let (mut runtime, paths) = event_fixture();
     let mut peer = connect_as(&mut runtime, Profile::Semantic);
     let mut hello = [[5; 16].as_slice(), &[6; 16], &7u32.to_le_bytes(), &[0, 0]].concat();
-    wire::put_wide(&mut hello, b"source").unwrap();
+    wire::put_compact(&mut hello, b"source").unwrap();
     peer.send(0, 1, &hello);
     assert_eq!(peer.recv(&mut runtime).kind, 2);
     runtime.output(b"\x1b]2;idle\x07\x1b]8;;https://example.test\x07".to_vec());
@@ -689,7 +689,7 @@ fn parsed_semantic_refusals_and_durable_failures_use_refused_ack_shape() {
         );
         assert_eq!(&message.payload[27..39], &[0; 12]);
         assert!(
-            !wire::get_wide(&message.payload, 39, true)
+            !wire::get_compact(&message.payload, 39, true)
                 .unwrap()
                 .is_empty()
         );
@@ -697,7 +697,7 @@ fn parsed_semantic_refusals_and_durable_failures_use_refused_ack_shape() {
     let connect_source = |runtime: &mut Runtime<FakeNative>| {
         let mut peer = connect_as(runtime, Profile::Semantic);
         let mut hello = [[5; 16].as_slice(), &[6; 16], &7u32.to_le_bytes(), &[0, 1]].concat();
-        wire::put_wide(&mut hello, b"source").unwrap();
+        wire::put_compact(&mut hello, b"source").unwrap();
         peer.send(0, 1, &hello);
         assert_eq!(peer.recv(runtime).kind, 2);
         peer
@@ -780,7 +780,7 @@ fn authenticated_semantic_source_epoch_is_fenced_before_admission() {
     let (mut runtime, paths) = event_fixture();
     let mut peer = connect_as(&mut runtime, Profile::Semantic);
     let mut hello = [[5; 16].as_slice(), &[6; 16], &7u32.to_le_bytes(), &[0, 1]].concat();
-    wire::put_wide(&mut hello, b"source").unwrap();
+    wire::put_compact(&mut hello, b"source").unwrap();
     peer.send(0, 1, &hello);
     assert_eq!(peer.recv(&mut runtime).kind, 2);
     peer.send(
