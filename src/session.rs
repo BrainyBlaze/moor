@@ -393,7 +393,7 @@ pub type Effects = SmallVec<[Effect; 4]>;
 schema!(enum Peer; Controller(bool, bool), Semantic(Arc<[u8]>));
 schema!(enum Pending; Input(ConnId, OwnedInput), Application([u8; 16], InputPending),
     Semantic(Arc<[u8]>, Binding, SemanticEvent, Option<[u8; 16]>),
-    Sources, Hello(PendingHello), Ack(Arc<[u8]>, SemanticAck));
+    Sources, Hello(Box<PendingHello>), Ack(Arc<[u8]>, SemanticAck));
 schema!(struct PendingQuery fields; conn: ConnId, correlation: u64, epoch: u32, shape: QueryShape,
     fallback: Option<Vec<u8>>, deadline: u64);
 schema!(struct Termination fields; peer: Option<ConnId>, started: u64, containment: u8, method: u8, expired: bool);
@@ -1196,9 +1196,9 @@ impl Machine {
                 source.pending = COMMIT_PENDING;
             }
             if let Err(Pending::Hello(pending)) =
-                self.commit_sources(Pending::Hello(pending), changes, false)
+                self.commit_sources(Pending::Hello(Box::new(pending)), changes, false)
             {
-                self.finish_hello(pending, now, false);
+                self.finish_hello(*pending, now, false);
                 self.set_writable(false);
             }
         }
@@ -1299,7 +1299,7 @@ impl Machine {
                 self.finish_input(pending.controller, pending.input, receipt);
             }
             (Pending::Hello(hello), Completion::Sources(success)) => {
-                self.finish_hello(hello, now, success);
+                self.finish_hello(*hello, now, success);
             }
             (Pending::Ack(name, ack), Completion::Sources(success)) => {
                 let source = self.sources.get_mut(&name).expect("pending source");
