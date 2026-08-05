@@ -97,6 +97,7 @@ fn output_events_clear_and_lifecycle_use_bounded_worker_lanes() {
         Some((log, 4)),
         Some(EventConfig {
             store: event_store,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -196,6 +197,7 @@ fn rejected_event_admission_does_not_advance_the_durable_cursor() {
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -239,6 +241,7 @@ fn event_history_compacts_only_at_the_byte_cap_and_keeps_snapshot_then_trigger()
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -328,6 +331,7 @@ fn compaction_may_exceed_the_cap_only_for_its_occurrence_trigger() {
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -397,6 +401,7 @@ fn stateful_source_admission_reserves_mandatory_maximum_baseline() {
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -511,6 +516,7 @@ fn sequence_exhaustion_while_compacting_preserves_the_append_prefix() {
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             created: 10,
             session: "AS9z".into(),
             generation: None,
@@ -596,6 +602,7 @@ fn epoch_exhaustion_preserves_history_and_reports_the_trigger_position() {
         None,
         Some(EventConfig {
             store: events,
+            path: event_path.clone(),
             stream: EventStream::at(Cursor(epoch, 0, 0, 1)),
             created: 10,
             session: "AS9z".into(),
@@ -651,6 +658,7 @@ fn final_commit_reports_the_accepted_trigger_before_its_diagnostic() {
         None,
         Some(EventConfig {
             store,
+            path: event_path.clone(),
             stream: EventStream::at(Cursor(0, 0, 0, u64::MAX - 1)),
             created: 10,
             session: "AS9z".into(),
@@ -689,6 +697,7 @@ fn shutdown_stages_lifecycle_before_one_ordered_final_event_transaction() {
         None,
         Some(EventConfig {
             store: event_store,
+            path: event_path.clone(),
             stream: EventStream::new(),
             created: 10,
             session: "AS9z".into(),
@@ -764,6 +773,7 @@ fn mandatory_overflow_closes_only_its_lane_while_semantic_overflow_is_rejected()
                 None,
                 Some(EventConfig {
                     store: events,
+                    path: event_path.clone(),
                     stream: EventStream::new(),
                     created: 10,
                     session: "AS9z".into(),

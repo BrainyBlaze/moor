@@ -486,16 +486,20 @@ pub fn probe_session(
     }
 }
 
-crate::schema!(enum Decision [Clone, Copy]; Proceed, Attach, Cleanup, Offline, Missing, Running, Already, Identify);
+crate::schema!(enum Decision [Clone, Copy]; Proceed, Attach, Cleanup, Offline, Missing, Stopped, Running, Already, Identify);
 use Decision::*;
 
-const ATTACH_POLICY: [Decision; 6] = [Missing, Proceed, Proceed, Missing, Missing, Identify];
+// Indexed by SessionState ordinal. Both stale residue shapes — an orphaned
+// rendezvous and an exit-record-only remnant — are the one stale liveness state
+// of §2.3, so §13.3's state-keyed message applies to both.
+const ATTACH_POLICY: [Decision; 6] = [Missing, Proceed, Proceed, Stopped, Stopped, Identify];
 const CLEAR_POLICY: [Decision; 6] = [Missing, Proceed, Proceed, Offline, Offline, Identify];
 const REMOVE_POLICY: [Decision; 6] = [Missing, Running, Running, Cleanup, Cleanup, Identify];
 
 fn decide(session: &OsStr, path: &Path, table: [Decision; 6]) -> CommandResult<Decision> {
     match table[platform::classify(path) as usize] {
         Decision::Missing => Err(session_error(session, "does not exist")),
+        Decision::Stopped => Err(session_error(session, "is not running")),
         Decision::Running => Err(session_error(session, "is running")),
         Decision::Already => Err(session_error(session, "is already running")),
         Decision::Identify => Err(session_error(session, "could not be identified")),
