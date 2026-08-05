@@ -477,7 +477,7 @@ pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> RuntimeReply {
 }
 
 fn semantic_code(error: SemanticRefusal) -> u16 {
-    [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10][error as usize]
+    [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10, 15][error as usize]
 }
 
 pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> {

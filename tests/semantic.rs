@@ -1159,7 +1159,14 @@ fn input_notice_ack_at_deadline_cannot_authorize_a_write() {
 }
 
 #[test]
-fn producer_replacement_after_preparation_cancels_write_permission() {
+fn producer_replacement_after_a_completed_write_reports_written_then_source_lost() {
+    // Schema §7.1 confines APPLICATION_SOURCE_UNAVAILABLE to replacement
+    // *before* the write, where nothing is written. Here the PTY write
+    // completed, so §7.2 requires a written receipt describing it, and
+    // §10.3.4 requires the correlation to be retained and the lost producer
+    // to be reported as application-receipt-missing{source-lost}. Reporting a
+    // delivered input as refused is the one direction the spec forbids,
+    // because the controller's recovery is to send the bytes again.
     let mut machine = exact_machine();
     let input = application(b"x");
     let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
@@ -1167,24 +1174,38 @@ fn producer_replacement_after_preparation_cancels_write_permission() {
         .accept_notice(10, ticket, &notice_ack(&input, true), 1)
         .unwrap();
     connect_at(&mut machine, 11, &hello(SemanticMode::Stateful), 1).unwrap();
-    assert_eq!(
-        machine.input_written(permit, 2),
-        Err(SemanticRefusal::SourceUnavailable)
+    assert_eq!(machine.input_written(permit, 2), Ok(()));
+    let changes = machine.poll(3);
+    assert!(
+        changes.iter().any(|change| matches!(change,
+            SemanticChange::Missing(effect)
+                if effect.reason == MissingReason::SourceLost
+                    && effect.receipt.application_id == input.receipt.application_id)),
+        "{changes:?}"
     );
 }
 
 #[test]
-fn producer_degradation_after_preparation_cancels_write_permission() {
+fn producer_degradation_after_a_completed_write_reports_written_then_source_lost() {
     let mut machine = exact_machine();
     let input = application(b"x");
     let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
     let permit = machine
         .accept_notice(10, ticket, &notice_ack(&input, true), 1)
         .unwrap();
-    machine.poll(15_000);
-    assert_eq!(
-        machine.input_written(permit, 15_000),
-        Err(SemanticRefusal::SourceUnavailable)
+    // The write must complete inside the 10 s input-lease deadline, and only
+    // then may the 15 s heartbeat timeout degrade the source. The previous
+    // revision polled at 15 000 before completing, which expired the lease and
+    // suppressed the receipt entirely, so it asserted a refusal it never
+    // actually exercised.
+    assert_eq!(machine.input_written(permit, 2), Ok(()));
+    let changes = machine.poll(15_001);
+    assert!(
+        changes.iter().any(|change| matches!(change,
+            SemanticChange::Missing(effect)
+                if effect.reason == MissingReason::SourceLost
+                    && effect.receipt.application_id == input.receipt.application_id)),
+        "{changes:?}"
     );
 }
 
@@ -1204,8 +1225,40 @@ fn unanswered_input_notices_expire_at_two_seconds() {
     let input = application(b"x");
     machine.prepare_input(&input, 0).unwrap();
     assert!(machine.expire_notices(1_999).is_empty());
-    assert_eq!(machine.expire_notices(2_000).len(), 1);
+    let expired = machine.expire_notices(2_000);
+    assert_eq!(expired.len(), 1);
+    // Schema §11 is a closed set and §10.2.9 requires the receipt to name the
+    // reason: a notice that was never acknowledged is APPLICATION_NOTICE_TIMEOUT
+    // (19), not APPLICATION_SOURCE_UNAVAILABLE (17).
+    let receipt = InputReceipt::decode(&expired[0]).unwrap();
+    assert_eq!((receipt.status, receipt.result), (1, 19));
     assert_eq!(machine.pending_correlations(), 0);
+}
+
+#[test]
+fn a_receipt_naming_an_unwritten_correlation_is_application_not_written() {
+    // Schema §14.8 assigns SEM_APPLICATION_NOT_WRITTEN (15) to a provider
+    // receipt that arrives before the PTY write completed; folding it into
+    // SEM_UNKNOWN_APPLICATION_REQUEST (9) loses the distinction between "I do
+    // not know that request" and "that request has not been written yet".
+    let mut machine = exact_machine();
+    let input = application(b"x");
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    // Accepted notice, so the correlation exists and is bound, but the write
+    // has deliberately not been completed.
+    let _permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
+    let event = SemanticEvent {
+        id: id(9),
+        sequence: 2,
+        kind: SemanticEventKind::ApplicationReceipt,
+        exact_payload: b"receipt".to_vec().into(),
+    };
+    assert_eq!(
+        machine.admit_receipt(10, &event, input.receipt),
+        Err(SemanticRefusal::NotWritten)
+    );
 }
 
 #[test]

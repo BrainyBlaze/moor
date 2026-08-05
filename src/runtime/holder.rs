@@ -597,10 +597,10 @@ impl<N: Native> Runtime<N> {
             }
             ControllerRequest::Status => self.send_status(id, false),
             ControllerRequest::LogClear(incarnation, observed) => {
-                wire::require(
-                    incarnation == self.config.incarnation,
-                    wire::WireError::Malformed,
-                )?;
+                if incarnation != self.config.incarnation {
+                    self.clear_result(id, observed, (2, 1, None));
+                    return Ok(());
+                }
                 match self.storage.clear(id, observed, self.machine.output_end()) {
                     Ok(()) => {}
                     Err(StorageError::Disabled) => self.clear_result(id, observed, (1, 0, None)),
