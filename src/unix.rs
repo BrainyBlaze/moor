@@ -418,7 +418,7 @@ fn holder_setup(
         .extend_from_slice(&shared::random_array::<16>()?);
     let exited = child.try_wait().text()?.map(native_exit);
     let running = artifacts.running.clone();
-    let holder = artifacts.runtime(
+    let mut holder = artifacts.runtime(
         (pty, done_rx),
         (
             synthetic,
@@ -429,6 +429,7 @@ fn holder_setup(
             },
         ),
     );
+    holder.set_rows(config.terminal.1.ws_row);
     Ok((holder, running, exited, generation))
 }
 
