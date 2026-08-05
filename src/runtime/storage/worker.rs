@@ -40,14 +40,17 @@ impl Work {
             // committed candidate followed by a reported failure.
             #[cfg(test)]
             Self::Staged(bytes, epoch, start, end, gate, fail) => {
-                let commit = *store.replace(&bytes, epoch, start, end)?;
+                // The gate precedes the write, so a caller that waits for entry
+                // and then forces its deadline gets the stronger permitted
+                // ordering: the operation is already issued, its lane is
+                // quarantined and its job popped, and only then does the commit
+                // land. With no gate the same variant commits and then returns
+                // the injected error.
                 if let Some((entered, gate)) = gate {
-                    // Announce only after the commit, so a caller can force its
-                    // deadline knowing the operation is durably past its write
-                    // and still in flight.
                     let _ = entered.send(());
                     let _ = gate.recv();
                 }
+                let commit = *store.replace(&bytes, epoch, start, end)?;
                 return if fail {
                     Err(StoreError::Corrupt)
                 } else {

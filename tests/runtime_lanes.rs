@@ -287,9 +287,11 @@ fn a_commit_landing_after_its_lane_is_quarantined_still_advances_the_frontier() 
         Work::Staged(b"late".to_vec(), 2, 0, 4, Some((announce, gate)), false),
     )
     .unwrap();
-    // Deterministic, not timing-dependent: the operation announces itself only
-    // after committing, so the timeout below is forced while it is provably in
-    // flight and past its write.
+    // Deterministic, not timing-dependent: the operation announces entry and
+    // then waits BEFORE its write, so the timeout below is forced while it is
+    // already issued but has not yet committed. The commit therefore lands
+    // strictly after the lane is quarantined and its job popped, which is the
+    // stronger ordering the contract permits.
     entered
         .recv_timeout(Duration::from_secs(2))
         .expect("the staged commit never reported entry");
