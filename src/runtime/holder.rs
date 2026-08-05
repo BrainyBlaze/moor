@@ -60,8 +60,8 @@ impl<N: Native> Runtime<N> {
                     let _ = self.native.resize(rows, columns);
                 }
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
-                PolicyEffect::CommitSources(ticket, changes) => {
-                    let purpose = Purpose::Sources(ticket.get());
+                PolicyEffect::CommitSources(ticket, changes, mandatory) => {
+                    let purpose = Purpose::Sources(ticket.get(), mandatory);
                     if !changes.is_empty()
                         && !events::semantic_changes(now(), changes)
                             .is_ok_and(|events| self.storage.commit(purpose, &events).is_ok())
@@ -417,7 +417,7 @@ impl<N: Native> Runtime<N> {
         let mut changes = Vec::new();
         for effect in self.machine.transition(Transition::Ending).unwrap() {
             match effect {
-                PolicyEffect::CommitSources(_, values) => changes.extend(values),
+                PolicyEffect::CommitSources(_, values, _) => changes.extend(values),
                 effect => self.apply([effect]),
             }
         }
@@ -793,7 +793,7 @@ impl<N: Native> Runtime<N> {
                     self.complete(ticket, Completion::Semantic(result));
                 }
             }
-            Purpose::Sources(id) => {
+            Purpose::Sources(id, _) => {
                 let success = done.result.is_ok();
                 if let Some(ticket) = CommitTicket::from_raw(id) {
                     self.complete(ticket, Completion::Sources(success));

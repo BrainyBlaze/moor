@@ -9,6 +9,7 @@ pub mod store {
 #[allow(dead_code)]
 enum Purpose {
     Test(u64),
+    Sources(u64, bool),
     Background,
     Lifecycle,
     Final,

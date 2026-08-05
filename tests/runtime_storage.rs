@@ -140,11 +140,11 @@ fn output_events_clear_and_lifecycle_use_bounded_worker_lanes() {
     };
     storage
         .commit(
-            Purpose::Sources(77),
+            Purpose::Sources(77, true),
             &[semantic_source(20, &effect).unwrap()],
         )
         .unwrap();
-    wait(&mut storage, Purpose::Sources(77));
+    wait(&mut storage, Purpose::Sources(77, true));
     let (event_commit, body) = Store::read_only(&event_path, Kind::Event, 1).unwrap();
     let body = String::from_utf8(body).unwrap();
     assert_eq!(
@@ -795,6 +795,33 @@ fn mandatory_overflow_closes_only_its_lane_while_semantic_overflow_is_rejected()
     );
     assert_eq!(observed.health() & 2, 0);
     assert_ne!(observed.health() & 4, 0);
+    for path in [event_path, exit_path] {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    // A source transition the holder observed is mandatory: §8.4.4 reserves
+    // storage for it precisely so it cannot be dropped, so overflowing the
+    // queue with one closes the lane rather than returning a soft Busy that
+    // the caller cannot honour. Returning Busy here dropped the degraded or
+    // disconnected record while the stream still reported itself writable.
+    let (mut mandatory, event_path, exit_path) = make("mandatory-source-overflow");
+    assert_eq!(
+        mandatory.commit(Purpose::Sources(5, true), &[event("ready", 11, &[])]),
+        Err(StorageError::Disabled)
+    );
+    assert_eq!(mandatory.health() & 2, 0);
+    for path in [event_path, exit_path] {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    // A producer request carried on the same purpose is rejectable, so it is
+    // refused before any state change and the stream stays open.
+    let (mut rejectable, event_path, exit_path) = make("rejectable-source-overflow");
+    assert_eq!(
+        rejectable.commit(Purpose::Sources(5, false), &[event("ready", 11, &[])]),
+        Err(StorageError::Busy)
+    );
+    assert_ne!(rejectable.health() & 2, 0);
     for path in [event_path, exit_path] {
         let _ = fs::remove_dir_all(path);
     }
