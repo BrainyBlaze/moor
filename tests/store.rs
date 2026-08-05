@@ -567,3 +567,27 @@ fn recovery_refuses_linked_slots() {
     ));
     fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
+    // The frontier mechanism keys on this: `None` must mean "nothing selectable
+    // right now", never "index zero". A caller that mistook it for a frontier
+    // would regress the status descriptor instead of merely delaying it.
+    let path = temp("selected-now");
+    let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
+    assert_eq!(store.selected_now().map(|commit| commit.index), Some(1));
+    store.append_capped(b"xyz", 64, 3).unwrap();
+    let advanced = store.selected_now().expect("a valid commit");
+    assert_eq!(advanced.index, 2);
+    assert_eq!(advanced.end, 3);
+    // Both commit slots invalid: selectable state is gone, so the answer is
+    // None and the caller keeps whatever it last saw.
+    for slot in ["commit.0", "commit.1"] {
+        fs::write(path.join(slot), [0u8; 92]).unwrap();
+    }
+    assert_eq!(store.selected_now(), None);
+    // The already-open writer handle still reports its own last valid commit,
+    // which is exactly the last-known-valid policy the frontier relies on.
+    assert_eq!(store.selected().index, 2);
+    fs::remove_dir_all(path).unwrap();
+}

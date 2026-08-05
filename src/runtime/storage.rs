@@ -241,12 +241,10 @@ impl SessionStorage {
     /// residual case needs a handle-bound refresh rather than a re-open by
     /// pathname, which would reintroduce §11.4's check/use window.
     pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
-        // The worker publishes after each operation, but an external reader can
-        // validate a commit the moment run() flushes it, so between those two
-        // instants only a holder-side read of the same validated handles can name
-        // what a reader selects. Measured: without this, the descriptor reports a
-        // stale commit in 6 of 10 runs under load. Both sources are monotone and
-        // combine by taking the greater.
+        // Two monotone sources combined by taking the greater. The worker
+        // publishes after each operation; a holder-side read covers the interval
+        // between run() flushing a commit — at which point an external reader can
+        // already validate it — and the worker publishing it.
         let published = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
         let selected = self
             .event_view
