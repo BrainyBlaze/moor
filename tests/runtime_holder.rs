@@ -152,6 +152,7 @@ fn fixture() -> (Runtime<FakeNative>, PathBuf) {
         writes,
         storage,
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 0,
         native: FakeNative,
     });
@@ -206,6 +207,7 @@ fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathB
             bytes,
         ),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 0,
         native: FakeNative,
     });
@@ -303,6 +305,7 @@ fn maximum_valid_controller_input_crosses_the_pty_queue_without_local_refusal() 
         writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 0,
         native: FakeNative,
     });
@@ -679,6 +682,7 @@ fn c1_queries_receive_matching_c1_synthetic_replies_for_all_identity_classes() {
         writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 3,
         native: FakeNative,
     });
@@ -1068,6 +1072,7 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
         writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 0,
         native: ExitNative(exited),
     });

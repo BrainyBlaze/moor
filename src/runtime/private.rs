@@ -29,7 +29,7 @@ fn text_error(value: impl ToString) -> String {
 crate::schema!(struct pub SessionEntry pub fields; name: OsString, path: PathBuf, state: SessionState);
 crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str,
     event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_layout: u8, log_cap: u64);
-crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: SessionStorage, status: Vec<u8>, running: String);
+crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: SessionStorage, status: Vec<u8>, commit_at: usize, running: String);
 crate::schema!(struct Lifecycle derive [Deserialize] fields; session: String, wire_generation: u32, incarnation: String,
     start_mono_ms: String, boot_id: String, event_path: Option<String>, instrument_path: Option<String>);
 
@@ -640,6 +640,7 @@ pub fn holder_artifacts(
     status.extend_from_slice(&incarnation);
     status.push(config.event_path.map_or(0, |_| config.event_layout));
     put_wide(&mut status, config.event_identity.unwrap_or_default()).map_err(crate::protocol)?;
+    let commit_at = status.len();
     if let Some(commit) = commit.filter(|_| config.event_layout == 2) {
         status.push(commit.body);
         status.extend_from_slice(&commit.index.to_le_bytes());
@@ -662,6 +663,7 @@ pub fn holder_artifacts(
         },
         storage,
         status,
+        commit_at,
         running,
     })
 }

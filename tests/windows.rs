@@ -271,6 +271,7 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
         writes,
         storage: SessionStorage::new(None, None, lifecycle, 4, 1024),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 3,
         native: Fake(sizes.clone()),
     });
@@ -370,6 +371,7 @@ fn holder_reports_exact_log_clear_barriers_and_keeps_validated_handles() {
         writes,
         storage: SessionStorage::new(Some((log, 1024)), None, lifecycle, 4, 1024),
         status: Vec::new(),
+        commit_at: 0,
         synthetic: 3,
         native: Fake,
     });

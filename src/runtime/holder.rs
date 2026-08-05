@@ -228,7 +228,7 @@ pub trait Native {
 }
 
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, writes: Receiver<(u64, Option<u16>)>, storage: SessionStorage,
-    status: Vec<u8>, synthetic: u8, native: N);
+    status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
 schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshake: u64);
 
 impl Peer {
@@ -243,7 +243,7 @@ impl Peer {
 
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
     writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
-    frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, storage: SessionStorage, status: Vec<u8>, synthetic: u8, native: N,
+    frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
     heartbeat_at: u64, heartbeat_flags: u8, machine: Machine);
 
 impl<N: Native> Runtime<N> {
@@ -296,6 +296,7 @@ impl<N: Native> Runtime<N> {
             scanner: Scanner::new(24),
             storage: config.storage,
             status: config.status,
+            commit_at: config.commit_at,
             synthetic: config.synthetic,
             native: config.native,
             heartbeat_at: 0,
@@ -810,6 +811,16 @@ impl<N: Native> Runtime<N> {
         let (epoch, index, start, end) = self.storage.log_status().unwrap_or_default();
         let mut payload = Vec::with_capacity(self.status.len() + 69);
         payload.extend_from_slice(&self.status);
+        // §5/OB-39: these must name the commit a reader would select, so they
+        // are refreshed per send instead of replaying the launch commit.
+        if let Some((body, index, length, hash)) = self.storage.event_commit()
+            && let Some(fields) = payload.get_mut(self.commit_at..self.commit_at + 49)
+        {
+            fields[0] = body;
+            fields[1..9].copy_from_slice(&index.to_le_bytes());
+            fields[9..17].copy_from_slice(&length.to_le_bytes());
+            fields[17..49].copy_from_slice(&hash);
+        }
         payload.extend(
             StatusTail {
                 replay,
@@ -856,6 +867,7 @@ impl PreparedArtifacts {
             writes: io.1,
             storage: self.storage,
             status: self.status,
+            commit_at: self.commit_at,
             synthetic: platform.0,
             native: platform.1,
         })

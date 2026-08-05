@@ -250,7 +250,8 @@ fn portable_event_status_advertises_the_selected_commit_frontier() {
         },
     )
     .unwrap();
-    let (storage, status) = (artifacts.storage, artifacts.status);
+    let commit_at = artifacts.commit_at;
+    let (mut storage, status) = (artifacts.storage, artifacts.status);
     let (commit, _) = Store::read_only(&event, Kind::Event, 1).unwrap();
     let mut at = 4 + identity.len() + 4 + 16;
     assert_eq!(status[at], 2);
@@ -267,6 +268,29 @@ fn portable_event_status_advertises_the_selected_commit_frontier() {
         commit.length
     );
     assert_eq!(&status[at + 17..at + 49], &commit.hash);
+
+    // #23.1: the prebuilt blob necessarily holds the launch commit, so
+    // send_status patches these bytes per send from the live selection. That
+    // requires the recorded offset to be exactly where the fields sit...
+    assert_eq!(commit_at, at, "recorded commit offset");
+    // ...and the live accessor to actually advance past the launch commit,
+    // which is what OB-39 means by "the commit a reader would select".
+    storage.observe(moor::terminal::Observation::Ready).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while storage.event_commit().map(|selected| selected.1) == Some(commit.index)
+        && std::time::Instant::now() < deadline
+    {
+        storage.poll();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let live = storage.event_commit().expect("an enabled event lane");
+    assert!(
+        live.1 > commit.index,
+        "selected commit must advance past the launch commit: {} vs {}",
+        live.1,
+        commit.index
+    );
+    assert_ne!(live.3, commit.hash, "committed body hash must change");
     drop(storage);
     fs::remove_dir_all(root).unwrap();
 }
