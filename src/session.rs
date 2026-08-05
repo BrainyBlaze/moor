@@ -232,7 +232,8 @@ schema!(struct Retained fields; id: [u8; 16], sequence: u64, kind: SemanticEvent
 schema!(struct default Source fields; binding: Binding = Binding { conn: 0, epoch: 0, producer: [0; 16] },
     flags: u8 = ACTIVE, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected,
     entries: VecDeque<Retained> = VecDeque::new(), pending: u8 = 0, last_seen: u64 = 0);
-schema!(struct PendingHello fields; name: Arc<[u8]>, source: Source, superseded: Option<ConnId>);
+schema!(struct PendingHello fields; name: Arc<[u8]>, source: Source, superseded: Option<ConnId>,
+    missing: Vec<[u8; 16]>);
 const STATEFUL: u8 = 1;
 const ACTIVE: u8 = 2;
 const EXACT: u8 = 4;
@@ -1008,10 +1009,15 @@ impl Machine {
         pending.source.last_seen = now;
         self.sources.insert(pending.name.clone(), pending.source);
         if let Some(old) = pending.superseded {
-            self.applications
-                .values_mut()
-                .filter(|application| application.binding.conn == old && application.written())
-                .for_each(|application| application.emitted |= 2);
+            // Only the ids this committed batch actually carried may be marked
+            // reported. A write that completed while the batch was in flight was
+            // never part of it, so suppressing it here would drop its
+            // source-lost record permanently (§10.3.4).
+            for id in &pending.missing {
+                if let Some(application) = self.applications.get_mut(id) {
+                    application.emitted |= 2;
+                }
+            }
             if old != conn {
                 self.peers.remove(&old);
                 self.cancel_notice(17, |application| application.binding.conn == old);
@@ -1153,11 +1159,13 @@ impl Machine {
                 SourceReason::Superseded,
             )));
         }
+        let mut missing = Vec::new();
         for value in self.applications.values() {
             if Some(value.binding.conn) == superseded && value.written() && value.emitted & 2 == 0 {
                 changes.push(SemanticChange::Missing(
                     value.effect(MissingReason::SourceLost),
                 ));
+                missing.push(value.receipt.application_id);
             }
         }
         if hello.mode == SemanticMode::Stateful {
@@ -1170,6 +1178,7 @@ impl Machine {
         }
         let pending = PendingHello {
             name: hello.source,
+            missing,
             source: Source {
                 binding,
                 flags: SOURCE_FLAGS[hello.mode as usize * 4],

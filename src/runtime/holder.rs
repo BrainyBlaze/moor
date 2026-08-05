@@ -47,26 +47,30 @@ impl<N: Native> Runtime<N> {
                     state.splice(..0, size);
                     self.send(id, 5, &state);
                     if let Some((rows, columns)) = resize {
-                        self.scanner.set_rows(rows);
-                        let _ = self.native.resize(rows, columns);
+                        self.resize(rows, columns);
                     }
                     self.send_status(id, true);
                     if let Some(result) = result {
                         self.reply(id, Reply::Lease(result));
                     }
                 }
-                PolicyEffect::Resize(rows, columns) => {
-                    self.scanner.set_rows(rows);
-                    let _ = self.native.resize(rows, columns);
-                }
+                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns),
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
                 PolicyEffect::CommitSources(ticket, changes, mandatory) => {
                     let purpose = Purpose::Sources(ticket.get(), mandatory);
-                    if !changes.is_empty()
-                        && !events::semantic_changes(now(), changes)
-                            .is_ok_and(|events| self.storage.commit(purpose, &events).is_ok())
-                    {
-                        let _ = self.transition(Transition::Writable(false));
+                    let submitted = changes.is_empty()
+                        || events::semantic_changes(now(), changes)
+                            .is_ok_and(|events| self.storage.commit(purpose, &events).is_ok());
+                    if !submitted {
+                        // A mandatory observation cannot be refused, so its
+                        // failure is a storage failure and closes the stream.
+                        // A rejectable request must fail before any state change
+                        // and disturb neither the lane nor another peer, so only
+                        // its own requester is resolved (closure §5.7).
+                        if mandatory {
+                            let _ = self.transition(Transition::Writable(false));
+                        }
+                        self.complete(ticket, Completion::Sources(false));
                     }
                 }
                 PolicyEffect::CommitSemantic(ticket, source, epoch, producer, event, receipt) => {
@@ -147,6 +151,16 @@ impl<N: Native> Runtime<N> {
         }
     }
 
+    /// The tracked-mode scanner resolves a scroll region against the row count,
+    /// so it may only adopt a geometry the platform actually applied: adopting a
+    /// failed resize makes the next preamble claim a default region that is not
+    /// the child's (§6 of the schema, §5.2).
+    fn resize(&mut self, rows: u16, columns: u16) {
+        if self.native.resize(rows, columns).is_ok() {
+            self.scanner.set_rows(rows);
+        }
+    }
+
     fn reply(&mut self, id: ConnId, reply: Reply) {
         match wire::encode_reply(reply, self.config.incarnation) {
             wire::RuntimeReply::Frame(kind, payload) => self.send(id, kind, &payload),
@@ -204,6 +218,28 @@ impl<N: Native> Runtime<N> {
             self.broadcast(0x12, &payload, true);
         }
     }
+    /// The single completion-consumption path. Every caller routes through it so
+    /// that a durable event advancement always produces OB-30's coalesced level
+    /// trigger — a shutdown wait that consumed completions silently left a
+    /// connected controller waiting for a 0x11 that never came — and so the
+    /// selected-commit cache is current before any descriptor copies it.
+    fn drain_storage(&mut self, awaited: Option<Purpose>) -> Option<bool> {
+        let mut result = None;
+        let mut advanced = false;
+        for done in self.storage.poll() {
+            advanced |= done.lane == SessionStorage::EVENT_LANE && done.result.is_ok();
+            if awaited == Some(done.purpose) {
+                result = Some(done.result.is_ok());
+            } else {
+                self.storage_done(done);
+            }
+        }
+        if advanced {
+            self.broadcast(0x11, &[], false);
+        }
+        result
+    }
+
     fn complete(&mut self, ticket: CommitTicket, completion: Completion) {
         let _ = self.transition(Transition::Complete(monotonic(), ticket, completion));
     }
@@ -384,16 +420,7 @@ impl<N: Native> Runtime<N> {
                 }
             }
         }
-        let mut advanced = false;
-        for done in self.storage.poll() {
-            advanced |= done.lane == SessionStorage::EVENT_LANE && done.result.is_ok();
-            self.storage_done(done);
-        }
-        if advanced {
-            // OB-30: one coalesced level trigger per poll telling consumers the
-            // durable event stream advanced, so none of them has to poll it.
-            self.broadcast(0x11, &[], false);
-        }
+        self.drain_storage(None);
         let _ = self.transition(Transition::Writable(self.storage.health() & 2 != 0));
         self.tick(monotonic());
     }
@@ -743,14 +770,7 @@ impl<N: Native> Runtime<N> {
             if self.machine.termination_expired() {
                 return false;
             }
-            let mut result = None;
-            for done in self.storage.poll() {
-                if purpose == Some(done.purpose) {
-                    result = Some(done.result.is_ok());
-                } else {
-                    self.storage_done(done);
-                }
-            }
+            let result = self.drain_storage(purpose);
             if let Some(result) = result {
                 return result;
             }
@@ -804,6 +824,9 @@ impl<N: Native> Runtime<N> {
     }
 
     pub(super) fn send_status(&mut self, id: u64, attach: bool) {
+        // §5/OB-39: the descriptor must name the commit a reader would select,
+        // so any completion already available is applied before it is copied.
+        self.drain_storage(None);
         let policy = self.machine.status(id);
         let mut replay = policy.replay;
         replay.modes_exact = self.scanner.modes().exact();

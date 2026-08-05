@@ -1296,3 +1296,36 @@ fn semantic_source_sequence_exhaustion_never_wraps_or_becomes_bad_sequence() {
         Err(SemanticRefusal::ResourceExhausted)
     );
 }
+
+#[test]
+fn write_completing_while_replacement_commit_is_pending_still_reports_source_lost() {
+    let mut machine = exact_machine();
+    let input = application(b"x");
+    let (ticket, _) = machine.prepare_input(&input, 0).unwrap();
+    let permit = machine
+        .accept_notice(10, ticket, &notice_ack(&input, true), 1)
+        .unwrap();
+
+    // Admission snapshots the replacement transaction while the application
+    // is still Writing, so it is not part of that transaction's missing set.
+    let admitted = machine
+        .begin_hello(11, hello(SemanticMode::Stateful))
+        .unwrap();
+    assert!(!admitted.iter().any(|change| matches!(change,
+        SemanticChange::Missing(effect)
+            if effect.receipt.application_id == input.receipt.application_id)));
+
+    // The PTY completion races ahead of durable completion of the replacement.
+    assert_eq!(machine.input_written(permit, 2), Ok(()));
+    machine.adopt_hello(11, 3);
+    machine.finish_hello(11, true).unwrap().unwrap();
+
+    let changes = machine.poll(4);
+    assert!(
+        changes.iter().any(|change| matches!(change,
+        SemanticChange::Missing(effect)
+            if effect.reason == MissingReason::SourceLost
+                && effect.receipt.application_id == input.receipt.application_id)),
+        "{changes:?}"
+    );
+}

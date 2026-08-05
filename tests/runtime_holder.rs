@@ -3,7 +3,7 @@
 use moor::events::{Cursor as EventCursor, EventStream, canonical_header};
 use moor::runtime::holder::{CoreConfig, HolderConfig, Native, NativeExit, Runtime};
 use moor::runtime::io::Duplex;
-use moor::runtime::private::{lifecycle_running, monotonic};
+use moor::runtime::private::{ArtifactConfig, holder_artifacts, lifecycle_running, monotonic};
 use moor::runtime::storage::{EventConfig, SessionStorage};
 use moor::session::{LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, ResultOutcome};
 use moor::store::{Kind, Store};
@@ -197,6 +197,7 @@ fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathB
             None,
             Some(EventConfig {
                 store: events,
+                path: event_path.clone(),
                 stream: EventStream::new(),
                 created: 1,
                 session: "AS9zZXNzaW9u".into(),
@@ -1177,4 +1178,224 @@ fn retirement_waits_for_the_termination_result_to_flush() {
     );
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn status_drains_a_completed_event_commit_before_copying_its_frontier() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-status-race-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let marker = root.join("session");
+    let event = root.join("events");
+    let artifacts = holder_artifacts(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        [5; 16],
+        (1, 1, [2; 16]),
+        ArtifactConfig {
+            marker: &marker,
+            event_path: Some(&event),
+            encoding: "posix-bytes",
+            event_identity: Some(event.as_os_str().as_encoded_bytes()),
+            instrument_identity: None,
+            event_layout: 2,
+            log_cap: 0,
+        },
+    )
+    .unwrap();
+    let commit_at = artifacts.commit_at;
+    let initial = Store::read_only(&event, Kind::Event, 7).unwrap().0;
+    let (_, writes) = mpsc::channel();
+    let mut runtime = artifacts.runtime(
+        (
+            duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+            writes,
+        ),
+        (0, FakeNative),
+    );
+    let mut peer = connect(&mut runtime);
+    peer.send(0, 1, &wire::controller_hello(b"\x01/session").unwrap());
+    assert_eq!(peer.recv(&mut runtime).kind, 2);
+
+    runtime.output(b"\x1b]2;advanced\x07".to_vec());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let durable = loop {
+        let selected = Store::read_only(&event, Kind::Event, 7).unwrap().0;
+        if selected.index > initial.index {
+            break selected;
+        }
+        assert!(Instant::now() < deadline, "event commit did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    // The worker completion is queued, but Runtime::poll currently handles the
+    // STATUS request before draining storage completions.
+    peer.send(7, 13, &[]);
+    let status = peer.recv_kind(&mut runtime, 14);
+    let reported = u64::from_le_bytes(
+        status.payload[commit_at + 1..commit_at + 9]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(reported, durable.index, "STATUS reported a stale commit");
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_native_resize_does_not_change_the_scanner_row_model() {
+    struct FailResize;
+    impl Native for FailResize {
+        fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
+            Err("injected resize failure".into())
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-failed-resize-{}-{nonce}",
+        std::process::id()
+    ));
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+    let (_, writes) = mpsc::channel();
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        writes,
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: FailResize,
+    });
+
+    let mut owner = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut owner, &mut runtime);
+    owner.send(7, 3, &[80, 0, 50, 0, 1]);
+    owner.recv_kind(&mut runtime, 5);
+    owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 0x16);
+
+    // Runtime starts at 24 rows. Because the requested 50-row resize failed,
+    // 1..24 is still the full/default region and must serialize as CSI r.
+    runtime.output(b"\x1b[1;24r".to_vec());
+    let mut observer = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut observer, &mut runtime);
+    observer.send(7, 3, &[0; 5]);
+    let terminal = observer.recv_kind(&mut runtime, 5);
+    let preamble = &terminal.payload[2..];
+    assert!(preamble.windows(3).any(|part| part == b"\x1b[r"));
+    assert!(!preamble.windows(7).any(|part| part == b"\x1b[1;24r"));
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rejectable_source_queue_overflow_does_not_close_unrelated_semantic_peers() {
+    let (mut runtime, paths) = event_fixture_with(1, 1 << 20);
+    let semantic_hello = |producer: u8, mode: u8, source: &[u8]| {
+        let mut payload = [
+            [5; 16].as_slice(),
+            &[producer; 16],
+            &7u32.to_le_bytes(),
+            &[mode, 1],
+        ]
+        .concat();
+        wire::put_compact(&mut payload, source).unwrap();
+        payload
+    };
+
+    // An edge producer needs no source-lifecycle commit and is already healthy.
+    let mut existing = connect_as(&mut runtime, Profile::Semantic);
+    existing.send(0, 1, &semantic_hello(6, 0, b"edge"));
+    assert_eq!(existing.recv(&mut runtime).kind, 2);
+
+    // Occupy the one-job event queue. Even if the worker has finished, the
+    // holder has not polled its completion, so admission is deterministically full.
+    runtime.output(b"\x1b]2;queued\x07".to_vec());
+    let mut candidate = connect_as(&mut runtime, Profile::Semantic);
+    candidate.send(0, 1, &semantic_hello(7, 1, b"stateful"));
+    let refusal = candidate.recv_kind(&mut runtime, 9);
+    assert_eq!(
+        u16::from_le_bytes(refusal.payload[..2].try_into().unwrap()),
+        12
+    );
+
+    // The stateful hello is rejectable and may be refused, but §5.7 says the
+    // stream and unrelated accepted producer stay live.
+    if let Some(message) = existing.try_recv(&mut runtime) {
+        assert_ne!(
+            message.kind, 9,
+            "unrelated producer received global exhaustion"
+        );
+    }
+    assert!(
+        !existing.closed(&mut runtime),
+        "unrelated producer was closed"
+    );
+
+    drop(runtime);
+    for path in paths {
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn final_event_commit_wakes_connected_controllers() {
+    let (mut runtime, paths) = event_fixture_with(8, 1 << 20);
+    let initial = Store::read_only(&paths[0], Kind::Event, 7).unwrap().0;
+    let mut peer = connect(&mut runtime);
+    hello(&mut peer, &mut runtime);
+    while peer.try_recv(&mut runtime).is_some() {}
+
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let (_, durable) = runtime.finish_exit(&running, NativeExit::Code(7), None);
+    assert!(durable);
+    let selected = Store::read_only(&paths[0], Kind::Event, 7).unwrap().0;
+    assert!(selected.index > initial.index, "final event did not commit");
+
+    let wakeup = peer.recv_kind(&mut runtime, 0x11);
+    assert!(wakeup.payload.is_empty());
+
+    drop(runtime);
+    for path in paths {
+        fs::remove_dir_all(path).unwrap();
+    }
 }
