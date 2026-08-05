@@ -505,13 +505,18 @@ fn decide(session: &OsStr, path: &Path, table: [Decision; 6]) -> CommandResult<D
 
 pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> CommandResult<i32> {
     let resolve = |session: &OsStr| platform::resolve(session, invoked);
+    // §13.3 freezes three states and three messages, so the diagnostic has to
+    // come from the classification and not from mere path existence: an
+    // indeterminate listener that accepts and then fails the identity exchange
+    // is not a stale session, and the caller's next move differs (investigate
+    // versus clean up).
     let unavailable = |session: &OsStr, path: &Path| {
         session_error(
             session,
-            if path.exists() || companion(path, ".exit").exists() {
-                "is not running"
-            } else {
-                "does not exist"
+            match platform::classify(path) {
+                SessionState::Missing => "does not exist",
+                SessionState::Stale | SessionState::Exited => "is not running",
+                _ => "could not be identified",
             },
         )
     };

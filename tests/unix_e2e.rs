@@ -773,14 +773,15 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
     ]);
     assert!(start.status.success(), "{start:?}");
     wait_for(&socket, b"attached\r\n");
-    let mut attach = Command::new(env!("CARGO_BIN_EXE_moor"))
+    // attach requires a controlling terminal (§13.1), so the viewer runs under
+    // a real pseudo-terminal and the detach byte is typed into its master.
+    let (mut master, slave) = terminal_pair(24, 80);
+    let mut attach = terminal_command(&slave)
         .args(["attach", name])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    attach.stdin.take().unwrap().write_all(&[0x1c]).unwrap();
+    terminal_output(&mut master, b"attached", Duration::from_secs(5));
+    master.write_all(&[0x1c]).unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     let status = loop {
         if let Some(status) = attach.try_wait().unwrap() {
@@ -968,14 +969,15 @@ fn list_status_probe_is_bounded_and_marks_fully_attached_viewers() {
     let root = isolated_root(alias);
     let started = invoked(alias, &["start", "live", "/bin/sh", "-c", "sleep 30"]);
     assert!(started.status.success(), "{started:?}");
+    // attach requires a controlling terminal (§13.1).
+    let (mut input, slave) = terminal_pair(24, 80);
     let mut attach = invoked_command(alias)
         .args(["attach", "live"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave.try_clone().unwrap()))
         .spawn()
         .unwrap();
-    let mut input = attach.stdin.take().unwrap();
     let until = Instant::now() + Duration::from_secs(3);
     let mut last = invoked(alias, &["list"]);
     let attached = loop {

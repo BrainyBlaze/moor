@@ -61,7 +61,9 @@ fn bad_option(arg: &OsStr, command: &str) -> Error {
 }
 fn parse_size(value: &OsString) -> CliResult<u64> {
     let s = value.to_str().ok_or_else(|| bad_value(value, "-C"))?;
-    let (digits, scale) = match s.as_bytes().last() {
+    // OB-3 freezes the suffix as case-insensitive; the closure draft's
+    // lowercase-only reading loses to the authoritative register.
+    let (digits, scale) = match s.as_bytes().last().map(u8::to_ascii_lowercase) {
         Some(b'k') => (&s[..s.len() - 1], 1024u64),
         Some(b'm') => (&s[..s.len() - 1], 1 << 20),
         Some(b'g') => (&s[..s.len() - 1], 1 << 30),
@@ -145,8 +147,12 @@ fn scan<'a>(
         let arg = &args[i];
         if arg == "--" {
             let rest = &args[i + 1..];
+            // OB-4 makes `--` a grammar terminator in every phase, so it may
+            // introduce a dash-leading operand but never participates in the
+            // operand count: a trailing `--` with nothing after it just ends
+            // option recognition.
             return_if!(
-                !creating && (!operands.is_empty() || rest.len() != 1),
+                !creating && (rest.len() > 1 || !operands.is_empty() && !rest.is_empty()),
                 Err(invalid_args())
             );
             operands.extend(rest);

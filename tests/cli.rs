@@ -52,13 +52,24 @@ fn invalid_mode_uses_frozen_two_line_stdout() {
 fn strict_numeric_and_reserved_names_are_rejected() {
     for args in [
         &["start", "s", "-C", "-1"][..],
-        &["start", "s", "-C", "1K"][..],
+        &["start", "s", "-C", "1kk"][..],
+        &["start", "s", "-C", ""][..],
         &["tail", "-n", "garbage", "s"][..],
         &["start", "session.log"][..],
     ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(out.stderr.is_empty(), "{args:?}");
+    }
+    // OB-3 freezes the size suffix as case-insensitive, so the uppercase forms
+    // are values, not argument errors. They reach dispatch and fail later on
+    // the session rather than on the operand.
+    for args in [
+        &["start", "s", "-C", "1K"][..],
+        &["start", "s", "-C", "4M"][..],
+        &["start", "s", "-C", "1G"][..],
+    ] {
+        assert!(parses(args), "{args:?}");
     }
 }
 

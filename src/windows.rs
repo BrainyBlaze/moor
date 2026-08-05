@@ -1470,28 +1470,24 @@ mod native {
             || {
                 let marker = read_marker(path).map_err(|_| false)?.0;
                 let pipe = pipe_name(&marker);
-                if unsafe { WaitNamedPipeW(pipe.as_ptr(), timeout.min(250)) } == 0 {
+                if unsafe { WaitNamedPipeW(pipe.as_ptr(), timeout) } == 0 {
                     return Err(unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND);
                 }
-                controller(path, timeout.min(250)).map_err(|_| false)
+                controller(path, timeout).map_err(|_| false)
             },
         )
     }
     pub(crate) fn classify(path: &Path) -> SessionState {
-        inspect(path, false, 250)
+        // Schema §9.3 freezes the identity exchange at 2 s (see unix::classify).
+        inspect(path, false, 2_000)
     }
     pub(crate) fn sessions(invoked: &OsStr, status: bool) -> Result<Vec<SessionEntry>> {
         let root = root(invoked)?;
         discover_sessions(
             &root,
             |name| session_name(name, true),
-            |path, remaining| {
-                inspect(
-                    path,
-                    status,
-                    remaining.as_millis().min(u128::from(u32::MAX)) as u32,
-                )
-            },
+            // OB-8 bounds the whole listing at 2 s (see unix::sessions).
+            |path, remaining| inspect(path, status, remaining.as_millis().min(250) as u32),
         )
     }
     pub(crate) fn cleanup(path: &Path) -> Result<()> {
