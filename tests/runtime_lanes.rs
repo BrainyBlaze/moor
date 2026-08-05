@@ -271,48 +271,16 @@ fn staged_lane(name: &str) -> (Lane, PathBuf) {
     (Lane::new(store, 4, 1 << 20), path)
 }
 
-#[test]
-fn a_commit_landing_after_its_lane_is_quarantined_still_advances_the_frontier() {
-    // The worker checks its open flag before each operation but not during, so
-    // an already-issued commit may land after try_complete times out and
-    // quarantines the lane. The descriptor must still name it: this is the
-    // permanent case a completion-only frontier can never observe. Uses the
-    // worker frontier alone — no holder duplicate involved.
-    let (mut lane, path) = staged_lane("late-timeout");
-    let base = lane.selected().index;
-    let (announce, entered) = mpsc::channel();
-    let (release, gate) = mpsc::channel();
-    lane.submit(
-        Purpose::Test(1),
-        Work::Staged(b"late".to_vec(), 2, 0, 4, Some((announce, gate)), false),
-    )
-    .unwrap();
-    // Deterministic, not timing-dependent: the operation announces entry and
-    // then waits BEFORE its write, so the timeout below is forced while it is
-    // already issued but has not yet committed. The commit therefore lands
-    // strictly after the lane is quarantined and its job popped, which is the
-    // stronger ordering the contract permits.
-    entered
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the staged commit never reported entry");
-    let done = lane.try_complete(Instant::now() + Duration::from_secs(3));
-    assert!(
-        matches!(done, Some(Done { result: Err(_), .. })),
-        "expected a timeout"
-    );
-    assert!(!lane.writable(), "the lane must be quarantined");
-    // Now let the already-issued commit finish.
-    drop(release);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while lane.selected().index == base && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(
-        lane.selected().index > base,
-        "frontier stayed at {base} after a post-quarantine commit"
-    );
-    let _ = fs::remove_dir_all(path);
-}
+// OWED: the quarantine-boundary guards. The previous revision of this test
+// asserted FORBIDDEN behaviour — releasing its gate after quarantine made the
+// worker initiate body and commit writes after closure, which §8.5 prohibits —
+// so it is removed rather than left standing. It cannot simply be weakened to a
+// completes-then-quarantines case either: once the completion is queued,
+// try_complete reads the Ok and never expires, which is the deadline-precedence
+// defect itself. The three phase-boundary guards (before any write; after the
+// body flush and before the commit is issued; and §8.5's permitted
+// already-issued commit-flush case) therefore land with the deadline-precedence
+// fix, and need the gate inside Store::replace rather than in Work::run.
 
 #[test]
 fn a_valid_candidate_followed_by_a_reported_error_still_advances_the_frontier() {

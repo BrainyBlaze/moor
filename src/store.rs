@@ -515,10 +515,12 @@ fn recover(
     kind: Kind,
     generation: Option<u32>,
 ) -> Result<(Commit, Sha256, Vec<u8>), StoreError> {
-    match (
-        read_commit(slots, 0, kind, generation)?,
-        read_commit(slots, 1, kind, generation)?,
-    ) {
+    // §13: both slots are validated INDEPENDENTLY and the greater valid commit
+    // index wins. A slot that cannot be read is therefore not selectable, not
+    // fatal: its length can change between the metadata check and the read, and
+    // propagating that error hid an independently valid alternate candidate.
+    let candidate = |slot| read_commit(slots, slot, kind, generation).unwrap_or(None);
+    match (candidate(0), candidate(1)) {
         (Some(a), Some(b)) if a.0.index == b.0.index || a.0.generation != b.0.generation => {
             Err(StoreError::Corrupt)
         }
