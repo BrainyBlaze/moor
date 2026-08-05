@@ -1,204 +1,338 @@
 use moor::session::{
-    ControllerConnection, InputAdmission, LeaseMachine, LeaseOperation, LeaseRequest, LeaseRole,
-    OwnedInput, Phase, ResultOutcome, ResultReason, TokenSource, legal_in_phase,
+    Completion, Effect, Effects, LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, Machine,
+    OwnedInput, Reply, Request, ResultOutcome, ResultReason, Transition, WriteTicket,
 };
-use moor::wire::WireError;
+use moor::wire::InputReceipt;
 
-struct Tokens(Vec<Option<[u8; 16]>>);
-impl TokenSource for Tokens {
-    fn token(&mut self) -> Option<[u8; 16]> {
-        self.0.remove(0)
-    }
-}
 fn token(n: u8) -> [u8; 16] {
     [n; 16]
 }
-fn fresh(role: LeaseRole) -> LeaseRequest {
-    LeaseRequest {
-        operation: LeaseOperation::Fresh,
-        role,
-        epoch: 0,
-        incarnation: [0; 16],
-        token: [0; 16],
-    }
+
+fn new_machine(incarnation: [u8; 16]) -> Machine {
+    Machine::new(7, incarnation, [8; 16])
 }
-fn input(epoch: u32, id: u64, bytes: &[u8]) -> OwnedInput {
+
+fn request<'a>(machine: &mut Machine, now: u64, conn: u64, request: Request<'a>) -> Effects {
+    machine
+        .transition(Transition::Peer(now, conn, request))
+        .unwrap()
+}
+
+fn transition<'a>(machine: &mut Machine, event: Transition<'a>) -> Effects {
+    machine.transition(event).unwrap()
+}
+
+fn lease(
+    machine: &mut Machine,
+    now: u64,
+    conn: u64,
+    request_: LeaseRequest,
+    token: Option<[u8; 16]>,
+) -> LeaseResult {
+    request(machine, now, conn, Request::Lease(request_, token))
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+            _ => None,
+        })
+        .expect("lease result")
+}
+
+fn fresh(machine: &mut Machine, now: u64, conn: u64, token: Option<[u8; 16]>) -> LeaseResult {
+    machine.register_controller(conn);
+    lease(
+        machine,
+        now,
+        conn,
+        LeaseRequest::fresh(LeaseRole::InputOnly),
+        token,
+    )
+}
+
+fn input(epoch: u32, request: u64, terminal: &[u8]) -> OwnedInput {
     OwnedInput {
         epoch,
-        request_id: id,
-        exact_payload: bytes.to_vec(),
+        request_id: request,
+        exact_payload: [
+            epoch.to_le_bytes().as_slice(),
+            request.to_le_bytes().as_slice(),
+            &[0],
+            terminal,
+        ]
+        .concat()
+        .into(),
     }
+}
+
+fn write(effects: Effects) -> WriteTicket {
+    effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Write(ticket, _) => Some(ticket),
+            _ => None,
+        })
+        .expect("terminal write")
+}
+
+fn receipt(effects: Effects) -> Vec<u8> {
+    effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Send(_, Reply::Input(receipt)) => Some(receipt),
+            _ => None,
+        })
+        .expect("input receipt")
+}
+
+fn disconnect(machine: &mut Machine, conn: u64) {
+    transition(machine, Transition::Disconnect(conn));
 }
 
 #[test]
 fn disconnect_resume_rotates_token_and_preserves_input_replay() {
     let incarnation = token(9);
-    let mut machine = LeaseMachine::new(incarnation);
-    let mut tokens = Tokens(vec![Some(token(1)), Some(token(2))]);
-    let granted = machine.request(10, &fresh(LeaseRole::InputOnly), 0, &mut tokens);
+    let mut machine = new_machine(incarnation);
+    let granted = fresh(&mut machine, 0, 10, Some(token(1)));
     assert_eq!(
         (granted.outcome, granted.epoch, granted.token),
         (ResultOutcome::Granted, 1, token(1))
     );
-    let request = input(1, 1, b"complete input payload");
-    assert_eq!(
-        machine.admit_input_at(10, &request, 1),
-        InputAdmission::Execute
-    );
-    assert_eq!(
-        machine.admit_input_at(10, &request, 2),
-        InputAdmission::Refuse(ResultReason::BadSequence)
-    );
-    machine
-        .finish_input(10, request.clone(), b"exact receipt".to_vec())
-        .unwrap();
-    machine.disconnect(10);
-
-    let resumed = machine.request(
+    let input = input(1, 1, b"complete input payload");
+    let ticket = write(request(
+        &mut machine,
+        1,
+        10,
+        Request::Input(input.clone(), None),
+    ));
+    assert!(request(&mut machine, 2, 10, Request::Input(input.clone(), None)).is_empty());
+    let exact = receipt(transition(
+        &mut machine,
+        Transition::Complete(3, ticket, Completion::Write(22, None)),
+    ));
+    disconnect(&mut machine, 10);
+    machine.register_controller(11);
+    let resumed = lease(
+        &mut machine,
+        5_000,
         11,
-        &LeaseRequest {
+        LeaseRequest {
             operation: LeaseOperation::Resume,
             role: LeaseRole::InputOnly,
             epoch: 1,
             incarnation,
             token: token(1),
         },
-        5_000,
-        &mut tokens,
+        Some(token(2)),
     );
     assert_eq!(
         (resumed.outcome, resumed.token),
         (ResultOutcome::Resumed, token(2))
     );
     assert_eq!(
-        machine.admit_input(11, &request),
-        InputAdmission::Replay(b"exact receipt".to_vec())
+        receipt(request(
+            &mut machine,
+            5_000,
+            11,
+            Request::Input(input, None)
+        )),
+        exact
     );
-
-    let old = machine.request(
+    machine.register_controller(12);
+    let old = lease(
+        &mut machine,
+        5_001,
         12,
-        &LeaseRequest {
+        LeaseRequest {
             operation: LeaseOperation::Resume,
             role: LeaseRole::InputOnly,
             epoch: 1,
             incarnation,
             token: token(1),
         },
-        5_001,
-        &mut Tokens(vec![]),
+        None,
     );
     assert_eq!(old.outcome, ResultOutcome::Refused);
 }
 
 #[test]
 fn input_replay_rejects_changed_or_skipped_requests() {
-    let mut machine = LeaseMachine::new(token(9));
-    let grant = machine.request(
-        1,
-        &fresh(LeaseRole::Viewer),
-        0,
-        &mut Tokens(vec![Some(token(1))]),
-    );
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
     let first = input(grant.epoch, 1, b"one");
+    let ticket = write(request(
+        &mut machine,
+        1,
+        1,
+        Request::Input(first.clone(), None),
+    ));
+    let exact = receipt(transition(
+        &mut machine,
+        Transition::Complete(1, ticket, Completion::Write(3, None)),
+    ));
     assert_eq!(
-        machine.admit_input_at(1, &first, 1),
-        InputAdmission::Execute
+        receipt(request(&mut machine, 1, 1, Request::Input(first, None))),
+        exact
     );
-    machine.finish_input(1, first.clone(), vec![7]).unwrap();
-    assert_eq!(
-        machine.admit_input(1, &first),
-        InputAdmission::Replay(vec![7])
+    for refused in [input(1, 1, b"changed"), input(1, 3, b"skip")] {
+        let value = InputReceipt::decode(&receipt(request(
+            &mut machine,
+            1,
+            1,
+            Request::Input(refused, None),
+        )))
+        .unwrap();
+        assert_eq!((value.status, value.result), (1, 6));
+    }
+}
+
+#[test]
+fn resumed_exact_input_waits_for_the_original_write_and_receives_its_result() {
+    let incarnation = token(9);
+    let mut machine = new_machine(incarnation);
+    let grant = fresh(&mut machine, 0, 10, Some(token(1)));
+    let input = input(grant.epoch, 1, b"slow write");
+    let ticket = write(request(
+        &mut machine,
+        1,
+        10,
+        Request::Input(input.clone(), None),
+    ));
+    disconnect(&mut machine, 10);
+    machine.register_controller(11);
+    let resumed = lease(
+        &mut machine,
+        2,
+        11,
+        LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::InputOnly,
+            epoch: grant.epoch,
+            incarnation,
+            token: grant.token,
+        },
+        Some(token(2)),
     );
+    assert_eq!(resumed.outcome, ResultOutcome::Resumed);
+    assert!(request(&mut machine, 3, 11, Request::Input(input.clone(), None)).is_empty());
+    let exact = receipt(transition(
+        &mut machine,
+        Transition::Complete(3, ticket, Completion::Write(10, None)),
+    ));
     assert_eq!(
-        machine.admit_input(1, &input(1, 1, b"changed")),
-        InputAdmission::Refuse(ResultReason::BadSequence)
-    );
-    assert_eq!(
-        machine.admit_input(1, &input(1, 3, b"skip")),
-        InputAdmission::Refuse(ResultReason::BadSequence)
+        receipt(request(&mut machine, 4, 11, Request::Input(input, None))),
+        exact
     );
 }
 
 #[test]
 fn owner_activity_refreshes_deadline() {
-    let mut machine = LeaseMachine::new(token(9));
-    let grant = machine.request(
-        1,
-        &fresh(LeaseRole::Viewer),
-        0,
-        &mut Tokens(vec![Some(token(1))]),
-    );
-    machine.touch_owner(1, 9_000).unwrap();
-    machine.expire(10_001);
-    assert_eq!(
-        machine.admit_input_at(1, &input(grant.epoch, 1, b"x"), 10_001),
-        InputAdmission::Execute
-    );
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
+    request(&mut machine, 9_000, 1, Request::Touch(grant.epoch));
+    transition(&mut machine, Transition::Tick(10_001));
+    assert!(machine.status(1).owns_lease);
+    assert!(matches!(
+        request(
+            &mut machine,
+            10_001,
+            1,
+            Request::Input(input(grant.epoch, 1, b"x"), None)
+        )
+        .first(),
+        Some(Effect::Write(..))
+    ));
 }
 
 #[test]
-fn late_keepalive_cannot_revive_an_expired_lease() {
-    let mut machine = LeaseMachine::new(token(9));
-    let grant = machine.request(
-        1,
-        &fresh(LeaseRole::Viewer),
-        0,
-        &mut Tokens(vec![Some(token(1))]),
-    );
-    assert_eq!(
-        machine.keepalive(1, grant.epoch, grant.token, 10_000),
-        Err(ResultReason::NotHeld)
-    );
+fn expiry_reports_and_clears_the_current_owner_once() {
+    let mut machine = new_machine(token(9));
+    fresh(&mut machine, 0, 7, Some(token(1)));
+    transition(&mut machine, Transition::Tick(9_999));
+    assert!(machine.status(7).owns_lease);
+    transition(&mut machine, Transition::Tick(10_000));
+    assert!(!machine.status(7).owns_lease);
+    let effects = transition(&mut machine, Transition::Tick(10_001));
+    assert!(effects.is_empty());
 }
 
 #[test]
-fn late_owner_touch_cannot_revive_an_expired_lease() {
-    let mut machine = LeaseMachine::new(token(9));
-    machine.request(
+fn late_keepalive_touch_and_input_cannot_revive_an_expired_lease() {
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
+    let effects = request(
+        &mut machine,
+        10_000,
         1,
-        &fresh(LeaseRole::Viewer),
-        0,
-        &mut Tokens(vec![Some(token(1))]),
+        Request::Keepalive(grant.epoch, grant.token),
     );
-    assert_eq!(machine.touch_owner(1, 10_000), Err(ResultReason::NotHeld));
+    assert!(matches!(
+        effects.as_slice(),
+        [
+            Effect::Send(1, Reply::ControllerError(15, _)),
+            Effect::Close(1)
+        ]
+    ));
+
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
+    assert!(
+        machine
+            .transition(Transition::Peer(10_000, 1, Request::Touch(grant.epoch)))
+            .is_err()
+    );
+
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
+    let refused = InputReceipt::decode(&receipt(request(
+        &mut machine,
+        10_000,
+        1,
+        Request::Input(input(grant.epoch, 1, b"x"), None),
+    )))
+    .unwrap();
+    assert_eq!((refused.status, refused.result), (1, 15));
 }
 
 #[test]
-fn late_input_cannot_revive_an_expired_lease() {
-    let mut machine = LeaseMachine::new(token(9));
-    let grant = machine.request(
+fn invalid_input_sequence_does_not_refresh_the_owner_deadline() {
+    let mut machine = new_machine(token(9));
+    let grant = fresh(&mut machine, 0, 1, Some(token(1)));
+    let refused = InputReceipt::decode(&receipt(request(
+        &mut machine,
+        9_999,
         1,
-        &fresh(LeaseRole::Viewer),
-        0,
-        &mut Tokens(vec![Some(token(1))]),
-    );
-    assert_eq!(
-        machine.admit_input_at(1, &input(grant.epoch, 1, b"x"), 10_000),
-        InputAdmission::Refuse(ResultReason::NotHeld)
-    );
+        Request::Input(input(grant.epoch, 2, b"skip"), None),
+    )))
+    .unwrap();
+    assert_eq!((refused.status, refused.result), (1, 6));
+    transition(&mut machine, Transition::Tick(10_000));
+    assert!(!machine.status(1).owns_lease);
 }
 
 #[test]
 fn maximum_epoch_is_granted_once_and_token_failure_consumes_nothing() {
-    let mut machine = LeaseMachine::with_allocated(token(9), u32::MAX - 1);
-    let failed = machine.request(1, &fresh(LeaseRole::Viewer), 0, &mut Tokens(vec![None]));
+    let mut machine = Machine::new(7, token(9), [8; 16]).allocated(u32::MAX - 1);
+    let failed = fresh(&mut machine, 0, 1, None);
     assert_eq!(
         (failed.outcome, failed.reason),
         (ResultOutcome::Refused, ResultReason::Exhausted)
     );
-    let final_grant = machine.request(
+    let final_grant = lease(
+        &mut machine,
         1,
-        &fresh(LeaseRole::Viewer),
         1,
-        &mut Tokens(vec![Some(token(1))]),
+        LeaseRequest::fresh(LeaseRole::InputOnly),
+        Some(token(1)),
     );
     assert_eq!(final_grant.epoch, u32::MAX);
-    machine.release(1, u32::MAX, token(1));
-    let exhausted = machine.request(
+    request(&mut machine, 2, 1, Request::Release(u32::MAX, token(1)));
+    machine.register_controller(2);
+    let exhausted = lease(
+        &mut machine,
         2,
-        &fresh(LeaseRole::Viewer),
         2,
-        &mut Tokens(vec![Some(token(2))]),
+        LeaseRequest::fresh(LeaseRole::InputOnly),
+        Some(token(2)),
     );
     assert_eq!(
         (exhausted.outcome, exhausted.reason),
@@ -207,60 +341,36 @@ fn maximum_epoch_is_granted_once_and_token_failure_consumes_nothing() {
 }
 
 #[test]
-fn phase_table_fences_state_changing_frames() {
-    assert!(legal_in_phase(Phase::Unattached, 0x03));
-    assert!(legal_in_phase(Phase::InputOnly, 0x09));
-    assert!(!legal_in_phase(Phase::InputOnly, 0x03));
-    assert!(legal_in_phase(Phase::Observer, 0x15));
-    assert!(legal_in_phase(Phase::Viewer, 0x0c));
-    assert!(!legal_in_phase(Phase::Closing, 0x0f));
-}
-
-#[test]
-fn controller_identity_generation_and_phase_transitions_are_fenced() {
-    let identity = b"canonical identity".to_vec();
-    let mut connection = ControllerConnection::new(7, identity.clone());
-    assert_eq!(
-        connection.hello(8, &identity),
-        Err(WireError::GenerationMismatch)
+fn machine_phase_table_fences_state_changing_frames() {
+    let mut machine = new_machine(token(9));
+    machine.register_controller(1);
+    assert!(machine.legal(1, 0x03));
+    let grant = lease(
+        &mut machine,
+        0,
+        1,
+        LeaseRequest::fresh(LeaseRole::InputOnly),
+        Some(token(1)),
     );
-    assert_eq!(
-        connection.hello(0, b"other identity"),
-        Err(WireError::IdentityMismatch)
+    assert!(machine.legal(1, 0x09));
+    assert!(!machine.legal(1, 0x03));
+    request(
+        &mut machine,
+        1,
+        1,
+        Request::Release(grant.epoch, grant.token),
     );
-    assert_eq!(connection.hello(0, &identity), Ok(7));
-    assert_eq!(connection.phase(), Some(Phase::Unattached));
-    assert_eq!(
-        connection.frame(0, 0x0d),
-        Err(WireError::GenerationMismatch)
+    assert!(machine.legal(1, 0x03));
+
+    machine.register_controller(2);
+    request(
+        &mut machine,
+        0,
+        2,
+        Request::Attach(0, 0, false, false, None),
     );
-    connection.frame(7, 0x0d).unwrap();
-    assert_eq!(
-        connection.lease(LeaseOperation::Fresh, LeaseRole::Viewer, true),
-        Err(WireError::Malformed)
-    );
-    connection
-        .lease(LeaseOperation::Fresh, LeaseRole::InputOnly, true)
-        .unwrap();
-    assert_eq!(connection.phase(), Some(Phase::InputOnly));
-
-    let mut viewer = ControllerConnection::new(7, identity.clone());
-    viewer.hello(7, &identity).unwrap();
-    viewer
-        .lease(LeaseOperation::Resume, LeaseRole::Viewer, true)
-        .unwrap();
-    assert_eq!(viewer.phase(), Some(Phase::Resumed));
-    viewer.attach(false, true).unwrap();
-    assert_eq!(viewer.phase(), Some(Phase::Viewer));
-    viewer.released().unwrap();
-    assert_eq!(viewer.phase(), Some(Phase::Observer));
-
-    connection.released().unwrap();
-    assert_eq!(connection.phase(), Some(Phase::Unattached));
-
-    let mut impossible = ControllerConnection::new(7, identity.clone());
-    impossible.hello(7, &identity).unwrap();
-    assert_eq!(impossible.attach(false, true), Err(WireError::Malformed));
+    assert!(machine.legal(2, 0x15));
+    assert!(!machine.legal(2, 0x09));
 }
 
 #[test]
@@ -276,7 +386,7 @@ fn typed_lease_payloads_round_trip_exact_wire_bytes() {
     assert_eq!(encoded.len(), 40);
     assert_eq!(LeaseRequest::decode_wire(&encoded).unwrap(), request);
 
-    let result = moor::session::LeaseResult {
+    let result = LeaseResult {
         outcome: ResultOutcome::Granted,
         reason: ResultReason::None,
         role: LeaseRole::Viewer,
@@ -285,8 +395,5 @@ fn typed_lease_payloads_round_trip_exact_wire_bytes() {
     };
     let encoded = result.encode_wire().unwrap();
     assert_eq!(encoded.len(), 24);
-    assert_eq!(
-        moor::session::LeaseResult::decode_wire(&encoded).unwrap(),
-        result
-    );
+    assert_eq!(LeaseResult::decode_wire(&encoded).unwrap(), result);
 }

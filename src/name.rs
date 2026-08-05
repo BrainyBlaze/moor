@@ -1,62 +1,32 @@
-use std::ffi::{OsStr, OsString};
+use std::borrow::Cow;
+use std::ffi::OsStr;
 #[cfg(not(any(unix, windows)))]
 compile_error!("Moor supports only Unix-family systems and Windows");
 
 #[cfg(unix)]
-fn bytes(value: &OsStr) -> Vec<u8> {
+fn bytes(value: &OsStr) -> Cow<'_, [u8]> {
     use std::os::unix::ffi::OsStrExt;
-    value.as_bytes().to_vec()
+    Cow::Borrowed(value.as_bytes())
 }
 
 #[cfg(windows)]
-fn bytes(value: &OsStr) -> Vec<u8> {
+fn bytes(value: &OsStr) -> Cow<'_, [u8]> {
     use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<_> = value.encode_wide().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < wide.len() {
-        let unit = wide[i] as u32;
-        let code = if (0xd800..=0xdbff).contains(&unit)
-            && wide
-                .get(i + 1)
-                .is_some_and(|n| (0xdc00..=0xdfff).contains(&(*n as u32)))
-        {
-            i += 1;
-            0x10000 + ((unit - 0xd800) << 10) + wide[i] as u32 - 0xdc00
-        } else {
-            unit
-        };
-        if code <= 0x7f {
-            out.push(code as u8);
-        } else if code <= 0x7ff {
-            out.extend([(0xc0 | code >> 6) as u8, (0x80 | code & 0x3f) as u8]);
-        } else if code <= 0xffff {
-            out.extend([
-                (0xe0 | code >> 12) as u8,
-                (0x80 | code >> 6 & 0x3f) as u8,
-                (0x80 | code & 0x3f) as u8,
-            ]);
-        } else {
-            out.extend([
-                (0xf0 | code >> 18) as u8,
-                (0x80 | code >> 12 & 0x3f) as u8,
-                (0x80 | code >> 6 & 0x3f) as u8,
-                (0x80 | code & 0x3f) as u8,
-            ]);
-        }
-        i += 1;
-    }
-    out
+    Cow::Owned(crate::windows::wtf8_encode(
+        &value.encode_wide().collect::<Vec<_>>(),
+    ))
 }
 
 fn render_bytes(raw: &[u8]) -> String {
-    let mut out = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len().saturating_mul(4));
     for byte in raw.iter().copied() {
         if byte.is_ascii_alphanumeric() || b"._/-".contains(&byte) {
             out.push(byte as char);
         } else {
-            use std::fmt::Write;
-            write!(out, "\\x{byte:02X}").unwrap();
+            out.push_str("\\x");
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
         }
     }
     out
@@ -67,61 +37,40 @@ pub fn render(value: &OsStr) -> String {
 
 pub fn program(value: &OsStr) -> String {
     let raw = bytes(value);
-    #[cfg(unix)]
-    let base = raw.rsplit(|byte| *byte == b'/').next().unwrap_or(&[]);
-    #[cfg(windows)]
-    let base = raw
-        .rsplit(|byte| *byte == b'/' || *byte == b'\\')
+    raw.rsplit(|byte| separator(*byte))
         .next()
-        .unwrap_or(&[]);
-    if base.is_empty() {
-        "moor".into()
-    } else {
-        render_bytes(base)
-    }
+        .filter(|base| !base.is_empty())
+        .map_or_else(|| "moor".into(), render_bytes)
 }
 
-#[cfg(unix)]
-pub fn valid_session(value: &OsStr) -> bool {
-    let raw = bytes(value);
-    if raw.is_empty() || raw.contains(&0) || raw.last() == Some(&b'/') {
-        return false;
-    }
-    let final_part = raw.rsplit(|b| *b == b'/').next().unwrap();
-    if final_part.is_empty() || final_part == b"." || final_part == b".." {
-        return false;
-    }
-    ![b".log".as_slice(), b".events", b".exit", b".instrument"]
-        .iter()
-        .any(|suffix| final_part.ends_with(suffix))
+fn separator(byte: u8) -> bool {
+    byte == b'/' || cfg!(windows) && byte == b'\\'
 }
 
-#[cfg(windows)]
 pub fn valid_session(value: &OsStr) -> bool {
     let raw = bytes(value);
-    if raw.is_empty() || raw.last().is_some_and(|b| *b == b'/' || *b == b'\\') {
+    if raw.is_empty() || raw.contains(&0) || raw.last().is_some_and(|byte| separator(*byte)) {
         return false;
     }
-    let final_part = raw.rsplit(|b| *b == b'/' || *b == b'\\').next().unwrap();
-    if final_part.is_empty()
-        || final_part == b"."
-        || final_part == b".."
-        || final_part.contains(&b':')
-        || final_part.last().is_some_and(|b| *b == b' ' || *b == b'.')
+    let final_part = raw.rsplit(|byte| separator(*byte)).next().unwrap();
+    if final_part.is_empty() || matches!(final_part, b"." | b"..") {
+        return false;
+    }
+    #[cfg(windows)]
+    if final_part.contains(&b':')
+        || final_part
+            .last()
+            .is_some_and(|byte| matches!(*byte, b' ' | b'.'))
     {
         return false;
     }
     ![b".log".as_slice(), b".events", b".exit", b".instrument"]
         .iter()
         .any(|suffix| {
-            final_part.len() >= suffix.len()
-                && final_part[final_part.len() - suffix.len()..]
-                    .iter()
-                    .zip(*suffix)
-                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            let tail = final_part.get(final_part.len().saturating_sub(suffix.len())..);
+            #[cfg(unix)]
+            return tail == Some(*suffix);
+            #[cfg(windows)]
+            tail.is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
         })
-}
-
-pub fn rendered(value: &OsString) -> String {
-    render(value.as_os_str())
 }

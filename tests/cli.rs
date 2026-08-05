@@ -10,7 +10,7 @@ fn run(args: &[&str]) -> Output {
 fn parses(args: &[&str]) -> bool {
     let mut argv = vec![std::ffi::OsString::from("moor")];
     argv.extend(args.iter().map(std::ffi::OsString::from));
-    moor::cli::parse(argv).is_ok()
+    moor::cli::parse(&argv).is_ok()
 }
 
 const HELP: &str = "Usage:\n  moor <session> [options] [command [argument...]]\n  moor new|start|run [options] <session> [options] [command [argument...]]\n  moor attach [options] <session>\n  moor push <session>\n  moor kill [-f] [-q] <session>\n  moor rm [-q] <session> | moor rm -a [-q]\n  moor list [-a]\n  moor current\n  moor tail [-f] [-n N] <session>\n  moor clear [<session>]\n\nAttach/create options:\n  -e <char>  detach byte (default ^\\)\n  -E         disable detach\n  -r <mode>  child redraw: none, ctrl_l, winch (default none)\n  -R <mode>  viewer reset: none, move (default none)\n  -z         pass ^Z to the child\n  -q         suppress informational messages\n  -t         viewer is not VT-compatible\n\nCreate-only options:\n  -C <size>  log cap (default 1m; 0 disables)\n  -2 <path>  redirect child standard error\n  -T <path>  event store directory\n  -S <path>  launch-time instrumentation object\n  -d <path>  child working directory\n";
@@ -273,7 +273,7 @@ fn every_reserved_suffix_is_rejected_in_bare_and_path_forms() {
 fn parsed_action_preserves_defaults_repetition_paths_and_child_arguments() {
     use moor::cli::{Action, CreateMode, Redraw};
     use std::ffi::OsString;
-    let args = [
+    let args: Vec<_> = [
         "moor", "start", "-C", "1k", "session", "-C", "2m", "-r", "winch", "-d", "work", "--",
         "child", "-x",
     ]
@@ -285,7 +285,7 @@ fn parsed_action_preserves_defaults_repetition_paths_and_child_arguments() {
         session,
         command,
         options,
-    } = moor::cli::parse(args).unwrap()
+    } = moor::cli::parse(&args).unwrap()
     else {
         panic!()
     };
