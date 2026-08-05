@@ -157,7 +157,8 @@ schema!(enum ordinal pub SemanticMode; Edge, Stateful);
 schema!(enum ordinal pub SemanticEventKind; Transition, Snapshot, ApplicationReceipt);
 schema!(enum ordinal pub SemanticAckStatus; Accepted, Duplicate, Refused);
 schema!(enum ordinal pub SemanticRefusal; CapabilityAbsent, StaleToken, Generation, SourceConflict, ResourceExhausted, BadSequence,
-    EventConflict, SnapshotRequired, InvalidPayload, Superseded, ApplicationConflict, UnknownApplication, SourceUnavailable);
+    EventConflict, SnapshotRequired, InvalidPayload, Superseded, ApplicationConflict, UnknownApplication, SourceUnavailable,
+    NotWritten);
 type SemResult<T = ()> = Result<T, SemanticRefusal>;
 pub fn next_semantic_sequence(high: u64) -> Result<u64, SemanticRefusal> {
     high.checked_add(1)
@@ -289,7 +290,7 @@ impl Source {
         event: &SemanticEvent,
         receipt: Option<ApplicationReceipt>,
         writable: bool,
-        valid_application: impl FnOnce(ApplicationReceipt) -> bool,
+        valid_application: impl FnOnce(ApplicationReceipt) -> SemResult,
     ) -> SemResult<Option<SemanticAck>> {
         use SemanticRefusal::*;
         reject! {
@@ -321,7 +322,9 @@ impl Source {
         reject! {
             event.sequence <= high => if high == u64::MAX { ResourceExhausted } else { BadSequence },
             self.pending != 0 || next_semantic_sequence(high)? != event.sequence => BadSequence,
-            receipt.is_some_and(|receipt| !valid_application(receipt)) => UnknownApplication,
+        }
+        if let Some(receipt) = receipt {
+            valid_application(receipt)?;
         }
         Ok(None)
     }
@@ -945,17 +948,17 @@ impl Machine {
         if value.binding.conn != conn || value.receipt != receipt {
             return self.refuse_semantic(conn, None, SemanticRefusal::SourceUnavailable);
         }
-        let permitted = now < value.deadline
-            && self.current_source(value)
-            && value.binding.conn == conn
-            && ack.prepared;
+        let expired = now >= value.deadline;
+        let permitted =
+            !expired && self.current_source(value) && value.binding.conn == conn && ack.prepared;
         if !permitted {
             let AppState::Notice(pending) =
                 self.applications.remove(&application_id).unwrap().state
             else {
                 unreachable!()
             };
-            return self.refuse_input(pending.controller, pending.input, 17);
+            let code = if expired { 19 } else { 17 };
+            return self.refuse_input(pending.controller, pending.input, code);
         }
         let value = self.applications.get_mut(&application_id).unwrap();
         let AppState::Notice(pending) = std::mem::replace(&mut value.state, AppState::Writing)
@@ -1208,16 +1211,21 @@ impl Machine {
         let binding = source.binding;
         let receipt = projection.as_ref().map(|value| value.receipt);
         let duplicate = match source.admit(&event, receipt, self.writable, |receipt| {
-            self.applications
+            let bound = self
+                .applications
                 .get(&receipt.application_id)
-                .is_some_and(|value| {
+                .filter(|value| {
                     (
                         value.binding.conn,
-                        value.written(),
                         value.receipt.lease_epoch,
                         value.receipt.request_id,
-                    ) == (conn, true, receipt.lease_epoch, receipt.request_id)
-                })
+                    ) == (conn, receipt.lease_epoch, receipt.request_id)
+                });
+            match bound {
+                Some(value) if value.written() => Ok(()),
+                Some(_) => Err(NotWritten),
+                None => Err(UnknownApplication),
+            }
         }) {
             Ok(duplicate) => duplicate,
             Err(error) => return self.refuse_semantic(conn, Some(event), error),
@@ -1258,10 +1266,7 @@ impl Machine {
                 let mut application = self.applications.remove(&id).expect("pending application");
                 debug_assert!(matches!(application.state, AppState::Writing));
                 application.state = AppState::Written;
-                let current = self.current_source(&application);
-                let failure = (error.is_some() || written != pending.expected)
-                    .then_some(20)
-                    .or((!current).then_some(17));
+                let failure = (error.is_some() || written != pending.expected).then_some(20);
                 if failure.is_none() {
                     application.deadline = now.saturating_add(60_000);
                     self.applications.insert(id, application);
@@ -1478,7 +1483,7 @@ impl Machine {
         self.effects
             .extend(force.then_some(Effect::Terminate(true)));
         self.effects.extend(report.map(Effect::ReportTermination));
-        self.cancel_notice(17, |application| now >= application.deadline);
+        self.cancel_notice(19, |application| now >= application.deadline);
         self.update_sources(SourceTrigger::Timeout(now), Some(now));
         while self
             .queries
