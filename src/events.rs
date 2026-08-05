@@ -383,10 +383,21 @@ fn quoted(value: &str) -> String {
 }
 
 fn upper_escapes(bytes: &mut [u8]) {
-    for at in 0..bytes.len().saturating_sub(5) {
-        if bytes[at..at + 4] == *b"\\u00" {
-            bytes[at + 4].make_ascii_uppercase();
-            bytes[at + 5].make_ascii_uppercase();
+    // Walks escapes rather than scanning for the literal bytes `\u00`, because
+    // a serialized `\\` is a backslash of the value's own content: scanning
+    // would uppercase the `ab` in a title whose text is `«` and silently
+    // alter what the child emitted (§9.4).
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'\\' {
+            at += 1;
+        } else if bytes.get(at + 1) == Some(&b'u') {
+            for hex in at + 2..(at + 6).min(bytes.len()) {
+                bytes[hex].make_ascii_uppercase();
+            }
+            at += 6;
+        } else {
+            at += 2;
         }
     }
 }

@@ -26,7 +26,21 @@ impl Modes {
             Some((top, bottom)) => write!(out, "\x1b[{top};{bottom}r").unwrap(),
             None => out.extend_from_slice(b"\x1b[r"),
         }
-        for mode in [6u32, 1, 2004, 1000, 1002, 1003, 1005, 1006, 1004, 25] {
+        for mode in [6u32, 1, 2004] {
+            flag(&mut out, mode as u16, self.has(mode));
+        }
+        // Schema §6 groups 9 and 10 clear every constituent mode first and only
+        // then set the tracked ones, so an arbitrary combination left in the
+        // viewer cannot survive because the child selected a different member.
+        for group in [[1000u32, 1002, 1003].as_slice(), &[1005, 1006]] {
+            for mode in group {
+                flag(&mut out, *mode as u16, false);
+            }
+            for mode in group.iter().filter(|mode| self.has(**mode)) {
+                flag(&mut out, *mode as u16, true);
+            }
+        }
+        for mode in [1004u32, 25] {
             flag(&mut out, mode as u16, self.has(mode));
         }
         Some(out)
