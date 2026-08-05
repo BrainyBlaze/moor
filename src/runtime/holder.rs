@@ -668,6 +668,7 @@ impl<N: Native> Runtime<N> {
             ReassemblyAborted => (7, 3, b"fragment run changed type or scope"),
             ReassemblyTimeout => (8, 13, b"fragment reassembly deadline exceeded"),
             ResourceExhausted => (13, 12, b"protocol resource exhausted"),
+            GenerationMismatch => (9, 3, b"generation did not match"),
         };
         self.refuse(id, (controller, semantic, diagnostic));
     }

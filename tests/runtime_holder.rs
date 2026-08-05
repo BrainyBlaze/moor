@@ -400,7 +400,9 @@ fn unattached_geometry_without_a_lease_request_is_malformed() {
 }
 
 #[test]
-fn amended_geometry_accepts_full_u16_and_refuses_only_mixed_zero_shape() {
+fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
+    // The largest geometry inside both frozen bounds: 2000x1000 is exactly the
+    // 2,000,000-cell cap, and each dimension is within 1..=32767.
     let (mut runtime, root) = fixture();
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
@@ -408,8 +410,8 @@ fn amended_geometry_accepts_full_u16_and_refuses_only_mixed_zero_shape() {
         7,
         3,
         &[
-            u16::MAX.to_le_bytes().as_slice(),
-            u16::MAX.to_le_bytes().as_slice(),
+            2000u16.to_le_bytes().as_slice(),
+            &1000u16.to_le_bytes(),
             &[1],
         ]
         .concat(),
@@ -422,8 +424,8 @@ fn amended_geometry_accepts_full_u16_and_refuses_only_mixed_zero_shape() {
         11,
         &[
             lease.epoch.to_le_bytes().as_slice(),
-            u16::MAX.to_le_bytes().as_slice(),
-            u16::MAX.to_le_bytes().as_slice(),
+            &2000u16.to_le_bytes(),
+            &1000u16.to_le_bytes(),
         ]
         .concat(),
     );
@@ -432,18 +434,60 @@ fn amended_geometry_accepts_full_u16_and_refuses_only_mixed_zero_shape() {
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 
-    let (mut runtime, root) = fixture();
-    let mut peer = connect(&mut runtime);
-    hello(&mut peer, &mut runtime);
-    peer.send(7, 3, &[80, 0, 0, 0, 1]);
-    let error = peer.recv_kind(&mut runtime, 13);
-    assert_eq!(
-        u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
-        14
-    );
-    assert!(peer.closed(&mut runtime));
-    drop(runtime);
-    fs::remove_dir_all(root).unwrap();
+    // Every out-of-range shape is refused, each with its own frozen code:
+    // half-specified is 14, out-of-range is 5. 32768 is one past the signed
+    // 16-bit console ceiling; 2001x1000 is one cell past the product cap; and
+    // 32767x32767 is the case a u16 product computation would silently wrap.
+    for (columns, rows, code, at_attach) in [
+        (80u16, 0u16, 14u16, true),
+        (0, 24, 14, true),
+        (32_768, 1, 5, true),
+        (1, 32_768, 5, true),
+        (2001, 1000, 5, true),
+        (32_767, 32_767, 5, true),
+        (32_768, 1, 5, false),
+        (2001, 1000, 5, false),
+    ] {
+        let (mut runtime, root) = fixture();
+        let mut peer = connect(&mut runtime);
+        hello(&mut peer, &mut runtime);
+        if at_attach {
+            peer.send(
+                7,
+                3,
+                &[columns.to_le_bytes().as_slice(), &rows.to_le_bytes(), &[1]].concat(),
+            );
+        } else {
+            peer.send(
+                7,
+                3,
+                &[0u16.to_le_bytes().as_slice(), &0u16.to_le_bytes(), &[1]].concat(),
+            );
+            peer.recv_kind(&mut runtime, 5);
+            peer.recv_kind(&mut runtime, 4);
+            let lease =
+                LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
+            peer.send(
+                7,
+                11,
+                &[
+                    lease.epoch.to_le_bytes().as_slice(),
+                    &columns.to_le_bytes(),
+                    &rows.to_le_bytes(),
+                ]
+                .concat(),
+            );
+        }
+        let error = peer.recv_kind(&mut runtime, 13);
+        assert_eq!(
+            u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+            code,
+            "{columns}x{rows} at_attach={at_attach}"
+        );
+        assert!(peer.closed(&mut runtime));
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

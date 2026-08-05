@@ -238,6 +238,8 @@ const EXACT: u8 = 4;
 const COMMIT_PENDING: u8 = 1;
 const ACK_PENDING: u8 = 2;
 const SOURCE_FLAGS: [u8; 8] = [2, 2, 2, 0, 3, 7, 3, 1];
+pub const GEOMETRY_LIMIT: u16 = 32_767;
+pub const GEOMETRY_CELLS: u32 = 2_000_000;
 macro_rules! reject {
     ($($invalid:expr => $error:expr),+ $(,)?) => {
         $(if $invalid { return Err($error); })+
@@ -558,11 +560,20 @@ impl Machine {
     }
 
     fn geometry(&mut self, conn: ConnId, columns: u16, rows: u16) -> bool {
-        return_if!((columns == 0) == (rows == 0), true);
-        self.send(
-            conn,
-            Reply::ControllerError(14, b"geometry was half specified"),
-        );
+        let refusal = if (columns == 0) != (rows == 0) {
+            Some((14, b"geometry was half specified".as_slice()))
+        } else if columns > GEOMETRY_LIMIT
+            || rows > GEOMETRY_LIMIT
+            || u32::from(columns) * u32::from(rows) > GEOMETRY_CELLS
+        {
+            Some((5, b"geometry exceeded its valid range".as_slice()))
+        } else {
+            None
+        };
+        let Some((code, diagnostic)) = refusal else {
+            return true;
+        };
+        self.send(conn, Reply::ControllerError(code, diagnostic));
         self.effects.push(Effect::Close(conn));
         false
     }
@@ -1431,7 +1442,7 @@ impl Machine {
                     .replay
                     .back()
                     .map_or(self.lost, |record| record.sequence);
-                require_policy(acknowledged <= high)?;
+                crate::wire::require(acknowledged <= high, WireError::BadSequence)?;
             }
             Request::Terminate(identity, generation, incarnation, force) => {
                 if (identity, generation, incarnation)
