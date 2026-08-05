@@ -497,10 +497,13 @@ pub(crate) fn connect(path: &Path) -> Result<WireClient> {
 }
 
 pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
-    let terminal = ViewerTerminal::detect(libc::STDIN_FILENO);
-    let geometry = terminal
-        .and_then(|terminal| terminal.size())
-        .unwrap_or((0, 0));
+    // §13.1 gives attach without a controlling terminal status 1; the Windows
+    // path already refused it. Proceeding produced a viewer that wrote the
+    // preamble to a pipe and detached at EOF.
+    let terminal = ViewerTerminal::detect(libc::STDIN_FILENO)
+        .ok_or_else(|| String::from("no controlling terminal"))?;
+    let geometry = terminal.size().unwrap_or((0, 0));
+    let terminal = Some(terminal);
     let _raw = terminal.map(ViewerTerminal::guard).transpose()?;
     let mut client = connect(path).map_err(|_| missing(path))?;
     let (detach, pass_suspend) = (options.detach, options.pass_suspend);
@@ -549,15 +552,15 @@ fn inspect(path: &Path, status: bool, timeout: Duration) -> shared::SessionState
             fs::symlink_metadata(path)
                 .is_ok_and(|meta| meta.file_type().is_socket() && owned(&meta))
         },
-        || {
-            bounded(path, timeout.min(Duration::from_millis(250)))
-                .map_err(|error| error.contains("Connection refused"))
-        },
+        || bounded(path, timeout).map_err(|error| error.contains("Connection refused")),
     )
 }
 
 pub(crate) fn classify(path: &Path) -> shared::SessionState {
-    inspect(path, false, Duration::from_millis(250))
+    // Schema §9.3 freezes the identity exchange at 2 s. Truncating it made a
+    // holder that answers between 250 ms and 2 s classify as indeterminate,
+    // which every command then refuses.
+    inspect(path, false, Duration::from_secs(2))
 }
 
 pub(crate) fn sessions(invoked: &OsStr, status: bool) -> Result<Vec<shared::SessionEntry>> {
@@ -565,7 +568,9 @@ pub(crate) fn sessions(invoked: &OsStr, status: bool) -> Result<Vec<shared::Sess
     shared::discover_sessions(
         &root,
         |name| shared::session_name(name, false),
-        |path, remaining| inspect(path, status, remaining),
+        // OB-8 bounds the whole listing at 2 s, so each entry keeps its own
+        // short slice of that budget rather than the full exchange deadline.
+        |path, remaining| inspect(path, status, remaining.min(Duration::from_millis(250))),
     )
 }
 
