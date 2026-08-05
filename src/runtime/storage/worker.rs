@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 type Outcome = Result<(Commit, bool), StoreError>;
 type Job = (Purpose, Instant, usize);
-schema!(enum pub(crate) Work; Append(Arc<[u8]>, u64, u64), Replace(Vec<u8>, u32, u64, u64), Clear(u64, u64), #[cfg(test)] Hold(Receiver<()>));
+schema!(enum pub(crate) Work; Append(Arc<[u8]>, u64, u64), Replace(Vec<u8>, u32, u64, u64), Clear(u64, u64), #[cfg(test)] Hold(Receiver<()>),
+    #[cfg(test)] Staged(Vec<u8>, u32, u64, u64, Option<(Sender<()>, Receiver<()>)>, bool));
 
 impl Work {
     fn size(&self) -> usize {
@@ -32,6 +33,26 @@ impl Work {
                 }
                 let epoch = selected.epoch.checked_add(1).ok_or(StoreError::Exhausted)?;
                 store.replace(&[], epoch, end, end)
+            }
+            // Commits, then either blocks past the caller's deadline or reports
+            // an error, so the two ambiguous-durability paths become testable:
+            // a commit that lands after its lane is quarantined, and a valid
+            // committed candidate followed by a reported failure.
+            #[cfg(test)]
+            Self::Staged(bytes, epoch, start, end, gate, fail) => {
+                let commit = *store.replace(&bytes, epoch, start, end)?;
+                if let Some((entered, gate)) = gate {
+                    // Announce only after the commit, so a caller can force its
+                    // deadline knowing the operation is durably past its write
+                    // and still in flight.
+                    let _ = entered.send(());
+                    let _ = gate.recv();
+                }
+                return if fail {
+                    Err(StoreError::Corrupt)
+                } else {
+                    Ok((commit, false))
+                };
             }
             #[cfg(test)]
             Self::Hold(wait) => {
