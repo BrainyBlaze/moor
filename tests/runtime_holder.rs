@@ -159,6 +159,10 @@ fn fixture() -> (Runtime<FakeNative>, PathBuf) {
 }
 
 fn event_fixture() -> (Runtime<FakeNative>, [PathBuf; 2]) {
+    event_fixture_with(1, 1)
+}
+
+fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathBuf; 2]) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -198,8 +202,8 @@ fn event_fixture() -> (Runtime<FakeNative>, [PathBuf; 2]) {
                 generation: Some(7),
             }),
             lifecycle,
-            1,
-            1,
+            jobs,
+            bytes,
         ),
         status: Vec::new(),
         synthetic: 0,
@@ -694,6 +698,52 @@ fn c1_queries_receive_matching_c1_synthetic_replies_for_all_identity_classes() {
     assert_eq!(*capture.lock().unwrap(), expected);
     drop((child, runtime));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_committed_event_record_wakes_controllers_with_an_empty_frame() {
+    // OB-30 gives the supervisor two carriers: HEARTBEAT for liveness and
+    // WAKEUP for "the durable event stream advanced". Without WAKEUP the only
+    // way to learn a session's stream moved is to poll every session's store,
+    // which is the design OB-30 exists to remove. Schema §2 freezes type 0x11
+    // with an empty payload.
+    let (mut runtime, paths) = event_fixture_with(8, 1 << 20);
+    let mut peer = connect(&mut runtime);
+    hello(&mut peer, &mut runtime);
+    // A title observation is a durable `state` event, so its commit advances
+    // the stream. A WAKEUP is owed even though this controller never attached.
+    runtime.output(b"\x1b]2;idle\x07".to_vec());
+    let wakeup = peer.recv_kind(&mut runtime, 0x11);
+    assert!(wakeup.payload.is_empty(), "{wakeup:?}");
+    drop(runtime);
+    for path in paths {
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[test]
+fn a_quiet_session_never_wakes_a_controller() {
+    // The other half of OB-30: silence on WAKEUP is the normal state of a quiet
+    // session and must never be readable as death. A session that commits
+    // nothing must emit no 0x11 at all — the wakeup is a level trigger on
+    // durable advance, not a periodic tick. (Heartbeat cadence is a separate
+    // carrier; asserting it here would mean sleeping out its 5 s interval.)
+    let (mut runtime, paths) = event_fixture_with(8, 1 << 20);
+    let mut peer = connect(&mut runtime);
+    hello(&mut peer, &mut runtime);
+    peer.send(7, 3, &[0, 0, 0, 0, 1]);
+    peer.recv_kind(&mut runtime, 5);
+    peer.recv_kind(&mut runtime, 4);
+    for _ in 0..8 {
+        runtime.poll();
+    }
+    while let Some(message) = peer.try_recv(&mut runtime) {
+        assert_ne!(message.kind, 0x11, "quiet session emitted a WAKEUP");
+    }
+    drop(runtime);
+    for path in paths {
+        fs::remove_dir_all(path).unwrap();
+    }
 }
 
 #[test]

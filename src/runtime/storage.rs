@@ -13,7 +13,7 @@ const TERMINAL_RESERVATION: usize = 14_210;
 
 schema!(enum pub Purpose [Clone, Copy, Debug, Eq, PartialEq]; Background, Clear(u64, u64), Lifecycle, Semantic(u64, bool), Sources(u64), Final);
 schema!(enum pub StorageError [Clone, Copy, Debug, Eq, PartialEq]; Disabled, Busy);
-schema!(struct pub Done pub fields; purpose: Purpose, result: Result<(Commit, bool), StoreError>);
+schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Result<(Commit, bool), StoreError>);
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);
 schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
     generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
@@ -203,12 +203,17 @@ impl SessionStorage {
 
     pub fn poll(&mut self) -> smallvec::SmallVec<[Done; 4]> {
         let now = Instant::now();
-        self.lanes
-            .iter_mut()
-            .flatten()
-            .flat_map(|lane| std::iter::from_fn(|| lane.try_complete(now)))
-            .collect()
+        let mut out = smallvec::SmallVec::new();
+        for (at, lane) in self.lanes.iter_mut().enumerate() {
+            let Some(lane) = lane else { continue };
+            while let Some(done) = lane.try_complete(now) {
+                out.push(Done { lane: at, ..done });
+            }
+        }
+        out
     }
+
+    pub const EVENT_LANE: usize = 1;
 
     pub fn health(&self) -> u8 {
         self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
