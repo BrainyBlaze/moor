@@ -275,7 +275,7 @@ fn controller_error_is_reported_without_waiting_for_an_unrelated_reply() {
         .encode(7, 2, &ack(7, [9; 16], &identity), &mut inbound)
         .unwrap();
     let mut refusal = 15_u16.to_le_bytes().to_vec();
-    wire::put_wide(&mut refusal, b"lease not held").unwrap();
+    wire::put_compact(&mut refusal, b"lease not held").unwrap();
     codec.encode(7, 0x13, &refusal, &mut inbound).unwrap();
     let mut client = handshake(Cursor::new(inbound), Vec::new(), identity).unwrap();
     let error = client.receive_kind(0x16).unwrap_err();

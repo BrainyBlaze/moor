@@ -84,7 +84,7 @@ fn accepted(message: Message) -> Inbound {
         .get(..2)
         .and_then(|value| value.try_into().ok())
         .map(u16::from_le_bytes);
-    let diagnostic = crate::wire::get_wide(&message.payload, 2, true);
+    let diagnostic = crate::wire::get_compact(&message.payload, 2, true);
     let refusal = match (code, diagnostic) {
         (Some(code), Some(text)) if !text.is_empty() => format!(
             "holder refused request ({code}): {}",

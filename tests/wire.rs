@@ -7,8 +7,8 @@ use moor::wire::{
     StatusExtension, StatusTail, ViewerEvent, ViewerStream, WireError, controller_hello,
     controller_hello_ack, crc32c, decode_controller, decode_controller_hello_ack,
     decode_log_clear_result, decode_query, decode_semantic, decode_terminate_result, decode_viewer,
-    get_wide, lease_token_payload, log_clear_payload, log_clear_result_payload, put_wide,
-    terminate_result_payload, validate_status_flags,
+    get_wide, lease_token_payload, log_clear_payload, log_clear_result_payload, put_compact,
+    put_wide, terminate_result_payload, validate_status_flags,
 };
 
 #[test]
@@ -461,7 +461,7 @@ fn typed_request_decoders_preserve_exact_conditional_payloads() {
     application.extend_from_slice(&10u64.to_le_bytes());
     application.push(1);
     application.extend_from_slice(&[7; 16]);
-    put_wide(&mut application, b"source-1").unwrap();
+    put_compact(&mut application, b"source-1").unwrap();
     application.extend_from_slice(b"bytes");
     match decode_controller(9, &application, None).unwrap() {
         ControllerRequest::Policy(PolicyRequest::Input(input, Some(projected))) => {
@@ -509,8 +509,8 @@ fn typed_request_decoders_preserve_exact_conditional_payloads() {
     receipt.extend_from_slice(&5u32.to_le_bytes());
     receipt.extend_from_slice(&6u64.to_le_bytes());
     receipt.push(0);
-    put_wide(&mut receipt, b"session").unwrap();
-    put_wide(&mut receipt, b"turn").unwrap();
+    put_compact(&mut receipt, b"session").unwrap();
+    put_compact(&mut receipt, b"turn").unwrap();
     match decode_semantic(7, 4, &receipt).unwrap() {
         PolicyRequest::SemanticEvent(event_request, Some(projected)) => {
             assert_eq!(
