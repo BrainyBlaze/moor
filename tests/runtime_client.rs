@@ -274,9 +274,18 @@ fn controller_error_is_reported_without_waiting_for_an_unrelated_reply() {
     codec
         .encode(7, 2, &ack(7, [9; 16], &identity), &mut inbound)
         .unwrap();
-    let mut refusal = 15_u16.to_le_bytes().to_vec();
-    wire::put_compact(&mut refusal, b"lease not held").unwrap();
-    codec.encode(7, 0x13, &refusal, &mut inbound).unwrap();
+    // Built through the holder's own reply encoder rather than hand-assembled,
+    // so the frame type and prefix width are the ones a real holder emits. A
+    // hand-written 0x13 frame would pass even while the holder emitted 0x0D,
+    // which is exactly how N1 stayed invisible.
+    let moor::wire::RuntimeReply::Frame(kind, refusal) = wire::encode_reply(
+        moor::session::Reply::ControllerError(15, b"lease not held"),
+        [9; 16],
+    ) else {
+        panic!("a controller refusal is an unscoped frame");
+    };
+    assert_eq!(kind, 0x13, "schema §2 assigns ERROR the type byte 0x13");
+    codec.encode(7, kind, &refusal, &mut inbound).unwrap();
     let mut client = handshake(Cursor::new(inbound), Vec::new(), identity).unwrap();
     let error = client.receive_kind(0x16).unwrap_err();
     assert!(
