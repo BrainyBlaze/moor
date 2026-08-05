@@ -17,7 +17,7 @@ schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Resul
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);
 schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
     generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
-schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, event_view: Option<Store>, events: Option<Events>);
+schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, events: Option<Events>);
 
 impl Events {
     fn body(&self, cursor: Cursor, history: bool, records: &str) -> String {
@@ -42,10 +42,8 @@ impl SessionStorage {
     ) -> Self {
         let log_cap = log.as_ref().map_or(0, |(_, cap)| *cap);
         let log = log.map(|(store, _)| Lane::new(store, jobs.min(64), bytes.min(1 << 20)));
-        let mut event_view = None;
         let (event_lane, events) = events
             .map(|config| {
-                event_view = config.store.duplicate().ok();
                 let reserved = events::canonical_header(
                     config.created,
                     &config.session,
@@ -77,7 +75,6 @@ impl SessionStorage {
                 Some(Lane::new(lifecycle, jobs.min(1), bytes.min(4 << 20))),
             ],
             log_cap,
-            event_view,
             events,
         }
     }
@@ -241,17 +238,14 @@ impl SessionStorage {
     /// residual case needs a handle-bound refresh rather than a re-open by
     /// pathname, which would reintroduce §11.4's check/use window.
     pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
-        // Two monotone sources combined by taking the greater. The worker
-        // publishes after each operation; a holder-side read covers the interval
-        // between run() flushing a commit — at which point an external reader can
-        // already validate it — and the worker publishing it.
-        let published = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
-        let selected = self
-            .event_view
-            .as_ref()
-            .and_then(Store::selected_now)
-            .filter(|commit| commit.index > published.index)
-            .unwrap_or(published);
+        // The worker publishes this frontier after every operation, from a
+        // recovery read on its own validated handles, so it covers both the Ok
+        // and the reported-error paths. It does NOT cover the interval between
+        // run() flushing a commit and the worker publishing it: a holder-side
+        // read would, but only once the store uses position-independent I/O,
+        // because duplicated handles share a file offset on POSIX and a
+        // concurrent read would corrupt the writer's position.
+        let selected = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
         Some((
             selected.body,
             selected.index,
