@@ -228,6 +228,16 @@ impl SessionStorage {
         })
     }
 
+    /// The event lane's currently selected commit, which is what a reader
+    /// would select. §5 of the schema requires the status descriptor to carry
+    /// this rather than uncommitted writer state or a stale launch value.
+    pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
+        self.lanes[Self::EVENT_LANE].as_ref().map(|lane| {
+            let commit = lane.selected();
+            (commit.body, commit.index, commit.length, commit.hash)
+        })
+    }
+
     pub fn log_status(&self) -> Option<(u32, u64, u64, u64)> {
         self.lanes[0].as_ref().map(|lane| {
             let commit = lane.selected();
