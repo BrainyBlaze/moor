@@ -373,7 +373,7 @@ fn invalid_keepalive_reports_lease_not_held_before_closing() {
         ]
         .concat(),
     );
-    let error = peer.recv_kind(&mut runtime, 13);
+    let error = peer.recv_kind(&mut runtime, 0x13);
     assert_eq!(
         u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
         15
@@ -393,7 +393,7 @@ fn unattached_geometry_without_a_lease_request_is_malformed() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[80, 0, 24, 0, 0]);
-    let error = peer.recv_kind(&mut runtime, 13);
+    let error = peer.recv_kind(&mut runtime, 0x13);
     assert_eq!(
         u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
         5
@@ -482,7 +482,7 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
                 .concat(),
             );
         }
-        let error = peer.recv_kind(&mut runtime, 13);
+        let error = peer.recv_kind(&mut runtime, 0x13);
         assert_eq!(
             u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
             code,
@@ -501,7 +501,7 @@ fn hello_mismatches_and_trailing_codec_faults_are_encoded_before_close() {
         let (mut runtime, root) = fixture();
         let mut peer = connect(&mut runtime);
         peer.send(scope, 1, &wire::controller_hello(identity).unwrap());
-        let error = peer.recv_kind(&mut runtime, 13);
+        let error = peer.recv_kind(&mut runtime, 0x13);
         assert_eq!(
             u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
             expected
@@ -541,7 +541,7 @@ fn hello_mismatches_and_trailing_codec_faults_are_encoded_before_close() {
         2,
         "valid coalesced prefix was discarded"
     );
-    let error = peer.recv_kind(&mut runtime, 13);
+    let error = peer.recv_kind(&mut runtime, 0x13);
     assert_eq!(
         u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
         2

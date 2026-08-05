@@ -468,7 +468,7 @@ pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> RuntimeReply {
             wire_rules!(scoped ack.epoch, 2; incarnation; [u8::from(ack.snapshot_required)]; 32768u32.to_le_bytes(); 5000u32.to_le_bytes(); 60000u32.to_le_bytes(); 600000u32.to_le_bytes())
         }
         ControllerError(code, diagnostic) => {
-            wire_rules!(frame 13, error_payload(code, diagnostic))
+            wire_rules!(frame 0x13, error_payload(code, diagnostic))
         }
         Termination(outcome, containment, method, diagnostic) => wire_rules!(
             frame 16,
