@@ -11,7 +11,7 @@ use worker::{Lane, Work};
 
 const TERMINAL_RESERVATION: usize = 14_210;
 
-schema!(enum pub Purpose [Clone, Copy, Debug, Eq, PartialEq]; Background, Clear(u64, u64), Lifecycle, Semantic(u64, bool), Sources(u64), Final);
+schema!(enum pub Purpose [Clone, Copy, Debug, Eq, PartialEq]; Background, Clear(u64, u64), Lifecycle, Semantic(u64, bool), Sources(u64, bool), Final);
 schema!(enum pub StorageError [Clone, Copy, Debug, Eq, PartialEq]; Disabled, Busy);
 schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Result<(Commit, bool), StoreError>);
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);

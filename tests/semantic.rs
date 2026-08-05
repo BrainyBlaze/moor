@@ -88,7 +88,7 @@ impl SemanticMachine {
         let mut changes = Vec::new();
         for effect in self.request(0, conn, Request::SemanticHello(hello)) {
             match effect {
-                Effect::CommitSources(ticket, batch) => {
+                Effect::CommitSources(ticket, batch, _) => {
                     state.commit = Some(ticket);
                     changes = batch;
                 }
@@ -222,7 +222,7 @@ impl SemanticMachine {
                     producer = Some(conn);
                     ack = Some(value);
                 }
-                Effect::CommitSources(ticket, changes) => {
+                Effect::CommitSources(ticket, changes, _) => {
                     source_effect = changes.into_iter().find_map(|change| match change {
                         SemanticChange::Source(effect) => Some(effect),
                         _ => None,
@@ -265,7 +265,7 @@ impl SemanticMachine {
         effects
             .into_iter()
             .filter_map(|effect| match effect {
-                Effect::CommitSources(_, changes) => Some(changes),
+                Effect::CommitSources(_, changes, _) => Some(changes),
                 _ => None,
             })
             .flatten()

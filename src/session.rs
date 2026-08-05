@@ -373,7 +373,7 @@ schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(
     SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]),
     Termination(u8, u8, u8, &'static [u8]));
 schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(u16, u16),
-    Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>),
+    Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool),
     CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>),
     QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64),
     OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
@@ -815,18 +815,28 @@ impl Machine {
         };
     }
 
+    /// `mandatory` marks a holder observation the protocol cannot refuse — a
+    /// source degrading or disconnecting really happened, and §8.4.4 reserves
+    /// storage for it. Overflowing the queue with one closes the store
+    /// (closure §5.7); a rejectable producer request is refused instead.
     fn commit_sources(
         &mut self,
         pending: Pending,
         changes: Vec<SemanticChange>,
+        mandatory: bool,
     ) -> Result<(), Pending> {
         let ticket = self.admit(pending)?;
-        self.effects.push(Effect::CommitSources(ticket, changes));
+        self.effects
+            .push(Effect::CommitSources(ticket, changes, mandatory));
         Ok(())
     }
 
     fn persist_sources(&mut self, changes: Vec<SemanticChange>) {
-        if !changes.is_empty() && self.commit_sources(Pending::Sources, changes).is_err() {
+        if !changes.is_empty()
+            && self
+                .commit_sources(Pending::Sources, changes, true)
+                .is_err()
+        {
             self.set_writable(false);
         }
     }
@@ -1177,7 +1187,7 @@ impl Machine {
                 source.pending = COMMIT_PENDING;
             }
             if let Err(Pending::Hello(pending)) =
-                self.commit_sources(Pending::Hello(pending), changes)
+                self.commit_sources(Pending::Hello(pending), changes, false)
             {
                 self.finish_hello(pending, now, false);
                 self.set_writable(false);
@@ -1329,6 +1339,7 @@ impl Machine {
                         .commit_sources(
                             Pending::Ack(name.clone(), ack),
                             vec![SemanticChange::Source(change)],
+                            false,
                         )
                         .is_err()
                     {

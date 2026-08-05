@@ -88,7 +88,10 @@ impl Lane {
         else {
             if matches!(
                 purpose,
-                Purpose::Background | Purpose::Lifecycle | Purpose::Final
+                Purpose::Background
+                    | Purpose::Lifecycle
+                    | Purpose::Final
+                    | Purpose::Sources(_, true)
             ) {
                 self.close();
                 return Err(StorageError::Disabled);
