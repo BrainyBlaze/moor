@@ -425,3 +425,40 @@ fn mouse_groups_clear_every_constituent_before_setting_tracked_bits() {
         assert!(!quiet.contains(set), "{quiet:?} unexpectedly set {set}");
     }
 }
+
+#[test]
+fn scroll_region_tracking_follows_the_session_row_count() {
+    // The tracked-mode scanner resolves a scroll region against the current row
+    // count (schema §6), so a fixed 24 corrupts the preamble in both
+    // directions on any other geometry: a valid full-range region reads as
+    // out-of-range and falsely degrades, while a real 24-row region on a taller
+    // session reads as the default and yields an exact-claimed preamble that
+    // omits the region the child actually set.
+    let esc = char::from(0x1b);
+    let render = |rows: u16, bytes: &str| {
+        let mut scanner = Scanner::new(rows);
+        scanner.scan(0, bytes.as_bytes());
+        let exact = scanner.modes().exact();
+        let preamble = scanner
+            .modes()
+            .preamble()
+            .map(|bytes| String::from_utf8(bytes).unwrap());
+        (exact, preamble)
+    };
+
+    // On a 50-row session the full range is the default region.
+    let (exact, preamble) = render(50, &format!("{esc}[1;50r"));
+    assert!(exact, "a full-range region must not degrade tracking");
+    assert!(preamble.unwrap().contains(&format!("{esc}[r")));
+
+    // A 24-row region on that same session is a real region and is restated.
+    let (exact, preamble) = render(50, &format!("{esc}[1;24r"));
+    assert!(exact);
+    assert!(preamble.unwrap().contains(&format!("{esc}[1;24r")));
+
+    // Past the row count is unrepresentable, so exactness is cleared and the
+    // preamble is withheld rather than guessed.
+    let (exact, preamble) = render(24, &format!("{esc}[1;50r"));
+    assert!(!exact, "an out-of-range region must clear exactness");
+    assert!(preamble.is_none());
+}

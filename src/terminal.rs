@@ -90,6 +90,9 @@ impl Scanner {
             ..Self::default()
         }
     }
+    pub fn set_rows(&mut self, rows: u16) {
+        self.rows = rows;
+    }
     pub fn modes(&self) -> &Modes {
         &self.modes
     }

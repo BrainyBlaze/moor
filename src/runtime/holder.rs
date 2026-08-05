@@ -47,6 +47,7 @@ impl<N: Native> Runtime<N> {
                     state.splice(..0, size);
                     self.send(id, 5, &state);
                     if let Some((rows, columns)) = resize {
+                        self.scanner.set_rows(rows);
                         let _ = self.native.resize(rows, columns);
                     }
                     self.send_status(id, true);
@@ -55,6 +56,7 @@ impl<N: Native> Runtime<N> {
                     }
                 }
                 PolicyEffect::Resize(rows, columns) => {
+                    self.scanner.set_rows(rows);
                     let _ = self.native.resize(rows, columns);
                 }
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
@@ -252,6 +254,12 @@ impl<N: Native> Runtime<N> {
     }
     pub fn output_end(&self) -> u64 {
         self.machine.output_end()
+    }
+    /// The tracked-mode scanner resolves a scroll region's omitted bottom
+    /// against the current row count (schema §6), so it has to start from the
+    /// creation geometry rather than a fixed 24.
+    pub fn set_rows(&mut self, rows: u16) {
+        self.scanner.set_rows(rows);
     }
     fn clear_result(&mut self, id: u64, prior: u64, result: ClearResult) {
         let (outcome, reason, commit) = result;
