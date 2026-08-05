@@ -759,7 +759,7 @@ fn child_process(inherited: i32) -> io::Result<()> {
         if inherited >= 3 && libc::fcntl(inherited, libc::F_SETFD, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
-        if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+        if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -900,11 +900,18 @@ fn monotonic() -> Result<u64> {
 
 #[cfg(target_os = "macos")]
 fn monotonic() -> Result<u64> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
     unsafe extern "C" {
         fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
     }
-    let mut scale: libc::mach_timebase_info = unsafe { std::mem::zeroed() };
-    syscall!(unsafe { libc::mach_timebase_info(&mut scale) } == 0 && scale.denom != 0);
+    let mut scale = Timebase::default();
+    syscall!(unsafe { mach_timebase_info(&mut scale) } == 0 && scale.denom != 0);
     let nanos = u128::from(unsafe { mach_continuous_time() }) * u128::from(scale.numer)
         / u128::from(scale.denom);
     u64::try_from(nanos / 1_000_000).map_err(|_| "monotonic clock overflow".into())

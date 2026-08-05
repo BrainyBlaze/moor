@@ -75,7 +75,7 @@ fn set_age(path: &Path, seconds: u64) {
 
 fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
     let (mut master, mut slave) = (-1, -1);
-    let size = libc::winsize {
+    let mut size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
         ws_xpixel: 0,
@@ -87,8 +87,8 @@ fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
+                std::ptr::null_mut::<libc::termios>(),
+                &mut size,
             )
         },
         0
@@ -117,7 +117,7 @@ fn terminal_command(slave: &File) -> Command {
     command.stderr(Stdio::from(slave.try_clone().unwrap()));
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
