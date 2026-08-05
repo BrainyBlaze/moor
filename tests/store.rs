@@ -593,12 +593,17 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
 }
 
 #[test]
-fn concurrent_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
+fn contended_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
     // A duplicated descriptor shares the underlying file position, so this is
     // the guard for the store being positional: with seek-then-io primitives a
     // reader moves the writer's cursor between its seek and its write and lands
     // bytes at the wrong offset. Every commit must stay selectable and the final
     // retained bytes must be exactly what was written.
+    //
+    // This schedule is CONTENDED, not barrier-forced: it does not guarantee the
+    // interleaving on any single run. Its standing as evidence rests on the
+    // seek-based mutant failing it consistently — measured 10 of 10 — rather
+    // than on one lucky failure.
     let path = temp("dup-interleave");
     let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
     let view = store.duplicate().unwrap();

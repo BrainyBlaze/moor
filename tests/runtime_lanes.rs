@@ -264,3 +264,74 @@ fn explicit_quarantine_prevents_a_queued_write_after_the_in_flight_operation() {
     drop(lane);
     let _ = fs::remove_dir_all(path);
 }
+
+fn staged_lane(name: &str) -> (Lane, PathBuf) {
+    let path = temp(name);
+    let store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
+    (Lane::new(store, 4, 1 << 20), path)
+}
+
+#[test]
+fn a_commit_landing_after_its_lane_is_quarantined_still_advances_the_frontier() {
+    // The worker checks its open flag before each operation but not during, so
+    // an already-issued commit may land after try_complete times out and
+    // quarantines the lane. The descriptor must still name it: this is the
+    // permanent case a completion-only frontier can never observe. Uses the
+    // worker frontier alone — no holder duplicate involved.
+    let (mut lane, path) = staged_lane("late-timeout");
+    let base = lane.selected().index;
+    let (announce, entered) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    lane.submit(
+        Purpose::Test(1),
+        Work::Staged(b"late".to_vec(), 2, 0, 4, Some((announce, gate)), false),
+    )
+    .unwrap();
+    // Deterministic, not timing-dependent: the operation announces itself only
+    // after committing, so the timeout below is forced while it is provably in
+    // flight and past its write.
+    entered
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the staged commit never reported entry");
+    let done = lane.try_complete(Instant::now() + Duration::from_secs(3));
+    assert!(
+        matches!(done, Some(Done { result: Err(_), .. })),
+        "expected a timeout"
+    );
+    assert!(!lane.writable(), "the lane must be quarantined");
+    // Now let the already-issued commit finish.
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lane.selected().index == base && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        lane.selected().index > base,
+        "frontier stayed at {base} after a post-quarantine commit"
+    );
+    let _ = fs::remove_dir_all(path);
+}
+
+#[test]
+fn a_valid_candidate_followed_by_a_reported_error_still_advances_the_frontier() {
+    // A write or flush can report an error after leaving a candidate readers
+    // validate, so publishing only on Ok would leave the frontier behind
+    // permanently. Recovery runs after both outcomes.
+    let (mut lane, path) = staged_lane("post-write-error");
+    let base = lane.selected().index;
+    lane.submit(
+        Purpose::Test(1),
+        Work::Staged(b"kept".to_vec(), 2, 0, 4, None, true),
+    )
+    .unwrap();
+    let done = next(&mut lane);
+    assert!(
+        matches!(done.result, Err(_)),
+        "the operation must report failure"
+    );
+    assert!(
+        lane.selected().index > base,
+        "frontier stayed at {base} despite a valid committed candidate"
+    );
+    let _ = fs::remove_dir_all(path);
+}
