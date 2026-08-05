@@ -1,0 +1,2501 @@
+//! Byte-exact conformance against the frozen §16 vectors of
+//! spec/moor-wire-schema.md.
+//!
+//! This lane exists because consumer issue #12 found a length-prefix-width
+//! defect that 243 passing tests could not see: tests/wire.rs round-trips only
+//! the 24-byte framing of the §16 vectors and never decodes their payloads,
+//! and its payload fixtures were written from the implementation rather than
+//! from the schema. Every vector here is the exact hex copied from §16, and
+//! encoders are byte-compared against those bytes.
+
+#![cfg(unix)]
+
+// ---- vectors: V12, V21, V22 ----
+// Conformance lane: §16 platform vectors V12, V21, V22 (+ V13 supersession).
+// Every vector below is the EXACT hex copied from spec/moor-wire-schema.md §16.
+// Nothing here is computed from the implementation.
+
+use moor::runtime::private::{
+    copy_digest, decode_launch_record, fixed_record, instrument_ack, validate_instrument_ack,
+};
+use moor::store::{Commit, Kind};
+use moor::windows::Marker;
+use moor::wire::crc32c;
+
+fn hex(s: &str) -> Vec<u8> {
+    let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    assert!(digits.len() % 2 == 0, "odd hex digit count");
+    digits
+        .chunks(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                .expect("invalid hex digit in frozen vector")
+        })
+        .collect()
+}
+
+// §16 V12 — Windows rendezvous marker, generation 7, holder incarnation
+// 00..0F, local pipe \\.\pipe\moor-000102030405060708090a0b0c0d0e0f.
+fn v12() -> Vec<u8> {
+    hex("4D 4F 4F 52 4D 52 4B 33 01 00 00 00 07 00 00 00
+         00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
+         2E 00 5C 5C 2E 5C 70 69 70 65 5C 6D 6F 6F 72 2D
+         30 30 30 31 30 32 30 33 30 34 30 35 30 36 30 37
+         30 38 30 39 30 61 30 62 30 63 30 64 30 65 30 66
+         B1 25 D5 68")
+}
+
+// §16 V21 — supervised-launch discriminator, generation 7, nonce 00..0F;
+// exactly 32 bytes followed by EOF.
+fn v21() -> Vec<u8> {
+    hex("4D 4F 4F 52 4C 43 48 33 01 00 00 00 07 00 00 00
+         00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F")
+}
+
+// §16 V22 — instrumentation-load acknowledgement, generation 7,
+// requested-child PID 0x00001234, nonce 10..1F; exactly 36 bytes then EOF.
+fn v22() -> Vec<u8> {
+    hex("4D 4F 4F 52 49 4E 53 33 01 00 00 00 07 00 00 00
+         34 12 00 00 10 11 12 13 14 15 16 17 18 19 1A 1B
+         1C 1D 1E 1F")
+}
+
+// §16 V13 — the frozen 137-byte schema-v2 header body, final LF included,
+// copied verbatim from the ```jsonl block in the schema.
+const V13_BODY: &[u8] = b"{\"v\":2,\"type\":\"header\",\"ts\":0,\"session\":\"AgABAgMEBQYHCAkKCwwNDg8QERITFBUWFw==\",\"generation\":7,\"epoch\":0,\"next_seq\":0,\"first_retained\":0}\n";
+
+// §16 V13 — the frozen SHA-256 the schema states for that body.
+fn v13_hash() -> [u8; 32] {
+    hex("2C 71 E9 28 70 77 41 50 F5 DB EE C3 4F 19 05 2D
+         82 87 4F 6E B4 AC 4B C9 F8 D4 BF 7A D7 43 ED FB")
+    .try_into()
+    .unwrap()
+}
+
+fn incarnation() -> [u8; 16] {
+    (0u8..16).collect::<Vec<_>>().try_into().unwrap()
+}
+
+fn v22_nonce() -> [u8; 16] {
+    (0x10u8..0x20).collect::<Vec<_>>().try_into().unwrap()
+}
+
+// Rewrite the trailing CRC-32C so a single-field mutation is rejected for
+// that field, not merely for a stale checksum.
+fn with_valid_crc(mut bytes: Vec<u8>) -> Vec<u8> {
+    let checksum = crc32c(&bytes[..80]).to_le_bytes();
+    bytes[80..84].copy_from_slice(&checksum);
+    bytes
+}
+
+// Drive §15's stream entrypoint over an in-memory byte stream: reads report
+// data as available and EOF when the bytes run out.
+fn stream_record<const N: usize>(bytes: &[u8], eof: bool) -> Result<[u8; N], String> {
+    let mut cursor = std::io::Cursor::new(bytes.to_vec());
+    fixed_record::<N>(&mut cursor, "record", "invalid record", eof, |_| {
+        Ok(Some(usize::MAX))
+    })
+}
+
+// ---------------------------------------------------------------- V12 ----
+
+#[test]
+fn v16_platform_v12_frozen_vector_is_84_bytes_with_declared_pipe_length() {
+    // §12: 84 bytes total = 34 fixed + 46-byte pipe name + 4-byte CRC, and
+    // offset 32 declares that pipe-name length. Tie declared to actual so a
+    // prefix-width or layout regression cannot hide.
+    let bytes = v12();
+    assert_eq!(bytes.len(), 84);
+    let declared = u16::from_le_bytes([bytes[32], bytes[33]]) as usize;
+    assert_eq!(declared, 46);
+    assert_eq!(
+        declared,
+        bytes.len() - 34 - 4,
+        "declared vs actual pipe length"
+    );
+}
+
+#[test]
+fn v16_platform_v12_marker_encode_matches_frozen_bytes() {
+    let marker = Marker::new(7, incarnation(), incarnation()).unwrap();
+    assert_eq!(marker.encode().to_vec(), v12());
+}
+
+#[test]
+fn v16_platform_v12_marker_decode_accepts_frozen_bytes_and_round_trips() {
+    let decoded = Marker::decode(&v12()).unwrap();
+    assert_eq!(
+        decoded,
+        Marker::new(7, incarnation(), incarnation()).unwrap()
+    );
+    assert_eq!(decoded.generation, 7);
+    assert_eq!(decoded.incarnation, incarnation());
+    assert_eq!(decoded.pipe_length, [0x2E, 0x00]);
+    assert_eq!(&decoded.pipe[..14], br"\\.\pipe\moor-");
+    assert_eq!(
+        &decoded.pipe[14..],
+        b"000102030405060708090a0b0c0d0e0f".as_slice()
+    );
+    assert_eq!(decoded.encode().to_vec(), v12());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_wrong_total_length() {
+    let bytes = v12();
+    assert!(Marker::decode(&bytes[..83]).is_err());
+    let mut long = bytes.clone();
+    long.push(0);
+    assert!(Marker::decode(&long).is_err());
+    assert!(Marker::decode(&[]).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_wrong_magic() {
+    let mut bytes = v12();
+    bytes[0] = b'X'; // MOORMRK3 -> XOORMRK3
+    assert!(Marker::decode(&with_valid_crc(bytes)).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_wrong_format_flags_or_reserved() {
+    // §12: byte 8 is format 01, byte 9 flags zero, bytes 10-11 reserved zero.
+    for at in [8usize, 9, 10, 11] {
+        let mut bytes = v12();
+        bytes[at] ^= 0x01;
+        assert!(
+            Marker::decode(&with_valid_crc(bytes)).is_err(),
+            "fixed-field byte {at}"
+        );
+    }
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_zero_generation() {
+    let mut bytes = v12();
+    bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+    assert!(Marker::decode(&with_valid_crc(bytes)).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_wrong_pipe_length() {
+    let mut bytes = v12();
+    bytes[32..34].copy_from_slice(&45u16.to_le_bytes()); // must be exactly 46
+    assert!(Marker::decode(&with_valid_crc(bytes)).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_wrong_pipe_prefix() {
+    let mut bytes = v12();
+    assert_eq!(bytes[34], b'\\');
+    bytes[34] = b'/'; // \\.\pipe\moor- prefix is frozen
+    assert!(Marker::decode(&with_valid_crc(bytes)).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_uppercase_hex_digit() {
+    let mut bytes = v12();
+    let at = bytes[48..80]
+        .iter()
+        .position(|byte| byte.is_ascii_lowercase())
+        .expect("frozen pipe name contains a lowercase hex letter")
+        + 48;
+    bytes[at] = bytes[at].to_ascii_uppercase();
+    assert!(Marker::decode(&with_valid_crc(bytes)).is_err());
+}
+
+#[test]
+fn v16_platform_v12_marker_rejects_bad_crc() {
+    let mut bytes = v12();
+    bytes[83] ^= 0x01;
+    assert!(Marker::decode(&bytes).is_err());
+}
+
+// ---------------------------------------------------------------- V21 ----
+
+#[test]
+fn v16_platform_v21_frozen_vector_is_32_bytes() {
+    assert_eq!(v21().len(), 32); // §15.1: exactly 32 bytes then EOF
+}
+
+#[test]
+fn v16_platform_v21_launch_record_accepted_with_generation_7() {
+    assert_eq!(decode_launch_record(&v21()), Some(7));
+}
+
+#[test]
+fn v16_platform_v21_stream_accepts_exact_record_then_eof() {
+    // §15.1 end to end: the stream entrypoint accepts exactly 32 bytes
+    // followed by EOF, and the accepted bytes decode as generation 7.
+    let record = stream_record::<32>(&v21(), true).unwrap();
+    assert_eq!(record.to_vec(), v21());
+    assert_eq!(decode_launch_record(&record), Some(7));
+}
+
+#[test]
+fn v16_platform_v21_stream_rejects_extra_byte_and_short_record() {
+    let mut long = v21();
+    long.push(0);
+    assert!(stream_record::<32>(&long, true).is_err());
+    assert!(stream_record::<32>(&v21()[..31], true).is_err());
+}
+
+#[test]
+fn v16_platform_v21_rejects_short_record() {
+    let bytes = v21();
+    assert_eq!(decode_launch_record(&bytes[..31]), None);
+    assert_eq!(decode_launch_record(&[]), None);
+}
+
+#[test]
+fn v16_platform_v21_rejects_over_long_record() {
+    let mut bytes = v21();
+    bytes.push(0);
+    assert_eq!(decode_launch_record(&bytes), None);
+}
+
+#[test]
+fn v16_platform_v21_accepts_generation_2_lower_bound() {
+    // §15.1: supervised generation range is 2..=u32::MAX.
+    let mut bytes = v21();
+    bytes[12..16].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(decode_launch_record(&bytes), Some(2));
+}
+
+#[test]
+fn v16_platform_v21_rejects_generation_below_supervised_range() {
+    // §15.1: a discriminator carrying generation 0 or 1 is refused.
+    for generation in [0u32, 1] {
+        let mut bytes = v21();
+        bytes[12..16].copy_from_slice(&generation.to_le_bytes());
+        assert_eq!(
+            decode_launch_record(&bytes),
+            None,
+            "generation {generation}"
+        );
+    }
+}
+
+#[test]
+fn v16_platform_v21_rejects_bad_magic() {
+    let mut bytes = v21();
+    bytes[0] = b'X'; // MOORLCH3 -> XOORLCH3
+    assert_eq!(decode_launch_record(&bytes), None);
+}
+
+#[test]
+fn v16_platform_v21_rejects_wrong_format_flags_or_reserved() {
+    // §15.1: byte 8 is format 01, byte 9 flags zero, bytes 10-11 reserved.
+    for at in [8usize, 9, 10, 11] {
+        let mut bytes = v21();
+        bytes[at] ^= 0x01;
+        assert_eq!(decode_launch_record(&bytes), None, "fixed-field byte {at}");
+    }
+}
+
+#[test]
+fn v16_platform_v21_rejects_all_zero_nonce() {
+    // §15.1: the nonce is a fresh random value; all-zero is refused.
+    let mut bytes = v21();
+    bytes[16..].fill(0);
+    assert_eq!(decode_launch_record(&bytes), None);
+}
+
+// ---------------------------------------------------------------- V22 ----
+
+#[test]
+fn v16_platform_v22_frozen_vector_is_36_bytes() {
+    assert_eq!(v22().len(), 36); // §15.2: exactly 36 bytes then EOF
+}
+
+#[test]
+fn v16_platform_v22_instrument_ack_matches_frozen_bytes() {
+    assert_eq!(
+        instrument_ack(7, 0x1234, v22_nonce()).unwrap().to_vec(),
+        v22()
+    );
+}
+
+#[test]
+fn v16_platform_v22_validate_accepts_frozen_bytes() {
+    assert!(validate_instrument_ack(&v22(), true, 7, 0x1234, v22_nonce()).is_ok());
+}
+
+#[test]
+fn v16_platform_v22_stream_accepts_exact_record_then_eof() {
+    let record = stream_record::<36>(&v22(), true).unwrap();
+    assert_eq!(record.to_vec(), v22());
+    assert!(validate_instrument_ack(&record, true, 7, 0x1234, v22_nonce()).is_ok());
+}
+
+#[test]
+fn v16_platform_v22_stream_rejects_extra_byte_and_short_record() {
+    let mut long = v22();
+    long.push(0);
+    assert!(stream_record::<36>(&long, true).is_err());
+    assert!(stream_record::<36>(&v22()[..35], true).is_err());
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_wrong_length() {
+    let bytes = v22();
+    assert!(validate_instrument_ack(&bytes[..35], true, 7, 0x1234, v22_nonce()).is_err());
+    let mut long = bytes.clone();
+    long.push(0);
+    assert!(validate_instrument_ack(&long, true, 7, 0x1234, v22_nonce()).is_err());
+    assert!(validate_instrument_ack(&[], true, 7, 0x1234, v22_nonce()).is_err());
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_wrong_magic_format_flags_or_reserved() {
+    // §15.2: bytes 0-7 magic MOORINS3, byte 8 format 01, byte 9 flags zero,
+    // bytes 10-11 reserved zero.
+    for at in [0usize, 8, 9, 10, 11] {
+        let mut bytes = v22();
+        bytes[at] ^= 0x01;
+        assert!(
+            validate_instrument_ack(&bytes, true, 7, 0x1234, v22_nonce()).is_err(),
+            "fixed-field byte {at}"
+        );
+    }
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_wrong_pid() {
+    assert!(validate_instrument_ack(&v22(), true, 7, 0x4321, v22_nonce()).is_err());
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_wrong_generation() {
+    assert!(validate_instrument_ack(&v22(), true, 8, 0x1234, v22_nonce()).is_err());
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_wrong_nonce() {
+    let mut nonce = v22_nonce();
+    nonce[0] ^= 0x01;
+    assert!(validate_instrument_ack(&v22(), true, 7, 0x1234, nonce).is_err());
+}
+
+#[test]
+fn v16_platform_v22_validate_rejects_missing_eof() {
+    assert!(validate_instrument_ack(&v22(), false, 7, 0x1234, v22_nonce()).is_err());
+}
+
+#[test]
+fn v16_platform_v22_encoder_refuses_zero_pid_and_zero_generation() {
+    // §15.2: PID is nonzero and generation is 1 (unsupervised) or the exact
+    // supervised generation — never zero.
+    assert!(instrument_ack(7, 0, v22_nonce()).is_err());
+    assert!(instrument_ack(0, 0x1234, v22_nonce()).is_err());
+    assert!(validate_instrument_ack(&v22(), true, 7, 0, v22_nonce()).is_err());
+    assert!(validate_instrument_ack(&v22(), true, 0, 0x1234, v22_nonce()).is_err());
+}
+
+// ---------------------------------------------------------------- V13 ----
+
+#[test]
+fn v16_platform_v13_frozen_body_is_137_bytes_with_frozen_sha256() {
+    // §16 V13 freezes the header BODY (137 UTF-8 bytes including final LF)
+    // and its SHA-256 independently of the superseded 76-byte commit record.
+    // Both survive the MOORCMT1 amendment, so assert them from the frozen
+    // bytes: the length check ties the commit's declared body-prefix length
+    // to the actual body, and the digest is recomputed through the crate's
+    // own hashing entrypoint rather than trusted from this test.
+    assert_eq!(V13_BODY.len(), 137);
+    use std::io::Write as _;
+    let path =
+        std::env::temp_dir().join(format!("moor-v16-platform-v13-{}.body", std::process::id()));
+    let mut file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(V13_BODY).unwrap();
+    let digest = copy_digest(&mut file, None);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(digest.unwrap(), v13_hash());
+}
+
+#[test]
+fn v16_platform_v13_superseded_current_moorcmt1_shape() {
+    // GAP / SUPERSEDED: §16 V13 freezes a 76-byte MOOREVC2 Windows-only event
+    // commit record. That form is superseded by the ratified portable 92-byte
+    // MOORCMT1 record (consumer issue #5), so the frozen 76-byte bytes are NOT
+    // asserted. No ratified byte-exact MOORCMT1 vector exists in §16, so this
+    // test pins the CURRENT record shape through the public encoder instead,
+    // reusing the values §16 freezes for V13: generation 7, epoch 0, commit
+    // slot 0, body slot 0, commit index 1, body prefix length 137 (0x89), and
+    // the frozen SHA-256 of the 137-byte schema-v2 header body.
+    let hash = v13_hash();
+    let commit = Commit {
+        slot: 0,
+        body: 0,
+        kind: Kind::Event,
+        generation: 7,
+        epoch: 0,
+        index: 1,
+        length: V13_BODY.len() as u64,
+        start: 0,
+        end: 0,
+        hash,
+    };
+    let bytes = commit.encode();
+    assert_eq!(bytes.len(), 92);
+    assert_eq!(&bytes[..8], b"MOORCMT1");
+    assert_eq!(bytes[8], 0x01, "record format");
+    assert_eq!(bytes[9], 0x00, "commit slot");
+    assert_eq!(bytes[10], 0x00, "body slot");
+    assert_eq!(bytes[11], Kind::Event as u8, "record kind");
+    assert_eq!(&bytes[12..16], 7u32.to_le_bytes().as_slice(), "generation");
+    assert_eq!(&bytes[16..20], 0u32.to_le_bytes().as_slice(), "epoch");
+    assert_eq!(&bytes[20..24], [0; 4], "reserved");
+    assert_eq!(
+        &bytes[24..32],
+        1u64.to_le_bytes().as_slice(),
+        "commit index"
+    );
+    assert_eq!(
+        &bytes[32..40],
+        137u64.to_le_bytes().as_slice(),
+        "body prefix length"
+    );
+    assert_eq!(&bytes[40..48], 0u64.to_le_bytes().as_slice(), "start");
+    assert_eq!(&bytes[48..56], 0u64.to_le_bytes().as_slice(), "end");
+    assert_eq!(&bytes[56..88], hash.as_slice(), "body prefix SHA-256");
+    assert_eq!(
+        &bytes[88..92],
+        crc32c(&bytes[..88]).to_le_bytes().as_slice(),
+        "CRC-32C over bytes 0..88"
+    );
+}
+
+// ---- vectors: V14, V15, V17, V19, V20 ----
+// Conformance lane: semantic producer wire — §16 vectors V14, V15, V17, V19, V20.
+//
+// Every byte string below is copied verbatim from spec/moor-wire-schema.md §16.
+// Nothing in this file is derived from the implementation; the implementation
+// is driven AT the frozen bytes in both directions wherever the public API
+// exposes an entrypoint for that direction.
+
+/// Parses whitespace-separated hex octets exactly as they appear in §16.
+/// (Prefixed to keep the assembled conformance file collision-free.)
+fn v16_semantic_hex(s: &str) -> Vec<u8> {
+    s.split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("hex octet"))
+        .collect()
+}
+
+/// §16 V14 — semantic `HELLO`, generation 7, stateful source `claude`, all
+/// three capabilities. Frozen bytes, header included.
+const V16_SEMANTIC_V14: &str = "
+    4D 4F 4F 53 01 01 00 00 00 00 00 00 01 00 00 00
+    2E 00 00 00 C8 42 0C 36 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17
+    18 19 1A 1B 1C 1D 1E 1F 07 00 00 00 01 07 06 00
+    63 6C 61 75 64 65";
+
+/// §16 V15 — semantic `APPLICATION_RECEIPT`, source epoch 5 / source sequence
+/// 2, accepted, provider ids `sess`/`turn`. Frozen bytes, header included.
+const V16_SEMANTIC_V15: &str = "
+    4D 4F 4F 53 01 04 00 00 05 00 00 00 03 00 00 00
+    41 00 00 00 C2 D3 5C 3F 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 02 00 00 00 00 00 00 00
+    10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F
+    03 00 00 00 01 00 00 00 00 00 00 00 00 04 00 73
+    65 73 73 04 00 74 75 72 6E";
+
+/// §16 V17 — semantic `INPUT_NOTICE` matching V16; the final 32 bytes are
+/// SHA-256("hello"). Frozen bytes, header included.
+const V16_SEMANTIC_V17: &str = "
+    4D 4F 4F 53 01 05 00 00 05 00 00 00 04 00 00 00
+    44 00 00 00 8C B0 EC 04 20 21 22 23 24 25 26 27
+    28 29 2A 2B 2C 2D 2E 2F 03 00 00 00 02 00 00 00
+    00 00 00 00 05 00 00 00 00 00 00 00 2C F2 4D BA
+    5F B0 A3 0E 26 E8 3B 2A C5 B9 E2 9E 1B 16 1E 5C
+    1F A7 42 5E 73 04 33 62 93 8B 98 24";
+
+/// §16 V19 — accepted durable `SEMANTIC_ACK` for V15, status `00`, result
+/// code zero, event epoch 2 / sequence 9. Frozen bytes, header included.
+const V16_SEMANTIC_V19: &str = "
+    4D 4F 4F 53 01 07 00 00 05 00 00 00 05 00 00 00
+    29 00 00 00 68 84 6D AE 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 02 00 00 00 00 00 00 00
+    00 00 00 02 00 00 00 09 00 00 00 00 00 00 00 00
+    00";
+
+/// §16 V20 — duplicate `SEMANTIC_ACK` after V15 is retried; status `01`,
+/// result code zero, original durable position epoch 2 / sequence 9, frame
+/// sequence advanced from V19. Frozen bytes, header included.
+const V16_SEMANTIC_V20: &str = "
+    4D 4F 4F 53 01 07 00 00 05 00 00 00 06 00 00 00
+    29 00 00 00 01 03 29 75 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 02 00 00 00 00 00 00 00
+    01 00 00 02 00 00 00 09 00 00 00 00 00 00 00 00
+    00";
+
+/// SHA-256("hello") written down independently of the vector (well-known
+/// digest), so V17's trailing 32 bytes are cross-checked against knowledge
+/// that did not come from §16 or from the implementation.
+const V16_SEMANTIC_SHA256_HELLO: &str = "
+    2C F2 4D BA 5F B0 A3 0E 26 E8 3B 2A C5 B9 E2 9E
+    1B 16 1E 5C 1F A7 42 5E 73 04 33 62 93 8B 98 24";
+
+/// Feeds one frozen frame stream through the real reassembly entrypoint.
+fn v16_semantic_feed(next_in: u32, stream: &[u8]) -> Vec<moor::wire::Message> {
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, next_in, 1);
+    let mut out = Vec::new();
+    codec
+        .feed(0, stream, &mut out)
+        .expect("frozen §16 frame must be accepted by Codec::feed");
+    assert_eq!(
+        codec.buffered_len(),
+        0,
+        "the declared payload lengths must consume the frozen bytes exactly"
+    );
+    out
+}
+
+/// Encodes one payload through the real framing encoder at a given outbound
+/// frame sequence and returns the emitted bytes (header + CRC included).
+fn v16_semantic_encode(next_out: u32, scope: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, 1, next_out);
+    let mut out = Vec::new();
+    codec
+        .encode(scope, kind, payload, &mut out)
+        .expect("frozen §16 payload must be encodable");
+    out
+}
+
+fn v16_semantic_bytes_from(start: u8) -> [u8; 16] {
+    core::array::from_fn(|index| start + index as u8)
+}
+
+// ---------------------------------------------------------------------------
+// V14 — semantic HELLO
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_semantic_v14_frame_decodes_through_codec() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V14);
+    assert_eq!(
+        frame.len(),
+        24 + 0x2E,
+        "V14 is a 24-byte header plus 0x2E payload"
+    );
+    let messages = v16_semantic_feed(1, &frame);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0].scope, 0,
+        "SEMANTIC_HELLO carries source epoch zero"
+    );
+    assert_eq!(messages[0].kind, 1);
+    assert_eq!(&messages[0].payload[..], &frame[24..]);
+}
+
+#[test]
+fn v16_semantic_v14_hello_decodes_stateful_claude_with_all_capabilities() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V14);
+    let payload = &frame[24..];
+    // Before the length-prefix fix this failed with OversizedMessage because
+    // the 2-byte §14.4 source-id prefix was misread as a 4-byte wide prefix.
+    let request = moor::wire::decode_semantic(0, 1, payload)
+        .expect("V14 must decode; a failure here reproduces consumer issue #12");
+    let moor::session::Request::SemanticHello(hello) = request else {
+        panic!("V14 must decode as SemanticHello");
+    };
+    assert_eq!(hello.token, v16_semantic_bytes_from(0x00));
+    assert_eq!(hello.producer, v16_semantic_bytes_from(0x10));
+    assert_eq!(hello.generation, 7);
+    assert_eq!(hello.mode, moor::session::SemanticMode::Stateful);
+    assert_eq!(hello.capabilities, 0x07, "all three capability bits");
+    assert_ne!(hello.capabilities & 0x01, 0, "bit 0 ASSERTION");
+    assert_ne!(hello.capabilities & 0x02, 0, "bit 1 APPLICATION_RECEIPT");
+    assert_ne!(hello.capabilities & 0x04, 0, "bit 2 INPUT_NOTICE");
+    assert_eq!(&*hello.source, b"claude");
+}
+
+#[test]
+fn v16_semantic_v14_source_id_uses_two_byte_compact_prefix() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V14);
+    let payload = &frame[24..];
+    // Payload layout: token 0..16, producer 16..32, generation 32..36,
+    // mode 36, capabilities 37, then the §14.4 length-prefixed source id.
+    assert_eq!(
+        &payload[38..40],
+        &[0x06, 0x00],
+        "source id carries a plain 2-byte little-endian length prefix"
+    );
+    // Encode direction: the §1.1 compact writer must reproduce the frozen
+    // prefix-plus-bytes field exactly.
+    let mut field = Vec::new();
+    moor::wire::put_compact(&mut field, b"claude").expect("source id fits the compact cap");
+    assert_eq!(field, &payload[38..46]);
+    // Decode direction: the compact reader resolves the frozen field with an
+    // exact tail — no trailing bytes, so the prefix cannot be 4 bytes wide.
+    assert_eq!(
+        moor::wire::get_compact(payload, 38, true),
+        Some(&b"claude"[..])
+    );
+    // The exact issue-#12 misread, driven at the frozen bytes: interpreting
+    // this field's prefix as the §1.1.1 wide 4-byte form reads length
+    // 0x6C630006 and must fail, not resolve.
+    assert_eq!(moor::wire::get_wide(payload, 38, true), None);
+    // Whole-payload encode: frozen §16 field values, serialized only through
+    // the crate's writers, must reproduce V14's payload byte-for-byte.
+    let mut rebuilt = Vec::new();
+    rebuilt.extend_from_slice(&v16_semantic_bytes_from(0x00));
+    rebuilt.extend_from_slice(&v16_semantic_bytes_from(0x10));
+    rebuilt.extend_from_slice(&7u32.to_le_bytes());
+    rebuilt.push(0x01); // mode: stateful
+    rebuilt.push(0x07); // capabilities: all three
+    moor::wire::put_compact(&mut rebuilt, b"claude").expect("source id fits the compact cap");
+    assert_eq!(rebuilt, payload);
+}
+
+#[test]
+fn v16_semantic_v14_frame_reencodes_byte_for_byte() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V14);
+    // Framing encode direction: header fields and CRC-32C are produced by the
+    // implementation and must equal the frozen bytes, including checksum
+    // C8 42 0C 36.
+    assert_eq!(v16_semantic_encode(1, 0, 1, &frame[24..]), frame);
+}
+
+#[test]
+fn v16_semantic_v14_hello_with_nonzero_source_epoch_is_refused() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V14);
+    // §14.1: SEMANTIC_HELLO uses source epoch zero; the same frozen payload
+    // presented under a nonzero epoch must not decode as a hello.
+    assert!(matches!(
+        moor::wire::decode_semantic(5, 1, &frame[24..]),
+        Err(moor::wire::WireError::Malformed)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// V15 — APPLICATION_RECEIPT
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_semantic_v15_frame_decodes_through_codec() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V15);
+    assert_eq!(
+        frame.len(),
+        24 + 0x41,
+        "V15 is a 24-byte header plus 0x41 payload"
+    );
+    let messages = v16_semantic_feed(3, &frame);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].scope, 5, "source epoch 5");
+    assert_eq!(messages[0].kind, 4);
+    assert_eq!(&messages[0].payload[..], &frame[24..]);
+}
+
+#[test]
+fn v16_semantic_v15_receipt_ranges_resolve_to_sess_and_turn() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V15);
+    let payload = &frame[24..];
+    let request = moor::wire::decode_semantic(5, 4, payload).expect("V15 must decode");
+    let moor::session::Request::SemanticEvent(event, Some(projection)) = request else {
+        panic!("V15 must decode as SemanticEvent with a receipt projection");
+    };
+    assert_eq!(event.id, v16_semantic_bytes_from(0x00));
+    assert_eq!(event.sequence, 2);
+    assert_eq!(
+        event.kind,
+        moor::session::SemanticEventKind::ApplicationReceipt
+    );
+    // The crate's projection contract retains the payload minus the leading
+    // event id (16) and source sequence (8); the provider-id ranges below are
+    // defined relative to that retained slice, so pin it to the frozen bytes
+    // before resolving them. (§14.5 freezes the field layout; the 24-byte
+    // exclusion is the decoder's documented representation, asserted here so
+    // the range resolution is anchored to §16 bytes.)
+    assert_eq!(&*event.exact_payload, &payload[24..]);
+    assert_eq!(
+        projection.receipt.application_id,
+        v16_semantic_bytes_from(0x10)
+    );
+    assert_eq!(projection.receipt.lease_epoch, 3);
+    assert_eq!(projection.receipt.request_id, 1);
+    assert_eq!(projection.status, 0, "accepted");
+    // The projection returns byte RANGES into the retained payload. Resolve
+    // them against those exact retained bytes: an off-by-N range produced by
+    // a wrong-width length prefix lands on the wrong bytes and fails here.
+    let session = &event.exact_payload[projection.provider_session.clone()];
+    assert_eq!(
+        session, b"sess",
+        "provider session id resolved from its range"
+    );
+    let turn = &event.exact_payload[projection.provider_turn.clone()];
+    assert_eq!(turn, b"turn", "provider turn id resolved from its range");
+}
+
+#[test]
+fn v16_semantic_v15_provider_ids_use_two_byte_compact_prefixes() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V15);
+    let payload = &frame[24..];
+    // Payload layout: id 0..16, sequence 16..24, application id 24..40,
+    // lease epoch 40..44, controller request id 44..52, status 52, then the
+    // two length-prefixed provider identifiers.
+    assert_eq!(&payload[53..55], &[0x04, 0x00], "session id 2-byte prefix");
+    assert_eq!(&payload[59..61], &[0x04, 0x00], "turn id 2-byte prefix");
+    // Encode direction through the crate's compact writer.
+    let mut fields = Vec::new();
+    moor::wire::put_compact(&mut fields, b"sess").expect("session id fits the compact cap");
+    moor::wire::put_compact(&mut fields, b"turn").expect("turn id fits the compact cap");
+    assert_eq!(fields, &payload[53..65]);
+    // Decode direction through the crate's compact reader.
+    assert_eq!(
+        moor::wire::get_compact(payload, 53, false),
+        Some(&b"sess"[..])
+    );
+    assert_eq!(
+        moor::wire::get_compact(payload, 59, true),
+        Some(&b"turn"[..])
+    );
+    // The issue-#12 misread at the frozen bytes: a wide 4-byte prefix would
+    // read lengths 0x65730004 / 0x75740004 and must fail on both fields.
+    assert_eq!(moor::wire::get_wide(payload, 53, false), None);
+    assert_eq!(moor::wire::get_wide(payload, 59, true), None);
+}
+
+#[test]
+fn v16_semantic_v15_frame_reencodes_byte_for_byte() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V15);
+    assert_eq!(v16_semantic_encode(3, 5, 4, &frame[24..]), frame);
+}
+
+// ---------------------------------------------------------------------------
+// V17 — INPUT_NOTICE
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_semantic_v17_notice_encoder_reproduces_frozen_payload() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V17);
+    let payload = &frame[24..];
+    assert_eq!(payload.len(), 0x44, "16 + 4 + 8 + 8 + 32");
+    // The digest field is the vector's frozen final 32 bytes.
+    let digest: [u8; 32] = payload[36..68].try_into().unwrap();
+    let notice = moor::session::InputNotice {
+        receipt: moor::session::ApplicationReceipt {
+            application_id: v16_semantic_bytes_from(0x20),
+            lease_epoch: 3,
+            request_id: 2,
+        },
+        byte_count: 5,
+        digest,
+    };
+    let reply = moor::wire::encode_reply(moor::session::Reply::Notice(notice), [0; 16]);
+    let moor::wire::RuntimeReply::Frame(kind, encoded) = reply else {
+        panic!("INPUT_NOTICE must encode as an unscoped semantic frame body");
+    };
+    assert_eq!(kind, 5);
+    assert_eq!(
+        encoded, payload,
+        "notice encoder output equals V17's frozen payload"
+    );
+}
+
+#[test]
+fn v16_semantic_v17_digest_is_sha256_of_hello() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V17);
+    // Cross-check the vector's trailing 32 bytes against the well-known
+    // SHA-256("hello") digest recorded independently above.
+    assert_eq!(
+        &frame[24 + 36..],
+        &v16_semantic_hex(V16_SEMANTIC_SHA256_HELLO)[..]
+    );
+}
+
+#[test]
+fn v16_semantic_v17_frame_reencodes_byte_for_byte() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V17);
+    // Holder-to-producer frame sequence 4, source epoch 5, type 5, checksum
+    // 8C B0 EC 04 — all reproduced by the implementation's framer.
+    assert_eq!(v16_semantic_encode(4, 5, 5, &frame[24..]), frame);
+}
+
+#[test]
+fn v16_semantic_v17_is_a_direction_violation_for_the_holder_decoder() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V17);
+    // §14.3: INPUT_NOTICE flows holder → producer; a producer sending it back
+    // is malformed, so the holder-side payload decoder must refuse it.
+    assert!(matches!(
+        moor::wire::decode_semantic(5, 5, &frame[24..]),
+        Err(moor::wire::WireError::Malformed)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// V19 / V20 — SEMANTIC_ACK, accepted then duplicate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v16_semantic_v19_accepted_ack_encoder_reproduces_frozen_payload() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V19);
+    let payload = &frame[24..];
+    // 0x29 = 41 = 16 id + 8 sequence + 1 status + 2 result code + 4 epoch +
+    // 8 sequence + 2 diagnostic prefix. Only a 2-byte empty-diagnostic prefix
+    // is consistent with the frozen length; a wide prefix would make it 43.
+    assert_eq!(payload.len(), 0x29);
+    assert_eq!(
+        &payload[39..41],
+        &[0x00, 0x00],
+        "empty diagnostic, 2-byte prefix"
+    );
+    let ack = moor::session::SemanticAck {
+        id: v16_semantic_bytes_from(0x00),
+        sequence: 2,
+        status: moor::session::SemanticAckStatus::Accepted,
+        position: Some(moor::session::EventPosition {
+            epoch: 2,
+            sequence: 9,
+        }),
+    };
+    let reply = moor::wire::encode_reply(moor::session::Reply::SemanticAck(ack), [0; 16]);
+    let moor::wire::RuntimeReply::Frame(kind, encoded) = reply else {
+        panic!("SEMANTIC_ACK must encode as an unscoped semantic frame body");
+    };
+    assert_eq!(kind, 7);
+    assert_eq!(encoded, payload, "accepted ACK equals V19's frozen payload");
+}
+
+#[test]
+fn v16_semantic_v20_duplicate_ack_encoder_reproduces_frozen_payload() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V20);
+    let payload = &frame[24..];
+    assert_eq!(payload.len(), 0x29);
+    let ack = moor::session::SemanticAck {
+        id: v16_semantic_bytes_from(0x00),
+        sequence: 2,
+        status: moor::session::SemanticAckStatus::Duplicate,
+        // §16 V20: the original durable position epoch 2 / sequence 9 remains.
+        position: Some(moor::session::EventPosition {
+            epoch: 2,
+            sequence: 9,
+        }),
+    };
+    let reply = moor::wire::encode_reply(moor::session::Reply::SemanticAck(ack), [0; 16]);
+    let moor::wire::RuntimeReply::Frame(kind, encoded) = reply else {
+        panic!("SEMANTIC_ACK must encode as an unscoped semantic frame body");
+    };
+    assert_eq!(kind, 7);
+    assert_eq!(
+        encoded, payload,
+        "duplicate ACK equals V20's frozen payload"
+    );
+}
+
+#[test]
+fn v16_semantic_v19_v20_payloads_differ_only_in_status_byte() {
+    let accepted = v16_semantic_hex(V16_SEMANTIC_V19);
+    let duplicate = v16_semantic_hex(V16_SEMANTIC_V20);
+    let accepted = &accepted[24..];
+    let duplicate = &duplicate[24..];
+    // Status sits at payload offset 24 (16 id + 8 sequence). Everything else
+    // — result code zero, position epoch 2 / sequence 9, empty diagnostic —
+    // is identical between the accepted and duplicate ACKs.
+    assert_eq!(accepted[24], 0x00, "V19 status accepted");
+    assert_eq!(duplicate[24], 0x01, "V20 status duplicate");
+    assert_eq!(accepted[..24], duplicate[..24]);
+    assert_eq!(accepted[25..], duplicate[25..]);
+}
+
+#[test]
+fn v16_semantic_v17_v19_v20_stream_decodes_in_protocol_order() {
+    // V17, V19 and V20 share the holder-to-producer direction on source epoch
+    // 5, with frame sequences 4, 5 and 6: one codec must accept all three.
+    let stream = [
+        v16_semantic_hex(V16_SEMANTIC_V17),
+        v16_semantic_hex(V16_SEMANTIC_V19),
+        v16_semantic_hex(V16_SEMANTIC_V20),
+    ]
+    .concat();
+    let messages = v16_semantic_feed(4, &stream);
+    assert_eq!(messages.len(), 3);
+    let expected: [(u8, &str); 3] = [
+        (5, V16_SEMANTIC_V17),
+        (7, V16_SEMANTIC_V19),
+        (7, V16_SEMANTIC_V20),
+    ];
+    for (message, (kind, vector)) in messages.iter().zip(expected) {
+        assert_eq!(message.scope, 5);
+        assert_eq!(message.kind, kind);
+        assert_eq!(&message.payload[..], &v16_semantic_hex(vector)[24..]);
+    }
+}
+
+#[test]
+fn v16_semantic_v17_v19_v20_stream_reencodes_byte_for_byte() {
+    // One outbound codec starting at frame sequence 4 must reproduce V17,
+    // V19 and V20 — headers, advancing sequences and CRCs — from the frozen
+    // payloads alone.
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, 1, 4);
+    for (kind, vector) in [
+        (5, V16_SEMANTIC_V17),
+        (7, V16_SEMANTIC_V19),
+        (7, V16_SEMANTIC_V20),
+    ] {
+        let frame = v16_semantic_hex(vector);
+        let mut out = Vec::new();
+        codec
+            .encode(5, kind, &frame[24..], &mut out)
+            .expect("frozen §16 payload must be encodable");
+        assert_eq!(out, frame);
+    }
+}
+
+#[test]
+fn v16_semantic_v19_is_a_direction_violation_for_the_holder_decoder() {
+    let frame = v16_semantic_hex(V16_SEMANTIC_V19);
+    // §14.3: SEMANTIC_ACK flows holder → producer only.
+    assert!(matches!(
+        moor::wire::decode_semantic(5, 7, &frame[24..]),
+        Err(moor::wire::WireError::Malformed)
+    ));
+}
+
+#[test]
+fn v16_semantic_gap_no_producer_side_payload_decoder() {
+    // GAP: the crate is the holder; it exposes no producer-side payload
+    // parser for holder → producer frames (V17 INPUT_NOTICE, V19/V20
+    // SEMANTIC_ACK). For those vectors the decode direction is expressible
+    // only as framing reassembly (covered by the stream test) plus the §14.3
+    // holder-side direction refusal (covered above); their field-level decode
+    // cannot be driven through any public entrypoint. This test freezes that
+    // refusal for every holder → producer vector so the gap is visible, not
+    // silent.
+    for (kind, vector) in [
+        (5, V16_SEMANTIC_V17),
+        (7, V16_SEMANTIC_V19),
+        (7, V16_SEMANTIC_V20),
+    ] {
+        let frame = v16_semantic_hex(vector);
+        assert!(matches!(
+            moor::wire::decode_semantic(5, kind, &frame[24..]),
+            Err(moor::wire::WireError::Malformed)
+        ));
+    }
+}
+
+// ---- vectors: V7, V8, V9, V10, V16, V18 ----
+// Conformance lane: §16 vectors V7, V8, V9, V10, V16, V18 plus §7.3 replay
+// semantics. Every vector below is the exact hex copied from
+// spec/moor-wire-schema.md §16 — never computed from the implementation.
+// Helper and constant names carry the v16_input_ prefix so the assembled
+// suite has no collisions.
+
+const V16_INPUT_V7: &str = "
+    4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
+    11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
+    00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
+    00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
+    D3 42 42";
+
+const V16_INPUT_V8: &str = "
+    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0A 00 00 00
+    2B 00 00 00 EA B3 81 BB 03 00 00 00 01 00 00 00
+    00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
+    00 00 00";
+
+const V16_INPUT_V9: &str = "
+    4D 4F 4F 52 03 09 00 00 07 00 00 00 16 00 00 00
+    13 00 00 00 BA FD 47 3C 03 00 00 00 01 00 00 00
+    00 00 00 00 00 41 41 41 41 42 42";
+
+const V16_INPUT_V10: &str = "
+    4D 4F 4F 52 03 09 00 00 07 00 00 00 17 00 00 00
+    16 00 00 00 D6 1B 1C D3 03 00 00 00 01 00 00 00
+    00 00 00 00 00 44 49 46 46 45 52 45 4E 54";
+
+const V16_INPUT_V16: &str = "
+    4D 4F 4F 52 03 09 00 00 07 00 00 00 1E 00 00 00
+    2A 00 00 00 88 95 3C 6B 03 00 00 00 02 00 00 00
+    00 00 00 00 01 20 21 22 23 24 25 26 27 28 29 2A
+    2B 2C 2D 2E 2F 06 00 63 6C 61 75 64 65 68 65 6C
+    6C 6F";
+
+const V16_INPUT_V18: &str = "
+    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0B 00 00 00
+    2B 00 00 00 CD CE BD F2 03 00 00 00 01 00 00 00
+    00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
+    08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
+    00 00 00";
+
+fn v16_input_hex(s: &str) -> Vec<u8> {
+    let digits: Vec<u8> = s
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|c| c.to_digit(16).unwrap() as u8)
+        .collect();
+    assert_eq!(digits.len() % 2, 0, "hex vector has whole bytes");
+    digits
+        .chunks(2)
+        .map(|pair| (pair[0] << 4) | pair[1])
+        .collect()
+}
+
+/// V8's frozen holder incarnation `00 01 .. 0F`.
+fn v16_input_incarnation() -> [u8; 16] {
+    std::array::from_fn(|i| i as u8)
+}
+
+fn v16_input_declared_length(frame: &[u8]) -> u32 {
+    u32::from_le_bytes(frame[16..20].try_into().unwrap())
+}
+
+fn v16_input_feed(codec: &mut moor::wire::Codec, bytes: &[u8]) -> Vec<moor::wire::Message> {
+    let mut out = Vec::new();
+    codec
+        .feed(0, bytes, &mut out)
+        .expect("frozen frames are accepted");
+    out
+}
+
+fn v16_input_decode(
+    payload: &[u8],
+) -> (
+    moor::session::OwnedInput,
+    Option<moor::session::ApplicationInput>,
+) {
+    match moor::wire::decode_controller(9, payload, None).expect("frozen INPUT payload decodes") {
+        moor::wire::ControllerRequest::Policy(moor::session::Request::Input(
+            input,
+            application,
+        )) => (input, application),
+        _ => panic!("kind 9 must decode to an input request"),
+    }
+}
+
+/// A Machine matching V8's frozen receipt: generation 7, incarnation 00..0F,
+/// with a freshly granted input lease at epoch 3 for controller connection 1.
+fn v16_input_machine() -> moor::session::Machine {
+    use moor::session::{
+        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
+    };
+    let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]).allocated(2);
+    machine.register_controller(1);
+    let effects = machine
+        .transition(Transition::Peer(
+            0,
+            1,
+            Request::Lease(LeaseRequest::fresh(LeaseRole::InputOnly), Some([5; 16])),
+        ))
+        .unwrap();
+    let granted = effects
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Send(1, Reply::Lease(result)) => Some(result),
+            _ => None,
+        })
+        .expect("lease result");
+    assert_eq!(granted.outcome, ResultOutcome::Granted);
+    assert_eq!(granted.epoch, 3, "V7's frozen lease epoch");
+    machine
+}
+
+fn v16_input_request(
+    machine: &mut moor::session::Machine,
+    now: u64,
+    input: moor::session::OwnedInput,
+    application: Option<moor::session::ApplicationInput>,
+) -> moor::session::Effects {
+    machine
+        .transition(moor::session::Transition::Peer(
+            now,
+            1,
+            moor::session::Request::Input(input, application),
+        ))
+        .unwrap()
+}
+
+/// Extracts the one terminal-write effect and asserts no receipt was sent yet.
+fn v16_input_write(effects: moor::session::Effects) -> (moor::session::WriteTicket, Vec<u8>) {
+    use moor::session::{Effect, Reply};
+    let mut write = None;
+    for effect in effects {
+        match effect {
+            Effect::Write(ticket, bytes) => {
+                assert!(write.replace((ticket, bytes)).is_none(), "one write only");
+            }
+            Effect::Send(_, Reply::Input(_)) => panic!("receipt before the write completed"),
+            _ => {}
+        }
+    }
+    write.expect("terminal write effect")
+}
+
+/// Extracts the one input receipt and asserts nothing was written.
+fn v16_input_receipt_only(effects: moor::session::Effects) -> Vec<u8> {
+    use moor::session::{Effect, Reply};
+    let mut receipt = None;
+    for effect in effects {
+        match effect {
+            Effect::Send(1, Reply::Input(bytes)) => {
+                assert!(receipt.replace(bytes).is_none(), "one receipt only");
+            }
+            Effect::Write(..) => panic!("refusal or replay must write nothing"),
+            _ => {}
+        }
+    }
+    receipt.expect("input receipt")
+}
+
+/// A §7.1 flags-00 input payload in exact wire layout, for §7.3 cases the
+/// frozen vectors do not reach (skips, below-high-water, wrong first id).
+fn v16_input_owned(epoch: u32, request_id: u64, terminal: &[u8]) -> moor::session::OwnedInput {
+    moor::session::OwnedInput {
+        epoch,
+        request_id,
+        exact_payload: [
+            epoch.to_le_bytes().as_slice(),
+            request_id.to_le_bytes().as_slice(),
+            &[0],
+            terminal,
+        ]
+        .concat()
+        .into(),
+    }
+}
+
+fn v16_input_complete(
+    machine: &mut moor::session::Machine,
+    now: u64,
+    ticket: moor::session::WriteTicket,
+    written: u64,
+) -> Vec<u8> {
+    let effects = machine
+        .transition(moor::session::Transition::Complete(
+            now,
+            ticket,
+            moor::session::Completion::Write(written, None),
+        ))
+        .unwrap();
+    v16_input_receipt_only(effects)
+}
+
+// ---------------------------------------------------------------- V7 framing
+
+#[test]
+fn v16_input_v7_header_lengths_close_arithmetically() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    assert_eq!(v7.len(), 67);
+    let (first, second) = v7.split_at(41);
+    assert_eq!(v16_input_declared_length(first), 17);
+    assert_eq!(first.len(), 24 + 17);
+    assert_eq!(first[6], 1, "first frame carries MORE");
+    assert_eq!(v16_input_declared_length(second), 2);
+    assert_eq!(second.len(), 24 + 2);
+    assert_eq!(second[6], 0, "continuation ends the run");
+}
+
+#[test]
+fn v16_input_v7_reassembles_at_every_split_boundary() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let expected = v16_input_hex("03 00 00 00 01 00 00 00 00 00 00 00 00 41 41 41 41 42 42");
+    for split in 0..=v7.len() {
+        let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+        let mut messages = v16_input_feed(&mut codec, &v7[..split]);
+        messages.extend(v16_input_feed(&mut codec, &v7[split..]));
+        assert_eq!(messages.len(), 1, "exactly one message at split {split}");
+        let message = &messages[0];
+        assert_eq!((message.scope, message.kind), (7, 9));
+        assert_eq!(&message.payload[..], expected.as_slice());
+    }
+}
+
+#[test]
+fn v16_input_v7_fed_one_byte_at_a_time_yields_one_message() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut messages = Vec::new();
+    for byte in &v7 {
+        messages.extend(v16_input_feed(&mut codec, std::slice::from_ref(byte)));
+    }
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].payload.len(), 19);
+    assert_eq!(&messages[0].payload[13..], b"AAAABB".as_slice());
+}
+
+#[test]
+fn v16_input_v7_decodes_to_plain_input_request() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let messages = v16_input_feed(&mut codec, &v7);
+    let (input, application) = v16_input_decode(&messages[0].payload);
+    assert_eq!((input.epoch, input.request_id), (3, 1));
+    assert!(application.is_none(), "V7 sets no receipt-required flag");
+    assert_eq!(&input.exact_payload[..], &messages[0].payload[..]);
+    assert_eq!(&input.exact_payload[13..], b"AAAABB".as_slice());
+}
+
+#[test]
+fn v16_input_v7_single_frame_encoding_matches_frozen_v9() {
+    // GAP: Codec::encode splits a message only at the 1 MiB frame bound, so the
+    // encoder cannot reproduce V7's frozen two-frame MORE run (17 + 2 bytes).
+    // The frozen carrier of the identical 19-byte request as a single frame is
+    // V9, so encoding V7's reassembled payload at V9's sequence must reproduce
+    // V9 byte-for-byte; V7's framing itself is asserted decoder-side above.
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let v9 = v16_input_hex(V16_INPUT_V9);
+    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let messages = v16_input_feed(&mut decode, &v7);
+    let mut encode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 22);
+    let mut out = Vec::new();
+    encode.encode(7, 9, &messages[0].payload, &mut out).unwrap();
+    assert_eq!(out, v9);
+}
+
+// ------------------------------------------------------------- V8 / V18 receipt
+
+#[test]
+fn v16_input_v8_receipt_encoder_matches_frozen_payload() {
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let receipt = moor::wire::InputReceipt::outcome(3, 1, 7, v16_input_incarnation(), 6, None);
+    assert_eq!(receipt.encode().unwrap().as_slice(), &v8[24..]);
+}
+
+#[test]
+fn v16_input_v8_frame_encoder_matches_frozen_bytes() {
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 10);
+    let mut out = Vec::new();
+    codec.encode(7, 10, &v8[24..], &mut out).unwrap();
+    assert_eq!(out, v8, "header, CRC and payload all frozen");
+}
+
+#[test]
+fn v16_input_v8_decodes_back_from_frozen_bytes() {
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 10, 1);
+    let messages = v16_input_feed(&mut codec, &v8);
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].scope, messages[0].kind), (7, 10));
+    let receipt = moor::wire::InputReceipt::decode(&messages[0].payload).unwrap();
+    assert_eq!(receipt.epoch, 3);
+    assert_eq!(receipt.request, 1);
+    assert_eq!(receipt.generation, 7);
+    assert_eq!(receipt.incarnation, v16_input_incarnation());
+    assert_eq!(receipt.written, 6);
+    assert_eq!((receipt.status, receipt.result), (0, 0));
+}
+
+#[test]
+fn v16_input_receipt_frames_declare_exactly_43_payload_bytes() {
+    // §7.2 fixes the receipt at 4+8+4+16+8+1+2 = 43 bytes; the frozen headers
+    // declare 0x2B and their bodies close arithmetically at that length.
+    for hex in [V16_INPUT_V8, V16_INPUT_V18] {
+        let frame = v16_input_hex(hex);
+        assert_eq!(v16_input_declared_length(&frame), 43);
+        assert_eq!(frame.len() - 24, 43);
+    }
+    let v9 = v16_input_hex(V16_INPUT_V9);
+    assert_eq!(v16_input_declared_length(&v9), 19);
+    assert_eq!(v9.len() - 24, 19);
+}
+
+#[test]
+fn v16_input_v8_receipt_layout_offsets_are_load_bearing() {
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let payload = &v8[24..];
+    assert!(moor::wire::InputReceipt::decode(payload).is_ok());
+    let mut bad = payload.to_vec();
+    bad[40] = 2; // status byte at 4+8+4+16+8: only 00/01 exist
+    assert!(moor::wire::InputReceipt::decode(&bad).is_err());
+    let mut bad = payload.to_vec();
+    bad[41] = 1; // a written receipt carries result code zero
+    assert!(moor::wire::InputReceipt::decode(&bad).is_err());
+    let mut bad = payload.to_vec();
+    bad.truncate(42); // the receipt is exactly 43 bytes
+    assert!(moor::wire::InputReceipt::decode(&bad).is_err());
+}
+
+#[test]
+fn v16_input_v18_payload_is_byte_identical_to_v8() {
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let v18 = v16_input_hex(V16_INPUT_V18);
+    assert_eq!(
+        &v18[24..],
+        &v8[24..],
+        "cached receipt payload is reused exactly"
+    );
+    // Only the frame sequence advances, 10 -> 11, and with it the header CRC.
+    assert_eq!(u32::from_le_bytes(v8[12..16].try_into().unwrap()), 10);
+    assert_eq!(u32::from_le_bytes(v18[12..16].try_into().unwrap()), 11);
+    // Decoding V8 then V18 through one controller-side codec accepts both.
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 10, 1);
+    let first = v16_input_feed(&mut codec, &v8);
+    let second = v16_input_feed(&mut codec, &v18);
+    assert_eq!(first[0].payload, second[0].payload);
+}
+
+// ------------------------------------------------------ V9 / V10 frozen frames
+
+#[test]
+fn v16_input_v9_is_byte_identical_replay_of_v7() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let v9 = v16_input_hex(V16_INPUT_V9);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let reassembled = v16_input_feed(&mut codec, &v7);
+    let replay = v16_input_feed(&mut codec, &v9);
+    assert_eq!(reassembled[0].payload, replay[0].payload);
+    let (input7, _) = v16_input_decode(&reassembled[0].payload);
+    let (input9, application9) = v16_input_decode(&replay[0].payload);
+    assert_eq!(input7, input9, "identical metadata and bytes");
+    assert!(application9.is_none());
+}
+
+#[test]
+fn v16_input_v9_v10_frame_encoder_matches_frozen_bytes() {
+    let v9 = v16_input_hex(V16_INPUT_V9);
+    let v10 = v16_input_hex(V16_INPUT_V10);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 22);
+    let mut out = Vec::new();
+    codec.encode(7, 9, &v9[24..], &mut out).unwrap();
+    assert_eq!(out, v9);
+    out.clear();
+    codec.encode(7, 9, &v10[24..], &mut out).unwrap();
+    assert_eq!(out, v10, "sequence advances 22 -> 23 across the run");
+}
+
+#[test]
+fn v16_input_v10_carries_same_id_with_different_bytes() {
+    let v10 = v16_input_hex(V16_INPUT_V10);
+    assert_eq!(v16_input_declared_length(&v10), 22);
+    assert_eq!(v10.len() - 24, 22, "body length equals the declared length");
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 23, 1);
+    let messages = v16_input_feed(&mut codec, &v10);
+    let (input, application) = v16_input_decode(&messages[0].payload);
+    assert_eq!((input.epoch, input.request_id), (3, 1), "V7's identity");
+    assert!(application.is_none());
+    assert_eq!(&input.exact_payload[13..], b"DIFFERENT".as_slice());
+}
+
+// --------------------------------------------- §7.3 replay, in protocol order
+
+#[test]
+fn v16_input_replay_run_writes_once_and_replays_cached_v8_receipt() {
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let v8 = v16_input_hex(V16_INPUT_V8);
+    let v9 = v16_input_hex(V16_INPUT_V9);
+    let v10 = v16_input_hex(V16_INPUT_V10);
+    let v18 = v16_input_hex(V16_INPUT_V18);
+    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let m7 = v16_input_feed(&mut decode, &v7).remove(0);
+    let m9 = v16_input_feed(&mut decode, &v9).remove(0);
+    let m10 = v16_input_feed(&mut decode, &v10).remove(0);
+
+    let mut machine = v16_input_machine();
+    // V7: the new request writes AAAABB exactly once.
+    let (input7, application7) = v16_input_decode(&m7.payload);
+    let (ticket, bytes) = v16_input_write(v16_input_request(
+        &mut machine,
+        1,
+        input7.clone(),
+        application7,
+    ));
+    assert_eq!(bytes.as_slice(), b"AAAABB".as_slice());
+    // One input is in flight at a time: an identical resend while pending is
+    // absorbed without a second write and without a premature receipt (§7.2:
+    // "while the outcome is still pending no receipt is sent").
+    assert!(v16_input_request(&mut machine, 2, input7, None).is_empty());
+    // Completion produces V8's frozen receipt payload.
+    let receipt = v16_input_complete(&mut machine, 3, ticket, 6);
+    assert_eq!(receipt.as_slice(), &v8[24..]);
+
+    // The holder-to-controller framing of that cached payload at sequence 10
+    // is V8; the replay answer at sequence 11 is V18 — same payload, new frame.
+    let mut encode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 10);
+    let mut out = Vec::new();
+    encode.encode(7, 10, &receipt, &mut out).unwrap();
+    assert_eq!(out, v8);
+
+    // V9: identical replay — nothing written, cached V8 payload returned.
+    let (input9, application9) = v16_input_decode(&m9.payload);
+    let replayed = v16_input_receipt_only(v16_input_request(&mut machine, 4, input9, application9));
+    assert_eq!(replayed.as_slice(), &v8[24..]);
+    out.clear();
+    encode.encode(7, 10, &replayed, &mut out).unwrap();
+    assert_eq!(
+        out, v18,
+        "newly sequenced frame carrying the cached payload"
+    );
+
+    // V10: same request id, different bytes — BAD_SEQUENCE, nothing written.
+    let (input10, application10) = v16_input_decode(&m10.payload);
+    let refused =
+        v16_input_receipt_only(v16_input_request(&mut machine, 5, input10, application10));
+    let decoded = moor::wire::InputReceipt::decode(&refused).unwrap();
+    assert_eq!((decoded.status, decoded.result, decoded.written), (1, 6, 0));
+    assert_eq!(
+        refused.as_slice(),
+        moor::wire::InputReceipt::outcome(3, 1, 7, v16_input_incarnation(), 0, Some(6))
+            .encode()
+            .unwrap()
+            .as_slice()
+    );
+
+    // The refusal did not disturb the high-water entry: V9 replays again.
+    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 22, 1);
+    let m9_again = v16_input_feed(&mut decode, &v9).remove(0);
+    let (input9, _) = v16_input_decode(&m9_again.payload);
+    let replayed = v16_input_receipt_only(v16_input_request(&mut machine, 6, input9, None));
+    assert_eq!(replayed.as_slice(), &v8[24..]);
+}
+
+#[test]
+fn v16_input_first_request_id_of_an_epoch_must_be_one() {
+    // §7.3: a new lease epoch sets the high-water mark to 0 and the first
+    // request id is exactly 1; skipping to 2 is BAD_SEQUENCE with no write.
+    let mut machine = v16_input_machine();
+    let refused = v16_input_receipt_only(v16_input_request(
+        &mut machine,
+        1,
+        v16_input_owned(3, 2, b"early"),
+        None,
+    ));
+    let decoded = moor::wire::InputReceipt::decode(&refused).unwrap();
+    assert_eq!((decoded.status, decoded.result, decoded.request), (1, 6, 2));
+    // The mark is unchanged: id 1 is still the only admissible new request.
+    let (ticket, bytes) = v16_input_write(v16_input_request(
+        &mut machine,
+        2,
+        v16_input_owned(3, 1, b"one"),
+        None,
+    ));
+    assert_eq!(bytes.as_slice(), b"one".as_slice());
+    let receipt = v16_input_complete(&mut machine, 3, ticket, 3);
+    assert_eq!(
+        moor::wire::InputReceipt::decode(&receipt).unwrap().status,
+        0
+    );
+}
+
+#[test]
+fn v16_input_request_id_below_high_water_is_refused_not_replayed() {
+    // §7.3: only the exact high-water id replays; an older id is BAD_SEQUENCE
+    // rather than being answered with a newer request's receipt.
+    let mut machine = v16_input_machine();
+    let one = v16_input_owned(3, 1, b"one");
+    let (ticket, _) = v16_input_write(v16_input_request(&mut machine, 1, one.clone(), None));
+    let first_receipt = v16_input_complete(&mut machine, 2, ticket, 3);
+    let two = v16_input_owned(3, 2, b"two");
+    let (ticket, _) = v16_input_write(v16_input_request(&mut machine, 3, two.clone(), None));
+    let second_receipt = v16_input_complete(&mut machine, 4, ticket, 3);
+
+    let refused = v16_input_receipt_only(v16_input_request(&mut machine, 5, one, None));
+    let decoded = moor::wire::InputReceipt::decode(&refused).unwrap();
+    assert_eq!((decoded.status, decoded.result, decoded.request), (1, 6, 1));
+    assert_ne!(refused, first_receipt, "no stale cached answer");
+
+    // The high-water entry survives the refusal: id 2 still replays exactly.
+    let replayed = v16_input_receipt_only(v16_input_request(&mut machine, 6, two, None));
+    assert_eq!(replayed, second_receipt);
+}
+
+#[test]
+fn v16_input_request_id_skip_above_high_water_is_refused() {
+    // §7.3: more than one above the mark is BAD_SEQUENCE with nothing written,
+    // and high-water plus one afterwards still advances normally.
+    let mut machine = v16_input_machine();
+    let (ticket, _) = v16_input_write(v16_input_request(
+        &mut machine,
+        1,
+        v16_input_owned(3, 1, b"one"),
+        None,
+    ));
+    v16_input_complete(&mut machine, 2, ticket, 3);
+    let refused = v16_input_receipt_only(v16_input_request(
+        &mut machine,
+        3,
+        v16_input_owned(3, 3, b"skip"),
+        None,
+    ));
+    let decoded = moor::wire::InputReceipt::decode(&refused).unwrap();
+    assert_eq!((decoded.status, decoded.result, decoded.request), (1, 6, 3));
+    let (_, bytes) = v16_input_write(v16_input_request(
+        &mut machine,
+        4,
+        v16_input_owned(3, 2, b"two"),
+        None,
+    ));
+    assert_eq!(bytes.as_slice(), b"two".as_slice());
+}
+
+// ------------------------------------------------------------------------ V16
+
+#[test]
+fn v16_input_v16_declared_length_closes_only_with_compact_source_prefix() {
+    // Consumer issue #12 regression: the header declares payload length 0x2A
+    // (42), which closes arithmetically only when the source id carries §1.1's
+    // plain 2-byte length prefix. A 4-byte wide prefix would need 44 bytes.
+    let v16 = v16_input_hex(V16_INPUT_V16);
+    assert_eq!(v16_input_declared_length(&v16), 0x2A);
+    assert_eq!(v16.len() - 24, 42, "body length equals the declared length");
+    assert_eq!(4 + 8 + 1 + 16 + 2 + b"claude".len() + b"hello".len(), 42);
+    assert_ne!(4 + 8 + 1 + 16 + 4 + b"claude".len() + b"hello".len(), 42);
+    // The frozen prefix bytes themselves: 06 00 immediately before "claude".
+    assert_eq!(&v16[24 + 29..24 + 31], [0x06, 0x00].as_slice());
+    assert_eq!(&v16[24 + 31..24 + 37], b"claude".as_slice());
+}
+
+#[test]
+fn v16_input_v16_wide_prefixed_source_is_not_a_valid_input_payload() {
+    // Consumer issue #12, refuting direction: re-encode V16's body with a
+    // 4-byte wide prefix (§1.1.1) on the source id. §7.1 freezes the source id
+    // as §1.1 plain length-prefixed, so the wide form must not decode — its
+    // third and fourth prefix bytes land inside the source id, violating
+    // §14.2's grammar.
+    let v16 = v16_input_hex(V16_INPUT_V16);
+    let mut wide = v16[24..24 + 29].to_vec(); // epoch, request id, flags, app id
+    wide.extend_from_slice(&6u32.to_le_bytes());
+    wide.extend_from_slice(b"claude");
+    wide.extend_from_slice(b"hello");
+    assert_eq!(wide.len(), 44);
+    assert!(moor::wire::decode_controller(9, &wide, None).is_err());
+}
+
+#[test]
+fn v16_input_v16_decodes_source_and_application_id() {
+    let v16 = v16_input_hex(V16_INPUT_V16);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 30, 1);
+    let messages = v16_input_feed(&mut codec, &v16);
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].scope, messages[0].kind), (7, 9));
+    let (input, application) = v16_input_decode(&messages[0].payload);
+    assert_eq!((input.epoch, input.request_id), (3, 2));
+    let application = application.expect("APPLICATION_RECEIPT_REQUIRED is set");
+    let expected_id: [u8; 16] = std::array::from_fn(|i| 0x20 + i as u8);
+    assert_eq!(application.receipt.application_id, expected_id);
+    assert_eq!(application.receipt.lease_epoch, 3);
+    assert_eq!(application.receipt.request_id, 2);
+    assert_eq!(
+        &messages[0].payload[application.source.clone()],
+        b"claude".as_slice()
+    );
+    assert_eq!(
+        &messages[0].payload[application.terminal_at..],
+        b"hello".as_slice()
+    );
+}
+
+#[test]
+fn v16_input_v16_frame_encoder_matches_frozen_bytes() {
+    let v16 = v16_input_hex(V16_INPUT_V16);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 30);
+    let mut out = Vec::new();
+    codec.encode(7, 9, &v16[24..], &mut out).unwrap();
+    assert_eq!(out, v16);
+}
+
+#[test]
+fn v16_input_v16_without_matching_source_is_refused_cached_and_replayed() {
+    // §7.1: a receipt-required input needs an active stateful source named
+    // `claude` advertising INPUT_NOTICE and APPLICATION_RECEIPT; none exists,
+    // so the request is refused APPLICATION_SOURCE_UNAVAILABLE (17) with
+    // nothing written. §7.2/§7.3: the refused receipt becomes the high-water
+    // entry and an identical retry replays the cached refusal.
+    let v7 = v16_input_hex(V16_INPUT_V7);
+    let v16 = v16_input_hex(V16_INPUT_V16);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let m7 = v16_input_feed(&mut codec, &v7).remove(0);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 30, 1);
+    let m16 = v16_input_feed(&mut codec, &v16).remove(0);
+
+    let mut machine = v16_input_machine();
+    let (input7, application7) = v16_input_decode(&m7.payload);
+    let (ticket, _) = v16_input_write(v16_input_request(&mut machine, 1, input7, application7));
+    v16_input_complete(&mut machine, 2, ticket, 6);
+
+    // V16 is request id 2 — high-water plus one — but no source matches.
+    let (input16, application16) = v16_input_decode(&m16.payload);
+    let refused =
+        v16_input_receipt_only(v16_input_request(&mut machine, 3, input16, application16));
+    assert_eq!(
+        refused.as_slice(),
+        moor::wire::InputReceipt::outcome(3, 2, 7, v16_input_incarnation(), 0, Some(17))
+            .encode()
+            .unwrap()
+            .as_slice()
+    );
+
+    // The refused outcome is retained identically: an exact replay of the
+    // frozen bytes returns the cached refusal payload and writes nothing.
+    let (input16, application16) = v16_input_decode(&m16.payload);
+    let replayed =
+        v16_input_receipt_only(v16_input_request(&mut machine, 4, input16, application16));
+    assert_eq!(replayed, refused);
+}
+
+// ---- vectors: V1, V2, V3, V4, V5, V6, V11 ----
+// ===== group: framing (V1, V2, V3, V4, V5, V6, V11) =====
+// Byte-exact conformance against spec/moor-wire-schema.md §16. Every vector
+// below is the EXACT hex copied from §16 — never computed from the
+// implementation. Decodes go through the real public entrypoints
+// (Codec::feed, decode_controller, decode_viewer, Machine::transition) and
+// encodes are byte-compared against the frozen bytes.
+
+/// Local hex helper (prefixed so the assembled conformance file has no
+/// duplicate `hex` symbol across groups).
+fn v16_framing_hex(s: &str) -> Vec<u8> {
+    s.split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect()
+}
+
+// §16 V1 — side-effect-free HELLO, exact generation 7, sequence 1; hello
+// flags are reserved zero.
+fn v16_framing_v1() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
+         21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+         00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
+         30 30 30 2F 62 75 69 6C 64",
+    )
+}
+
+// §16 V2 — OUTPUT, record sequence 42, byte offset 4096, payload `hi`.
+fn v16_framing_v2() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 06 00 00 07 00 00 00 09 00 00 00
+         12 00 00 00 85 A9 11 DC 2A 00 00 00 00 00 00 00
+         00 10 00 00 00 00 00 00 68 69",
+    )
+}
+
+// §16 V3 — ATTACH with geometry 0×0 — preserve both (OB-19) — requesting the
+// lease.
+fn v16_framing_v3() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00
+         05 00 00 00 35 5C 53 49 00 00 00 00 01",
+    )
+}
+
+// §16 V4 — RESIZE, lease epoch 3, geometry 80×24 — payload is 8 bytes: epoch
+// then geometry.
+fn v16_framing_v4() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0B 00 00 00
+         08 00 00 00 7E AE 34 20 03 00 00 00 50 00 18 00",
+    )
+}
+
+// §16 V5 — RESIZE with 80×0 — half-specified, MUST be refused with
+// HALF_SPECIFIED_GEOMETRY.
+fn v16_framing_v5() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0C 00 00 00
+         08 00 00 00 7A AB 6D DA 03 00 00 00 50 00 00 00",
+    )
+}
+
+// §16 V6 — any frame with generation 0 — MUST be refused; shown as
+// OUTPUT_ACK.
+fn v16_framing_v6() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 07 00 00 00 00 00 00 03 00 00 00
+         08 00 00 00 DA 77 CE 5D 01 00 00 00 00 00 00 00",
+    )
+}
+
+// §16 V11 — ERROR carrying GENERATION_MISMATCH (9).
+fn v16_framing_v11() -> Vec<u8> {
+    v16_framing_hex(
+        "4D 4F 4F 52 03 13 00 00 07 00 00 00 0D 00 00 00
+         1E 00 00 00 3F E0 B5 E8 09 00 1A 00 67 65 6E 65
+         72 61 74 69 6F 6E 20 33 20 69 73 20 73 75 70 65
+         72 73 65 64 65 64",
+    )
+}
+
+/// V1's canonical session identity: tag `01` + POSIX socket-path bytes (§1.2).
+fn v16_framing_v1_identity() -> Vec<u8> {
+    let mut identity = vec![0x01];
+    identity.extend_from_slice(b"/tmp/.moor-1000/build");
+    identity
+}
+
+/// Asserts the frozen 24-byte header shape of §1: magic, version, and that the
+/// header CRC-32C over bytes 0–19 recomputes to the frozen bytes 20–23.
+fn v16_framing_assert_header(frame: &[u8]) {
+    assert!(frame.len() >= 24, "frame shorter than the 24-byte header");
+    assert_eq!(&frame[0..4], b"MOOR", "frozen magic");
+    assert_eq!(frame[4], 0x03, "frozen wire-schema-3 version byte");
+    let frozen = u32::from_le_bytes(frame[20..24].try_into().unwrap());
+    assert_eq!(
+        moor::wire::crc32c(&frame[..20]),
+        frozen,
+        "header CRC-32C over bytes 0-19 must recompute to the frozen checksum"
+    );
+}
+
+/// Feeds one frozen frame through the real controller Codec (with `next_in`
+/// positioned at the vector's frozen sequence) and returns the one decoded
+/// message.
+fn v16_framing_feed_one(next_in: u32, frame: &[u8]) -> moor::wire::Message {
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, next_in, 1);
+    let mut out = Vec::new();
+    codec
+        .feed(0, frame, &mut out)
+        .expect("the frozen frame must be accepted by the framing layer");
+    assert_eq!(out.len(), 1, "exactly one reassembled message");
+    out.remove(0)
+}
+
+/// Encodes one frame through the real Codec (with `next_out` positioned at the
+/// vector's frozen sequence) for byte-comparison against the frozen vector.
+fn v16_framing_encode_frame(next_out: u32, scope: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, next_out);
+    let mut out = Vec::new();
+    codec
+        .encode(scope, kind, payload, &mut out)
+        .expect("the frozen payload must be encodable");
+    out
+}
+
+/// A machine that has granted the input lease via ATTACH; returns it with the
+/// granted lease epoch.
+fn v16_framing_machine_with_lease(allocated: u32) -> (moor::session::Machine, u32) {
+    use moor::session::{Effect, Machine, Request, Transition};
+    let mut machine = Machine::new(7, [1; 16], [2; 16]).allocated(allocated);
+    machine.register_controller(1);
+    let effects = machine
+        .transition(Transition::Peer(
+            0,
+            1,
+            Request::Attach(0, 0, true, false, Some([3; 16])),
+        ))
+        .expect("attach must be accepted");
+    let epoch = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Attached(1, _, Some(lease), _) => Some(lease.epoch),
+            _ => None,
+        })
+        .expect("attach requesting the lease must report a lease result");
+    (machine, epoch)
+}
+
+// ---------------------------------------------------------------- V1: HELLO
+
+#[test]
+fn v16_framing_v1_hello_frame_decodes_through_codec_and_controller_decoder() {
+    let frame = v16_framing_v1();
+    v16_framing_assert_header(&frame);
+    // §1 header fields frozen by the vector: type HELLO, generation 7, seq 1,
+    // payload length 0x21.
+    assert_eq!(frame[5], 0x01, "frame type HELLO");
+    assert_eq!(&frame[16..20], &[0x21, 0, 0, 0], "payload length 33");
+    let message = v16_framing_feed_one(1, &frame);
+    assert_eq!(message.scope, 7, "generation 7 from the frozen header");
+    assert_eq!(message.kind, 1);
+    assert_eq!(
+        &message.payload[..],
+        &frame[24..],
+        "payload split exactly after byte 24"
+    );
+
+    // §3.1: magic repeat, schema version, two reserved-zero flag bytes, then
+    // the canonical session identity — wide-length-prefixed (§1.1.1, 4 bytes).
+    let identity = v16_framing_v1_identity();
+    assert_eq!(&message.payload[..7], b"MOOR\x03\0\0");
+    assert_eq!(
+        &message.payload[7..11],
+        &[0x16, 0x00, 0x00, 0x00],
+        "identity carries the 4-byte wide prefix (0x16 = 22), not a 2-byte one"
+    );
+    assert_eq!(
+        moor::wire::get_wide(&message.payload, 7, true),
+        Some(identity.as_slice())
+    );
+    let decoded = moor::wire::decode_controller(1, &message.payload, None);
+    let Ok(moor::wire::ControllerRequest::Hello(decoded_identity)) = decoded else {
+        panic!("V1 must decode as a controller HELLO");
+    };
+    assert_eq!(decoded_identity, identity.as_slice());
+}
+
+#[test]
+fn v16_framing_v1_hello_encoder_reproduces_frozen_bytes() {
+    let frame = v16_framing_v1();
+    let payload =
+        moor::wire::controller_hello(&v16_framing_v1_identity()).expect("identity within bounds");
+    assert_eq!(payload, frame[24..].to_vec(), "frozen §3.1 payload");
+    assert_eq!(
+        v16_framing_encode_frame(1, 7, 1, &payload),
+        frame,
+        "full frozen V1 frame including header CRC"
+    );
+}
+
+// --------------------------------------------------------------- V2: OUTPUT
+
+#[test]
+fn v16_framing_v2_output_frame_decodes_with_frozen_coordinates() {
+    let frame = v16_framing_v2();
+    v16_framing_assert_header(&frame);
+    let message = v16_framing_feed_one(9, &frame);
+    assert_eq!((message.scope, message.kind), (7, 6));
+    // §2 type 06: 8 bytes record sequence, 8 bytes byte offset, raw bytes to
+    // end of payload. §16 freezes sequence 42, offset 4096, bytes `hi`.
+    let payload = &message.payload[..];
+    assert_eq!(payload.len(), 0x12);
+    assert_eq!(u64::from_le_bytes(payload[0..8].try_into().unwrap()), 42);
+    assert_eq!(u64::from_le_bytes(payload[8..16].try_into().unwrap()), 4096);
+    assert_eq!(&payload[16..], b"hi");
+}
+
+#[test]
+fn v16_framing_v2_output_coordinates_apply_through_viewer_decoder() {
+    use moor::wire::{ReplayDescriptor, ViewerEvent, ViewerStream, decode_viewer};
+    let frame = v16_framing_v2();
+    let message = v16_framing_feed_one(9, &frame);
+    // A viewer whose ATTACH_ACK advertised exactly V2's record: §6.1 freezes
+    // that V2's two bytes occupy offsets 4096 and 4097 with exclusive end 4098.
+    let mut stream = ViewerStream::default();
+    stream.terminal = true;
+    stream.replay = Some(ReplayDescriptor {
+        first: 42,
+        last: 42,
+        start: 4096,
+        end: 4098,
+        complete: false,
+        modes_exact: false,
+    });
+    stream.next = Some((42, 4096));
+    assert_eq!(
+        decode_viewer(&mut stream, &message, (b"".as_slice(), 7, [9; 16])),
+        Ok(Some(ViewerEvent::Output(42, true, b"hi")))
+    );
+    assert_eq!(
+        stream.next,
+        Some((43, 4098)),
+        "next record is 43 and the next byte offset is exactly offset + payload_length"
+    );
+}
+
+#[test]
+fn v16_framing_v2_output_encoder_reproduces_frozen_bytes() {
+    let frame = v16_framing_v2();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&42u64.to_le_bytes());
+    payload.extend_from_slice(&4096u64.to_le_bytes());
+    payload.extend_from_slice(b"hi");
+    assert_eq!(payload, frame[24..].to_vec(), "frozen §6.1 payload");
+    assert_eq!(v16_framing_encode_frame(9, 7, 6, &payload), frame);
+}
+
+// --------------------------------------------------------------- V3: ATTACH
+
+#[test]
+fn v16_framing_v3_attach_zero_geometry_decodes_as_preserve_with_lease_bit() {
+    let frame = v16_framing_v3();
+    v16_framing_assert_header(&frame);
+    let message = v16_framing_feed_one(2, &frame);
+    assert_eq!((message.scope, message.kind), (7, 3));
+    assert_eq!(
+        &message.payload[..],
+        &[0, 0, 0, 0, 1],
+        "geometry 0x0 then flags bit 0"
+    );
+    // §2 type 03: geometry (§4), then 1 byte flags, bit 0 = request the lease.
+    use moor::session::Request;
+    use moor::wire::{ControllerRequest, decode_controller};
+    assert!(matches!(
+        decode_controller(3, &message.payload, None),
+        Ok(ControllerRequest::Policy(Request::Attach(
+            0, 0, true, false, None
+        )))
+    ));
+    assert!(matches!(
+        decode_controller(3, &message.payload, Some([7; 16])),
+        Ok(ControllerRequest::Policy(Request::Attach(0, 0, true, false, Some(token))))
+            if token == [7; 16]
+    ));
+}
+
+#[test]
+fn v16_framing_v3_attach_preserve_is_accepted_and_resizes_nothing() {
+    use moor::session::{Effect, Machine, Request, ResultOutcome, Transition};
+    // OB-19/§4: zero in either dimension means preserve; both zero preserves
+    // both — the attach succeeds and no resize of the child occurs.
+    let mut machine = Machine::new(7, [1; 16], [2; 16]);
+    machine.register_controller(1);
+    let effects = machine
+        .transition(Transition::Peer(
+            0,
+            1,
+            Request::Attach(0, 0, true, false, Some([3; 16])),
+        ))
+        .expect("ATTACH with geometry 0x0 must be accepted");
+    let (lease, resize) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Attached(1, false, lease, resize) => Some((lease.clone(), *resize)),
+            _ => None,
+        })
+        .expect("the connection must attach");
+    assert_eq!(resize, None, "geometry 0x0 preserves the child geometry");
+    assert!(
+        lease.is_some_and(|result| result.outcome == ResultOutcome::Granted),
+        "flags bit 0 requests and receives the input lease"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Close(_) | Effect::Resize(..))),
+        "preserve must neither refuse the attach nor resize the child"
+    );
+}
+
+#[test]
+fn v16_framing_v3_attach_encoder_reproduces_frozen_bytes() {
+    let frame = v16_framing_v3();
+    assert_eq!(v16_framing_encode_frame(2, 7, 3, &[0, 0, 0, 0, 1]), frame);
+}
+
+// --------------------------------------------------------------- V4: RESIZE
+
+#[test]
+fn v16_framing_v4_resize_decodes_epoch_then_geometry() {
+    let frame = v16_framing_v4();
+    v16_framing_assert_header(&frame);
+    let message = v16_framing_feed_one(0x0b, &frame);
+    assert_eq!((message.scope, message.kind), (7, 0x0b));
+    // §2 type 0B: 4 bytes lease epoch, then geometry (§4) columns/rows.
+    assert_eq!(&message.payload[..], &[3, 0, 0, 0, 0x50, 0, 0x18, 0]);
+    use moor::session::Request;
+    use moor::wire::{ControllerRequest, decode_controller};
+    assert!(matches!(
+        decode_controller(0x0b, &message.payload, None),
+        Ok(ControllerRequest::Policy(Request::Resize(3, 80, 24)))
+    ));
+}
+
+#[test]
+fn v16_framing_v4_resize_applies_80x24_under_lease_epoch_3() {
+    use moor::session::{Effect, Request, Transition};
+    // Allocation history of two prior epochs makes the freshly granted lease
+    // epoch exactly V4's frozen `03 00 00 00`.
+    let (mut machine, epoch) = v16_framing_machine_with_lease(2);
+    assert_eq!(
+        epoch, 3,
+        "granted lease epoch matches V4's frozen epoch field"
+    );
+    let effects = machine
+        .transition(Transition::Peer(1, 1, Request::Resize(3, 80, 24)))
+        .expect("RESIZE under the current lease epoch must be accepted");
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Resize(24, 80))),
+        "the child must be resized to 80 columns x 24 rows"
+    );
+}
+
+#[test]
+fn v16_framing_v4_resize_encoder_reproduces_frozen_bytes() {
+    let frame = v16_framing_v4();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
+    assert_eq!(payload, frame[24..].to_vec());
+    assert_eq!(v16_framing_encode_frame(0x0b, 7, 0x0b, &payload), frame);
+}
+
+// ------------------------------------------- V5: half-specified geometry
+
+#[test]
+fn v16_framing_v5_half_specified_geometry_is_refused_with_code_14() {
+    let frame = v16_framing_v5();
+    v16_framing_assert_header(&frame);
+    // The frame itself is well-formed — the refusal is a geometry policy
+    // refusal, not a framing error.
+    let message = v16_framing_feed_one(0x0c, &frame);
+    assert_eq!((message.scope, message.kind), (7, 0x0b));
+    use moor::session::{Effect, Machine, Reply, Request, Transition};
+    use moor::wire::{ControllerRequest, decode_controller};
+    assert!(matches!(
+        decode_controller(0x0b, &message.payload, None),
+        Ok(ControllerRequest::Policy(Request::Resize(3, 80, 0)))
+    ));
+    let mut machine = Machine::new(7, [1; 16], [2; 16]);
+    machine.register_controller(1);
+    let effects = machine
+        .transition(Transition::Peer(0, 1, Request::Resize(3, 80, 0)))
+        .expect("the refusal is an ERROR reply, not a decode failure");
+    let reply = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Send(1, reply @ Reply::ControllerError(..)) => Some(reply.clone()),
+            _ => None,
+        })
+        .expect("80x0 must produce a controller ERROR");
+    // §4/§11: one zero and the other not is HALF_SPECIFIED_GEOMETRY, code 14.
+    let Reply::ControllerError(code, _) = reply.clone() else {
+        unreachable!()
+    };
+    assert_eq!(code, 14, "frozen HALF_SPECIFIED_GEOMETRY code");
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Close(1))),
+        "the refused connection closes"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Resize(..))),
+        "nothing is resized"
+    );
+    // The machine's actual refusal, pushed through the real reply encoder,
+    // must carry code 14 LE followed by a nonempty plain-length-prefixed
+    // diagnostic (§1.1). The diagnostic text itself is not frozen by the
+    // schema, so only its shape is asserted. The frame TYPE the encoder
+    // assigns is asserted separately in
+    // v16_framing_error_replies_encode_as_frame_type_0x13.
+    let moor::wire::RuntimeReply::Frame(_, payload) = moor::wire::encode_reply(reply, [1; 16])
+    else {
+        panic!("a controller ERROR reply must map to one unscoped frame");
+    };
+    assert_eq!(&payload[..2], &[0x0e, 0x00], "HALF_SPECIFIED_GEOMETRY LE");
+    assert!(
+        moor::wire::get_compact(&payload, 2, true).is_some_and(|diagnostic| !diagnostic.is_empty()),
+        "the diagnostic is a nonempty §1.1 2-byte-length-prefixed field"
+    );
+}
+
+#[test]
+fn v16_framing_v5_encoder_reproduces_frozen_bytes() {
+    // The refusal is semantic, not syntactic: an encoder must still be able
+    // to emit the frozen V5 frame byte-for-byte (a controller really sends it).
+    let frame = v16_framing_v5();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    assert_eq!(payload, frame[24..].to_vec());
+    assert_eq!(v16_framing_encode_frame(0x0c, 7, 0x0b, &payload), frame);
+}
+
+// -------------------------------------------------- V6: generation zero
+
+#[test]
+fn v16_framing_v6_generation_zero_on_non_hello_is_refused() {
+    let frame = v16_framing_v6();
+    v16_framing_assert_header(&frame);
+    assert_eq!(&frame[8..12], &[0; 4], "frozen generation field is zero");
+    assert_eq!(frame[5], 0x07, "shown as OUTPUT_ACK");
+    // §2 type 07 payload: 8 bytes highest record sequence consumed — the
+    // frozen vector acknowledges record 1, and the frame is otherwise valid,
+    // so the zero generation is the only refusal cause.
+    assert_eq!(
+        &frame[24..],
+        1u64.to_le_bytes(),
+        "frozen OUTPUT_ACK of record 1"
+    );
+    // next_in = 3 matches the frozen sequence.
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 3, 1);
+    let mut out = Vec::new();
+    let result = codec.feed(0, &frame, &mut out);
+    assert!(
+        result.is_err(),
+        "generation 0 is legal only on the first controller HELLO (§1/§3.1)"
+    );
+    assert!(out.is_empty(), "the frame must never surface as a message");
+    // Spec §10.2.4 freezes this refusal as GENERATION_MISMATCH — §11 code 9.
+    // V11 proves the answering ERROR payload bytes on the wire, and
+    // v16_framing_error_replies_encode_as_frame_type_0x13 proves the frame
+    // type the reply encoder assigns to it.
+    assert_eq!(result, Err(moor::wire::WireError::GenerationMismatch));
+
+    // Encoding a generation-0 non-HELLO frame must be equally impossible.
+    let mut encoder = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 3);
+    let mut bytes = Vec::new();
+    assert!(
+        encoder.encode(0, 7, &frame[24..], &mut bytes).is_err(),
+        "an encoder must refuse to emit generation 0 on a non-HELLO frame"
+    );
+}
+
+// ------------------------------------------------------------- V11: ERROR
+
+#[test]
+fn v16_framing_v11_error_payload_matches_frozen_bytes_with_compact_prefix() {
+    let frame = v16_framing_v11();
+    v16_framing_assert_header(&frame);
+    // §2 type 13: 2 bytes code (§11), then a nonempty length-prefixed (§1.1,
+    // 2-byte) diagnostic. Frozen payload length 0x1E = 30 = 2 + 2 + 26 —
+    // provable only with the plain 2-byte prefix; a wide prefix would make it
+    // 32 and change the header length field.
+    assert_eq!(&frame[16..20], &[0x1e, 0, 0, 0], "frozen payload length 30");
+    let payload = &frame[24..];
+    assert_eq!(payload.len(), 30);
+    assert_eq!(
+        u16::from_le_bytes(payload[..2].try_into().unwrap()),
+        9,
+        "frozen GENERATION_MISMATCH code (§11)"
+    );
+    assert_eq!(
+        &payload[2..4],
+        &[0x1a, 0x00],
+        "2-byte length prefix of the 26-byte diagnostic"
+    );
+    assert_eq!(&payload[4..], b"generation 3 is superseded");
+    assert_eq!(
+        moor::wire::get_compact(payload, 2, true),
+        Some(b"generation 3 is superseded".as_slice()),
+        "the diagnostic decodes through the real §1.1 compact-prefix reader"
+    );
+    // Encoder direction: the real error-payload builder must reproduce the
+    // frozen bytes exactly.
+    assert_eq!(
+        moor::wire::error_payload(9, b"generation 3 is superseded"),
+        payload.to_vec()
+    );
+}
+
+#[test]
+fn v16_framing_v11_error_frame_round_trips_through_codec() {
+    let frame = v16_framing_v11();
+    let message = v16_framing_feed_one(0x0d, &frame);
+    assert_eq!((message.scope, message.kind), (7, 0x13));
+    assert_eq!(&message.payload[..], &frame[24..]);
+    let payload = moor::wire::error_payload(9, b"generation 3 is superseded");
+    assert_eq!(
+        v16_framing_encode_frame(0x0d, 7, 0x13, &payload),
+        frame,
+        "full frozen V11 frame including header CRC"
+    );
+}
+
+// ----------------------------------------------- ERROR reply frame type
+
+#[test]
+fn v16_framing_error_replies_encode_as_frame_type_0x13() {
+    // §2 freezes ERROR as type `13` HEX = 0x13 = 19 — the type byte V11
+    // carries at offset 5. The holder's reply encoder must place every
+    // controller refusal in that frame type: the controller-side runtime
+    // recognises a refusal only under kind 0x13, so any other kind misfiles
+    // the refusal as a different frame.
+    //
+    // KNOWN-FAILING at review time: encode_reply builds ControllerError with
+    // the DECIMAL literal 13 (= 0x0D, which §2 assigns to STATUS), so the
+    // holder emits refusals the client can never recognise. This is the §2
+    // contract assertion that catches it; V11's frozen type byte 0x13 is the
+    // authority.
+    for (code, diagnostic) in [
+        (9u16, b"generation 3 is superseded".as_slice()),
+        (14, b"geometry was half specified"),
+    ] {
+        let moor::wire::RuntimeReply::Frame(kind, payload) = moor::wire::encode_reply(
+            moor::session::Reply::ControllerError(code, diagnostic),
+            [1; 16],
+        ) else {
+            panic!("a controller ERROR reply must map to one unscoped frame");
+        };
+        assert_eq!(
+            kind, 0x13,
+            "ERROR frame type is 0x13 (§2, proven on the wire by V11), \
+             not decimal 13 = 0x0D (STATUS)"
+        );
+        assert_eq!(payload, moor::wire::error_payload(code, diagnostic));
+    }
+}
+
+// ------------------------------------------------------ header CRC sweep
+
+#[test]
+fn v16_framing_header_crc32c_recomputes_for_every_group_vector() {
+    for (name, frame) in [
+        ("V1", v16_framing_v1()),
+        ("V2", v16_framing_v2()),
+        ("V3", v16_framing_v3()),
+        ("V4", v16_framing_v4()),
+        ("V5", v16_framing_v5()),
+        ("V6", v16_framing_v6()),
+        ("V11", v16_framing_v11()),
+    ] {
+        v16_framing_assert_header(&frame);
+        // §1: payload length field matches the actual frozen payload size.
+        let length = u32::from_le_bytes(frame[16..20].try_into().unwrap()) as usize;
+        assert_eq!(24 + length, frame.len(), "{name}: declared payload length");
+    }
+}
+
+// ---- vectors: V1, V7 ----
+// v16_extra_ — completeness-critic additions to the §16 vector lane.
+//
+// These tests close the §17 "Framing and reassembly" refusal bullets that had
+// no test anywhere in tests/ (unknown version, unknown type, non-zero reserved
+// byte, sequence gap mid-run, type change mid-run, declared length above the
+// frame cap, run at/over the message bound), plus the §1.1 compact-prefix cap
+// boundary — the untested half of the consumer-issue-#12 contract — and the
+// §16 V1 "hello flags are reserved zero" refusal.
+//
+// Every mutation starts from the FROZEN §16 bytes (V1, V7) copied verbatim
+// from spec/moor-wire-schema.md, with exactly one field changed and the header
+// CRC-32C recomputed so the refusal under test — not the checksum — is what
+// fires. Unmutated controls assert the frozen bytes still decode.
+
+/// §16 V1 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
+const V16_EXTRA_V1: &str = "\
+4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00 \
+21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16 \
+00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31 \
+30 30 30 2F 62 75 69 6C 64";
+
+/// §16 V7 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
+/// Two frames: 24+17 bytes (MORE=1), then 24+2 bytes (MORE=0).
+const V16_EXTRA_V7: &str = "\
+4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00 \
+11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00 \
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00 \
+00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22 \
+D3 42 42";
+
+fn v16_extra_hex(s: &str) -> Vec<u8> {
+    s.split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect()
+}
+
+/// Recompute the header CRC-32C for the frame starting at `at`, so a mutated
+/// frame is refused by the semantic check under test rather than the checksum.
+fn v16_extra_patch_crc(bytes: &mut [u8], at: usize) {
+    let checksum = moor::wire::crc32c(&bytes[at..at + 20]);
+    bytes[at + 20..at + 24].copy_from_slice(&checksum.to_le_bytes());
+}
+
+fn v16_extra_feed_controller(bytes: &[u8]) -> Result<usize, moor::wire::WireError> {
+    let mut out = Vec::new();
+    moor::wire::Codec::new(moor::wire::Profile::Controller)
+        .feed(0, bytes, &mut out)
+        .map(|()| out.len())
+}
+
+/// Hand-assemble one semantic-profile frame per §1 (magic MOOS, version 1)
+/// with a real CRC-32C. Used only where Codec::encode cannot express the shape
+/// (a MORE run exceeding the message bound is refused encoder-side).
+fn v16_extra_semantic_frame(
+    kind: u8,
+    more: u8,
+    scope: u32,
+    sequence: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(24 + payload.len());
+    frame.extend_from_slice(b"MOOS");
+    frame.push(1);
+    frame.push(kind);
+    frame.push(more);
+    frame.push(0);
+    frame.extend_from_slice(&scope.to_le_bytes());
+    frame.extend_from_slice(&sequence.to_le_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    let checksum = moor::wire::crc32c(&frame[..20]);
+    frame.extend_from_slice(&checksum.to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn v16_extra_frozen_v1_control_still_decodes() {
+    // Sanity anchor for every mutation below: the frozen bytes are valid.
+    assert_eq!(
+        v16_extra_feed_controller(&v16_extra_hex(V16_EXTRA_V1)),
+        Ok(1)
+    );
+}
+
+#[test]
+fn v16_extra_framing_unknown_version_is_refused() {
+    // §1: version is frozen at 3 for the controller profile; §17 "an unknown
+    // version". Byte 4 of the frozen V1 header is the version.
+    let mut bytes = v16_extra_hex(V16_EXTRA_V1);
+    bytes[4] = 4;
+    v16_extra_patch_crc(&mut bytes, 0);
+    assert_eq!(
+        v16_extra_feed_controller(&bytes),
+        Err(moor::wire::WireError::UnknownVersion)
+    );
+}
+
+#[test]
+fn v16_extra_framing_unknown_type_is_refused() {
+    // §2 assigns frame kinds; zero and anything past the table are unknown.
+    // §17 "an unknown type". Byte 5 of the frozen V1 header is the kind.
+    for unknown in [0u8, 0x1b, 0xff] {
+        let mut bytes = v16_extra_hex(V16_EXTRA_V1);
+        bytes[5] = unknown;
+        v16_extra_patch_crc(&mut bytes, 0);
+        assert_eq!(
+            v16_extra_feed_controller(&bytes),
+            Err(moor::wire::WireError::UnknownType),
+            "kind {unknown:#04x}"
+        );
+    }
+}
+
+#[test]
+fn v16_extra_framing_nonzero_reserved_byte_is_refused() {
+    // §1: the reserved header byte MUST be zero; §17 "a non-zero reserved
+    // bit". Byte 7 of the frozen V1 header is the reserved byte.
+    for reserved in [1u8, 0x80] {
+        let mut bytes = v16_extra_hex(V16_EXTRA_V1);
+        bytes[7] = reserved;
+        v16_extra_patch_crc(&mut bytes, 0);
+        assert_eq!(
+            v16_extra_feed_controller(&bytes),
+            Err(moor::wire::WireError::Malformed),
+            "reserved {reserved:#04x}"
+        );
+    }
+}
+
+#[test]
+fn v16_extra_framing_sequence_gap_mid_run_is_refused() {
+    // §17 "a sequence gap mid-run". V7's second frame carries sequence 0x15;
+    // bumping it to 0x16 leaves a gap after the first frame is consumed.
+    // Offset 41 is the start of the second frame; +12 is its sequence field.
+    let mut bytes = v16_extra_hex(V16_EXTRA_V7);
+    bytes[41 + 12] = 0x16;
+    v16_extra_patch_crc(&mut bytes, 41);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut out = Vec::new();
+    assert_eq!(
+        codec.feed(0, &bytes, &mut out),
+        Err(moor::wire::WireError::BadSequence)
+    );
+    assert!(
+        out.is_empty(),
+        "no message may be delivered from a gapped run"
+    );
+}
+
+#[test]
+fn v16_extra_framing_type_change_mid_run_aborts_reassembly() {
+    // §17 "a type change mid-run". V7's continuation frame switches from
+    // INPUT (0x09) to OUTPUT_ACK (0x07): the run must abort, not splice.
+    let mut bytes = v16_extra_hex(V16_EXTRA_V7);
+    bytes[41 + 5] = 0x07;
+    v16_extra_patch_crc(&mut bytes, 41);
+    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut out = Vec::new();
+    assert_eq!(
+        codec.feed(0, &bytes, &mut out),
+        Err(moor::wire::WireError::ReassemblyAborted)
+    );
+    assert!(out.is_empty());
+}
+
+#[test]
+fn v16_extra_framing_declared_length_above_frame_cap_is_refused() {
+    // §1: a controller frame body is capped at 1 MiB. A header declaring one
+    // byte more must be refused before any body bytes are awaited.
+    let mut bytes = v16_extra_hex(V16_EXTRA_V1)[..24].to_vec();
+    bytes[16..20].copy_from_slice(&(((1u32 << 20) + 1).to_le_bytes()));
+    v16_extra_patch_crc(&mut bytes, 0);
+    assert_eq!(
+        v16_extra_feed_controller(&bytes),
+        Err(moor::wire::WireError::OversizedFrame)
+    );
+}
+
+#[test]
+fn v16_extra_framing_run_at_message_bound_is_accepted_and_one_byte_above_refused() {
+    // §17 "a run exceeding the message bound" — decoder side, at the limit and
+    // one above. Semantic profile: 64 KiB frames, 1 MiB reassembled bound.
+    // Sixteen full MORE frames total exactly 1 MiB; a terminal empty frame
+    // closes the run at the bound and must be accepted.
+    let chunk = vec![0x41u8; 1 << 16];
+    let mut at_limit = Vec::new();
+    for part in 0..16u32 {
+        at_limit.extend_from_slice(&v16_extra_semantic_frame(3, 1, 1, part + 1, &chunk));
+    }
+    let mut closing = at_limit.clone();
+    closing.extend_from_slice(&v16_extra_semantic_frame(3, 0, 1, 17, &[]));
+    let mut codec = moor::wire::Codec::new(moor::wire::Profile::Semantic);
+    let mut out = Vec::new();
+    codec.feed(0, &closing, &mut out).unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0].payload.len(),
+        1 << 20,
+        "exactly the bound is accepted"
+    );
+
+    // The same run with one extra payload byte in the terminal frame is over
+    // the bound and must be refused with nothing delivered.
+    let mut over = at_limit;
+    over.extend_from_slice(&v16_extra_semantic_frame(3, 0, 1, 17, &[0x41]));
+    let mut codec = moor::wire::Codec::new(moor::wire::Profile::Semantic);
+    let mut out = Vec::new();
+    assert_eq!(
+        codec.feed(0, &over, &mut out),
+        Err(moor::wire::WireError::OversizedMessage)
+    );
+    assert!(out.is_empty());
+}
+
+#[test]
+fn v16_extra_compact_prefix_cap_is_4096_on_both_sides() {
+    // §1.1: the plain length prefix is exactly 2 bytes with a 4096-byte cap.
+    // This is the other half of the consumer-issue-#12 contract: the lane
+    // already pins the prefix WIDTH at the frozen vectors; this pins the CAP,
+    // which no test anywhere exercised. A u16 prefix can spell values up to
+    // 65535, so 4097..=65535 must be refused on decode even though the prefix
+    // itself still fits.
+    let mut at_cap = Vec::new();
+    moor::wire::put_compact(&mut at_cap, &[0x61; 4096]).unwrap();
+    assert_eq!(at_cap.len(), 2 + 4096, "prefix is exactly 2 bytes");
+    assert_eq!(&at_cap[..2], &[0x00, 0x10], "little-endian u16 length 4096");
+    assert_eq!(
+        moor::wire::get_compact(&at_cap, 0, true).map(<[u8]>::len),
+        Some(4096)
+    );
+
+    assert_eq!(
+        moor::wire::put_compact(&mut Vec::new(), &[0x61; 4097]),
+        Err(moor::wire::WireError::OversizedMessage)
+    );
+
+    let mut over_cap = 4097u16.to_le_bytes().to_vec();
+    over_cap.extend_from_slice(&[0x61; 4097]);
+    assert_eq!(
+        moor::wire::get_compact(&over_cap, 0, true),
+        None,
+        "a compact prefix spelling 4097 must be refused despite the bytes being present"
+    );
+}
+
+#[test]
+fn v16_extra_hello_nonzero_flags_are_refused() {
+    // §16 V1: "hello flags are reserved zero"; §17 "nonzero hello flags
+    // refused". The frozen V1 payload carries the two flag bytes at offsets
+    // 5 and 6 (after MOOR and the version byte).
+    let payload = v16_extra_hex(V16_EXTRA_V1)[24..].to_vec();
+    assert!(
+        matches!(
+            moor::wire::decode_controller(1, &payload, None),
+            Ok(moor::wire::ControllerRequest::Hello(identity))
+                if identity == b"\x01/tmp/.moor-1000/build"
+        ),
+        "frozen V1 payload control"
+    );
+    for flag_byte in [5usize, 6] {
+        let mut mutated = payload.clone();
+        mutated[flag_byte] = 1;
+        assert_eq!(
+            moor::wire::decode_controller(1, &mutated, None).err(),
+            Some(moor::wire::WireError::Malformed),
+            "flag byte at payload offset {flag_byte}"
+        );
+    }
+}
