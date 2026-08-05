@@ -163,16 +163,6 @@ impl Store {
     pub fn selected(&self) -> &Commit {
         &self.selected
     }
-    /// A second view of the same already-validated handles, for a component
-    /// that must observe the commit frontier without owning the writer.
-    pub fn duplicate(&self) -> Result<Self, StoreError> {
-        let slot = |at: usize| self.slots[at].try_clone();
-        Ok(Self {
-            slots: [slot(0)?, slot(1)?, slot(2)?, slot(3)?],
-            selected: self.selected,
-            hash: self.hash.clone(),
-        })
-    }
     /// The commit a reader would select right now, recovered through this
     /// store's own already-validated handles. Handle-bound rather than by
     /// pathname, so it admits no substitution between check and use (§11.4
