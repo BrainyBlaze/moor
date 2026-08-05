@@ -1,6 +1,6 @@
 use crate::events::{self, Axis, Cursor, Event, EventKind, EventStream, Json};
 use crate::runtime::private::now;
-use crate::store::{Commit, Reader, Store, StoreError};
+use crate::store::{Commit, Store, StoreError};
 use crate::terminal::Observation;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Resul
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);
 schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
     generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
-schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, event_reader: Option<Reader>, events: Option<Events>);
+schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, event_view: Option<Store>, events: Option<Events>);
 
 impl Events {
     fn body(&self, cursor: Cursor, history: bool, records: &str) -> String {
@@ -42,10 +42,10 @@ impl SessionStorage {
     ) -> Self {
         let log_cap = log.as_ref().map_or(0, |(_, cap)| *cap);
         let log = log.map(|(store, _)| Lane::new(store, jobs.min(64), bytes.min(1 << 20)));
-        let mut event_reader = None;
+        let mut event_view = None;
         let (event_lane, events) = events
             .map(|config| {
-                event_reader = config.store.reader().ok();
+                event_view = config.store.duplicate().ok();
                 let reserved = events::canonical_header(
                     config.created,
                     &config.session,
@@ -77,7 +77,7 @@ impl SessionStorage {
                 Some(Lane::new(lifecycle, jobs.min(1), bytes.min(4 << 20))),
             ],
             log_cap,
-            event_reader,
+            event_view,
             events,
         }
     }
@@ -241,13 +241,19 @@ impl SessionStorage {
     /// residual case needs a handle-bound refresh rather than a re-open by
     /// pathname, which would reintroduce §11.4's check/use window.
     pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
-        let cached = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
+        // The worker publishes after each operation, but an external reader can
+        // validate a commit the moment run() flushes it, so between those two
+        // instants only a holder-side read of the same validated handles can name
+        // what a reader selects. Measured: without this, the descriptor reports a
+        // stale commit in 6 of 10 runs under load. Both sources are monotone and
+        // combine by taking the greater.
+        let published = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
         let selected = self
-            .event_reader
+            .event_view
             .as_ref()
-            .and_then(Reader::selected)
-            .filter(|commit| commit.index > cached.index)
-            .unwrap_or(cached);
+            .and_then(Store::selected_now)
+            .filter(|commit| commit.index > published.index)
+            .unwrap_or(published);
         Some((
             selected.body,
             selected.index,

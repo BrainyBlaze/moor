@@ -1,5 +1,5 @@
 use super::{Done, Purpose, StorageError};
-use crate::store::{Commit, Reader, Store, StoreError};
+use crate::store::{Commit, Store, StoreError};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::sync::{
@@ -60,7 +60,6 @@ impl Lane {
         let open = Arc::new(AtomicBool::new(true));
         let worker_open = Arc::clone(&open);
         std::thread::spawn(move || {
-            let reader = store.reader().ok();
             for operation in work {
                 if !worker_open.load(Ordering::Acquire) {
                     break;
@@ -72,7 +71,7 @@ impl Lane {
                 // publishing only the Ok commit would leave the frontier behind
                 // permanently. Never publishes an attempted commit blindly, and
                 // never moves backwards.
-                if let Some(commit) = reader.as_ref().and_then(Reader::selected) {
+                if let Some(commit) = store.selected_now() {
                     let mut frontier = published.lock().expect("frontier lock");
                     if commit.index > frontier.index {
                         *frontier = commit;

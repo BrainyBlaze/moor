@@ -97,17 +97,6 @@ fn make_commit(
 }
 
 schema!(struct pub Store fields; slots: [File; 4], selected: Commit, hash: Sha256);
-schema!(struct pub Reader fields; slots: [File; 4], kind: Kind, generation: u32);
-
-impl Reader {
-    /// The commit a reader would select right now, or None while no valid commit
-    /// is selectable.
-    pub fn selected(&self) -> Option<Commit> {
-        recover(&self.slots, self.kind, Some(self.generation))
-            .ok()
-            .map(|(commit, _, _)| commit)
-    }
-}
 
 impl Store {
     pub fn remove(path: &Path) -> Result<(), StoreError> {
@@ -174,20 +163,28 @@ impl Store {
     pub fn selected(&self) -> &Commit {
         &self.selected
     }
-    /// A reader bound to this store's already-validated slot handles. The
-    /// descriptor must name the commit a reader would select (§5), and an
-    /// external reader sees a commit the instant it is flushed — before any
-    /// in-process notification. Duplicating the open handles reads the same file
-    /// objects that were validated at open, so unlike re-opening the path it
-    /// admits no substitution between check and use (§11.4 item 5), and the
-    /// generation stays fenced.
-    pub fn reader(&self) -> Result<Reader, StoreError> {
+    /// A second view of the same already-validated handles, for a component
+    /// that must observe the commit frontier without owning the writer.
+    pub fn duplicate(&self) -> Result<Self, StoreError> {
         let slot = |at: usize| self.slots[at].try_clone();
-        Ok(Reader {
+        Ok(Self {
             slots: [slot(0)?, slot(1)?, slot(2)?, slot(3)?],
-            kind: self.selected.kind,
-            generation: self.selected.generation,
+            selected: self.selected,
+            hash: self.hash.clone(),
         })
+    }
+    /// The commit a reader would select right now, recovered through this
+    /// store's own already-validated handles. Handle-bound rather than by
+    /// pathname, so it admits no substitution between check and use (§11.4
+    /// item 5) and keeps the generation fenced.
+    pub fn selected_now(&self) -> Option<Commit> {
+        recover(
+            &self.slots,
+            self.selected.kind,
+            Some(self.selected.generation),
+        )
+        .ok()
+        .map(|(commit, _, _)| commit)
     }
     pub fn append_capped(
         &mut self,
