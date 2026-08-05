@@ -1327,3 +1327,40 @@ fn observed_exit_is_durable_listed_and_emitted_to_events() {
     assert!(!events.exists());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn attach_pins_every_liveness_cell_of_the_frozen_state_matrix() {
+    // §13.3 freezes three states and three messages. Nothing covered attach on
+    // either stale residue shape, which is how it kept emitting the absent
+    // diagnostic. Both shapes are one liveness state (§2.3, §4.5), so both must
+    // report "is not running".
+    let dir = temp();
+    let cell = |name: &str, expected: &str| {
+        let path = dir.join(name);
+        let out = moor(&["attach", path.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1), "{name}: {out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            text.contains(expected),
+            "{name}: wanted {expected:?}, got {text:?}"
+        );
+        assert!(out.stderr.is_empty(), "{name}: {out:?}");
+    };
+
+    cell("absent", "does not exist");
+
+    // stale, orphaned rendezvous: a bound socket with no listener behind it.
+    stale_socket(&dir.join("stale"));
+    cell("stale", "is not running");
+
+    // stale, exit-record-only residue: what `list -a` renders as [exited].
+    set_age(&dir.join("exited"), 1);
+    assert!(!dir.join("exited").exists());
+    cell("exited", "is not running");
+
+    // indeterminate: something is there that we could not identify as ours.
+    fs::write(dir.join("indeterminate"), b"not a socket").unwrap();
+    cell("indeterminate", "could not be identified");
+
+    fs::remove_dir_all(dir).unwrap();
+}
