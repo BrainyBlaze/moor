@@ -389,3 +389,39 @@ fn private_updates_are_atomic_and_exact_bound_is_accepted() {
         [Observation::State(_, _, true)]
     ));
 }
+
+#[test]
+fn mouse_groups_clear_every_constituent_before_setting_tracked_bits() {
+    // Schema §6 groups 9 and 10 are frozen as "reset all constituents in
+    // order, then set each tracked enabled bit in the same order". Emitting one
+    // h-or-l per mode instead leaves an arbitrary combination already present
+    // in the viewer partly intact, and puts the set before the resets.
+    let render = |bytes: &[u8]| {
+        let mut scanner = Scanner::new(24);
+        scanner.scan(0, bytes);
+        String::from_utf8(scanner.modes().preamble().expect("exact")).unwrap()
+    };
+    let esc = char::from(0x1b);
+    let seq =
+        |modes: &[&str]| -> String { modes.iter().map(|mode| format!("{esc}[{mode}")).collect() };
+    let reporting = render(seq(&["?1000h"]).as_bytes());
+    assert!(
+        reporting.contains(&seq(&["?1000l", "?1002l", "?1003l", "?1000h"])),
+        "{reporting:?}"
+    );
+    let encoding = render(seq(&["?1006h"]).as_bytes());
+    assert!(
+        encoding.contains(&seq(&["?1005l", "?1006l", "?1006h"])),
+        "{encoding:?}"
+    );
+    // With both groups off, only the five resets appear and nothing is set.
+    let quiet = render(b"");
+    assert!(
+        quiet.contains(&seq(&["?1000l", "?1002l", "?1003l"]))
+            && quiet.contains(&seq(&["?1005l", "?1006l"])),
+        "{quiet:?}"
+    );
+    for set in ["?1000h", "?1002h", "?1003h", "?1005h", "?1006h"] {
+        assert!(!quiet.contains(set), "{quiet:?} unexpectedly set {set}");
+    }
+}

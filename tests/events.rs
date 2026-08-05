@@ -280,3 +280,49 @@ fn exhaustion_precedence_is_sequence_then_epoch_then_commit() {
     assert!(records[1].contains("\"type\":\"ready\""));
     assert!(records[2].contains("\"axis\":\"commit\""));
 }
+
+#[test]
+fn observed_values_containing_a_backslash_round_trip_unaltered() {
+    // §9.4 forbids interpreting, resolving or rewriting an observed title or
+    // link. The canonical serializer uppercases the hex of the control escapes
+    // it emits, and a stateless scan for the bytes `\u00` cannot tell those
+    // apart from a serialized `\\` followed by content that happens to spell
+    // one, so a title whose own text is `«` had its content rewritten.
+    let title = format!("pre{}u00ab post", char::from(b'\\'));
+    let line = canonical_event(
+        0,
+        0,
+        EventKind::Transition,
+        &event(
+            "state",
+            0,
+            &[
+                ("state", Json::String("idle")),
+                ("title", Json::String(&title)),
+                ("truncated", Json::Bool(false)),
+            ],
+        ),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(parsed["title"].as_str(), Some(title.as_str()));
+
+    // A genuine control character still serializes with uppercase hex and
+    // still decodes back to the exact byte the child emitted.
+    let control = format!("x{}y", char::from(0x1a));
+    let line = canonical_event(
+        0,
+        0,
+        EventKind::Transition,
+        &event(
+            "link",
+            0,
+            &[
+                ("uri", Json::String(&control)),
+                ("truncated", Json::Bool(false)),
+            ],
+        ),
+    );
+    assert!(line.contains("x\\u001Ay"), "{line}");
+    let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(parsed["uri"].as_str(), Some(control.as_str()));
+}
