@@ -177,6 +177,11 @@ impl Store {
     /// store's own already-validated handles. Handle-bound rather than by
     /// pathname, so it admits no substitution between check and use (§11.4
     /// item 5) and keeps the generation fenced.
+    ///
+    /// `None` means no valid commit is selectable through these handles at this
+    /// instant. That is never treated as a frontier: every caller keeps its
+    /// last known valid commit, so an unreadable or torn moment can only delay
+    /// the frontier, never regress or zero it.
     pub fn selected_now(&self) -> Option<Commit> {
         recover(
             &self.slots,
