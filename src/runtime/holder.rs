@@ -117,7 +117,7 @@ impl<N: Native> Runtime<N> {
                         .filter(|peer| peer.is(Profile::Controller))
                         .for_each(|peer| peer.scope = self.config.generation);
                     self.broadcast(
-                        13,
+                        0x13,
                         &wire::error_payload(13, b"output coordinates exhausted"),
                         false,
                     );
@@ -655,7 +655,7 @@ impl<N: Native> Runtime<N> {
         }
         if let Some(profile) = profile {
             let (kind, code) = match profile {
-                Profile::Controller => (13, controller),
+                Profile::Controller => (0x13, controller),
                 Profile::Semantic => (9, semantic),
             };
             self.send(id, kind, &wire::error_payload(code, diagnostic));
