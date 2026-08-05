@@ -1328,16 +1328,11 @@ mod native {
 
     impl HolderNative for Native {
         fn resize(&mut self, rows: u16, columns: u16) -> Result<()> {
+            let (Ok(x), Ok(y)) = (i16::try_from(columns), i16::try_from(rows)) else {
+                return Err("geometry exceeds the console interface limit".into());
+            };
             check(
-                unsafe {
-                    ResizePseudoConsole(
-                        self.conpty.0,
-                        COORD {
-                            X: columns as i16,
-                            Y: rows as i16,
-                        },
-                    )
-                } >= 0,
+                unsafe { ResizePseudoConsole(self.conpty.0, COORD { X: x, Y: y }) } >= 0,
                 "resize ConPTY",
             )
         }

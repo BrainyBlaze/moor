@@ -30,7 +30,7 @@ macro_rules! integer_readers {
 schema!(enum pub Profile [Clone, Copy, Debug, Eq, PartialEq]; Controller, Semantic);
 schema!(enum pub WireError [Clone, Debug, Eq, PartialEq]; UnknownVersion, UnknownType,
     OversizedFrame, OversizedMessage, Malformed, BadSequence, ReassemblyAborted,
-    ReassemblyTimeout, ResourceExhausted);
+    ReassemblyTimeout, ResourceExhausted, GenerationMismatch);
 
 pub(crate) fn require(valid: bool, error: WireError) -> Result<(), WireError> {
     valid.then_some(()).ok_or(error)
@@ -127,7 +127,13 @@ fn message_size(profile: Profile, scope: u32, kind: u8) -> Result<Option<usize>,
         (profile, kind),
         (Profile::Controller, 1) | (Profile::Semantic, 1 | 9)
     );
-    well_formed(scope != 0 || zero)?;
+    require(
+        scope != 0 || zero,
+        match profile {
+            Profile::Controller => WireError::GenerationMismatch,
+            Profile::Semantic => WireError::Malformed,
+        },
+    )?;
     Ok(match (profile, kind) {
         (Profile::Controller, 10) => Some(43),
         (Profile::Controller, 0x15) => Some(40),
