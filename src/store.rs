@@ -3,7 +3,7 @@ use fs2::FileExt as _;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self};
 use std::path::Path;
 
 const LIMITS: [u64; 4] = [0, 320 << 10, u64::MAX, 4 << 20];
@@ -162,6 +162,18 @@ impl Store {
     }
     pub fn selected(&self) -> &Commit {
         &self.selected
+    }
+    /// A second view of the same already-validated handles. Safe only because
+    /// every store read and write is positional: a duplicated descriptor shares
+    /// the underlying file position, so a seek-based store would let this view
+    /// corrupt the writer.
+    pub fn duplicate(&self) -> Result<Self, StoreError> {
+        let slot = |at: usize| self.slots[at].try_clone();
+        Ok(Self {
+            slots: [slot(0)?, slot(1)?, slot(2)?, slot(3)?],
+            selected: self.selected,
+            hash: self.hash.clone(),
+        })
     }
     /// The commit a reader would select right now, recovered through this
     /// store's own already-validated handles. Handle-bound rather than by
@@ -620,22 +632,50 @@ fn read_commit(
     );
     Ok(Some((commit, hash, body)))
 }
+// Every store read and write is positional. A seek-then-io pair is unsafe here
+// because a duplicated handle shares the underlying file position, so a
+// concurrent reader could move the writer's cursor between its seek and its
+// write and land bytes at the wrong offset.
+#[cfg(unix)]
+fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, out, offset)
+}
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut offset: u64, mut out: &mut [u8]) -> io::Result<()> {
+    while !out.is_empty() {
+        match std::os::windows::fs::FileExt::seek_read(file, out, offset)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            count => (out, offset) = (&mut out[count..], offset + count as u64),
+        }
+    }
+    Ok(())
+}
+#[cfg(unix)]
+fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, bytes, offset)
+}
+#[cfg(windows)]
+fn write_all_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match std::os::windows::fs::FileExt::seek_write(file, bytes, offset)? {
+            0 => return Err(io::ErrorKind::WriteZero.into()),
+            count => (bytes, offset) = (&bytes[count..], offset + count as u64),
+        }
+    }
+    Ok(())
+}
 fn read_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
     let size: usize = length.try_into().map_err(|_| StoreError::Corrupt)?;
     let mut out = Vec::new();
     out.try_reserve_exact(size)
         .map_err(|_| StoreError::Corrupt)?;
     out.resize(size, 0);
-    let mut file = file;
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut out)?;
+    read_exact_at(file, offset, &mut out)?;
     Ok(out)
 }
 fn update(file: &File, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-    let mut file = file;
     file.set_len(offset)?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(bytes)?;
+    write_all_at(file, offset, bytes)?;
     file.sync_all()?;
     Ok(())
 }

@@ -591,3 +591,44 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
     assert_eq!(store.selected().index, 2);
     fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn concurrent_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
+    // A duplicated descriptor shares the underlying file position, so this is
+    // the guard for the store being positional: with seek-then-io primitives a
+    // reader moves the writer's cursor between its seek and its write and lands
+    // bytes at the wrong offset. Every commit must stay selectable and the final
+    // retained bytes must be exactly what was written.
+    let path = temp("dup-interleave");
+    let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
+    let view = store.duplicate().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
+    let reader = std::thread::spawn(move || {
+        let mut highest = 0;
+        while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(commit) = view.selected_now() {
+                assert!(commit.index >= highest, "frontier regressed");
+                highest = commit.index;
+            }
+        }
+        highest
+    });
+    let mut end = 0;
+    for step in 0..200u64 {
+        let payload = [b'a' + (step % 26) as u8; 7];
+        end += payload.len() as u64;
+        store.append_capped(&payload, 1 << 20, end).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let observed = reader.join().unwrap();
+    assert!(observed > 1, "the reader never saw the writer advance");
+
+    // The writer's own view and an independent reopen must agree exactly, which
+    // fails if any write landed at a cursor the reader had moved.
+    assert_eq!(store.selected().end, end);
+    let (commit, body) = Store::read_only(&path, Kind::Log, 7).unwrap();
+    assert_eq!(commit.end, end);
+    assert_eq!(body.len() as u64, commit.end - commit.start);
+    fs::remove_dir_all(path).unwrap();
+}
