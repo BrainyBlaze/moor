@@ -626,7 +626,6 @@ pub fn holder_artifacts(
     let commit = event.as_ref().map(|store| *store.selected());
     let events = event.map(|store| EventConfig {
         store,
-        path: config.event_path.map(Path::to_path_buf).unwrap_or_default(),
         stream: EventStream::new(),
         created: start.0,
         session,
