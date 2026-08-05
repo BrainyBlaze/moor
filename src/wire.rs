@@ -136,6 +136,7 @@ fn message_size(profile: Profile, scope: u32, kind: u8) -> Result<Option<usize>,
     )?;
     Ok(match (profile, kind) {
         (Profile::Controller, 10) => Some(43),
+        (Profile::Controller, 0x11) => Some(0),
         (Profile::Controller, 0x15) => Some(40),
         (Profile::Controller, 0x16 | 0x19) => Some(24),
         (Profile::Controller, 0x17 | 0x18) => Some(20),

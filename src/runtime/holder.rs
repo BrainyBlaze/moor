@@ -375,8 +375,15 @@ impl<N: Native> Runtime<N> {
                 }
             }
         }
+        let mut advanced = false;
         for done in self.storage.poll() {
+            advanced |= done.lane == SessionStorage::EVENT_LANE && done.result.is_ok();
             self.storage_done(done);
+        }
+        if advanced {
+            // OB-30: one coalesced level trigger per poll telling consumers the
+            // durable event stream advanced, so none of them has to poll it.
+            self.broadcast(0x11, &[], false);
         }
         let _ = self.transition(Transition::Writable(self.storage.health() & 2 != 0));
         self.tick(monotonic());
@@ -435,11 +442,11 @@ impl<N: Native> Runtime<N> {
                 return Ok(None);
             }
             if let Some(status) = exited {
-                if !self.pty_open {
+                // The drain deadline bounds how long output draining may
+                // continue; it never discards the observed exit itself, which
+                // is the only input to the §7.4 record and the §8.2 event.
+                if !self.pty_open || monotonic() >= drain_until {
                     return Ok(Some(status));
-                }
-                if monotonic() >= drain_until {
-                    return Ok(None);
                 }
             } else if let Some(status) = self.native.exited()? {
                 self.child_running = false;

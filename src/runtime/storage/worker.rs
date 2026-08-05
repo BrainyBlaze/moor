@@ -130,7 +130,11 @@ impl Lane {
         if let Ok((commit, _)) = result {
             self.selected = commit;
         }
-        Some(Done { purpose, result })
+        Some(Done {
+            lane: 0,
+            purpose,
+            result,
+        })
     }
 
     pub(crate) fn selected(&self) -> &Commit {

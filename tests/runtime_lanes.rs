@@ -21,6 +21,8 @@ enum StorageError {
 }
 
 struct Done {
+    #[allow(dead_code)]
+    lane: usize,
     purpose: Purpose,
     result: Result<(Commit, bool), StoreError>,
 }
@@ -185,7 +187,8 @@ fn store_failure_closes_writable_health_and_future_admission() {
         next(&mut lane),
         Done {
             purpose: Purpose::Test(1),
-            result: Err(StoreError::Corrupt)
+            result: Err(StoreError::Corrupt),
+            ..
         }
     ));
     assert!(!lane.writable());
