@@ -197,7 +197,6 @@ fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathB
             None,
             Some(EventConfig {
                 store: events,
-                path: event_path.clone(),
                 stream: EventStream::new(),
                 created: 1,
                 session: "AS9zZXNzaW9u".into(),
