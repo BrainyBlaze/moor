@@ -70,8 +70,7 @@ pub struct Client {
     pub identity: Vec<u8>,
 }
 
-schema!(struct pub(crate) InputLease pub fields; role: LeaseRole, epoch: u32, token: [u8; 16], next: Option<u64>);
-schema!(enum pub(crate) LeaseCommand<'a> [Clone, Copy]; Input(&'a [u8]), Resize(u16, u16), Keepalive, Release);
+schema!(struct pub(crate) InputLease pub fields; role: LeaseRole, epoch: u32, token: [u8; 16], next: Option<u64>, pending: Vec<u8>);
 
 pub(crate) type Inbound = std::result::Result<Message, (String, bool)>;
 
@@ -290,7 +289,7 @@ impl Client {
                     return Err("input reader failed".into());
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if lease.send(&mut self, LeaseCommand::Keepalive).is_err() {
+                    if lease.control(&mut self, 0x18).is_err() {
                         lease.resume(&mut self, &mut reconnect)?;
                     }
                     continue;
@@ -299,19 +298,20 @@ impl Client {
             if bytes.is_empty() {
                 break;
             }
+            lease.stage(bytes);
             loop {
-                if lease.send(&mut self, LeaseCommand::Input(&bytes)).is_ok()
+                if lease.replay(&mut self).is_ok()
                     && let Ok(receipt) = self.receive_kind(10)
                 {
                     let receipt =
                         InputReceipt::decode(&receipt.payload).map_err(crate::protocol)?;
-                    lease.receipt(receipt, &self, bytes.len())?;
+                    lease.receipt(receipt, &self)?;
                     break;
                 }
                 lease.resume(&mut self, &mut reconnect)?;
             }
         }
-        lease.send(&mut self, LeaseCommand::Release)?;
+        lease.control(&mut self, 0x17)?;
         let released =
             LeaseResult::decode_wire(&self.receive_kind(0x16)?.payload).map_err(crate::protocol)?;
         crate::require(
@@ -346,57 +346,60 @@ impl InputLease {
             epoch: result.epoch,
             token: result.token,
             next: Some(1),
+            pending: Vec::new(),
         }))
     }
 
-    pub(crate) fn send(&self, client: &mut Client, command: LeaseCommand<'_>) -> Result<()> {
-        match command {
-            LeaseCommand::Input(bytes) => {
-                let request = self.next.ok_or("input request space exhausted")?;
-                client.send(
-                    9,
-                    &crate::wire::join(&[
-                        &self.epoch.to_le_bytes(),
-                        &request.to_le_bytes(),
-                        &[0],
-                        bytes,
-                    ]),
-                )
-            }
-            LeaseCommand::Resize(rows, columns) => {
-                let mut payload = [0; 8];
-                payload[..4].copy_from_slice(&self.epoch.to_le_bytes());
-                payload[4..6].copy_from_slice(&columns.to_le_bytes());
-                payload[6..].copy_from_slice(&rows.to_le_bytes());
-                client.send(0x0b, &payload)
-            }
-            LeaseCommand::Keepalive | LeaseCommand::Release => client.send(
-                if matches!(command, LeaseCommand::Keepalive) {
-                    0x18
-                } else {
-                    0x17
-                },
-                &crate::wire::lease_token_payload(self.epoch, self.token)
-                    .map_err(crate::protocol)?,
-            ),
-        }
+    pub(crate) fn pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
-    pub(crate) fn receipt(
-        &mut self,
-        receipt: InputReceipt,
-        client: &Client,
-        written: usize,
-    ) -> Result<()> {
+    pub(crate) fn stage(&mut self, bytes: Vec<u8>) {
+        debug_assert!(!bytes.is_empty() && self.pending.is_empty());
+        self.pending = bytes;
+    }
+
+    pub(crate) fn replay(&self, client: &mut Client) -> Result<()> {
+        crate::return_if!(!self.pending(), Ok(()));
+        let request = self.next.ok_or("input request space exhausted")?;
+        client.send(
+            9,
+            &crate::wire::join(&[
+                &self.epoch.to_le_bytes(),
+                &request.to_le_bytes(),
+                &[0],
+                &self.pending,
+            ]),
+        )
+    }
+
+    pub(crate) fn resize(&self, client: &mut Client, rows: u16, columns: u16) -> Result<()> {
+        let mut payload = [0; 8];
+        payload[..4].copy_from_slice(&self.epoch.to_le_bytes());
+        payload[4..6].copy_from_slice(&columns.to_le_bytes());
+        payload[6..].copy_from_slice(&rows.to_le_bytes());
+        client.send(0x0b, &payload)
+    }
+
+    pub(crate) fn control(&self, client: &mut Client, kind: u8) -> Result<()> {
+        client.send(
+            kind,
+            &crate::wire::lease_token_payload(self.epoch, self.token).map_err(crate::protocol)?,
+        )
+    }
+
+    pub(crate) fn receipt(&mut self, receipt: InputReceipt, client: &Client) -> Result<()> {
+        crate::require(self.pending(), "unexpected input receipt")?;
         let expected = InputReceipt::outcome(
             self.epoch,
             self.next.ok_or("input request space exhausted")?,
             client.generation,
             client.incarnation,
-            written as u64,
+            self.pending.len() as u64,
             None,
         );
         crate::require(receipt == expected, "input was not delivered")?;
+        self.pending.clear();
         self.next = expected.request.checked_add(1);
         Ok(())
     }

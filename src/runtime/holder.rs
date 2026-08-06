@@ -31,12 +31,8 @@ const QUERY_REPLIES: [[&[u8]; 2]; 3] = [
 impl<N: Native> Runtime<N> {
     fn transition<'a>(&mut self, event: Transition<'a>) -> DecodeResult {
         let effects = self.machine.transition(event)?;
-        self.apply(effects);
-        Ok(())
-    }
-
-    fn apply(&mut self, effects: impl IntoIterator<Item = PolicyEffect>) {
         self.apply_with(effects, &mut monotonic);
+        Ok(())
     }
 
     fn apply_with(
@@ -228,13 +224,10 @@ impl<N: Native> Runtime<N> {
             }));
         self.buffered -= released;
         while let Some(id) = self.recipients.pop() {
-            if self
-                .peers
-                .get(&id)
-                .is_some_and(|peer| peer.deadline != 0 && now >= peer.deadline)
-            {
-                self.refuse(id, (12, 13, b"identity exchange deadline exceeded"));
-            } else if self.peers.get(&id).is_some_and(|peer| peer.handshake == 0) {
+            let reassembly = self.peers.get(&id).is_some_and(|peer| {
+                peer.handshake == 0 && (peer.deadline == 0 || now < peer.deadline)
+            });
+            if reassembly {
                 self.refuse_wire(id, wire::WireError::ReassemblyTimeout);
             } else {
                 self.refuse(id, (12, 13, b"identity exchange deadline exceeded"));
@@ -480,7 +473,7 @@ impl<N: Native> Runtime<N> {
             }
         }
         self.drain_storage(None);
-        self.poll_descriptors();
+        self.poll_descriptors_with(&mut monotonic);
         let _ = self.transition(Transition::Writable(self.storage.health() & 2 != 0));
         self.tick(monotonic());
     }
@@ -506,7 +499,7 @@ impl<N: Native> Runtime<N> {
         for effect in self.machine.transition(Transition::Ending).unwrap() {
             match effect {
                 PolicyEffect::CommitSources(_, values, _) => changes.extend(values),
-                effect => self.apply([effect]),
+                effect => self.apply_with([effect], &mut monotonic),
             }
         }
         let mut events = events::semantic_changes(now(), changes).unwrap_or_default();
@@ -612,7 +605,7 @@ impl<N: Native> Runtime<N> {
         };
         let mut failure = None;
         for message in frames.drain(..) {
-            if let Err(error) = self.message(id, &message) {
+            if let Err(error) = self.message_at(id, &message, monotonic()) {
                 failure = Some(error);
                 break;
             }
@@ -625,10 +618,6 @@ impl<N: Native> Runtime<N> {
         if let Some(error) = failure.or(trailing) {
             self.refuse_wire(id, error);
         }
-    }
-
-    fn message(&mut self, id: u64, message: &Message) -> DecodeResult {
-        self.message_at(id, message, monotonic())
     }
 
     fn message_at(&mut self, id: u64, message: &Message, time: u64) -> DecodeResult {
@@ -947,16 +936,12 @@ impl<N: Native> Runtime<N> {
                 }),
             request,
         });
-        self.poll_descriptors();
+        self.poll_descriptors_with(&mut monotonic);
     }
 
     /// STATUS and ATTACH copy event/log metadata at one memory-only
     /// linearization point. A lane in BODY/COMMIT phase makes the request wait,
     /// but never makes the holder read, hash, join, or spin on storage I/O.
-    fn poll_descriptors(&mut self) {
-        self.poll_descriptors_with(&mut monotonic);
-    }
-
     fn poll_descriptors_with(&mut self, clock: &mut impl FnMut() -> u64) {
         loop {
             let now = clock();

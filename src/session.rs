@@ -9,6 +9,26 @@ use std::sync::Arc;
 
 pub type ConnId = u64;
 
+macro_rules! lease_codec {
+    ($name:ident[$size:literal]; valid $this:ident => $valid:expr; raw $raw:ident => $raw_valid:expr;
+     value $value:expr; fields $($at:expr => $field:expr),+ $(,)?) => {
+        impl $name {
+            fn valid_wire(&self) -> bool { let $this = self; $valid }
+            pub fn encode_wire(&self) -> Result<[u8; $size], WireError> {
+                let $this = self;
+                crate::wire::require($valid, WireError::Malformed)?;
+                crate::wire::fixed_payload(&[$(($at, $field)),+])
+            }
+            pub fn decode_wire($raw: &[u8]) -> Result<Self, WireError> {
+                crate::wire::require($raw.len() == $size && $raw_valid, WireError::Malformed)?;
+                let value = $value;
+                crate::wire::require(value.valid_wire(), WireError::Malformed)?;
+                Ok(value)
+            }
+        }
+    };
+}
+
 schema!(enum ordinal pub LeaseOperation; Fresh, Resume);
 schema!(enum ordinal pub LeaseRole; Viewer, InputOnly);
 schema!(enum ordinal pub ResultOutcome; Granted, Resumed, Released, Refused);
@@ -18,82 +38,39 @@ schema!(struct default pub LeaseRequest derive [Clone, Debug, Eq, PartialEq] pub
     epoch: u32 = 0, incarnation: [u8; 16] = [0; 16], token: [u8; 16] = [0; 16]);
 schema!(struct pub LeaseResult derive [Clone, Debug, Eq, PartialEq] pub fields; outcome: ResultOutcome, reason: ResultReason, role: LeaseRole,
     epoch: u32, token: [u8; 16]);
+lease_codec!(LeaseRequest[40];
+    valid this => { let resume = this.operation == LeaseOperation::Resume;
+        (this.epoch != 0) == resume && (this.incarnation != [0; 16]) == resume && (this.token != [0; 16]) == resume };
+    raw bytes => bytes[0] <= 1 && bytes[1] <= 1 && bytes[2..4] == [0, 0];
+    value Self { operation: LeaseOperation::from_ordinal(bytes[0]), role: LeaseRole::from_ordinal(bytes[1]),
+        epoch: u32::from_le_bytes(bytes[4..8].try_into().unwrap()), incarnation: bytes[8..24].try_into().unwrap(),
+        token: bytes[24..40].try_into().unwrap() };
+    fields 0 => &[this.operation as u8], 1 => &[this.role as u8], 4 => &this.epoch.to_le_bytes(),
+        8 => &this.incarnation, 24 => &this.token,
+);
 impl LeaseRequest {
-    fn valid_wire(&self) -> bool {
-        let resume = self.operation == LeaseOperation::Resume;
-        (self.epoch != 0) == resume
-            && (self.incarnation != [0; 16]) == resume
-            && (self.token != [0; 16]) == resume
-    }
-
     pub fn fresh(role: LeaseRole) -> Self {
         Self {
             role,
             ..Self::default()
         }
     }
-    pub fn encode_wire(&self) -> Result<[u8; 40], WireError> {
-        crate::wire::require(self.valid_wire(), WireError::Malformed)?;
-        crate::wire::fixed_payload(&[
-            (0, &[self.operation as u8]),
-            (1, &[self.role as u8]),
-            (4, &self.epoch.to_le_bytes()),
-            (8, &self.incarnation),
-            (24, &self.token),
-        ])
-    }
-    pub fn decode_wire(bytes: &[u8]) -> Result<Self, WireError> {
-        crate::wire::require(
-            bytes.len() == 40 && bytes[0] <= 1 && bytes[1] <= 1 && bytes[2..4] == [0, 0],
-            WireError::Malformed,
-        )?;
-        let value = Self {
-            operation: LeaseOperation::from_ordinal(bytes[0]),
-            role: LeaseRole::from_ordinal(bytes[1]),
-            epoch: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            incarnation: bytes[8..24].try_into().unwrap(),
-            token: bytes[24..40].try_into().unwrap(),
-        };
-        crate::wire::require(value.valid_wire(), WireError::Malformed)?;
-        Ok(value)
-    }
 }
+lease_codec!(LeaseResult[24];
+    valid this => { let common = this.reason == ResultReason::None && this.epoch != 0;
+        match this.outcome {
+            ResultOutcome::Granted | ResultOutcome::Resumed => common && this.token != [0; 16],
+            ResultOutcome::Released => common && this.token == [0; 16],
+            ResultOutcome::Refused => matches!(this.reason as u8, 1..=7) && this.token == [0; 16],
+        } };
+    raw bytes => bytes[0] <= 3 && bytes[1] <= 8 && bytes[2] <= 1 && bytes[3] == 0;
+    value Self { outcome: ResultOutcome::from_ordinal(bytes[0]), reason: ResultReason::from_ordinal(bytes[1]),
+        role: LeaseRole::from_ordinal(bytes[2]), epoch: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        token: bytes[8..24].try_into().unwrap() };
+    fields 0 => &[this.outcome as u8], 1 => &[this.reason as u8], 2 => &[this.role as u8],
+        4 => &this.epoch.to_le_bytes(), 8 => &this.token,
+);
 impl LeaseResult {
-    fn valid_wire(&self) -> bool {
-        let common = self.reason == ResultReason::None && self.epoch != 0;
-        match self.outcome {
-            ResultOutcome::Granted | ResultOutcome::Resumed => common && self.token != [0; 16],
-            ResultOutcome::Released => common && self.token == [0; 16],
-            ResultOutcome::Refused => matches!(self.reason as u8, 1..=7) && self.token == [0; 16],
-        }
-    }
-
-    pub fn encode_wire(&self) -> Result<[u8; 24], WireError> {
-        crate::wire::require(self.valid_wire(), WireError::Malformed)?;
-        crate::wire::fixed_payload(&[
-            (0, &[self.outcome as u8]),
-            (1, &[self.reason as u8]),
-            (2, &[self.role as u8]),
-            (4, &self.epoch.to_le_bytes()),
-            (8, &self.token),
-        ])
-    }
-    pub fn decode_wire(bytes: &[u8]) -> Result<Self, WireError> {
-        crate::wire::require(
-            bytes.len() == 24 && bytes[0] <= 3 && bytes[1] <= 8 && bytes[2] <= 1 && bytes[3] == 0,
-            WireError::Malformed,
-        )?;
-        let value = Self {
-            outcome: ResultOutcome::from_ordinal(bytes[0]),
-            reason: ResultReason::from_ordinal(bytes[1]),
-            role: LeaseRole::from_ordinal(bytes[2]),
-            epoch: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            token: bytes[8..24].try_into().unwrap(),
-        };
-        crate::wire::require(value.valid_wire(), WireError::Malformed)?;
-        Ok(value)
-    }
-
     fn success(outcome: ResultOutcome, role: LeaseRole, epoch: u32, token: [u8; 16]) -> Self {
         Self {
             outcome,
