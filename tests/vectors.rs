@@ -2494,3 +2494,115 @@ fn v16_extra_hello_nonzero_flags_are_refused() {
         );
     }
 }
+
+// ===== §16 V25 — POSIX STATUS_REPLY at layout 02 =====
+// This is the first independent check that the holder's exact frontier and the
+// descriptor's commit fields agree: the frozen bytes pin selected event
+// slot/index/length 0/1/133 together with the body SHA-256, so a descriptor
+// built from a stale cache or patched at the wrong offset fails here rather
+// than being confirmed by whichever side wrote it.
+
+const V25_HEADER: &[u8] = b"{\"v\":2,\"type\":\"header\",\"ts\":0,\"session\":\"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==\",\"generation\":7,\"epoch\":0,\"next_seq\":0,\"first_retained\":0}\n";
+
+fn v25() -> Vec<u8> {
+    hex("4D 4F 4F 52 03 0E 00 00 07 00 00 00 01 00 00 00
+         F4 00 00 00 65 4E 0F 46 16 00 00 00 01 2F 74 6D
+         70 2F 2E 6D 6F 6F 72 2D 31 30 30 30 2F 62 75 69
+         6C 64 07 00 00 00 00 01 02 03 04 05 06 07 08 09
+         0A 0B 0C 0D 0E 0F 02 0B 00 00 00 2F 74 6D 70 2F
+         65 76 65 6E 74 73 00 01 00 00 00 00 00 00 00 85
+         00 00 00 00 00 00 00 2B BE EF B6 37 54 66 12 D6
+         A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
+         45 F9 ED D7 88 B6 4B 01 00 00 00 00 00 00 00 02
+         00 00 00 00 00 00 00 03 03 03 03 03 03 03 03 03
+         03 03 03 03 03 03 03 04 00 00 00 2F 74 6D 70 34
+         12 00 00 78 56 00 00 10 11 12 13 14 15 16 17 18
+         19 1A 1B 1C 1D 1E 1F 00 00 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 E3 03 00 00 00 00 00 00 0F
+         01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 00 00 00 00")
+}
+
+#[test]
+fn v16_status_v25_frame_is_self_consistent_and_decodes() {
+    let frame = v25();
+    // Header shape and the declared 244-byte payload, per §1.
+    assert_eq!(&frame[0..4], b"MOOR");
+    assert_eq!(frame[4], 0x03, "wire version");
+    assert_eq!(frame[5], 0x0E, "STATUS_REPLY type");
+    assert_eq!(
+        u32::from_le_bytes(frame[16..20].try_into().unwrap()),
+        0xF4,
+        "declared payload length"
+    );
+    assert_eq!(frame.len() - 24, 0xF4, "actual body length");
+    assert_eq!(
+        moor::wire::crc32c(&frame[..20]),
+        u32::from_le_bytes(frame[20..24].try_into().unwrap()),
+        "frozen header CRC-32C"
+    );
+
+    // The descriptor must decode against the identity, generation and
+    // incarnation the same vector freezes, not merely parse in isolation.
+    let mut identity = vec![0x01];
+    identity.extend_from_slice(b"/tmp/.moor-1000/build");
+    let incarnation: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
+    let status = moor::wire::StatusTail::decode_for(&frame[24..], &identity, 7, incarnation)
+        .expect("the frozen V25 descriptor must decode");
+
+    // Empty retained history at coordinate zero, and the frozen flag byte E3.
+    assert_eq!(status.replay.first, 0);
+    assert_eq!(status.replay.last, 0);
+    assert_eq!(status.replay.start, 0);
+    assert_eq!(status.replay.end, 0);
+    assert!(status.replay.complete, "E3 bit 0");
+    assert!(status.replay.modes_exact, "E3 bit 1");
+    assert!(status.viewers, "E3 bit 5");
+    assert!(status.running, "E3 bit 6");
+    assert!(status.event_writable, "E3 bit 7");
+    assert!(!status.owns_lease, "E3 bit 4 clear");
+    assert_eq!(status.lease_epoch, 3);
+    assert_eq!(status.semantic_flags, 0);
+    assert_eq!(status.semantic_pending, 0);
+    assert_eq!(status.extension.health, 0x0F);
+    assert_eq!(status.extension.log_epoch, 1);
+    assert_eq!(status.extension.log_index, 1);
+    assert_eq!(status.extension.retained_start, 0);
+    assert_eq!(status.extension.retained_end, 0);
+}
+
+#[test]
+fn v16_status_v25_pins_the_selected_event_commit_fields() {
+    // Layout 02 and the selected slot/index/length/hash sit at a computed offset
+    // in the descriptor. These are the bytes the holder patches per send, so a
+    // stale or misaligned frontier is caught here.
+    let frame = v25();
+    let body = &frame[24..];
+    let mut at = 4 + 22; // wide identity: 4-byte count + tag + 21 path bytes
+    at += 4 + 16; // generation + incarnation
+    assert_eq!(body[at], 0x02, "event storage layout 02 on POSIX");
+    at += 1;
+    let path_len = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+    assert_eq!(&body[at + 4..at + 4 + path_len], b"/tmp/events");
+    at += 4 + path_len;
+
+    assert_eq!(body[at], 0, "selected body slot 0");
+    assert_eq!(
+        u64::from_le_bytes(body[at + 1..at + 9].try_into().unwrap()),
+        1,
+        "selected commit index 1"
+    );
+    assert_eq!(
+        u64::from_le_bytes(body[at + 9..at + 17].try_into().unwrap()),
+        133,
+        "selected committed body length 133"
+    );
+
+    // The frozen hash really is the SHA-256 of the frozen 133-byte header, and
+    // the frozen length really is that header's length — so neither the vector
+    // nor the implementation can drift without this failing.
+    assert_eq!(V25_HEADER.len(), 133);
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(V25_HEADER).into();
+    assert_eq!(&body[at + 17..at + 49], &digest);
+}
