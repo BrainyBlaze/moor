@@ -229,19 +229,6 @@ fn create(args: &[OsString], mode: CreateMode, command: &str) -> CliResult<Actio
     })
 }
 
-fn create_mode(arg: &OsStr) -> Option<CreateMode> {
-    Some(match arg.to_str()? {
-        "new" | "n" => CreateMode::New,
-        "start" | "s" => CreateMode::Start,
-        "run" => CreateMode::Run,
-        "-A" => CreateMode::LegacyA,
-        "-c" => CreateMode::LegacyC,
-        "-n" => CreateMode::LegacyStart,
-        "-N" => CreateMode::LegacyRun,
-        _ => return None,
-    })
-}
-
 fn remove(args: &[OsString]) -> CliResult<Action> {
     let (options, seen, _, session) = fixed(args, "rm", ALL | 1 << 5, false, false)?;
     let all = seen & ALL != 0;
@@ -256,11 +243,15 @@ fn remove(args: &[OsString]) -> CliResult<Action> {
 pub fn parse(args: &[OsString]) -> Result<Action, Error> {
     return_if!(args.len() == 1, Ok(Action::Help));
     let first = &args[1];
-    if let Some(mode) = create_mode(first) {
-        return create(&args[2..], mode, first.to_str().unwrap());
-    }
     let rest = &args[2..];
     match first.to_str() {
+        Some(command @ ("new" | "n")) => create(rest, CreateMode::New, command),
+        Some(command @ ("start" | "s")) => create(rest, CreateMode::Start, command),
+        Some(command @ "run") => create(rest, CreateMode::Run, command),
+        Some(command @ "-A") => create(rest, CreateMode::LegacyA, command),
+        Some(command @ "-c") => create(rest, CreateMode::LegacyC, command),
+        Some(command @ "-n") => create(rest, CreateMode::LegacyStart, command),
+        Some(command @ "-N") => create(rest, CreateMode::LegacyRun, command),
         Some("--help" | "-h" | "?") if args.len() == 2 => Ok(Action::Help),
         Some("--version") if args.len() == 2 => Ok(Action::Version),
         Some("--help" | "-h" | "?" | "--version") => Err(invalid_args()),
