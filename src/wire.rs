@@ -632,16 +632,19 @@ pub fn decode_viewer<'a>(
             let replay = stream.replay.ok_or(WireError::Malformed)?;
             let (expected, expected_offset) = stream.next.ok_or(WireError::Malformed)?;
             let apply = sequence >= expected;
-            let valid = (replay.first..=replay.last).contains(&sequence)
+            let baseline = (replay.first..=replay.last).contains(&sequence)
                 && offset >= replay.start
                 && end <= replay.end
                 && (sequence != replay.first || offset == replay.start)
-                && (sequence != replay.last || end == replay.end)
-                && if apply {
-                    sequence == expected && offset == expected_offset
-                } else {
-                    end <= expected_offset && (sequence + 1 != expected || end == expected_offset)
-                };
+                && (sequence != replay.last || end == replay.end);
+            let live = apply && sequence > replay.last && offset >= replay.end;
+            let contiguous = if apply {
+                sequence == expected && offset == expected_offset
+            } else {
+                end <= expected_offset
+                    && (sequence.checked_add(1) != Some(expected) || end == expected_offset)
+            };
+            let valid = (baseline || live) && contiguous;
             well_formed(valid)?;
             if apply {
                 stream.next = sequence.checked_add(1).map(|next| (next, end));

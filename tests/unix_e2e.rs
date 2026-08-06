@@ -81,6 +81,7 @@ fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    let size = std::ptr::from_ref(&size).cast_mut();
     assert_eq!(
         unsafe {
             libc::openpty(
@@ -794,6 +795,65 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
     assert!(socket.exists());
     assert!(moor(&["kill", "-f", name]).status.success());
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn same_size_winch_redraw_notifies_the_child_exactly_once() {
+    let dir = temp();
+    let socket = dir.join("same-size-winch");
+    let name = socket.to_str().unwrap();
+    let start = moor(&[
+        "start",
+        name,
+        "/bin/sh",
+        "-c",
+        "trap 'printf \"WINCH\\n\"' WINCH; printf 'READY\\n'; while :; do read line || :; done",
+    ]);
+    assert!(start.status.success(), "{start:?}");
+    wait_for(&socket, b"READY\r\n");
+
+    let (mut master, slave) = terminal_pair(24, 80);
+    let mut attach = terminal_command(&slave)
+        .args(["attach", "-r", "winch", name])
+        .spawn()
+        .unwrap();
+    let _ = terminal_output(&mut master, b"READY\r\n", Duration::from_secs(1));
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        let logged = tail(&socket);
+        if logged
+            .stdout
+            .windows(b"WINCH\r\n".len())
+            .any(|part| part == b"WINCH\r\n")
+            || Instant::now() >= until
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(100));
+    let _ = master.write_all(&[0x1c]);
+    let until = Instant::now() + Duration::from_secs(2);
+    while attach.try_wait().unwrap().is_none() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if attach.try_wait().unwrap().is_none() {
+        attach.kill().unwrap();
+    }
+    let _ = attach.wait();
+    let logged = tail(&socket);
+    let _ = moor(&["kill", "-f", "-q", name]);
+    fs::remove_dir_all(dir).unwrap();
+
+    assert_eq!(
+        logged
+            .stdout
+            .windows(b"WINCH\r\n".len())
+            .filter(|part| *part == b"WINCH\r\n")
+            .count(),
+        1,
+        "{logged:?}"
+    );
 }
 
 #[test]
