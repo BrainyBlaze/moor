@@ -32,11 +32,6 @@ const FORCE: u16 = 1 << 12;
 const ALL: u16 = 1 << 13;
 const NUMBER: u16 = 1 << 14;
 const VALUES: u16 = 1 | 1 << 2 | 1 << 3 | 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | NUMBER;
-const REDRAWS: &[(&str, Redraw)] = &[
-    ("none", Redraw::None),
-    ("ctrl_l", Redraw::CtrlL),
-    ("winch", Redraw::Winch),
-];
 
 fn leading_dash(arg: &OsStr) -> bool {
     arg.as_encoded_bytes().first() == Some(&b'-')
@@ -84,11 +79,20 @@ fn parse_detach(value: &OsString) -> CliResult<u8> {
         _ => Err(bad_value(value, "-e")),
     }
 }
-fn choice<T: Copy>(value: &OsString, option: &str, choices: &[(&str, T)]) -> CliResult<T> {
-    choices
-        .iter()
-        .find_map(|&(name, result)| (value == name).then_some(result))
-        .ok_or_else(|| bad_value(value, option))
+fn redraw(value: &OsString) -> CliResult<Redraw> {
+    match value.to_str() {
+        Some("none") => Ok(Redraw::None),
+        Some("ctrl_l") => Ok(Redraw::CtrlL),
+        Some("winch") => Ok(Redraw::Winch),
+        _ => Err(bad_value(value, "-r")),
+    }
+}
+fn reset(value: &OsString) -> CliResult<Reset> {
+    match value.to_str() {
+        Some("none") => Ok(Reset::None),
+        Some("move") => Ok(Reset::Move),
+        _ => Err(bad_value(value, "-R")),
+    }
 }
 fn session(value: &OsStr) -> CliResult<OsString> {
     name::valid_session(value)
@@ -105,14 +109,8 @@ fn set_option(
     match id {
         0 => out.detach = Some(parse_detach(value.unwrap())?),
         1 => out.detach = None,
-        2 => out.redraw = choice(value.unwrap(), "-r", REDRAWS)?,
-        3 => {
-            out.reset = choice(
-                value.unwrap(),
-                "-R",
-                &[("none", Reset::None), ("move", Reset::Move)],
-            )?
-        }
+        2 => out.redraw = redraw(value.unwrap())?,
+        3 => out.reset = reset(value.unwrap())?,
         4..=6 => *[&mut out.pass_suspend, &mut out.quiet, &mut out.non_vt][id - 4] = true,
         7 => out.log_cap = parse_size(value.unwrap())?,
         8..=11 => {
@@ -141,12 +139,12 @@ fn scan<'a>(
     creating: bool,
     legacy: bool,
 ) -> CliResult<Scan<'a>> {
-    let (mut options, mut seen, mut lines, mut operands, mut i) =
-        (Options::default(), 0, 10, smallvec::SmallVec::new(), 0);
-    while i < args.len() {
-        let arg = &args[i];
+    let (mut options, mut seen, mut lines, mut operands) =
+        (Options::default(), 0, 10, smallvec::SmallVec::new());
+    let mut input = args.iter();
+    while let Some(arg) = input.next() {
         if arg == "--" {
-            let rest = &args[i + 1..];
+            let rest = input.as_slice();
             // OB-4 makes `--` a grammar terminator in every phase, so it may
             // introduce a dash-leading operand but never participates in the
             // operand count: a trailing `--` with nothing after it just ends
@@ -174,18 +172,15 @@ fn scan<'a>(
             let value = if VALUES & bit == 0 {
                 None
             } else {
-                i += 1;
-                Some(args.get(i).ok_or_else(|| {
+                Some(input.next().ok_or_else(|| {
                     Error(format!("Option '{}' requires an argument", OPTIONS[id]))
                 })?)
             };
             set_option(id, value, &mut options, &mut lines)?;
-            i += 1;
         } else {
             operands.push(arg);
-            i += 1;
             if creating && operands.len() == 2 {
-                operands.extend(&args[i..]);
+                operands.extend(input);
                 break;
             }
         }
