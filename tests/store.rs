@@ -5,6 +5,8 @@ use moor::runtime::private::{lifecycle_exit, lifecycle_running};
 use moor::session::{SourceEffect, SourceReason, SourceStatus};
 use moor::store::{Kind, Store, StoreError};
 use moor::wire::crc32c;
+#[cfg(unix)]
+use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,6 +21,23 @@ fn temp(name: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&path);
     path
+}
+
+#[cfg(unix)]
+fn descriptor_store(
+    directory: &File,
+    kind: Kind,
+    generation: u32,
+    initial: &[u8],
+) -> Result<Store, StoreError> {
+    let prepared = Store::prepare_at(directory)?;
+    let store = prepared
+        .lease_at(directory, kind, generation, initial, 0, 0)
+        .inspect_err(|_| prepared.rollback_at(directory))?;
+    prepared
+        .initialize_leased_at(directory, &store, initial)
+        .inspect_err(|_| prepared.rollback_at(directory))?;
+    Ok(store)
 }
 
 fn running(generation: u32) -> String {
@@ -277,7 +296,7 @@ fn descriptor_bound_creation_ignores_a_replacement_at_the_original_path() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
 
     let header = canonical_header(1, "AS9z", Some(7), Cursor(0, 0, 0, 1));
-    let store = Store::create_at(&directory, Kind::Event, 7, header.as_bytes(), 0, 0).unwrap();
+    let store = descriptor_store(&directory, Kind::Event, 7, header.as_bytes()).unwrap();
 
     assert_eq!(
         Store::read_only(&moved, Kind::Event, 7).unwrap().1,
@@ -300,7 +319,7 @@ fn descriptor_bound_creation_produces_the_exact_locked_slot_set() {
     fs::create_dir(&path).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     let directory = std::fs::File::open(&path).unwrap();
-    let store = Store::create_at(&directory, Kind::Log, 7, b"", 0, 0).unwrap();
+    let store = descriptor_store(&directory, Kind::Log, 7, b"").unwrap();
     let mut entries = fs::read_dir(&path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -335,7 +354,7 @@ fn descriptor_bound_creation_rejects_and_preserves_an_extra_entry() {
     fs::write(path.join("extra"), b"").unwrap();
     let directory = std::fs::File::open(&path).unwrap();
     assert!(matches!(
-        Store::create_at(&directory, Kind::Log, 7, b"", 0, 0),
+        descriptor_store(&directory, Kind::Log, 7, b""),
         Err(StoreError::Corrupt)
     ));
     assert_eq!(
@@ -455,10 +474,8 @@ fn prepared_store_rejects_a_substituted_slot_during_revalidation_and_initializat
         prepared.revalidate_at(&directory),
         Err(StoreError::Corrupt)
     ));
-    assert!(matches!(
-        prepared.initialize_at(&directory, Kind::Log, 7, b"", 0, 0),
-        Err(StoreError::Corrupt)
-    ));
+    let store = prepared.lease_at(&directory, Kind::Log, 7, b"", 0, 0);
+    assert!(matches!(store, Err(StoreError::Corrupt)));
     assert_eq!(fs::read(path.join("body.1")).unwrap(), b"replacement");
 
     prepared.rollback_at(&directory);
@@ -814,9 +831,12 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
     // would regress the status descriptor instead of merely delaying it.
     let path = temp("selected-now");
     let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
-    assert_eq!(store.selected_now().map(|commit| commit.index), Some(1));
+    assert_eq!(
+        store.selected_result().ok().map(|commit| commit.index),
+        Some(1)
+    );
     store.append_capped(b"xyz", 64, 3).unwrap();
-    let advanced = store.selected_now().expect("a valid commit");
+    let advanced = store.selected_result().expect("a valid commit");
     assert_eq!(advanced.index, 2);
     assert_eq!(advanced.end, 3);
     // Both commit slots invalid: selectable state is gone, so the answer is
@@ -824,7 +844,7 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
     for slot in ["commit.0", "commit.1"] {
         fs::write(path.join(slot), [0u8; 92]).unwrap();
     }
-    assert_eq!(store.selected_now(), None);
+    assert!(store.selected_result().is_err());
     // The already-open writer handle still reports its own last valid commit,
     // which is exactly the last-known-valid policy the frontier relies on.
     assert_eq!(store.selected().index, 2);
@@ -851,7 +871,7 @@ fn contended_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
     let reader = std::thread::spawn(move || {
         let mut highest = 0;
         while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(commit) = view.selected_now() {
+            if let Ok(commit) = view.selected_result() {
                 assert!(commit.index >= highest, "frontier regressed");
                 highest = commit.index;
             }
