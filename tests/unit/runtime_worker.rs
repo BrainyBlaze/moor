@@ -2,6 +2,7 @@ use std::sync::mpsc::Receiver;
 
 type TestGate = (Sender<()>, Receiver<()>);
 
+#[allow(dead_code)]
 pub(crate) enum TestWork {
     Hold(Receiver<()>),
     Staged(Vec<u8>, u32, u64, u64, Option<TestGate>, bool),
@@ -127,7 +128,7 @@ impl TestWork {
     }
 }
 
-#[allow(non_snake_case, clippy::too_many_arguments)]
+#[allow(dead_code, non_snake_case, clippy::too_many_arguments)]
 impl Work {
     pub(crate) fn Hold(wait: Receiver<()>) -> Self {
         Self::Test(TestWork::Hold(wait))
@@ -220,15 +221,20 @@ impl State {
 }
 
 impl Lane {
+    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<Commit> {
-        self.published.lock().expect("published lock").frontier
+        self.state
+            .published
+            .lock()
+            .expect("published lock")
+            .frontier
     }
 
     #[allow(dead_code)]
     pub(crate) fn block_publication(&self, entered: Sender<()>, release: Receiver<()>) {
-        let published = Arc::clone(&self.published);
+        let state = Arc::clone(&self.state);
         std::thread::spawn(move || {
-            let _guard = published.lock().expect("published lock");
+            let _guard = state.published.lock().expect("published lock");
             let _ = entered.send(());
             let _ = release.recv();
         });
