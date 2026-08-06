@@ -5,6 +5,7 @@ use moor::runtime::private::{lifecycle_exit, lifecycle_running};
 use moor::session::{SourceEffect, SourceReason, SourceStatus};
 use moor::store::{Kind, Store, StoreError};
 use moor::wire::crc32c;
+use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
@@ -48,6 +49,18 @@ fn running(generation: u32) -> String {
         (1, 2, [3; 16]),
         ("posix-bytes", None, None),
     )
+}
+
+fn stored_event_case(name: &str, kind: &str, tail: &str, valid: bool) {
+    let path = temp(&format!("event-schema-{name}-{kind}-{valid}"));
+    let body = format!(
+        "{}{{\"type\":\"{name}\",\"ts\":1,\"epoch\":0,\"seq\":0,\"kind\":\"{kind}\"{tail}}}\n",
+        canonical_header(1, "AS9z", Some(7), Cursor(0, 1, 0, 1))
+    );
+    let result = Store::create(&path, Kind::Event, 7, body.as_bytes(), 0, 1);
+    assert_eq!(result.is_ok(), valid, "{name}/{kind}: {tail}");
+    drop(result);
+    let _ = fs::remove_dir_all(path);
 }
 
 #[test]
@@ -609,6 +622,165 @@ fn event_commit_metadata_and_closed_header_are_validated() {
 }
 
 #[test]
+fn every_event_schema_row_enforces_kind_order_and_dependent_values() {
+    let producer = "AAAAAAAAAAAAAAAAAAAAAA==";
+    let semantic = format!(",\"source\":\"source\",\"producer\":\"{producer}\",\"source_epoch\":1");
+    let assertion = |assertion_kind| {
+        format!(
+            "{semantic},\"source_seq\":\"1\",\"event_id\":\"{producer}\",\"assertion_kind\":\"{assertion_kind}\",\"payload\":\"e30=\""
+        )
+    };
+    let receipt = |status| {
+        format!(
+            "{semantic},\"source_seq\":\"1\",\"event_id\":\"{producer}\",\"application_request_id\":\"{producer}\",\"lease_epoch\":1,\"request_id\":\"1\",\"status\":\"{status}\",\"provider_session\":\"\",\"provider_turn\":\"\""
+        )
+    };
+    let missing = |reason| {
+        format!(
+            "{semantic},\"application_request_id\":\"{producer}\",\"lease_epoch\":1,\"request_id\":\"1\",\"reason\":\"{reason}\""
+        )
+    };
+
+    for kind in ["transition", "snapshot"] {
+        for (name, tail) in [
+            ("ready", ""),
+            (
+                "state",
+                ",\"state\":\"idle\",\"title\":\"\",\"truncated\":false",
+            ),
+            (
+                "state",
+                ",\"state\":\"busy\",\"title\":\"working\",\"truncated\":true",
+            ),
+            (
+                "link",
+                ",\"uri\":\"https://example.invalid\",\"truncated\":false",
+            ),
+        ] {
+            stored_event_case(name, kind, tail, true);
+        }
+        for (status, reason) in [
+            ("connected", ""),
+            ("exact", ""),
+            ("degraded", "heartbeat-timeout"),
+            ("disconnected", "transport-closed"),
+            ("disconnected", "superseded"),
+            ("disconnected", "session-ending"),
+        ] {
+            stored_event_case(
+                "semantic-source",
+                kind,
+                &format!("{semantic},\"status\":\"{status}\",\"reason\":\"{reason}\""),
+                true,
+            );
+        }
+    }
+
+    for assertion_kind in ["transition", "snapshot"] {
+        stored_event_case(
+            "semantic-assertion",
+            "transition",
+            &assertion(assertion_kind),
+            true,
+        );
+    }
+    stored_event_case(
+        "semantic-assertion",
+        "snapshot",
+        &assertion("snapshot"),
+        true,
+    );
+    for status in ["accepted", "refused"] {
+        stored_event_case("application-receipt", "transition", &receipt(status), true);
+    }
+    for reason in ["deadline", "source-lost", "retention-expired"] {
+        stored_event_case(
+            "application-receipt-missing",
+            "transition",
+            &missing(reason),
+            true,
+        );
+    }
+    stored_event_case("stream-exhausted", "transition", ",\"axis\":\"seq\"", true);
+    stored_event_case(
+        "stream-exhausted",
+        "transition",
+        ",\"axis\":\"unknown\"",
+        false,
+    );
+    for tail in [
+        ",\"ended\":\"exited\",\"code\":0",
+        ",\"ended\":\"signalled\",\"signal\":9",
+        ",\"ended\":\"terminated\",\"code\":1,\"method\":\"graceful\"",
+        ",\"ended\":\"terminated\",\"code\":1,\"method\":\"forced\"",
+    ] {
+        stored_event_case("exit", "transition", tail, true);
+    }
+    for (scanner, reason) in [
+        ("osc", "deadline"),
+        ("query", "limit"),
+        ("osc", "cancelled"),
+        ("query", "malformed"),
+    ] {
+        stored_event_case(
+            "observer-degraded",
+            "transition",
+            &format!(",\"scanner\":\"{scanner}\",\"reason\":\"{reason}\""),
+            true,
+        );
+    }
+
+    for (name, tail) in [
+        ("stream-exhausted", ",\"axis\":\"seq\""),
+        (
+            "observer-degraded",
+            ",\"scanner\":\"query\",\"reason\":\"limit\"",
+        ),
+        ("exit", ",\"ended\":\"exited\",\"code\":0"),
+    ] {
+        stored_event_case(name, "snapshot", tail, false);
+    }
+    stored_event_case(
+        "application-receipt",
+        "snapshot",
+        &receipt("accepted"),
+        false,
+    );
+    stored_event_case(
+        "application-receipt-missing",
+        "snapshot",
+        &missing("deadline"),
+        false,
+    );
+    for (status, reason) in [
+        ("connected", "heartbeat-timeout"),
+        ("exact", "session-ending"),
+        ("degraded", ""),
+        ("disconnected", "heartbeat-timeout"),
+    ] {
+        stored_event_case(
+            "semantic-source",
+            "transition",
+            &format!("{semantic},\"status\":\"{status}\",\"reason\":\"{reason}\""),
+            false,
+        );
+    }
+    stored_event_case(
+        "semantic-assertion",
+        "snapshot",
+        &assertion("transition"),
+        false,
+    );
+    stored_event_case(
+        "state",
+        "transition",
+        ",\"title\":\"\",\"state\":\"idle\",\"truncated\":false",
+        false,
+    );
+    stored_event_case("ready", "transition", ",\"unknown\":0", false);
+}
+
+#[test]
 fn exhausted_events_are_terminal_and_match_their_axis_frontier() {
     let ready = event("ready", 1, &[]);
     let exhausted = |axis| event("stream-exhausted", 1, &[("axis", Json::String(axis))]);
@@ -644,6 +816,28 @@ fn exhausted_events_are_terminal_and_match_their_axis_frontier() {
             Err(StoreError::Corrupt)
         ));
         let _ = fs::remove_dir_all(path);
+    }
+
+    for (axis, epoch, index) in [("epoch", u32::MAX, 1), ("commit", 0, u64::MAX)] {
+        let body = [
+            canonical_header(1, "AS9z", Some(7), Cursor(epoch, 1, 0, index)),
+            canonical_event(epoch, 0, EventKind::Transition, &exhausted(axis)),
+        ]
+        .concat();
+        let path = temp(&format!("event-exhausted-valid-{axis}"));
+        let initial = canonical_header(1, "AS9z", Some(7), Cursor(0, 0, 0, 1));
+        let store = Store::create(&path, Kind::Event, 7, initial.as_bytes(), 0, 0).unwrap();
+        let mut selected = *store.selected();
+        selected.epoch = epoch;
+        selected.index = index;
+        selected.length = body.len() as u64;
+        selected.end = 1;
+        selected.hash = Sha256::digest(body.as_bytes()).into();
+        drop(store);
+        fs::write(path.join("body.0"), body).unwrap();
+        fs::write(path.join("commit.0"), selected.encode()).unwrap();
+        assert!(Store::read_only(&path, Kind::Event, 7).is_ok(), "{axis}");
+        fs::remove_dir_all(path).unwrap();
     }
 }
 

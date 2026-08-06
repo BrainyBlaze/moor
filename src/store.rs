@@ -1,4 +1,4 @@
-use crate::wire::crc32c;
+use crate::{events::Stored, wire::crc32c};
 use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -24,7 +24,8 @@ pub enum Kind {
 schema!(enum pub StoreError [Debug]; Io(std::io::Error), Corrupt, Exhausted);
 type Result<T> = std::result::Result<T, StoreError>;
 type Slots = [File; 4];
-type Meta = (u8, u8, u32, u64, u64, u64);
+type Meta = (u8, u8, u32, [u64; 3]);
+type Mutation<'a> = (Commit, Sha256, u64, &'a [u8], bool);
 
 fn require(valid: bool) -> Result<()> {
     valid.then_some(()).ok_or(StoreError::Corrupt)
@@ -42,18 +43,26 @@ schema!(struct pub Commit derive [Clone, Copy, Debug, Eq, PartialEq] pub fields;
     index: u64, length: u64, start: u64, end: u64, hash: [u8; 32]);
 
 impl Commit {
+    fn valid(&self) -> bool {
+        [self.slot, self.body].into_iter().all(|value| value <= 1)
+            && self.generation != 0
+            && self.index != 0
+            && self.start <= self.end
+            && self.length <= LIMITS[self.kind as usize]
+    }
+
     pub fn encode(&self) -> [u8; 92] {
         let mut out = [0; 92];
         out[..12].copy_from_slice(b"MOORCMT1\x01\0\0\0");
         out[9..12].copy_from_slice(&[self.slot, self.body, self.kind as u8]);
         out[12..16].copy_from_slice(&self.generation.to_le_bytes());
         out[16..20].copy_from_slice(&self.epoch.to_le_bytes());
-        for (position, value) in [self.index, self.length, self.start, self.end]
-            .into_iter()
-            .enumerate()
+        for (field, value) in
+            out[24..56]
+                .chunks_exact_mut(8)
+                .zip([self.index, self.length, self.start, self.end])
         {
-            let at = 24 + position * 8;
-            out[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            field.copy_from_slice(&value.to_le_bytes());
         }
         out[56..88].copy_from_slice(&self.hash);
         let checksum = crc32c(&out[..88]);
@@ -65,10 +74,8 @@ impl Commit {
         let actual = u32_at(bytes, 12);
         (&bytes[..9] == b"MOORCMT1\x01"
             && bytes[9] == slot
-            && bytes[10] <= 1
             && bytes[11] == kind as u8
             && bytes[20..24] == [0; 4]
-            && actual != 0
             && generation.is_none_or(|expected| expected == actual)
             && u32_at(bytes, 88) == crc32c(&bytes[..88]))
         .then(|| Self {
@@ -83,16 +90,12 @@ impl Commit {
             end: u64_at(bytes, 48),
             hash: bytes[56..88].try_into().unwrap(),
         })
-        .filter(|commit| {
-            commit.index != 0
-                && commit.start <= commit.end
-                && commit.length <= LIMITS[kind as usize]
-        })
+        .filter(Self::valid)
     }
 }
 
 fn commit(kind: Kind, generation: u32, meta: Meta, bytes: &[u8]) -> Result<(Commit, Sha256)> {
-    let (slot, body, epoch, index, start, end) = meta;
+    let (slot, body, epoch, [index, start, end]) = meta;
     let hash = Sha256::new().chain_update(bytes);
     let selected = Commit {
         slot,
@@ -106,15 +109,7 @@ fn commit(kind: Kind, generation: u32, meta: Meta, bytes: &[u8]) -> Result<(Comm
         end,
         hash: hash.clone().finalize().into(),
     };
-    require(
-        slot <= 1
-            && body <= 1
-            && generation != 0
-            && index != 0
-            && start <= end
-            && selected.length <= LIMITS[kind as usize]
-            && body_valid(&selected, bytes),
-    )?;
+    require(selected.valid() && body_valid(&selected, bytes))?;
     Ok((selected, hash))
 }
 
@@ -247,20 +242,13 @@ impl Store {
     }
 
     pub fn duplicate(&self) -> Result<Self> {
-        Ok(Self::from_parts(
-            four(|at| self.slots[at].try_clone().map_err(Into::into))?,
-            self.selected,
-            self.hash.clone(),
-        ))
+        four(|at| self.slots[at].try_clone().map_err(Into::into))
+            .map(|slots| Self::from_parts(slots, self.selected, self.hash.clone()))
     }
 
     pub fn selected_result(&self) -> Result<Commit> {
-        recover(
-            &self.slots,
-            self.selected.kind,
-            Some(self.selected.generation),
-        )
-        .map(|(commit, _, _)| commit)
+        let selected = self.selected;
+        recover(&self.slots, selected.kind, Some(selected.generation)).map(|(commit, _, _)| commit)
     }
 
     #[doc(hidden)]
@@ -280,14 +268,6 @@ impl Store {
             .ok_or(StoreError::Exhausted)?;
         if length <= cap {
             let index = prior.index.checked_add(1).ok_or(StoreError::Exhausted)?;
-            rewrite(
-                &self.slots[prior.body as usize],
-                prior.length,
-                bytes,
-                true,
-                &mut gate,
-                StoreStep::Body,
-            )?;
             let hash = self.hash.clone().chain_update(bytes);
             let selected = Commit {
                 slot: 1 - prior.slot,
@@ -297,7 +277,7 @@ impl Store {
                 hash: hash.clone().finalize().into(),
                 ..prior
             };
-            return self.install(selected, hash, &mut gate);
+            return self.install((selected, hash, prior.length, bytes, true), &mut gate);
         }
         let keep = length.min(cap);
         let fresh = usize::try_from(added.min(keep)).map_err(|_| StoreError::Exhausted)?;
@@ -333,25 +313,24 @@ impl Store {
             Kind::Exit => return Err(StoreError::Exhausted),
         };
         require(epoch == expected)?;
-        let meta = (1 - prior.slot, 1 - prior.body, epoch, index, start, end);
+        let meta = (1 - prior.slot, 1 - prior.body, epoch, [index, start, end]);
         let (selected, hash) = commit(prior.kind, prior.generation, meta, bytes)?;
-        rewrite(
-            &self.slots[selected.body as usize],
-            0,
-            bytes,
-            false,
-            &mut gate,
-            StoreStep::Body,
-        )?;
-        self.install(selected, hash, &mut gate)
+        self.install((selected, hash, 0, bytes, false), &mut gate)
     }
 
     fn install(
         &mut self,
-        selected: Commit,
-        hash: Sha256,
+        (selected, hash, offset, bytes, truncate): Mutation<'_>,
         gate: &mut impl FnMut(StoreStep) -> Result<()>,
     ) -> Result<&Commit> {
+        rewrite(
+            &self.slots[selected.body as usize],
+            offset,
+            bytes,
+            truncate,
+            gate,
+            StoreStep::Body,
+        )?;
         rewrite(
             &self.slots[2 + selected.slot as usize],
             0,
@@ -380,23 +359,17 @@ fn initial_commit(
     bytes: &[u8],
     range: std::ops::Range<u64>,
 ) -> Result<(Commit, Sha256)> {
-    commit(
-        kind,
-        generation,
-        (
-            0,
-            0,
-            u32::from(kind != Kind::Event),
-            1,
-            range.start,
-            range.end,
-        ),
-        bytes,
-    )
+    let meta = (
+        0,
+        0,
+        u32::from(kind != Kind::Event),
+        [1, range.start, range.end],
+    );
+    commit(kind, generation, meta, bytes)
 }
 
 fn body_valid(commit: &Commit, body: &[u8]) -> bool {
-    let stored = crate::events::Stored(
+    let stored = Stored(
         commit.generation,
         commit.epoch,
         commit.index,
@@ -520,11 +493,9 @@ fn validate_at(directory_file: &File, slots: &[File]) -> Result<()> {
             .iter()
             .position(|candidate| candidate.as_bytes() == name)
             .ok_or(StoreError::Corrupt)?;
-        let (entry, handle) = (
-            crate::unix::stat_at(directory_file, NAMES[at].as_ref())
-                .map_err(|_| StoreError::Corrupt)?,
-            slots[at].metadata()?,
-        );
+        let entry = crate::unix::stat_at(directory_file, NAMES[at].as_ref())
+            .map_err(|_| StoreError::Corrupt)?;
+        let handle = slots[at].metadata()?;
         require(
             seen & (1 << at) == 0
                 && entry.st_mode & libc::S_IFMT == libc::S_IFREG
@@ -568,11 +539,8 @@ fn recover(slots: &[File; 4], kind: Kind, generation: Option<u32>) -> Result<Can
     )
 }
 
-fn select_candidates(
-    left: Result<Option<Candidate>>,
-    right: Result<Option<Candidate>>,
-) -> Result<Candidate> {
-    match (left.unwrap_or(None), right.unwrap_or(None)) {
+fn select_candidates(left: Option<Candidate>, right: Option<Candidate>) -> Result<Candidate> {
+    match (left, right) {
         (Some(a), Some(b)) if a.0.index == b.0.index || a.0.generation != b.0.generation => {
             Err(StoreError::Corrupt)
         }
@@ -587,21 +555,15 @@ fn read_commit(
     slot: u8,
     kind: Kind,
     generation: Option<u32>,
-) -> Result<Option<Candidate>> {
+) -> Option<Candidate> {
     let file = &slots[2 + slot as usize];
-    return_if!(file.metadata()?.len() != 92, Ok(None));
-    let record = read_range(file, 0, 92)?;
-    let Some(commit) = Commit::decode(&record, slot, kind, generation) else {
-        return Ok(None);
-    };
-    let Some(body) = read_range(&slots[commit.body as usize], 0, commit.length).ok() else {
-        return Ok(None);
-    };
+    (file.metadata().ok()?.len() == 92).then_some(())?;
+    let record = read_range(file, 0, 92).ok()?;
+    let commit = Commit::decode(&record, slot, kind, generation)?;
+    let body = read_range(&slots[commit.body as usize], 0, commit.length).ok()?;
     let hash = Sha256::new().chain_update(&body);
-    Ok(
-        (hash.clone().finalize().as_slice() == commit.hash && body_valid(&commit, &body))
-            .then_some((commit, hash, body)),
-    )
+    (hash.clone().finalize().as_slice() == commit.hash && body_valid(&commit, &body))
+        .then_some((commit, hash, body))
 }
 
 #[cfg(unix)]
@@ -681,10 +643,9 @@ fn rewrite(
         gate(step)?;
         file.set_len(end)?;
     }
-    gate(if step == StoreStep::Commit {
-        StoreStep::Flush
-    } else {
-        step
+    gate(match step {
+        StoreStep::Commit => StoreStep::Flush,
+        step => step,
     })?;
     file.sync_all().map_err(Into::into)
 }

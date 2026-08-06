@@ -22,9 +22,8 @@ mod recovery_tests {
     }
 
     #[test]
-    fn one_unreadable_candidate_cannot_hide_an_independently_valid_alternate() {
-        let torn = Err(StoreError::Io(io::ErrorKind::UnexpectedEof.into()));
-        let selected = select_candidates(torn, Ok(Some(candidate(9)))).unwrap();
+    fn one_invalid_candidate_cannot_hide_an_independently_valid_alternate() {
+        let selected = select_candidates(None, Some(candidate(9))).unwrap();
         assert_eq!(selected.0.index, 9);
     }
 }

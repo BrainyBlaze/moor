@@ -33,6 +33,18 @@ const STORE_HEADER: &str =
     "v:2,type:=header,ts:*,session:*,generation:*,epoch:u,next_seq:*,first_retained:*";
 const STORE_LIFECYCLE: &str = "v:1,type:=lifecycle,phase:t,session:*,generation:*,wire_generation:u,incarnation:b16,start_wall_ms:D,start_mono_ms:D,boot_id:b16,path_encoding:=posix-bytes/windows-wtf8,event_path:n,instrument_path:n";
 const STORE_LIFECYCLE_END: &str = "|end_wall_ms:D,output_end:D,ended:=exited,code:u|end_wall_ms:D,output_end:D,ended:=signalled,signal:p|end_wall_ms:D,output_end:D,ended:=terminated,code:u,method:=graceful/forced";
+const STORE_EVENTS: &str = concat!(
+    "ready:type:=ready,ts:*,epoch:u,seq:*,kind:=transition/snapshot\n",
+    "state:type:=state,ts:*,epoch:u,seq:*,kind:=transition/snapshot,state:=idle/busy,title:t255,truncated:?\n",
+    "link:type:=link,ts:*,epoch:u,seq:*,kind:=transition/snapshot,uri:t2048,truncated:?\n",
+    "semantic-source:type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=connected,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=exact,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=degraded,reason:=heartbeat-timeout|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=disconnected,reason:=transport-closed/superseded/session-ending\n",
+    "semantic-assertion:type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=transition/snapshot,payload:j|type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=snapshot,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=snapshot,payload:j\n",
+    "application-receipt:type:=application-receipt,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,application_request_id:b16,lease_epoch:p,request_id:d,status:=accepted/refused,provider_session:b4096,provider_turn:b4096\n",
+    "application-receipt-missing:type:=application-receipt-missing,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,application_request_id:b16,lease_epoch:p,request_id:d,reason:=deadline/source-lost/retention-expired\n",
+    "stream-exhausted:type:=stream-exhausted,ts:*,epoch:u,seq:*,kind:=transition,axis:=seq/epoch/commit\n",
+    "exit:type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=exited,code:u|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=signalled,signal:p|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=terminated,code:u,method:=graceful/forced\n",
+    "observer-degraded:type:=observer-degraded,ts:*,epoch:u,seq:*,kind:=transition,scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
+);
 
 pub fn event(name: &'static str, ts: u64, fields: &[(&str, Json<'_>)]) -> Event {
     let mut tail = String::with_capacity(fields.len().saturating_mul(32));
@@ -147,27 +159,10 @@ pub fn semantic_changes(ts: u64, changes: Vec<SemanticChange>) -> Result<Vec<Eve
         .collect()
 }
 
-pub(crate) fn schema(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "ready" => "",
-        "state" => "state:=idle/busy,title:t255,truncated:?",
-        "link" => "uri:t2048,truncated:?",
-        "semantic-source" => "source:s,producer:b16,source_epoch:p,status:t,reason:t",
-        "semantic-assertion" => {
-            "source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=transition/snapshot,payload:j"
-        }
-        "application-receipt" => {
-            "source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,application_request_id:b16,lease_epoch:p,request_id:d,status:=accepted/refused,provider_session:b4096,provider_turn:b4096"
-        }
-        "application-receipt-missing" => {
-            "source:s,producer:b16,source_epoch:p,application_request_id:b16,lease_epoch:p,request_id:d,reason:=deadline/source-lost/retention-expired"
-        }
-        "stream-exhausted" => "axis:=seq/epoch/commit",
-        "exit" => {
-            "ended:=exited,code:u|ended:=signalled,signal:p|ended:=terminated,code:u,method:=graceful/forced"
-        }
-        "observer-degraded" => "scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
-        _ => return None,
+fn event_schema(name: &str) -> Option<&'static str> {
+    STORE_EVENTS.lines().find_map(|row| {
+        let (candidate, schema) = row.split_once(':')?;
+        (candidate == name).then_some(schema)
     })
 }
 
@@ -215,47 +210,20 @@ fn stored_header(line: &[u8], generation: u32) -> Option<(u32, u64, u64)> {
     (session.starts_with(&[1, b'/']) || session.len() == 25 && session.first() == Some(&2))
         .then_some(())?;
     let epoch = u32::try_from(fields["epoch"].as_u64()?).ok()?;
-    let (end, first) = (
-        fields["next_seq"].as_u64()?,
-        fields["first_retained"].as_u64()?,
-    );
+    let end = fields["next_seq"].as_u64()?;
+    let first = fields["first_retained"].as_u64()?;
     (first <= end && end <= STORE_EVENT_END).then_some((epoch, first, end))
 }
 
 fn stored_line(line: &[u8], epoch: u32, sequence: u64) -> Option<u8> {
     let fields = canonical_object(line, 32)?;
     let kind = fields.get("type")?.as_str()?;
-    let record = fields.get("kind")?.as_str()?;
-    let snapshot = record == "snapshot";
+    let snapshot = fields.get("kind")?.as_str()? == "snapshot";
     let assertion = fields.get("assertion_kind").and_then(Value::as_str) == Some("snapshot");
-    let source_state = match (
-        fields.get("status").and_then(Value::as_str),
-        fields.get("reason").and_then(Value::as_str),
-    ) {
-        (Some("connected" | "exact"), Some(""))
-        | (Some("degraded"), Some("heartbeat-timeout"))
-        | (Some("disconnected"), Some("transport-closed" | "superseded" | "session-ending")) => {
-            true
-        }
-        _ => kind != "semantic-source",
-    };
-    let shape = fields
-        .keys()
-        .take(5)
-        .map(String::as_str)
-        .eq(["type", "ts", "epoch", "seq", "kind"])
-        && store_fields(&fields, 5..fields.len(), schema(kind)?)
+    let shape = store_fields(&fields, 0..fields.len(), event_schema(kind)?)
         && fields["epoch"].as_u64() == Some(u64::from(epoch))
         && sequence < STORE_EVENT_END
-        && fields["seq"].as_u64() == Some(sequence)
-        && matches!(record, "transition" | "snapshot")
-        && (!snapshot
-            || matches!(
-                kind,
-                "ready" | "state" | "link" | "semantic-source" | "semantic-assertion"
-            ))
-        && (!snapshot || kind != "semantic-assertion" || assertion)
-        && source_state;
+        && fields["seq"].as_u64() == Some(sequence);
     shape.then(|| {
         u8::from(snapshot)
             | (u8::from(kind == "stream-exhausted") * 2)

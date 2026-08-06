@@ -489,6 +489,7 @@ fn an_atomically_issued_commit_may_finish_after_quarantine() {
     // Quarantine may therefore leave only that commit's already-issued flush
     // to finish; it must never permit a later write or truncate operation.
     entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(lane.phase(), 3, "the issued flush was not in COMMIT phase");
     assert_eq!(
         fs::metadata(path.join("commit.1")).unwrap().len(),
         92,
@@ -630,6 +631,32 @@ fn a_phase_zero_publication_lock_cannot_block_a_status_snapshot() {
 
     assert_eq!(prompt, Ok(true), "the holder waited or mapped Busy wrongly");
     drop(lane);
+    let _ = fs::remove_dir_all(path);
+}
+
+#[test]
+fn a_ready_completion_does_not_reacquire_the_frontier_lock() {
+    let (mut lane, path) = staged_lane("completion-frontier-lock");
+    let prior = frontier(&lane).index;
+    capped(&mut lane, Purpose::Test(1), b"ready".to_vec(), 64, 5).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lane.selected().is_none_or(|commit| commit.index == prior) {
+        assert!(Instant::now() < deadline, "worker did not publish");
+        std::thread::yield_now();
+    }
+
+    let (announce, entered) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    lane.block_publication(announce, gate);
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let done = lane.try_complete(Instant::now());
+    drop(release);
+
+    assert!(
+        done.is_some(),
+        "a ready completion waited on frontier state"
+    );
+    assert!(done.unwrap().result.is_ok());
     let _ = fs::remove_dir_all(path);
 }
 

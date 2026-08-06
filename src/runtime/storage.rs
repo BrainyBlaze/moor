@@ -22,14 +22,8 @@ schema!(struct pub(crate) StatusSnapshot derive [Clone, Copy] pub(crate) fields;
 schema!(enum pub(crate) SnapshotState; Ready(StatusSnapshot), Busy, Failed);
 
 impl Events {
-    fn body(&self, cursor: Cursor, history: bool, records: &str) -> String {
-        let history = if history { &self.records } else { "" };
-        let mut body =
-            events::canonical_header(self.created, &self.session, self.generation, cursor);
-        body.reserve(history.len() + records.len());
-        body.push_str(history);
-        body.push_str(records);
-        body
+    fn header(&self, cursor: Cursor) -> String {
+        events::canonical_header(self.created, &self.session, self.generation, cursor)
     }
 }
 
@@ -53,19 +47,18 @@ impl SessionStorage {
                 )
                 .len()
                     + TERMINAL_RESERVATION;
-                let state = Events {
-                    stream: config.stream,
-                    records: String::new(),
-                    created: config.created,
-                    session: config.session,
-                    generation: config.generation,
-                    reserved,
-                    snapshots: [None, None, None],
-                    semantic: Default::default(),
-                };
                 (
                     Lane::new(config.store, jobs.min(64), bytes.min(512 << 10)),
-                    state,
+                    Events {
+                        stream: config.stream,
+                        records: String::new(),
+                        created: config.created,
+                        session: config.session,
+                        generation: config.generation,
+                        reserved,
+                        snapshots: [None, None, None],
+                        semantic: Default::default(),
+                    },
                 )
             })
             .unzip();
@@ -99,7 +92,7 @@ impl SessionStorage {
 
     fn record(
         &mut self,
-        purpose: Purpose,
+        mut purpose: Purpose,
         transitions: &[Event],
         remember_after: Option<usize>,
     ) -> Result<(), StorageError> {
@@ -125,63 +118,62 @@ impl SessionStorage {
         let (mut records, mut cursor, mut exhausted) = next
             .transact(&[], transitions, false)
             .map_err(|_| StorageError::Disabled)?;
-        let mut body = events.body(cursor, true, &records);
+        let mut body = events.header(cursor);
+        let mut body_len = body.len() + events.records.len() + records.len();
         let mut compacted = false;
-        if body.len() > 256 << 10 {
-            let mut snapshots = events
-                .snapshots
-                .iter()
-                .flatten()
-                .cloned()
-                .collect::<Vec<_>>();
-            snapshots.extend(
+        if body_len > 256 << 10 {
+            let snapshots =
                 events
-                    .semantic
+                    .snapshots
                     .iter()
-                    .filter(|(key, _)| !retained.contains_key(*key))
-                    .map(|(_, (event, _))| event.clone()),
-            );
+                    .flatten()
+                    .chain(events.semantic.iter().filter_map(|(key, (event, _))| {
+                        (!retained.contains_key(key)).then_some(event)
+                    }))
+                    .cloned()
+                    .collect::<Vec<_>>();
             next = events.stream;
             (records, cursor, exhausted) = next
                 .transact(&snapshots, transitions, true)
                 .map_err(|_| StorageError::Disabled)?;
             compacted = !matches!(exhausted, Some(Axis::Sequence | Axis::Epoch));
-            body = events.body(cursor, !compacted, &records);
+            body = events.header(cursor);
+            body_len = body.len() + records.len() + usize::from(!compacted) * events.records.len();
         }
         return_if!(
-            body.len() > 320 << 10 || body.len() > 256 << 10 && changes && exhausted.is_none(),
+            body_len > 320 << 10 || body_len > 256 << 10 && changes && exhausted.is_none(),
             Err(StorageError::Busy)
         );
         let Cursor(epoch, next_sequence, first, _) = cursor;
         let accepted = exhausted != Some(Axis::Sequence);
-        let purpose = match purpose {
-            Purpose::Semantic(tag, _) => Purpose::Semantic(tag, exhausted.is_some()),
-            purpose => purpose,
-        };
+        if let Purpose::Semantic(tag, _) = purpose {
+            purpose = Purpose::Semantic(tag, exhausted.is_some());
+        }
+        body.reserve(body_len - body.len());
+        if !compacted {
+            body.push_str(&events.records);
+        }
+        body.push_str(&records);
         let body = body.into_bytes();
-        let submitted = if accepted {
-            purpose
-        } else {
-            Purpose::Background
-        };
+        if !accepted {
+            purpose = Purpose::Background;
+        }
         self.lanes[1]
             .as_mut()
             .ok_or(StorageError::Disabled)?
-            .submit(submitted, Work::Replace(body, epoch, first, next_sequence))?;
+            .submit(purpose, Work::Replace(body, epoch, first, next_sequence))?;
         events.stream = next;
         if compacted {
-            events.records = records;
-        } else {
-            events.records.push_str(&records);
+            events.records.clear();
         }
-        if accepted {
-            if let Some(slot) = remember_after {
-                events.snapshots[slot] = transitions.first().cloned();
-            }
-            events.reserved = reserved;
-            events.semantic.extend(retained);
+        events.records.push_str(&records);
+        return_if!(!accepted, Err(StorageError::Disabled));
+        if let Some(slot) = remember_after {
+            events.snapshots[slot] = transitions.first().cloned();
         }
-        accepted.then_some(()).ok_or(StorageError::Disabled)
+        events.reserved = reserved;
+        events.semantic.extend(retained);
+        Ok(())
     }
 
     pub fn clear(&mut self, tag: u64, observed: u64, end: u64) -> Result<(), StorageError> {
@@ -214,14 +206,13 @@ impl SessionStorage {
     pub const EVENT_LANE: usize = 1;
 
     pub fn health(&self) -> u8 {
-        let event = u8::from(
-            self.events
-                .as_ref()
-                .is_some_and(|events| events.stream.writable()),
-        ) << Self::EVENT_LANE;
+        let event = self
+            .events
+            .as_ref()
+            .is_some_and(|events| events.stream.writable());
         self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
             bits | (u8::from(lane.as_ref().is_some_and(Lane::writable)) << at)
-        }) & (!2 | event)
+        }) & (!2 | (u8::from(event) << Self::EVENT_LANE))
     }
 
     /// Acquire a nonblocking memory-only status linearization point across all
@@ -233,12 +224,11 @@ impl SessionStorage {
         let mut held = 0u8;
         for (at, lane) in self.lanes.iter().enumerate() {
             let Some(lane) = lane else { continue };
-            if lane.hold() {
-                held |= 1 << at;
-            } else {
+            if !lane.hold() {
                 self.release_held(held);
                 return SnapshotState::Busy;
             }
+            held |= 1 << at;
         }
         let event = self.lanes[Self::EVENT_LANE].as_ref().map(Lane::snapshot);
         let log = self.lanes[0].as_ref().map(Lane::snapshot);
@@ -288,9 +278,7 @@ impl SessionStorage {
     }
 
     pub(crate) fn quarantine_log(&mut self) {
-        if let Some(lane) = self.lanes[0].as_mut() {
-            lane.close();
-        }
+        self.lanes[0].iter_mut().for_each(Lane::close);
     }
 }
 

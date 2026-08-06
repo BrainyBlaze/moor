@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 type Outcome = Result<(Commit, bool), StoreError>;
 type Job = (Purpose, Instant, usize);
 type Submitted = (Work, Instant);
-schema!(struct Published fields; frontier: Option<Commit>, completed: VecDeque<Outcome>);
 schema!(enum pub(crate) Frontier; Ready(Option<Commit>), Busy, Failed);
 const BODY: u8 = 1;
 const DIRTY: u8 = 2;
@@ -24,7 +23,8 @@ const PUBLISHING: u8 = 16;
 
 struct State {
     bits: AtomicU8,
-    published: Mutex<Published>,
+    frontier: Mutex<Option<Commit>>,
+    completed: Mutex<VecDeque<Outcome>>,
 }
 
 impl State {
@@ -67,7 +67,7 @@ impl State {
             .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
     }
 
-    fn set_unless(&self, blocked: u8, set: u8) -> bool {
+    fn claim(&self, blocked: u8, set: u8) -> bool {
         self.bits
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state & blocked == 0).then_some(state | set)
@@ -75,19 +75,15 @@ impl State {
             .is_ok()
     }
 
-    fn publish(&self) -> bool {
-        self.set_unless(CLOSED, PUBLISHING)
-    }
-
-    fn expire(&self) -> bool {
-        self.set_unless(PUBLISHING, CLOSED)
-    }
-
-    fn finish(&self, failed: bool) {
+    fn finish(&self, failed: bool, result: Option<Outcome>) {
         if failed {
             self.close();
         }
+        let mut completed = self.completed.lock().expect("completion lock");
         self.bits.fetch_and(CLOSED, Ordering::AcqRel);
+        if let Some(result) = result {
+            completed.push_back(result);
+        }
     }
 
     fn close(&self) {
@@ -96,19 +92,6 @@ impl State {
 
     fn closed(&self) -> bool {
         self.bits.load(Ordering::Acquire) & CLOSED != 0
-    }
-
-    fn phase(&self) -> u8 {
-        self.bits.load(Ordering::Acquire) & PHASE
-    }
-
-    fn hold(&self) -> bool {
-        let state = self.bits.load(Ordering::Acquire);
-        state & PHASE == 0 && self.change(state, state | HELD).is_ok()
-    }
-
-    fn release(&self) {
-        self.bits.fetch_and(!PHASE, Ordering::Release);
     }
 }
 
@@ -168,10 +151,8 @@ impl Lane {
         let (submit, work) = mpsc::channel::<Submitted>();
         let state = Arc::new(State {
             bits: AtomicU8::new(0),
-            published: Mutex::new(Published {
-                frontier: Some(*store.selected()),
-                completed: VecDeque::new(),
-            }),
+            frontier: Mutex::new(Some(*store.selected())),
+            completed: Mutex::new(VecDeque::new()),
         });
         let worker_state = Arc::clone(&state);
         std::thread::spawn(move || {
@@ -184,7 +165,8 @@ impl Lane {
                 // commit, so publishing it directly avoids a full read/hash of
                 // the store after every append. Only an ambiguous commit-phase
                 // error needs recovery through the already validated handles.
-                let selected = match (&result, worker_state.phase()) {
+                let phase = worker_state.bits.load(Ordering::Acquire) & PHASE;
+                let selected = match (&result, phase) {
                     (Ok((commit, _)), _) => Some(*commit),
                     // None is published as an explicit unknown frontier; the
                     // holder then refuses STATUS/ATTACH instead of silently
@@ -193,27 +175,22 @@ impl Lane {
                     (Err(_), DIRTY) => None,
                     (Err(_), _) => Some(*store.selected()),
                 };
-                let completed = Instant::now();
-                let publishing = completed < deadline && worker_state.publish();
+                let publishing =
+                    worker_state.claim(CLOSED, PUBLISHING) && Instant::now() < deadline;
                 let result_failed = result.is_err();
-                let mut published = worker_state.published.lock().expect("published lock");
-                match (&mut published.frontier, selected) {
-                    (Some(current), Some(commit)) if commit.index > current.index => {
-                        *current = commit
-                    }
-                    (_, None) => published.frontier = None,
-                    _ => {}
+                {
+                    let mut frontier = worker_state.frontier.lock().expect("frontier lock");
+                    // Unknown is absorbing; otherwise publication is monotonic.
+                    *frontier = (*frontier)
+                        .zip(selected)
+                        .map(|(old, new)| if old.index < new.index { new } else { old });
                 }
                 let abandoned = worker_state.closed();
-                let failed = result_failed || completed >= deadline || abandoned;
+                let failed = result_failed || !publishing || abandoned;
                 // Make completion delivery a phase barrier: once a controller
                 // observes `next()`, the lane is already snapshottable (or
                 // terminally closed on failure).
-                worker_state.finish(failed);
-                if publishing && !abandoned {
-                    published.completed.push_back(result);
-                }
-                drop(published);
+                worker_state.finish(failed, (publishing && !abandoned).then_some(result));
                 if failed || worker_state.closed() {
                     break;
                 }
@@ -265,10 +242,10 @@ impl Lane {
             Err(failure(kind))
         } else {
             let state = Arc::clone(&self.state);
-            match state.published.try_lock() {
-                Ok(mut published) => match published.completed.pop_front() {
+            match state.completed.try_lock() {
+                Ok(mut completed) => match completed.pop_front() {
                     Some(result) => result,
-                    None if now < deadline || !self.state.expire() => return None,
+                    None if now < deadline || !self.state.claim(PUBLISHING, CLOSED) => return None,
                     None => Err(self.fail(ErrorKind::TimedOut)),
                 },
                 Err(TryLockError::WouldBlock) => return None,
@@ -288,14 +265,15 @@ impl Lane {
     }
 
     pub(crate) fn hold(&self) -> bool {
-        self.state.hold()
+        let state = self.state.bits.load(Ordering::Acquire);
+        state & PHASE == 0 && self.state.change(state, state | HELD).is_ok()
     }
     pub(crate) fn release(&self) {
-        self.state.release();
+        self.state.bits.fetch_and(!PHASE, Ordering::Release);
     }
     pub(crate) fn snapshot(&self) -> Frontier {
-        match self.state.published.try_lock() {
-            Ok(published) => Frontier::Ready(published.frontier),
+        match self.state.frontier.try_lock() {
+            Ok(frontier) => Frontier::Ready(*frontier),
             Err(TryLockError::WouldBlock) => Frontier::Busy,
             Err(TryLockError::Poisoned(_)) => Frontier::Failed,
         }
