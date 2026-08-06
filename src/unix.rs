@@ -29,6 +29,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
+type StoreResult<T> = std::result::Result<T, StoreError>;
 
 trait Text<T> {
     fn text(self) -> Result<T>;
@@ -72,7 +73,7 @@ macro_rules! syscall {
     };
 }
 
-crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: ArtifactTarget, log: Option<ArtifactTarget>, stage: Stage,
+crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: StoreTarget, log: Option<StoreTarget>, stage: Stage,
     command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
 crate::schema!(struct UnixNative fields; control: File, group: i32, child: Child);
 crate::schema!(struct ViewerTerminal derive [Clone, Copy] fields; fd: i32, saved: libc::termios);
@@ -91,23 +92,20 @@ struct PreparedInstrument {
 
 struct RawTerminal(ViewerTerminal);
 struct ChildGuard(Option<Child>);
+struct PendingEvent(PathBuf, File, OsString, Option<File>);
 struct EventTarget {
     operand: PathBuf,
-    parent: File,
-    leaf: OsString,
-    directory: Option<File>,
-    created: Option<(u64, u64)>,
-    prepared: Option<PreparedStore>,
-    validator: Option<Store>,
-    armed: bool,
+    target: StoreTarget,
 }
-struct ArtifactTarget {
+struct StoreTarget {
     parent: File,
     leaf: OsString,
     directory: File,
     identity: (u64, u64),
     prepared: PreparedStore,
     validator: Option<Store>,
+    exact_selection: bool,
+    owned: bool,
     armed: bool,
 }
 struct Stage(File, OsString, Option<(u64, u64)>, bool);
@@ -124,14 +122,22 @@ impl ChildGuard {
 }
 
 impl Config<'_> {
+    fn store_targets(&mut self) -> impl DoubleEndedIterator<Item = &mut StoreTarget> {
+        [
+            self.event.as_mut().map(|event| &mut event.target),
+            Some(&mut self.lifecycle),
+            self.log.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    fn retain_store_targets(&mut self) {
+        self.store_targets().for_each(StoreTarget::retain);
+    }
+
     fn retain_stores(&mut self) {
-        if let Some(event) = self.event.as_mut() {
-            event.retain();
-        }
-        self.lifecycle.retain();
-        if let Some(log) = self.log.as_mut() {
-            log.retain();
-        }
+        self.retain_store_targets();
         if let Some(instrument) = self.instrument.as_mut() {
             instrument.retain();
         }
@@ -146,13 +152,7 @@ impl Config<'_> {
         if let Some(instrument) = self.instrument.as_mut() {
             instrument.rollback();
         }
-        if let Some(log) = self.log.as_mut() {
-            log.rollback();
-        }
-        self.lifecycle.rollback();
-        if let Some(event) = self.event.as_mut() {
-            event.rollback();
-        }
+        self.store_targets().rev().for_each(StoreTarget::rollback);
         self.stage.rollback();
     }
 }
@@ -221,7 +221,7 @@ pub(crate) fn create(
     );
     let terminal = terminal_config(interactive)?;
     let root = root(invoked)?;
-    let mut event = validate_event_target(options.events.as_deref(), &root, path)?;
+    let event = validate_event_target(options.events.as_deref(), &root, path)?;
     let stderr = options.stderr.as_deref().map(open_stderr).transpose()?;
     let instrument_source = options
         .instrument
@@ -292,13 +292,11 @@ pub(crate) fn create(
         .text()?;
     let mut stage = stage;
     stage.capture()?;
-    if let Some(event) = &mut event {
-        event.prepare()?;
-    }
+    let event = event.map(PendingEvent::prepare).transpose()?;
     let log = (options.log_cap != 0)
-        .then(|| ArtifactTarget::prepare(&stage.0, &shared::companion(path, ".log")))
+        .then(|| StoreTarget::prepare(&stage.0, &shared::companion(path, ".log")))
         .transpose()?;
-    let lifecycle = ArtifactTarget::prepare(&stage.0, &shared::companion(path, ".exit"))?;
+    let lifecycle = StoreTarget::prepare(&stage.0, &shared::companion(path, ".exit"))?;
     let instrument = instrument_source
         .zip(instrument_path.as_deref())
         .map(|(source, path)| PreparedInstrument::prepare(source, &root, path))
@@ -512,7 +510,7 @@ fn holder(
             config
                 .log
                 .as_ref()
-                .map(ArtifactTarget::revalidate)
+                .map(StoreTarget::revalidate)
                 .transpose()
                 .map(|_| ())
         });
@@ -652,65 +650,32 @@ fn wait_natural_exit(
     }
 }
 
-enum InitialTarget<'a> {
-    Artifact(&'a ArtifactTarget),
-    Event(&'a EventTarget),
-}
-
-struct InitialStore<'a> {
-    target: InitialTarget<'a>,
-    store: &'a Store,
-    body: &'a [u8],
-}
-
-impl InitialStore<'_> {
-    fn initialize(&self) -> Result<()> {
-        match self.target {
-            InitialTarget::Artifact(target) => target.initialize(self.store, self.body),
-            InitialTarget::Event(target) => target.initialize(self.store, self.body),
-        }
-    }
-
-    fn descriptors(&self) -> Vec<i32> {
-        let (parent, directory, prepared) = match self.target {
-            InitialTarget::Artifact(target) => {
-                (&target.parent, &target.directory, &target.prepared)
-            }
-            InitialTarget::Event(target) => (
-                &target.parent,
-                target.directory.as_ref().expect("prepared event directory"),
-                target.prepared.as_ref().expect("prepared event slots"),
-            ),
-        };
-        let mut descriptors = Vec::from(prepared.raw_descriptors());
-        descriptors.extend(self.store.raw_descriptors());
-        descriptors.extend([parent.as_raw_fd(), directory.as_raw_fd()]);
-        descriptors.sort_unstable();
-        descriptors.dedup();
-        descriptors
-    }
-}
+struct InitialStore<'a>(&'a StoreTarget, &'a Store, &'a [u8]);
 
 fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (String, bool)> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let descriptors: Vec<_> = stores.iter().map(InitialStore::descriptors).collect();
     let mut workers = Vec::with_capacity(stores.len());
-    let mut failed = None;
-    for (at, store) in stores.iter().enumerate() {
+    let mut failed = false;
+    for store in stores {
+        let mut descriptors = Vec::from(store.0.prepared.raw_descriptors());
+        descriptors.extend(store.1.raw_descriptors());
+        descriptors.extend([store.0.parent.as_raw_fd(), store.0.directory.as_raw_fd()]);
+        descriptors.sort_unstable();
+        descriptors.dedup();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            failed = Some(at);
+            failed = true;
             break;
         }
         if pid == 0 {
-            unsafe { close_fds::close_open_fds(3, &descriptors[at]) };
-            let status = u8::from(store.initialize().is_err());
+            unsafe { close_fds::close_open_fds(3, &descriptors) };
+            let status = u8::from(store.0.initialize(store.1, store.2).is_err());
             unsafe { libc::_exit(i32::from(status)) }
         }
-        workers.push((pid, at, None));
+        workers.push((pid, None));
     }
-    while workers.iter().any(|worker| worker.2.is_none()) && Instant::now() < deadline {
-        for (pid, at, status) in &mut workers {
+    while workers.iter().any(|worker| worker.1.is_none()) && Instant::now() < deadline {
+        for (pid, status) in &mut workers {
             if status.is_some() {
                 continue;
             }
@@ -720,32 +685,32 @@ fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (St
                     let success = libc::WIFEXITED(observed) && libc::WEXITSTATUS(observed) == 0;
                     *status = Some(success);
                     if !success {
-                        failed.get_or_insert(*at);
+                        failed = true;
                     }
                 }
                 -1 if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => {
                     *status = Some(false);
-                    failed.get_or_insert(*at);
+                    failed = true;
                 }
                 _ => {}
             }
         }
-        if failed.is_some() {
+        if failed {
             break;
         }
         thread::sleep(Duration::from_millis(2));
     }
-    if failed.is_none() && workers.iter().all(|worker| worker.2 == Some(true)) {
+    if !failed && workers.iter().all(|worker| worker.1 == Some(true)) {
         return Ok(());
     }
-    for (pid, _, status) in &workers {
+    for (pid, status) in &workers {
         if status.is_none() {
             unsafe { libc::kill(*pid, libc::SIGKILL) };
         }
     }
     let reap_deadline = Instant::now() + Duration::from_millis(250);
-    while workers.iter().any(|worker| worker.2.is_none()) && Instant::now() < reap_deadline {
-        for (pid, _, status) in &mut workers {
+    while workers.iter().any(|worker| worker.1.is_none()) && Instant::now() < reap_deadline {
+        for (pid, status) in &mut workers {
             if status.is_none() {
                 let mut observed = 0;
                 if unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } == *pid {
@@ -755,9 +720,9 @@ fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (St
         }
         thread::sleep(Duration::from_millis(2));
     }
-    let confirmed = workers.iter().all(|worker| worker.2.is_some());
+    let confirmed = workers.iter().all(|worker| worker.1.is_some());
     Err((
-        if failed.is_some() {
+        if failed {
             "store initialization failed".into()
         } else {
             "store initialization timed out".into()
@@ -849,9 +814,11 @@ fn holder_setup(
             Cursor(0, 0, 0, 1),
         )
     });
+    let running_body = running.as_bytes();
     let lifecycle_store = config
         .lifecycle
-        .lease(Kind::Exit, generation, running.as_bytes())?;
+        .lease(Kind::Exit, generation, running_body)
+        .map_err(|error| format!("store lease failed: {error:?}"))?;
     let event_store = config
         .event
         .as_mut()
@@ -861,41 +828,30 @@ fn holder_setup(
     let log_store = config
         .log
         .as_mut()
-        .map(|log| log.lease(Kind::Log, generation, &[]))
+        .map(|log| {
+            log.lease(Kind::Log, generation, &[])
+                .map_err(|error| format!("store lease failed: {error:?}"))
+        })
         .transpose()?;
     adopt(generation);
-    let mut initial = vec![InitialStore {
-        target: InitialTarget::Artifact(&config.lifecycle),
-        store: &lifecycle_store,
-        body: running.as_bytes(),
-    }];
+    let mut initial = vec![InitialStore(
+        &config.lifecycle,
+        &lifecycle_store,
+        running_body,
+    )];
     if let (Some(target), Some(store), Some(body)) = (
         config.event.as_ref(),
         event_store.as_ref(),
         event_initial.as_deref(),
     ) {
-        initial.push(InitialStore {
-            target: InitialTarget::Event(target),
-            store,
-            body: body.as_bytes(),
-        });
+        initial.push(InitialStore(&target.target, store, body.as_bytes()));
     }
     if let (Some(target), Some(store)) = (config.log.as_ref(), log_store.as_ref()) {
-        initial.push(InitialStore {
-            target: InitialTarget::Artifact(target),
-            store,
-            body: &[],
-        });
+        initial.push(InitialStore(target, store, &[]));
     }
     if let Err((error, rollback)) = initialize_stores(&initial) {
         if !rollback {
-            config.lifecycle.retain();
-            if let Some(event) = config.event.as_mut() {
-                event.retain();
-            }
-            if let Some(log) = config.log.as_mut() {
-                log.retain();
-            }
+            config.retain_store_targets();
         }
         return Err(error.into());
     }
@@ -1158,7 +1114,7 @@ fn validate_event_target(
     path: Option<&Path>,
     root: &Path,
     marker: &Path,
-) -> Result<Option<EventTarget>> {
+) -> Result<Option<PendingEvent>> {
     let Some(path) = path else {
         return Ok(None);
     };
@@ -1179,16 +1135,7 @@ fn validate_event_target(
     if let Some(opened) = &opened {
         validate_event_directory(opened, path)?;
     }
-    Ok(Some(EventTarget {
-        operand: path.to_owned(),
-        parent,
-        leaf,
-        directory: opened,
-        created: None,
-        prepared: None,
-        validator: None,
-        armed: true,
-    }))
+    Ok(Some(PendingEvent(path.to_owned(), parent, leaf, opened)))
 }
 
 fn open_event_target(
@@ -1310,174 +1257,81 @@ where
     }
 }
 
-impl EventTarget {
-    fn store_error(&self, error: StoreError) -> String {
-        event_rejection(
-            &self.operand,
-            if matches!(error, StoreError::Corrupt) {
-                "identity-changed"
-            } else {
-                "io-error"
-            },
-        )
-    }
+fn event_store_error(operand: &Path, error: StoreError) -> String {
+    let cause = if matches!(error, StoreError::Corrupt) {
+        "identity-changed"
+    } else {
+        "io-error"
+    };
+    event_rejection(operand, cause)
+}
 
-    fn prepare(&mut self) -> Result<()> {
-        let operand = self.operand.clone();
-        let directory = self.provision()?;
-        self.prepared = Some(Store::prepare_at(directory).map_err(|error| {
-            event_rejection(
-                &operand,
-                if matches!(error, StoreError::Corrupt) {
-                    "identity-changed"
-                } else {
-                    "io-error"
-                },
-            )
-        })?);
-        Ok(())
-    }
+enum DirectoryFailure {
+    Io(io::Error),
+    Identity(Option<io::Error>),
+}
 
-    fn lease(&mut self, generation: u32, initial: &[u8]) -> Result<Store> {
-        let directory = self
-            .directory
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
-        let prepared = self
-            .prepared
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
-        let store = prepared
-            .lease_at(directory, Kind::Event, generation, initial, 0, 0)
-            .map_err(|error| self.store_error(error))?;
-        self.validator = Some(store.duplicate().map_err(|error| self.store_error(error))?);
-        Ok(store)
-    }
-
-    fn initialize(&self, store: &Store, initial: &[u8]) -> Result<()> {
-        self.parent
-            .sync_all()
-            .map_err(|_| event_rejection(&self.operand, "io-error"))?;
-        self.prepared
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?
-            .initialize_leased_at(
-                self.directory
-                    .as_ref()
-                    .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?,
-                store,
-                initial,
-            )
-            .map_err(|error| self.store_error(error))
-    }
-
-    fn provision(&mut self) -> Result<&File> {
-        if self.directory.is_none() {
-            let name =
-                native_name(&self.leaf).map_err(|_| event_rejection(&self.operand, "io-error"))?;
-            let status = unsafe { libc::mkdirat(self.parent.as_raw_fd(), name.as_ptr(), 0o700) };
-            if status != 0 {
-                let error = io::Error::last_os_error();
-                return Err(event_rejection(
-                    &self.operand,
-                    if error.kind() == io::ErrorKind::AlreadyExists {
-                        "identity-changed"
-                    } else {
-                        "io-error"
-                    },
-                ));
-            }
-            let created = stat_at(&self.parent, &self.leaf)
-                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
-            crate::ensure!(
-                created.st_mode & libc::S_IFMT == libc::S_IFDIR,
-                event_rejection(&self.operand, "identity-changed")
-            );
-            self.created = Some(stat_identity(&created));
-            chmod_at(&self.parent, &self.leaf, 0o700)
-                .map_err(|_| event_rejection(&self.operand, "io-error"))?;
-            let protected = stat_at(&self.parent, &self.leaf)
-                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
-            crate::ensure!(
-                protected.st_mode & libc::S_IFMT == libc::S_IFDIR
-                    && stat_identity(&protected) == self.created.unwrap()
-                    && protected.st_mode & 0o777 == 0o700,
-                event_rejection(&self.operand, "identity-changed")
-            );
-            let opened = open_directory_at(&self.parent, &self.leaf)
-                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
-            crate::ensure!(
-                file_id(
-                    &opened
-                        .metadata()
-                        .map_err(|_| event_rejection(&self.operand, "io-error"))?
-                ) == self.created.unwrap(),
-                event_rejection(&self.operand, "identity-changed")
-            );
-            self.directory = Some(opened);
-            let opened = self.directory.as_ref().unwrap();
-            validate_event_directory(opened, &self.operand)?;
+impl DirectoryFailure {
+    fn artifact(self) -> String {
+        match self {
+            Self::Io(error) | Self::Identity(Some(error)) => error.to_string(),
+            Self::Identity(None) => "artifact identity changed".into(),
         }
-        let directory = self.directory.as_ref().unwrap();
-        validate_event_directory(directory, &self.operand)?;
-        Ok(directory)
     }
 
-    fn revalidate(&self, root: &Path) -> Result<()> {
-        let resolved =
-            absolute(&self.operand).map_err(|_| event_rejection(&self.operand, "io-error"))?;
-        let (_, _, current) = open_event_target(root, &resolved, &self.operand)?;
-        let current = current.ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
-        let expected = self
-            .directory
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
-        crate::ensure!(
-            file_id(
-                &current
-                    .metadata()
-                    .map_err(|_| event_rejection(&self.operand, "io-error"))?
-            ) == file_id(
-                &expected
-                    .metadata()
-                    .map_err(|_| event_rejection(&self.operand, "io-error"))?
-            ),
-            event_rejection(&self.operand, "identity-changed")
-        );
-        let prepared = self
-            .prepared
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
-        prepared
-            .revalidate_at(expected)
-            .map_err(|error| self.store_error(error))?;
-        self.validator
-            .as_ref()
-            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?
-            .selected_result()
-            .map_err(|error| self.store_error(error))?;
-        Ok(())
-    }
-
-    fn retain(&mut self) {
-        self.armed = false;
-    }
-
-    fn rollback(&mut self) {
-        self.armed = false;
-        if let (Some(directory), Some(prepared)) = (&self.directory, &self.prepared) {
-            prepared.rollback_at(directory);
-        }
-        if self
-            .created
-            .is_some_and(|identity| directory_entry_matches(&self.parent, &self.leaf, identity))
-        {
-            let _ = remove_directory_at(&self.parent, &self.leaf);
-        }
+    fn event(self, operand: &Path) -> String {
+        let cause = match self {
+            Self::Identity(_) => "identity-changed",
+            Self::Io(_) => "io-error",
+        };
+        event_rejection(operand, cause)
     }
 }
 
-impl ArtifactTarget {
+fn create_directory_at(
+    parent: &File,
+    leaf: &OsStr,
+    name: &std::ffi::CStr,
+    require_owner: bool,
+) -> std::result::Result<(File, (u64, u64)), DirectoryFailure> {
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            DirectoryFailure::Identity(Some(error))
+        } else {
+            DirectoryFailure::Io(error)
+        });
+    }
+    let inspect = |error| DirectoryFailure::Identity(Some(error));
+    let stat = stat_at(parent, leaf).map_err(inspect)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(DirectoryFailure::Identity(None));
+    }
+    let identity = stat_identity(&stat);
+    let opened = (|| {
+        chmod_at(parent, leaf, 0o700).map_err(DirectoryFailure::Io)?;
+        let stat = stat_at(parent, leaf).map_err(inspect)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || stat_identity(&stat) != identity
+            || stat.st_mode & 0o777 != 0o700
+        {
+            return Err(DirectoryFailure::Identity(None));
+        }
+        let directory = open_directory_at(parent, leaf).map_err(inspect)?;
+        let meta = directory.metadata().map_err(DirectoryFailure::Io)?;
+        if !meta.is_dir() || file_id(&meta) != identity || require_owner && !protected(&meta, 0o700)
+        {
+            return Err(DirectoryFailure::Identity(None));
+        }
+        Ok(directory)
+    })();
+    if opened.is_err() && directory_entry_matches(parent, leaf, identity) {
+        let _ = remove_directory_at(parent, leaf);
+    }
+    opened.map(|directory| (directory, identity))
+}
+
+impl StoreTarget {
     fn prepare(parent: &File, path: &Path) -> Result<Self> {
         let parent = parent.try_clone().text()?;
         let leaf = path
@@ -1485,60 +1339,53 @@ impl ArtifactTarget {
             .ok_or("artifact path has no name")?
             .to_owned();
         let name = native_name(&leaf)?;
-        syscall!(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0);
-        let identity = match stat_at(&parent, &leaf) {
-            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => stat_identity(&stat),
-            result => {
-                let _ = remove_directory_at(&parent, &leaf);
-                return Err(result
-                    .err()
-                    .map_or("artifact identity changed".into(), |error| {
-                        error.to_string()
-                    }));
-            }
-        };
-        let prepared = (|| {
-            chmod_at(&parent, &leaf, 0o700).text()?;
-            let directory = open_directory_at(&parent, &leaf).text()?;
-            let meta = directory.metadata().text()?;
-            crate::ensure!(
-                meta.is_dir() && protected(&meta, 0o700) && file_id(&meta) == identity,
-                "artifact identity changed"
-            );
-            let prepared = Store::prepare_at(&directory)
-                .map_err(|error| format!("store preparation failed: {error:?}"))?;
-            Ok((directory, prepared))
-        })();
-        let (directory, prepared) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                if directory_entry_matches(&parent, &leaf, identity) {
-                    let _ = remove_directory_at(&parent, &leaf);
-                }
-                return Err(error);
-            }
-        };
-        Ok(Self {
-            parent,
-            leaf,
-            directory,
-            identity,
-            prepared,
-            validator: None,
-            armed: true,
-        })
+        let (directory, identity) =
+            create_directory_at(&parent, &leaf, &name, true).map_err(DirectoryFailure::artifact)?;
+        Self::from_directory(
+            (parent, leaf, directory, identity),
+            true,
+            true,
+            |_| Ok(()),
+            |error| format!("store preparation failed: {error:?}"),
+        )
     }
 
-    fn lease(&mut self, kind: Kind, generation: u32, initial: &[u8]) -> Result<Store> {
+    fn from_directory(
+        binding: (File, OsString, File, (u64, u64)),
+        owned: bool,
+        exact_selection: bool,
+        validate: impl FnOnce(&File) -> Result<()>,
+        store_error: impl FnOnce(StoreError) -> String,
+    ) -> Result<Self> {
+        let (parent, leaf, directory, identity) = binding;
+        let prepared =
+            validate(&directory).and_then(|()| Store::prepare_at(&directory).map_err(store_error));
+        match prepared {
+            Ok(prepared) => Ok(Self {
+                parent,
+                leaf,
+                directory,
+                identity,
+                prepared,
+                validator: None,
+                exact_selection,
+                owned,
+                armed: true,
+            }),
+            Err(error) => {
+                if owned && directory_entry_matches(&parent, &leaf, identity) {
+                    let _ = remove_directory_at(&parent, &leaf);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn lease(&mut self, kind: Kind, generation: u32, initial: &[u8]) -> StoreResult<Store> {
         let store = self
             .prepared
-            .lease_at(&self.directory, kind, generation, initial, 0, 0)
-            .map_err(|error| format!("store lease failed: {error:?}"))?;
-        self.validator = Some(
-            store
-                .duplicate()
-                .map_err(|error| format!("store lease failed: {error:?}"))?,
-        );
+            .lease_at(&self.directory, kind, generation, initial, 0, 0)?;
+        self.validator = Some(store.duplicate()?);
         Ok(store)
     }
 
@@ -1548,12 +1395,19 @@ impl ArtifactTarget {
             .initialize_leased_at(&self.directory, store, initial)
             .map_err(|error| format!("store initialization failed: {error:?}"))?;
         crate::ensure!(
-            store
-                .selected_result()
-                .is_ok_and(|selected| selected == *store.selected()),
+            !self.exact_selection
+                || store
+                    .selected_result()
+                    .is_ok_and(|selected| selected == *store.selected()),
             "store initialization failed: selected commit changed"
         );
         Ok(())
+    }
+
+    fn revalidate_store(&self) -> StoreResult<bool> {
+        self.prepared.revalidate_at(&self.directory)?;
+        let validator = self.validator.as_ref().ok_or(StoreError::Corrupt)?;
+        Ok(validator.selected_result()? == *validator.selected())
     }
 
     fn revalidate(&self) -> Result<()> {
@@ -1561,17 +1415,10 @@ impl ArtifactTarget {
             directory_entry_matches(&self.parent, &self.leaf, self.identity),
             "artifact identity changed"
         );
-        self.prepared
-            .revalidate_at(&self.directory)
+        let selected = self
+            .revalidate_store()
             .map_err(|error| format!("store identity changed: {error:?}"))?;
-        crate::ensure!(
-            self.validator.as_ref().is_some_and(|store| {
-                store
-                    .selected_result()
-                    .is_ok_and(|selected| selected == *store.selected())
-            }),
-            "store selected commit changed"
-        );
+        crate::ensure!(selected, "store selected commit changed");
         Ok(())
     }
 
@@ -1582,17 +1429,78 @@ impl ArtifactTarget {
     fn rollback(&mut self) {
         self.armed = false;
         self.prepared.rollback_at(&self.directory);
-        if directory_entry_matches(&self.parent, &self.leaf, self.identity) {
+        if self.owned && directory_entry_matches(&self.parent, &self.leaf, self.identity) {
             let _ = remove_directory_at(&self.parent, &self.leaf);
         }
     }
 }
 
-impl Drop for ArtifactTarget {
+impl Drop for StoreTarget {
     fn drop(&mut self) {
         if self.armed {
             self.rollback();
         }
+    }
+}
+
+impl PendingEvent {
+    fn prepare(self) -> Result<EventTarget> {
+        let PendingEvent(operand, parent, leaf, opened) = self;
+        let (directory, identity, owned) = match opened {
+            Some(directory) => {
+                let identity = directory
+                    .metadata()
+                    .map(|meta| file_id(&meta))
+                    .map_err(|_| event_rejection(&operand, "io-error"))?;
+                (directory, identity, false)
+            }
+            None => {
+                let name = native_name(&leaf).map_err(|_| event_rejection(&operand, "io-error"))?;
+                let (directory, identity) = create_directory_at(&parent, &leaf, &name, false)
+                    .map_err(|error| error.event(&operand))?;
+                (directory, identity, true)
+            }
+        };
+        let target = StoreTarget::from_directory(
+            (parent, leaf, directory, identity),
+            owned,
+            false,
+            |directory| {
+                for _ in 0..=u8::from(owned) {
+                    validate_event_directory(directory, &operand)?;
+                }
+                Ok(())
+            },
+            |error| event_store_error(&operand, error),
+        )?;
+        Ok(EventTarget { operand, target })
+    }
+}
+
+impl EventTarget {
+    fn lease(&mut self, generation: u32, initial: &[u8]) -> Result<Store> {
+        self.target
+            .lease(Kind::Event, generation, initial)
+            .map_err(|error| event_store_error(&self.operand, error))
+    }
+
+    fn revalidate(&self, root: &Path) -> Result<()> {
+        let resolved =
+            absolute(&self.operand).map_err(|_| event_rejection(&self.operand, "io-error"))?;
+        let (_, _, current) = open_event_target(root, &resolved, &self.operand)?;
+        let current = current.ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        crate::ensure!(
+            current
+                .metadata()
+                .map(|meta| file_id(&meta))
+                .map_err(|_| event_rejection(&self.operand, "io-error"))?
+                == self.target.identity,
+            event_rejection(&self.operand, "identity-changed")
+        );
+        self.target
+            .revalidate_store()
+            .map_err(|error| event_store_error(&self.operand, error))?;
+        Ok(())
     }
 }
 
@@ -1705,14 +1613,6 @@ impl PreparedInstrument {
 }
 
 impl Drop for PreparedInstrument {
-    fn drop(&mut self) {
-        if self.armed {
-            self.rollback();
-        }
-    }
-}
-
-impl Drop for EventTarget {
     fn drop(&mut self) {
         if self.armed {
             self.rollback();
