@@ -104,7 +104,7 @@ crate::schema!(struct StoreTarget fields; parent: File, leaf: OsString, director
 struct RawTerminal(ViewerTerminal);
 struct ChildGuard(Option<Child>);
 struct PendingEvent(PathBuf, File, OsString, Option<File>);
-struct Stage(File, OsString, Option<(u64, u64)>, bool);
+struct Stage(File, OsString, (u64, u64), bool);
 struct SetupError(String, bool);
 
 impl ChildGuard {
@@ -271,13 +271,8 @@ pub(crate) fn create(
         );
     }
     let (parent, publish) = socket_alias(path)?;
-    let stage = Stage(
-        parent,
-        OsString::from(format!(".moor-{}.stage", hex(shared::random_array()?))),
-        None,
-        true,
-    );
-    let stage_alias = publish.with_file_name(&stage.1);
+    let leaf = OsString::from(format!(".moor-{}.stage", hex(shared::random_array()?)));
+    let stage_alias = publish.with_file_name(&leaf);
     let stage_name = stage_alias
         .as_os_str()
         .to_fs_name::<GenericFilePath>()
@@ -289,8 +284,10 @@ pub(crate) fn create(
         .nonblocking(ListenerNonblockingMode::Accept)
         .create_sync()
         .text()?;
-    let mut stage = stage;
-    stage.capture()?;
+    let identity = entry_identity(&parent, &leaf, SFlag::S_IFSOCK, None)
+        .text()?
+        .ok_or_else(|| "staged rendezvous identity changed".to_string())?;
+    let stage = Stage(parent, leaf, identity, true);
     let event = event.map(PendingEvent::prepare).transpose()?;
     let log = (options.log_cap != 0)
         .then(|| StoreTarget::prepare(&stage.0, &shared::companion(path, ".log")))
@@ -388,25 +385,15 @@ impl Drop for Stage {
 }
 
 impl Stage {
-    fn capture(&mut self) -> Result<()> {
-        self.2 = entry_identity(&self.0, &self.1, SFlag::S_IFSOCK, None).text()?;
-        crate::require(self.2.is_some(), "staged rendezvous identity changed")
-    }
-
     fn matches(&self) -> bool {
-        self.2.is_some_and(|identity| {
-            entry_identity(&self.0, &self.1, SFlag::S_IFSOCK, None).ok() == Some(Some(identity))
-        })
-    }
-
-    fn revalidate(&self) -> Result<()> {
-        crate::require(self.matches(), "staged rendezvous identity changed")
+        entry_identity(&self.0, &self.1, SFlag::S_IFSOCK, None)
+            .is_ok_and(|identity| identity == Some(self.2))
     }
 
     fn published_identity(&self, destination: &OsStr) -> Result<(u64, u64)> {
         entry_identity(&self.0, destination, SFlag::S_IFSOCK, None)
             .text()?
-            .filter(|identity| self.2 == Some(*identity))
+            .filter(|identity| *identity == self.2)
             .ok_or_else(|| "published rendezvous identity changed".into())
     }
 
@@ -508,10 +495,11 @@ fn holder(
         return finalize_unpublished_exit(&mut state, &running, observed, &mut config, &mut ready);
     }
     let destination = path.file_name().ok_or("rendezvous has no name")?;
-    let publication = config.stage.revalidate().and_then(|()| {
-        publish_exclusive(&config.stage.0, &config.stage.1, destination)
-            .and_then(|()| config.stage.published_identity(destination))
-    });
+    let publication = crate::require(config.stage.matches(), "staged rendezvous identity changed")
+        .and_then(|()| {
+            publish_exclusive(&config.stage.0, &config.stage.1, destination)
+                .and_then(|()| config.stage.published_identity(destination))
+        });
     let marker = match publication {
         Ok(marker) => marker,
         Err(error) => {
@@ -628,65 +616,51 @@ fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (St
         }
         if pid == 0 {
             unsafe { close_fds::close_open_fds(3, &descriptors) };
-            let status = u8::from(store.0.initialize(store.1, store.2).is_err());
-            unsafe { libc::_exit(i32::from(status)) }
+            unsafe { libc::_exit(store.0.initialize(store.1, store.2).is_err() as i32) }
         }
-        workers.push((pid, None));
+        workers.push(pid);
     }
-    while workers.iter().any(|worker| worker.1.is_none()) && Instant::now() < deadline {
-        for (pid, status) in &mut workers {
-            if status.is_some() {
-                continue;
-            }
+    while !workers.is_empty() && !failed && Instant::now() < deadline {
+        workers.retain(|pid| {
             let mut observed = 0;
             match unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } {
                 result if result == *pid => {
                     let success = libc::WIFEXITED(observed) && libc::WEXITSTATUS(observed) == 0;
-                    *status = Some(success);
-                    if !success {
-                        failed = true;
-                    }
+                    failed |= !success;
+                    false
                 }
                 -1 if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => {
-                    *status = Some(false);
                     failed = true;
+                    false
                 }
-                _ => {}
+                _ => true,
             }
+        });
+        if !failed {
+            thread::sleep(Duration::from_millis(2));
         }
-        if failed {
-            break;
-        }
-        thread::sleep(Duration::from_millis(2));
     }
-    if !failed && workers.iter().all(|worker| worker.1 == Some(true)) {
+    if !failed && workers.is_empty() {
         return Ok(());
     }
-    for (pid, status) in &workers {
-        if status.is_none() {
-            unsafe { libc::kill(*pid, libc::SIGKILL) };
-        }
+    for pid in &workers {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
     let reap_deadline = Instant::now() + Duration::from_millis(250);
-    while workers.iter().any(|worker| worker.1.is_none()) && Instant::now() < reap_deadline {
-        for (pid, status) in &mut workers {
-            if status.is_none() {
-                let mut observed = 0;
-                if unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } == *pid {
-                    *status = Some(false);
-                }
-            }
-        }
+    while !workers.is_empty() && Instant::now() < reap_deadline {
+        workers.retain(|pid| {
+            let mut observed = 0;
+            (unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) }) != *pid
+        });
         thread::sleep(Duration::from_millis(2));
     }
-    let confirmed = workers.iter().all(|worker| worker.1.is_some());
     Err((
         if failed {
             "store initialization failed".into()
         } else {
             "store initialization timed out".into()
         },
-        confirmed,
+        workers.is_empty(),
     ))
 }
 
