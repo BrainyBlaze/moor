@@ -356,3 +356,36 @@ fn diagnostics_render_hostile_bytes_reversibly() {
         "moor: Invalid mode '-\\x0A\\xFF'\nTry 'moor --help' for more information.\n"
     );
 }
+
+#[test]
+fn v32_cli_numeric_fixtures_are_parsed_exactly() {
+    // The ratified §16 V32 numeric table. These are the fixtures that decide
+    // the OB-3 case-insensitivity reading, so they are the independent check on
+    // it rather than a restatement: 1k and 1K must both be 1024.
+    for operand in [
+        "0",
+        "1k",
+        "1K",
+        "2m",
+        "2M",
+        "3g",
+        "3G",
+        "18446744073709551615",
+        "18014398509481983k",
+    ] {
+        assert!(
+            parses(&["start", "s", "-C", operand]),
+            "-C {operand} must be a value"
+        );
+    }
+    // Overflow of the checked multiplication, a leading zero, a two-letter
+    // suffix, and a suffixed tail count are all invalid.
+    for args in [
+        &["start", "s", "-C", "18014398509481984k"][..],
+        &["start", "s", "-C", "01k"][..],
+        &["start", "s", "-C", "1kb"][..],
+        &["tail", "-n", "1k", "s"][..],
+    ] {
+        assert!(!parses(args), "{args:?} must be rejected");
+    }
+}
