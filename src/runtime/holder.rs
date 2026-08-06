@@ -366,9 +366,6 @@ impl<N: Native> Runtime<N> {
     pub fn shutdown_requested(&mut self, now: u64, force: bool) {
         let _ = self.transition(Transition::Shutdown(now, force));
     }
-}
-
-impl<N: Native> Runtime<N> {
     pub fn new(config: HolderConfig<N>) -> Self {
         let mut machine = Machine::new(
             config.core.generation,
@@ -411,17 +408,10 @@ impl<N: Native> Runtime<N> {
         termination: Option<bool>,
     ) -> (i32, bool) {
         let method = termination.map(|forced| if forced { "forced" } else { "graceful" });
-        let (exit, outcome) = match (status, method) {
-            (NativeExit::Code(code), Some(method)) => (
-                code as i32,
-                ("terminated", "code", u64::from(code), Some(method)),
-            ),
-            (NativeExit::Code(code), None) => {
-                (code as i32, ("exited", "code", u64::from(code), None))
-            }
-            (NativeExit::Signal(signal), _) => {
-                (1, ("signalled", "signal", u64::from(signal), None))
-            }
+        let ended = method.map_or("exited", |_| "terminated");
+        let (exit, outcome) = match status {
+            NativeExit::Code(code) => (code as i32, (ended, "code", u64::from(code), method)),
+            NativeExit::Signal(signal) => (1, ("signalled", "signal", u64::from(signal), None)),
         };
         let ts = now();
         let records = exit_records(running, (ts, now()), self.output_end(), outcome);
@@ -492,13 +482,11 @@ impl<N: Native> Runtime<N> {
     }
 
     pub fn finish(&mut self, event: Event, lifecycle: Vec<u8>) -> bool {
-        if !self.wait_storage(None) {
-            return false;
-        }
-        if self
-            .storage
-            .lifecycle(lifecycle, self.machine.output_end())
-            .is_err()
+        if !self.wait_storage(None)
+            || self
+                .storage
+                .lifecycle(lifecycle, self.machine.output_end())
+                .is_err()
             || !self.wait_storage(Some(Purpose::Lifecycle))
         {
             return false;
@@ -524,7 +512,6 @@ impl<N: Native> Runtime<N> {
         mut signal: impl FnMut() -> Option<bool>,
     ) -> Result<Option<NativeExit>> {
         let mut exited = None;
-        let mut drain_until = 0;
         loop {
             if exited.is_none() {
                 while let Some((transport, same_user)) = accept() {
@@ -538,7 +525,7 @@ impl<N: Native> Runtime<N> {
             if self.machine.termination_expired() {
                 return Ok(None);
             }
-            if let Some(status) = exited {
+            if let Some((status, drain_until)) = exited {
                 // The drain deadline bounds how long output draining may
                 // continue; it never discards the observed exit itself, which
                 // is the only input to the §7.4 record and the §8.2 event.
@@ -547,11 +534,11 @@ impl<N: Native> Runtime<N> {
                 }
             } else if let Some(status) = self.native.exited()? {
                 self.child_running = false;
-                exited = Some(status);
-                drain_until = self.machine.termination_started().map_or_else(
+                let drain_until = self.machine.termination_started().map_or_else(
                     || monotonic().saturating_add(2_000),
                     |started| started.saturating_add(10_000),
                 );
+                exited = Some((status, drain_until));
                 continue;
             }
             thread::sleep(Duration::from_millis(3));
@@ -580,8 +567,8 @@ impl<N: Native> Runtime<N> {
             .peers
             .values()
             .filter(|peer| peer.is(profile) && !peer.handshaking)
-            .count()
-            >= 64
+            .nth(63)
+            .is_some()
         {
             return self.refuse(id, (13, 12, b"connection limit exhausted"));
         }
@@ -684,24 +671,15 @@ impl<N: Native> Runtime<N> {
         }
         match request {
             ControllerRequest::Hello(identity) => {
-                let refusal = if message.scope != 0 && message.scope != self.config.generation {
-                    Some((9, 5, &b"generation did not match"[..]))
-                } else if identity != self.config.identity {
-                    Some((10, 3, &b"session identity did not match"[..]))
-                } else {
-                    None
-                };
-                if let Some(refusal) = refusal {
-                    self.refuse(id, refusal);
+                if message.scope != 0 && message.scope != self.config.generation {
+                    self.refuse(id, (9, 5, b"generation did not match"));
                     return Ok(());
                 }
-                wire::require(
-                    self.peers
-                        .get(&id)
-                        .is_some_and(|peer| peer.is(Profile::Controller))
-                        && self.machine.phase(id).is_none(),
-                    wire::WireError::Malformed,
-                )?;
+                if identity != self.config.identity {
+                    self.refuse(id, (10, 3, b"session identity did not match"));
+                    return Ok(());
+                }
+                wire::require(self.machine.phase(id).is_none(), wire::WireError::Malformed)?;
                 self.machine.register_controller(id);
                 let peer = self.peers.get_mut(&id).unwrap();
                 peer.handshaking = false;
@@ -742,19 +720,16 @@ impl<N: Native> Runtime<N> {
                 if let Some(peer) = self.peers.get_mut(&id) {
                     peer.deadline = 0;
                 }
-                if incarnation != self.config.incarnation {
-                    let _ = self.clear_result(id, observed, (2, 1, None));
-                    return Ok(());
-                }
-                match self.storage.clear(id, observed, self.machine.output_end()) {
-                    Ok(()) => {}
-                    Err(StorageError::Disabled) => {
-                        let _ = self.clear_result(id, observed, (1, 0, None));
+                let result = if incarnation != self.config.incarnation {
+                    (2, 1, None)
+                } else {
+                    match self.storage.clear(id, observed, self.machine.output_end()) {
+                        Ok(()) => return Ok(()),
+                        Err(StorageError::Disabled) => (1, 0, None),
+                        Err(StorageError::Busy) => (2, 2, None),
                     }
-                    Err(StorageError::Busy) => {
-                        let _ = self.clear_result(id, observed, (2, 2, None));
-                    }
-                }
+                };
+                let _ = self.clear_result(id, observed, result);
                 return Ok(());
             }
         }
@@ -790,12 +765,13 @@ impl<N: Native> Runtime<N> {
 
     fn refuse(&mut self, id: u64, refusal: Refusal) {
         let (controller, semantic, diagnostic) = refusal;
-        let profile = self.peers.get(&id).and_then(Peer::profile);
-        if profile == Some(Profile::Controller)
-            && self.peers.get(&id).is_some_and(|peer| peer.scope == 0)
-        {
-            self.peers.get_mut(&id).unwrap().scope = self.config.generation;
-        }
+        let profile = self.peers.get_mut(&id).and_then(|peer| {
+            let profile = peer.profile();
+            if profile == Some(Profile::Controller) && peer.scope == 0 {
+                peer.scope = self.config.generation;
+            }
+            profile
+        });
         if let Some(profile) = profile {
             let (kind, code) = match profile {
                 Profile::Controller => (0x13, controller),
@@ -976,35 +952,32 @@ impl<N: Native> Runtime<N> {
             };
             let (_, request) = self.descriptors.pop_front().expect("front descriptor");
             self.peers.get_mut(&peer).unwrap().descriptor_pending = false;
-            let result = match request {
+            self.storage.release_status_snapshot();
+            match request {
                 Descriptor::Status => {
-                    self.storage.release_status_snapshot();
                     if self.send_status(peer, false, snapshot, deadline, clock)
                         && let Some(peer) = self.peers.get_mut(&peer)
                     {
                         peer.deadline = 0;
                     }
-                    Ok(())
                 }
                 Descriptor::Attach(columns, rows, lease, non_vt, token) => {
                     // The copied store frontier is the descriptor's storage
                     // linearization point. Release before policy materializes
                     // a potentially large replay effect list.
-                    self.storage.release_status_snapshot();
-                    let effects = self.machine.transition(Transition::Peer(
+                    match self.machine.transition(Transition::Peer(
                         now,
                         peer,
                         PolicyRequest::Attach(columns, rows, lease, non_vt, token),
-                    ));
-                    effects.map(|effects| {
-                        self.status_snapshot = Some((snapshot, deadline));
-                        self.apply_with(effects, clock);
-                        self.status_snapshot = None;
-                    })
+                    )) {
+                        Ok(effects) => {
+                            self.status_snapshot = Some((snapshot, deadline));
+                            self.apply_with(effects, clock);
+                            self.status_snapshot = None;
+                        }
+                        Err(error) => self.refuse_wire(peer, error),
+                    }
                 }
-            };
-            if let Err(error) = result {
-                self.refuse_wire(peer, error);
             }
         }
     }
@@ -1077,8 +1050,8 @@ impl<N: Native> Runtime<N> {
 impl PreparedArtifacts {
     pub fn runtime<N: Native>(
         self,
-        io: (Duplex, Receiver<(u64, Option<u16>)>),
-        platform: (u8, N),
+        (pty, writes): (Duplex, Receiver<(u64, Option<u16>)>),
+        (synthetic, native): (u8, N),
     ) -> Runtime<N> {
         let storage = SessionStorage::new(
             self.storage.log,
@@ -1089,13 +1062,13 @@ impl PreparedArtifacts {
         );
         Runtime::new(HolderConfig {
             core: self.core,
-            pty: io.0,
-            writes: io.1,
+            pty,
+            writes,
             storage,
             status: self.status,
             commit_at: self.commit_at,
-            synthetic: platform.0,
-            native: platform.1,
+            synthetic,
+            native,
         })
     }
 }
