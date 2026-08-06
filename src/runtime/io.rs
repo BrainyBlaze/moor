@@ -425,9 +425,14 @@ pub fn attach_viewer_to(
             };
             let recovered = (|| {
                 lease.resume(stream.client, &mut reconnect)?;
+                if let Some((rows, columns)) = stream.size {
+                    request[..2].copy_from_slice(&columns.to_le_bytes());
+                    request[2..4].copy_from_slice(&rows.to_le_bytes());
+                }
                 request[4] &= !1;
                 stream.client.send(3, &request)?;
-                if let Some((rows, columns)) = stream.size {
+                if stream.options.redraw == Redraw::Winch {
+                    let (rows, columns) = stream.size.unwrap_or(geometry);
                     lease.resize(stream.client, rows, columns)?;
                 }
                 stream.lease = Some(lease);
