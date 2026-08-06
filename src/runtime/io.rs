@@ -1,14 +1,14 @@
 use crate::cli::{Options, Redraw, Reset};
-use crate::runtime::client::{Client, InputLease, LeaseCommand};
+use crate::runtime::client::{Client, InputLease};
 #[allow(unused_imports)]
 use crate::schema;
 use crate::session::{LeaseRole, ResultOutcome};
-use crate::wire::{InputReceipt, Message, ViewerEvent, ViewerStream, decode_viewer};
+use crate::wire::{Message, ViewerEvent, ViewerStream, decode_viewer};
 use crossbeam_channel::{Receiver as CrossReceiver, Sender as CrossSender, bounded, never, select};
 use interprocess::TryClone;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::*};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending,
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
 
-struct State(AtomicU64, AtomicBool, u64);
+struct State(AtomicU64, u64);
 
 pub struct Duplex<T = Event>(
     Sender<Option<(Vec<u8>, u64)>>,
@@ -28,7 +28,6 @@ pub struct Duplex<T = Event>(
 
 schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(Sender<bool>), Abort);
 pub struct ViewerSender(CrossSender<Command>);
-struct Pending(Vec<u8>, Option<Sender<bool>>);
 
 impl ViewerSender {
     pub fn send(&self, bytes: &[u8]) -> bool {
@@ -48,7 +47,7 @@ impl ViewerSender {
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
     start: Option<&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>)>, commands: CrossReceiver<Command>, sender: CrossSender<Command>,
     state: Arc<AtomicU8>, wire: ViewerStream, lease: Option<InputLease>,
-    size: Option<(u16, u16)>, pending: Option<Pending>);
+    size: Option<(u16, u16)>, release: Option<Sender<bool>>);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -86,14 +85,20 @@ impl Viewer<'_> {
                 }
                 self.client.send(7, &sequence.to_le_bytes())?;
             }
-            ViewerEvent::Receipt(receipt) => self.advance(Some(receipt), vec![])?,
+            ViewerEvent::Receipt(receipt) => {
+                self.lease
+                    .as_mut()
+                    .ok_or("viewer lease lost")?
+                    .receipt(receipt, self.client)?;
+                self.advance(vec![])?;
+            }
             ViewerEvent::Lease(result) => {
                 if let Some(start) = self.start.take() {
                     self.lease = InputLease::from_result(result, LeaseRole::Viewer)?;
                     start(ViewerSender(self.sender.clone()), self.state.clone());
                     if self.lease.is_some() {
                         match self.options.redraw {
-                            Redraw::CtrlL => self.advance(None, b"\x0c".to_vec())?,
+                            Redraw::CtrlL => self.advance(b"\x0c".to_vec())?,
                             Redraw::Winch => {
                                 let (rows, columns) = self.size.unwrap();
                                 self.command(Command::Resize(rows, columns))?;
@@ -103,9 +108,8 @@ impl Viewer<'_> {
                     }
                 } else {
                     let done = self
-                        .pending
+                        .release
                         .take()
-                        .and_then(|pending| pending.1)
                         .ok_or("unexpected viewer lease result")?;
                     let success = result.outcome == ResultOutcome::Released
                         && result.role == LeaseRole::Viewer;
@@ -119,31 +123,16 @@ impl Viewer<'_> {
         Ok(false)
     }
 
-    fn advance(&mut self, receipt: Option<InputReceipt>, input: Vec<u8>) -> Result<(), String> {
-        if self.lease.is_some() && !input.is_empty() {
-            debug_assert!(self.pending.is_none());
-            self.pending = Some(Pending(input, None));
+    fn advance(&mut self, input: Vec<u8>) -> Result<(), String> {
+        let lease = self.lease.as_mut().ok_or("viewer lease lost")?;
+        if !input.is_empty() {
+            lease.stage(input);
         }
-        if let Some(receipt) = receipt {
-            let mut pending = self.pending.take().ok_or("unexpected input receipt")?;
-            let lease = self.lease.as_mut().ok_or("viewer lease lost")?;
-            lease.receipt(receipt, self.client, pending.0.len())?;
-            if pending.1.is_some() {
-                pending.0.clear();
-                self.pending = Some(pending);
-            }
-        }
-        let lease = self.lease.as_ref().ok_or("viewer lease lost")?;
-        let Some(pending) = &self.pending else {
-            return Ok(());
-        };
-        let command = if pending.0.is_empty() {
-            debug_assert!(pending.1.is_some());
-            LeaseCommand::Release
+        if self.release.is_some() && !lease.pending() {
+            lease.control(self.client, 0x17)
         } else {
-            LeaseCommand::Input(&pending.0)
-        };
-        lease.send(self.client, command)
+            lease.replay(self.client)
+        }
     }
 
     fn command(&mut self, command: Command) -> Result<bool, String> {
@@ -154,17 +143,17 @@ impl Viewer<'_> {
                     self.client
                         .send(12, &query.encode().map_err(crate::protocol)?)?;
                 }
-                self.advance(None, ordinary)?;
+                self.advance(ordinary)?;
             }
             Command::Resize(rows, columns) => {
                 self.size = Some((rows, columns));
                 if let Some(lease) = &self.lease {
-                    lease.send(self.client, LeaseCommand::Resize(rows, columns))?;
+                    lease.resize(self.client, rows, columns)?;
                 }
             }
             Command::Keepalive => {
                 if let Some(lease) = &self.lease {
-                    lease.send(self.client, LeaseCommand::Keepalive)?;
+                    lease.control(self.client, 0x18)?;
                 }
             }
             Command::Release(done) => {
@@ -174,8 +163,8 @@ impl Viewer<'_> {
                     self.client.cancel();
                     return Ok(true);
                 }
-                self.pending = Some(Pending(ordinary, Some(done)));
-                self.advance(None, vec![])?;
+                self.release = Some(done);
+                self.advance(ordinary)?;
             }
             Command::Abort => unreachable!(),
         }
@@ -183,7 +172,7 @@ impl Viewer<'_> {
     }
 
     fn fail<T>(&mut self, error: impl Into<String>) -> Result<T, String> {
-        if let Some(done) = self.pending.take().and_then(|pending| pending.1) {
+        if let Some(done) = self.release.take() {
             let _ = done.send(false);
         }
         Err(error.into())
@@ -249,7 +238,7 @@ impl<T> Duplex<T> {
 
     pub fn try_send_payload(&self, bytes: Vec<u8>, payload: usize) -> Result<(), SendError> {
         let state = &self.2;
-        if state.1.load(Acquire) {
+        if state.0.load(Acquire) >> 63 != 0 {
             return Err(SendError::Closed);
         }
         let Some(overhead) = bytes.len().checked_sub(payload) else {
@@ -261,7 +250,7 @@ impl<T> Duplex<T> {
         let charge = usage(overhead, payload).ok_or(SendError::Full)?;
         state
             .0
-            .fetch_update(AcqRel, Acquire, |used| reserve(used, charge, state.2))
+            .fetch_update(AcqRel, Acquire, |used| reserve(used, charge, state.1))
             .map_err(|_| SendError::Full)?;
         self.0.send(Some((bytes, charge))).map_err(|_| {
             state.0.fetch_sub(charge, AcqRel);
@@ -270,12 +259,12 @@ impl<T> Duplex<T> {
     }
 
     pub fn shutdown(&self) {
-        self.2.1.store(true, Release);
+        self.2.0.fetch_or(1 << 63, Release);
         let _ = self.0.send(None);
     }
 
     pub fn pending(&self) -> usize {
-        let used = self.2.0.load(Acquire);
+        let used = self.2.0.load(Acquire) & !(1 << 63);
         (used >> 32) as usize + (used as u32) as usize
     }
 }
@@ -294,7 +283,6 @@ pub(crate) fn pump<T: Send + 'static>(
     let (tx, events) = bounded(8);
     let state = Arc::new(State(
         AtomicU64::new(0),
-        AtomicBool::new(false),
         usage(limit, payload_limit).unwrap(),
     ));
     std::thread::spawn(move || {
@@ -325,7 +313,7 @@ pub(crate) fn pump<T: Send + 'static>(
             };
             let _ = completed.send((written as u64, error));
             if error.is_some() {
-                ws.1.store(true, Release);
+                ws.0.fetch_or(1 << 63, Release);
                 break;
             }
             ws.0.fetch_sub(charge, AcqRel);
@@ -340,6 +328,7 @@ fn usage(overhead: usize, payload: usize) -> Option<u64> {
 }
 
 fn reserve(used: u64, charge: u64, limit: u64) -> Option<u64> {
+    crate::return_if!(used >> 63 != 0, None);
     let overhead = (used >> 32).checked_add(charge >> 32)?;
     let payload = u64::from(used as u32).checked_add(u64::from(charge as u32))?;
     (overhead <= limit >> 32 && payload <= u64::from(limit as u32))
@@ -375,14 +364,14 @@ pub fn attach_viewer_to(
         },
         lease: None,
         size: (options.redraw == Redraw::Winch).then_some(geometry),
-        pending: None,
+        release: None,
     };
     let mut heartbeat = Instant::now() + liveness;
     stream.client.send(3, &request)?;
     let paused = never();
     loop {
         let wait = heartbeat.saturating_duration_since(Instant::now());
-        let commands = if stream.pending.is_some() {
+        let commands = if stream.lease.as_ref().is_some_and(InputLease::pending) {
             &paused
         } else {
             &stream.commands
@@ -429,10 +418,10 @@ pub fn attach_viewer_to(
                 request[4] &= !1;
                 stream.client.send(3, &request)?;
                 if let Some((rows, columns)) = stream.size {
-                    lease.send(stream.client, LeaseCommand::Resize(rows, columns))?;
+                    lease.resize(stream.client, rows, columns)?;
                 }
                 stream.lease = Some(lease);
-                stream.advance(None, vec![])
+                stream.advance(vec![])
             })();
             if let Err(error) = recovered {
                 return stream.fail(error);
