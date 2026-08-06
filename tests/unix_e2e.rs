@@ -89,7 +89,7 @@ fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut::<libc::termios>(),
-                &size,
+                size,
             )
         },
         0
@@ -2099,7 +2099,8 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
                 .any(|line| line.contains(&session) && line.contains("[exited]")),
             "{listed:?}"
         );
-        assert!(invoked(alias, &["rm", &session]).status.success());
+        let removed = invoked(alias, &["rm", &session]);
+        assert!(removed.status.success(), "{removed:?}");
     }
     assert!(!root.exists() || fs::read_dir(&root).unwrap().next().is_none());
     let _ = fs::remove_dir(&root);
