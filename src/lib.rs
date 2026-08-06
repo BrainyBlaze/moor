@@ -90,9 +90,7 @@ pub(crate) fn protocol(error: impl std::fmt::Debug) -> String {
 }
 
 pub(crate) fn canonical_u64(text: &str) -> Option<u64> {
-    (text == "0" || matches!(text.as_bytes(), [b'1'..=b'9', ..]))
-        .then(|| text.parse().ok())
-        .flatten()
+    crate::wire::decimal(text.as_bytes(), u64::MAX, true)
 }
 
 pub mod cli;

@@ -2,12 +2,14 @@ use moor::runtime::private::{
     ArtifactConfig, SessionState, age, await_launch, await_launch_probe, clear_store, companion,
     decode_launch_record, decode_launch_result, discover_sessions, environment_key,
     holder_artifacts, instrument_ack, instrument_stage, launch_result, lifecycle_running,
-    monotonic, now, parse_boot_uuid, random_array, supervised_generation, validate_instrument_ack,
+    monotonic, now, parse_boot_uuid, random_array, session_name, supervised_generation,
+    validate_instrument_ack,
 };
 use moor::runtime::storage::SessionStorage;
 use moor::store::{Kind, Store};
 use moor::wire::{get_wide, put_wide};
 use std::cell::Cell;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Cursor, Read};
 use std::rc::Rc;
@@ -16,6 +18,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 struct AdoptionObservedInput {
     input: Cursor<Vec<u8>>,
     adopted: Rc<Cell<Option<u32>>>,
+}
+
+#[test]
+fn discovery_suffixes_share_exact_case_sensitive_and_insensitive_rules() {
+    for suffix in [".log", ".events", ".instrument"] {
+        assert_eq!(session_name(format!("session{suffix}").into(), false), None);
+    }
+    assert_eq!(
+        session_name(OsString::from("session.exit"), false),
+        Some(OsString::from("session"))
+    );
+    assert_eq!(
+        session_name(OsString::from("session.EXIT"), true),
+        Some(OsString::from("session"))
+    );
+    assert_eq!(
+        session_name(OsString::from("session.LOG"), false),
+        Some(OsString::from("session.LOG"))
+    );
+    assert_eq!(session_name(OsString::from("session.LOG"), true), None);
 }
 
 impl Read for AdoptionObservedInput {

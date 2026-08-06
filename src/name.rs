@@ -47,6 +47,18 @@ fn separator(byte: u8) -> bool {
     byte == b'/' || cfg!(windows) && byte == b'\\'
 }
 
+pub(crate) fn artifact_suffix_len(raw: &[u8], insensitive: bool) -> Option<usize> {
+    [b".log".as_slice(), b".events", b".exit", b".instrument"]
+        .into_iter()
+        .find(|suffix| {
+            raw.get(raw.len().saturating_sub(suffix.len())..)
+                .is_some_and(|tail| {
+                    tail == *suffix || insensitive && tail.eq_ignore_ascii_case(suffix)
+                })
+        })
+        .map(<[u8]>::len)
+}
+
 pub fn valid_session(value: &OsStr) -> bool {
     let raw = bytes(value);
     if raw.is_empty() || raw.contains(&0) || raw.last().is_some_and(|byte| separator(*byte)) {
@@ -64,13 +76,5 @@ pub fn valid_session(value: &OsStr) -> bool {
     {
         return false;
     }
-    ![b".log".as_slice(), b".events", b".exit", b".instrument"]
-        .iter()
-        .any(|suffix| {
-            let tail = final_part.get(final_part.len().saturating_sub(suffix.len())..);
-            #[cfg(unix)]
-            return tail == Some(*suffix);
-            #[cfg(windows)]
-            tail.is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
-        })
+    artifact_suffix_len(final_part, cfg!(windows)).is_none()
 }

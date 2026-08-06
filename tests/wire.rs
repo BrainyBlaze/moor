@@ -7,8 +7,9 @@ use moor::wire::{
     StatusExtension, StatusTail, ViewerEvent, ViewerStream, WireError, controller_hello,
     controller_hello_ack, crc32c, decode_controller, decode_controller_hello_ack,
     decode_log_clear_result, decode_query, decode_semantic, decode_terminate_result, decode_viewer,
-    get_wide, lease_token_payload, log_clear_payload, log_clear_result_payload, put_compact,
-    put_wide, terminate_result_payload, validate_status_flags,
+    get_wide, input_payload, lease_token_payload, log_clear_payload, log_clear_result_payload,
+    put_compact, put_wide, resize_payload, terminate_request_payload, terminate_result_payload,
+    validate_status_flags,
 };
 
 #[test]
@@ -533,6 +534,28 @@ fn exact_lease_and_log_builders_emit_valid_payloads() {
     let result = log_clear_result_payload(2, 3, 2, 7, 8, 99).unwrap();
     assert_eq!(decode_log_clear_result(&result), Ok((2, 3, 7)));
     assert!(decode_log_clear_result(&result[..31]).is_err());
+}
+
+#[test]
+fn exact_controller_request_builders_round_trip_through_the_decoder() {
+    let input = input_payload(3, 9, b"terminal");
+    assert!(matches!(
+        decode_controller(9, &input, None),
+        Ok(ControllerRequest::Policy(PolicyRequest::Input(request, None)))
+            if (request.epoch, request.request_id, &*request.exact_payload) == (3, 9, input.as_slice())
+    ));
+    let resize = resize_payload(3, 24, 80);
+    assert!(matches!(
+        decode_controller(0x0b, &resize, None),
+        Ok(ControllerRequest::Policy(PolicyRequest::Resize(3, 80, 24)))
+    ));
+    let terminate = terminate_request_payload(b"session", 7, [8; 16], true).unwrap();
+    assert!(matches!(
+        decode_controller(15, &terminate, None),
+        Ok(ControllerRequest::Policy(PolicyRequest::Terminate(
+            b"session", 7, incarnation, true
+        ))) if incarnation == [8; 16]
+    ));
 }
 
 #[test]

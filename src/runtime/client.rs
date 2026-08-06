@@ -15,7 +15,8 @@ use crate::unix as platform;
 use crate::windows as platform;
 use crate::wire::{
     Codec, InputReceipt, Message, Profile, StatusTail, controller_hello,
-    decode_controller_hello_ack, decode_log_clear_result, decode_terminate_result,
+    decode_controller_hello_ack, decode_error_payload, decode_log_clear_result,
+    decode_terminate_result, input_payload, resize_payload, terminate_request_payload,
 };
 use interprocess::TryClone;
 use std::ffi::OsStr;
@@ -78,19 +79,17 @@ fn accepted(message: Message) -> Inbound {
     if message.kind != 0x13 {
         return Ok(message);
     }
-    let code = message
-        .payload
-        .get(..2)
-        .and_then(|value| value.try_into().ok())
-        .map(u16::from_le_bytes);
-    let diagnostic = crate::wire::get_compact(&message.payload, 2, true);
-    let refusal = match (code, diagnostic) {
-        (Some(code), Some(text)) if !text.is_empty() => format!(
-            "holder refused request ({code}): {}",
-            String::from_utf8_lossy(text)
-        ),
-        _ => "invalid holder refusal".into(),
-    };
+    let refusal = decode_error_payload(&message.payload)
+        .filter(|(_, text)| !text.is_empty())
+        .map_or_else(
+            || "invalid holder refusal".into(),
+            |(code, text)| {
+                format!(
+                    "holder refused request ({code}): {}",
+                    String::from_utf8_lossy(text)
+                )
+            },
+        );
     Err((refusal, false))
 }
 
@@ -240,11 +239,9 @@ impl Client {
     }
 
     pub fn terminate(&mut self, force: bool) -> Result<(u8, u8, u8, Vec<u8>)> {
-        let mut payload = Vec::with_capacity(self.identity.len() + 23);
-        crate::wire::put_wide(&mut payload, &self.identity).map_err(crate::protocol)?;
-        payload.extend_from_slice(&self.generation.to_le_bytes());
-        payload.extend_from_slice(&self.incarnation);
-        payload.push(force.into());
+        let payload =
+            terminate_request_payload(&self.identity, self.generation, self.incarnation, force)
+                .map_err(crate::protocol)?;
         self.send(15, &payload)?;
         let result = self.receive_kind(16)?;
         let (outcome, containment, method, diagnostic) =
@@ -362,23 +359,11 @@ impl InputLease {
     pub(crate) fn replay(&self, client: &mut Client) -> Result<()> {
         crate::return_if!(!self.pending(), Ok(()));
         let request = self.next.ok_or("input request space exhausted")?;
-        client.send(
-            9,
-            &crate::wire::join(&[
-                &self.epoch.to_le_bytes(),
-                &request.to_le_bytes(),
-                &[0],
-                &self.pending,
-            ]),
-        )
+        client.send(9, &input_payload(self.epoch, request, &self.pending))
     }
 
     pub(crate) fn resize(&self, client: &mut Client, rows: u16, columns: u16) -> Result<()> {
-        let mut payload = [0; 8];
-        payload[..4].copy_from_slice(&self.epoch.to_le_bytes());
-        payload[4..6].copy_from_slice(&columns.to_le_bytes());
-        payload[6..].copy_from_slice(&rows.to_le_bytes());
-        client.send(0x0b, &payload)
+        client.send(0x0b, &resize_payload(self.epoch, rows, columns))
     }
 
     pub(crate) fn control(&self, client: &mut Client, kind: u8) -> Result<()> {
@@ -493,7 +478,7 @@ pub fn probe_session(
     }
 }
 
-crate::schema!(enum Decision [Clone, Copy]; Proceed, Attach, Cleanup, Offline, Missing, Stopped, Running, Already, Identify);
+crate::schema!(enum Decision [Clone, Copy, Debug]; Proceed, Attach, Cleanup, Offline, Missing, Stopped, Running, Already, Identify);
 use Decision::*;
 
 // Indexed by SessionState ordinal. Both stale residue shapes — an orphaned
@@ -502,6 +487,7 @@ use Decision::*;
 const ATTACH_POLICY: [Decision; 6] = [Missing, Proceed, Proceed, Stopped, Stopped, Identify];
 const CLEAR_POLICY: [Decision; 6] = [Missing, Proceed, Proceed, Offline, Offline, Identify];
 const REMOVE_POLICY: [Decision; 6] = [Missing, Running, Running, Cleanup, Cleanup, Identify];
+const UNAVAILABLE_POLICY: [Decision; 6] = [Missing, Identify, Identify, Stopped, Stopped, Identify];
 
 fn decide(session: &OsStr, path: &Path, table: [Decision; 6]) -> CommandResult<Decision> {
     match table[platform::classify(path) as usize] {
@@ -512,6 +498,10 @@ fn decide(session: &OsStr, path: &Path, table: [Decision; 6]) -> CommandResult<D
         Decision::Identify => Err(session_error(session, "could not be identified")),
         decision => Ok(decision),
     }
+}
+
+fn unavailable(session: &OsStr, path: &Path) -> CommandError {
+    decide(session, path, UNAVAILABLE_POLICY).unwrap_err()
 }
 
 /// Internal binary dispatch. Creation assumes the process has not started any
@@ -525,16 +515,6 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
     // indeterminate listener that accepts and then fails the identity exchange
     // is not a stale session, and the caller's next move differs (investigate
     // versus clean up).
-    let unavailable = |session: &OsStr, path: &Path| {
-        session_error(
-            session,
-            match platform::classify(path) {
-                SessionState::Missing => "does not exist",
-                SessionState::Stale | SessionState::Exited => "is not running",
-                _ => "could not be identified",
-            },
-        )
-    };
     match action {
         Action::Create {
             mode,

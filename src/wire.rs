@@ -349,6 +349,10 @@ pub fn log_clear_payload(incarnation: [u8; 16], observed: u64) -> Result<[u8; 24
     fixed_payload(&[(0, &incarnation), (16, &observed.to_le_bytes())])
 }
 
+wire_rules!(pure pub fn input_payload(epoch: u32, request: u64, bytes: &[u8]) -> Vec<u8> = wire_rules!(write epoch.to_le_bytes(); request.to_le_bytes(); [0]; bytes));
+wire_rules!(pure pub fn resize_payload(epoch: u32, rows: u16, columns: u16) -> [u8; 8] = fixed_payload::<8>(&[(0, &epoch.to_le_bytes()), (4, &columns.to_le_bytes()), (6, &rows.to_le_bytes())]).expect("fixed resize layout"));
+wire_rules!(pure pub fn terminate_request_payload(identity: &[u8], generation: u32, incarnation: [u8; 16], force: bool) -> Result<Vec<u8>, WireError> = { let mut payload = Vec::with_capacity(identity.len() + 23); put_wide(&mut payload, identity)?; payload.extend_from_slice(&generation.to_le_bytes()); payload.extend_from_slice(&incarnation); payload.push(force.into()); Ok(payload) });
+
 schema!(struct LogClearResult fields; outcome: u8, reason: u8, reserved: [u8; 2], epoch: u32,
     prior: u64, resulting: u64, cleared: u64);
 binary_record!(RawLogClearResult => LogClearResult[32] error WireError = WireError::Malformed;
@@ -421,6 +425,7 @@ wire_rules!(pure pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> Run
 
 wire_rules!(pure fn semantic_code(error: SemanticRefusal) -> u16 = [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10, 15][error as usize]);
 wire_rules!(pure pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> = wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u16).to_le_bytes(); diagnostic));
+wire_rules!(pure pub fn decode_error_payload(payload: &[u8]) -> Option<(u16, &[u8])> = { let code = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?); get_compact(payload, 2, true).map(|text| (code, text)) });
 wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x03\0\0".to_vec(), identity));
 
 wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [3]; generation.to_le_bytes(); incarnation), identity) });
