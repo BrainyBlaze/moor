@@ -2862,3 +2862,176 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
         "the reported loss is not a decodable failed record"
     );
 }
+
+// ---------------------------------------------------------------- V26 ----
+// §16 V26 — NON_VT attach and its required empty preamble. The attach
+// preserves geometry and sets only flag bit 1. The preamble payload is the
+// plain u16 zero length, NOT an absent frame. Both use per-direction
+// sequence 2. Exact hex from the schema.
+
+const V26_ATTACH: &str = "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00 \
+                          05 00 00 00 35 5C 53 49 00 00 00 00 02";
+const V26_PREAMBLE: &str = "4D 4F 4F 52 03 05 00 00 07 00 00 00 02 00 00 00 \
+                            02 00 00 00 08 9C 99 04 00 00";
+
+#[test]
+fn v26_both_frames_reproduce_the_frozen_bytes() {
+    for (kind, payload, bytes, label) in [
+        (3u8, vec![0, 0, 0, 0, 2], V26_ATTACH, "NON_VT attach"),
+        (5, vec![0, 0], V26_PREAMBLE, "empty preamble"),
+    ] {
+        let frame = hex(bytes);
+        v16_framing_assert_header(&frame);
+        assert_eq!(
+            frame[24..],
+            payload[..],
+            "{label}: frozen payload disagrees with the schema text"
+        );
+        assert_eq!(
+            v16_framing_encode_frame(2, 7, kind, &payload),
+            frame,
+            "{label}: encoder must reproduce the frozen frame at sequence 2"
+        );
+    }
+}
+
+#[test]
+fn v26_attach_decodes_as_non_vt_with_geometry_preserved() {
+    use moor::session::Request;
+    use moor::wire::{ControllerRequest, decode_controller};
+    let frame = hex(V26_ATTACH);
+    let message = v16_framing_feed_one(2, &frame);
+    assert_eq!((message.scope, message.kind), (7, 3));
+    // Flag bit 1 alone: no input lease is requested, NON_VT is.
+    assert!(
+        matches!(
+            decode_controller(3, &message.payload, None),
+            Ok(ControllerRequest::Policy(Request::Attach(
+                0, 0, false, true, None
+            )))
+        ),
+        "V26 must decode as a NON_VT attach with 0x0 geometry and no lease request"
+    );
+    // Only bits 0 and 1 exist; bit 2 upward is not a forward-compatible
+    // extension and must be refused rather than masked away.
+    for flags in [4u8, 8, 0x80, 0xFF] {
+        assert!(
+            decode_controller(3, &[0, 0, 0, 0, flags], None).is_err(),
+            "attach flags {flags:#04x} were accepted"
+        );
+    }
+}
+
+#[test]
+fn v26_non_vt_attach_preserves_child_geometry_and_grants_no_lease() {
+    use moor::session::{Effect, Machine, Request, Transition};
+    let mut machine = Machine::new(7, [1; 16], [2; 16]);
+    machine.register_controller(1);
+    let effects = machine
+        .transition(Transition::Peer(
+            0,
+            1,
+            Request::Attach(0, 0, false, true, Some([3; 16])),
+        ))
+        .expect("the NON_VT attach must be accepted");
+    let (lease, resize) = effects
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Attached(1, _, lease, resize) => Some((lease.clone(), *resize)),
+            _ => None,
+        })
+        .expect("the connection must attach");
+    assert_eq!(resize, None, "geometry 0x0 preserves the child geometry");
+    assert!(
+        lease.is_none(),
+        "flag bit 0 is clear, so no input lease may be granted"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Close(_) | Effect::Resize(..))),
+        "a NON_VT attach must neither be refused nor resize the child"
+    );
+}
+
+#[test]
+fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
+    use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
+    let frame = hex(V26_PREAMBLE);
+    let message = v16_framing_feed_one(2, &frame);
+    assert_eq!((message.scope, message.kind), (7, 5));
+
+    // Present-and-empty, not absent: the frame is delivered as a Terminal
+    // event carrying zero bytes, and it is what sets the stream's terminal
+    // state. An absent preamble leaves that state unset, so the two are
+    // observably different — which is the whole point of the requirement.
+    let mut stream = ViewerStream {
+        non_vt: true,
+        ..ViewerStream::default()
+    };
+    assert!(!stream.terminal, "the preamble has not been consumed yet");
+    assert_eq!(
+        decode_viewer(&mut stream, &message, (b"".as_slice(), 7, [9; 16])),
+        Ok(Some(ViewerEvent::Terminal(b""))),
+        "the empty preamble must decode as a present, empty terminal payload"
+    );
+    assert!(stream.terminal, "the preamble must set the terminal state");
+    assert!(
+        stream.non_vt,
+        "consuming the preamble must not clear NON_VT"
+    );
+
+    // The length is the plain §1.1 u16, not the §1.1.1 wide u32. A four-byte
+    // zero length must not be read as one zero-length field: under the plain
+    // u16 it is a zero length followed by two uncovered bytes.
+    //
+    // Two separate rules can refuse that payload, and they are asserted apart
+    // on purpose. On a NON_VT stream the emptiness rule refuses it because the
+    // two trailing bytes are a nonempty body:
+    let wide_frame = v16_framing_encode_frame(2, 7, 5, &[0, 0, 0, 0]);
+    let mut wide = ViewerStream {
+        non_vt: true,
+        ..ViewerStream::default()
+    };
+    let wide_message = v16_framing_feed_one(2, &wide_frame);
+    assert!(
+        decode_viewer(&mut wide, &wide_message, (b"".as_slice(), 7, [9; 16])).is_err(),
+        "a wide four-byte zero length was accepted on a NON_VT stream"
+    );
+    // ...and on an ordinary stream, where the emptiness rule does not apply,
+    // only the length-exactness check remains to refuse it. This case is what
+    // proves the plain u16 is read exactly; without it, deleting the exactness
+    // check leaves this lane green.
+    let mut wide_vt = ViewerStream::default();
+    assert!(
+        decode_viewer(&mut wide_vt, &wide_message, (b"".as_slice(), 7, [9; 16])).is_err(),
+        "a zero length followed by two uncovered bytes was accepted: the plain \
+         u16 length is not being checked for exactness"
+    );
+
+    // Under NON_VT the preamble must be empty, so a well-formed nonempty one
+    // is still refused.
+    let mut nonempty = ViewerStream {
+        non_vt: true,
+        ..ViewerStream::default()
+    };
+    let payload = [2, 0, b'h', b'i'];
+    let nonempty_message = v16_framing_feed_one(2, &v16_framing_encode_frame(2, 7, 5, &payload));
+    assert!(
+        decode_viewer(
+            &mut nonempty,
+            &nonempty_message,
+            (b"".as_slice(), 7, [9; 16])
+        )
+        .is_err(),
+        "a nonempty preamble was accepted on a NON_VT stream"
+    );
+    // The same nonempty preamble is valid when NON_VT was not requested,
+    // proving the refusal above is the NON_VT rule and not a framing accident.
+    let mut vt = ViewerStream::default();
+    assert_eq!(
+        decode_viewer(&mut vt, &nonempty_message, (b"".as_slice(), 7, [9; 16])),
+        Ok(Some(ViewerEvent::Terminal(b"hi"))),
+        "the nonempty preamble must be accepted on an ordinary stream"
+    );
+}
