@@ -66,7 +66,7 @@ impl<N: Native> Runtime<N> {
                         continue;
                     }
                     if let Some((rows, columns)) = resize {
-                        self.resize(rows, columns, false);
+                        self.resize(rows, columns);
                     }
                     if self.send_status(id, true, snapshot, deadline, clock) {
                         if let Some(peer) = self.peers.get_mut(&id) {
@@ -77,7 +77,7 @@ impl<N: Native> Runtime<N> {
                         }
                     }
                 }
-                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns, false),
+                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns),
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
                 PolicyEffect::CommitSources(ticket, changes, mandatory) => {
                     let purpose = Purpose::Sources(ticket.get(), mandatory);
@@ -178,13 +178,8 @@ impl<N: Native> Runtime<N> {
     /// so it may only adopt a geometry the platform actually applied: adopting a
     /// failed resize makes the next preamble claim a default region that is not
     /// the child's (§6 of the schema, §5.2).
-    fn resize(&mut self, rows: u16, columns: u16, redraw: bool) {
-        let result = if redraw {
-            self.native.redraw(rows, columns)
-        } else {
-            self.native.resize(rows, columns)
-        };
-        if result.is_ok() {
+    fn resize(&mut self, rows: u16, columns: u16) {
+        if self.native.resize(rows, columns).is_ok() {
             self.scanner.set_rows(rows);
         }
     }
@@ -295,9 +290,6 @@ schema!(enum pub NativeExit [Clone, Copy, Debug, Eq, PartialEq]; Code(u32), Sign
 
 pub trait Native {
     fn resize(&mut self, rows: u16, columns: u16) -> Result<()>;
-    fn redraw(&mut self, rows: u16, columns: u16) -> Result<()> {
-        self.resize(rows, columns)
-    }
     fn terminate(&mut self, force: bool) -> (u8, bool);
     fn exited(&mut self) -> Result<Option<NativeExit>>;
 }
