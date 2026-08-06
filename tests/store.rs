@@ -91,7 +91,9 @@ fn append_replace_recovery_and_uncommitted_tail_preserve_frontier() {
     let path = temp("store");
     let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
     assert_eq!(store.selected().index, 1);
-    store.append_capped(b"abc", u64::MAX, 3).unwrap();
+    store
+        .append_capped_with(b"abc", u64::MAX, 3, |_| Ok(()))
+        .unwrap();
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"abc");
     let body = path.join(format!("body.{}", store.selected().body));
     OpenOptions::new()
@@ -112,16 +114,18 @@ fn append_replace_recovery_and_uncommitted_tail_preserve_frontier() {
 fn capped_append_keeps_only_the_newest_suffix_and_validates_the_frontier() {
     let path = temp("capped-append");
     let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
-    store.append_capped(b"abc", 4, 3).unwrap();
-    let commit = store.append_capped(b"def", 4, 6).unwrap();
+    store.append_capped_with(b"abc", 4, 3, |_| Ok(())).unwrap();
+    let commit = store.append_capped_with(b"def", 4, 6, |_| Ok(())).unwrap();
     assert_eq!((commit.epoch, commit.start, commit.end), (2, 2, 6));
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"cdef");
 
-    let commit = store.append_capped(b"ghijkl", 4, 12).unwrap();
+    let commit = store
+        .append_capped_with(b"ghijkl", 4, 12, |_| Ok(()))
+        .unwrap();
     assert_eq!((commit.epoch, commit.start, commit.end), (3, 8, 12));
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"ijkl");
     assert!(matches!(
-        store.append_capped(b"x", 4, 99),
+        store.append_capped_with(b"x", 4, 99, |_| Ok(())),
         Err(StoreError::Corrupt)
     ));
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"ijkl");
@@ -132,7 +136,9 @@ fn capped_append_keeps_only_the_newest_suffix_and_validates_the_frontier() {
 fn torn_new_commit_falls_back_but_equal_valid_indexes_and_extra_entries_fail() {
     let path = temp("recovery");
     let mut store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
-    store.append_capped(b"abc", u64::MAX, 3).unwrap();
+    store
+        .append_capped_with(b"abc", u64::MAX, 3, |_| Ok(()))
+        .unwrap();
     fs::write(path.join("commit.1"), b"torn").unwrap();
     drop(store);
     assert_eq!(
@@ -775,7 +781,7 @@ fn a_writer_keeps_using_its_validated_slot_handles_after_path_replacement() {
     for name in ["body.0", "commit.1"] {
         fs::set_permissions(path.join(name), fs::Permissions::from_mode(0o600)).unwrap();
     }
-    store.append_capped(b"abc", 32, 3).unwrap();
+    store.append_capped_with(b"abc", 32, 3, |_| Ok(())).unwrap();
     assert_eq!(fs::read(&original_body).unwrap(), b"abc");
     assert_eq!(fs::read(&original_commit).unwrap().len(), 92);
     assert_eq!(fs::read(path.join("body.0")).unwrap(), b"replacement");
@@ -835,7 +841,7 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
         store.selected_result().ok().map(|commit| commit.index),
         Some(1)
     );
-    store.append_capped(b"xyz", 64, 3).unwrap();
+    store.append_capped_with(b"xyz", 64, 3, |_| Ok(())).unwrap();
     let advanced = store.selected_result().expect("a valid commit");
     assert_eq!(advanced.index, 2);
     assert_eq!(advanced.end, 3);
@@ -882,7 +888,9 @@ fn contended_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
     for step in 0..200u64 {
         let payload = [b'a' + (step % 26) as u8; 7];
         end += payload.len() as u64;
-        store.append_capped(&payload, 1 << 20, end).unwrap();
+        store
+            .append_capped_with(&payload, 1 << 20, end, |_| Ok(()))
+            .unwrap();
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let observed = reader.join().unwrap();

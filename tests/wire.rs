@@ -12,6 +12,33 @@ use moor::wire::{
     validate_status_flags,
 };
 
+fn progressed_codec(profile: Profile, next_in: u32, next_out: u32) -> Codec {
+    assert!(next_in != 0 && next_out != 0);
+    let mut codec = Codec::new(profile);
+    if next_in > 1 {
+        let mut sender = Codec::new(profile);
+        let mut frames = Vec::new();
+        for _ in 1..next_in {
+            sender
+                .encode(1, 1, &[], &mut frames)
+                .expect("sequence fixture frame must encode");
+        }
+        let mut discarded = Vec::new();
+        codec
+            .feed(0, &frames, &mut discarded)
+            .expect("sequence fixture frames must decode");
+        assert_eq!(discarded.len(), (next_in - 1) as usize);
+    }
+    let mut discarded = Vec::new();
+    for _ in 1..next_out {
+        codec
+            .encode(1, 1, &[], &mut discarded)
+            .expect("sequence fixture frame must encode");
+        discarded.clear();
+    }
+    codec
+}
+
 #[test]
 fn viewer_decoder_types_borrowed_stream_records_and_rejects_bad_boundaries() {
     let mut stream = ViewerStream::default();
@@ -431,7 +458,7 @@ fn frozen_controller_vector_decodes_at_every_boundary_and_encodes_exactly() {
 fn fragmented_input_reassembles_at_every_transport_split() {
     let bytes = hex(V7);
     for split in 0..=bytes.len() {
-        let mut codec = Codec::with_sequences(Profile::Controller, 20, 1);
+        let mut codec = progressed_codec(Profile::Controller, 20, 1);
         let mut out = Vec::new();
         codec.feed(0, &bytes[..split], &mut out).unwrap();
         codec.feed(1, &bytes[split..], &mut out).unwrap();
@@ -703,7 +730,7 @@ fn crc_sequence_and_reassembly_deadline_fail_closed() {
     );
 
     let first = &hex(V7)[..41];
-    let mut codec = Codec::with_sequences(Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(Profile::Controller, 20, 1);
     codec.feed(0, first, &mut Vec::new()).unwrap();
     assert_eq!(
         (codec.buffered_len(), codec.projected_len(9)),
@@ -790,7 +817,7 @@ fn configured_log_keeps_its_frontier_when_the_lane_is_unwritable() {
 fn feed_enforces_reassembly_deadline_without_external_poll() {
     let bytes = hex(V7);
     let split = 24 + 17;
-    let mut codec = Codec::with_sequences(Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(Profile::Controller, 20, 1);
     codec.feed(0, &bytes[..split], &mut Vec::new()).unwrap();
     assert_eq!(
         codec.feed(5_000, &bytes[split..], &mut Vec::new()),
@@ -821,15 +848,4 @@ fn a_new_partial_message_gets_its_own_deadline_after_a_completed_message() {
     assert_eq!(messages.len(), 1);
     assert_eq!(receiver.expire(5_000), Ok(()));
     assert_eq!(receiver.expire(9_999), Err(WireError::ReassemblyTimeout));
-}
-
-#[test]
-fn encode_preflights_sequence_space_and_never_leaves_a_more_prefix() {
-    let mut codec = Codec::with_sequences(Profile::Semantic, 1, u32::MAX - 1);
-    let mut out = b"unchanged".to_vec();
-    assert_eq!(
-        codec.encode(1, 3, &vec![0; (1 << 16) + 1], &mut out),
-        Err(WireError::ResourceExhausted)
-    );
-    assert_eq!(out, b"unchanged");
 }

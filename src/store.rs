@@ -263,10 +263,6 @@ impl Store {
         .map(|(commit, _, _)| commit)
     }
 
-    pub fn append_capped(&mut self, bytes: &[u8], cap: u64, end: u64) -> Result<&Commit> {
-        self.append_capped_with(bytes, cap, end, |_| Ok(()))
-    }
-
     #[doc(hidden)]
     pub fn append_capped_with(
         &mut self,
