@@ -3364,3 +3364,157 @@ fn v29_refuses_every_inconsistent_lease_request_and_result() {
         "short result"
     );
 }
+
+// ---------------------------------------------------------------- V27 ----
+// §16 V27 — private-mode query and its accepted reply. Correlation
+// 0102030405060708, lease epoch 3, echoed class 04, plain u16 byte lengths.
+// Both directions use frame sequence 3. Exact hex from the schema.
+
+const V27_QUERY: &str = "4D 4F 4F 52 03 14 00 00 07 00 00 00 03 00 00 00 \
+                         18 00 00 00 42 0B EA EE 08 07 06 05 04 03 02 01 \
+                         03 00 00 00 04 09 00 1B 5B 3F 32 30 30 34 24 70";
+const V27_REPLY: &str = "4D 4F 4F 52 03 0C 00 00 07 00 00 00 03 00 00 00\
+                         1A 00 00 00 EE BD 48 07 08 07 06 05 04 03 02 01 \
+                         03 00 00 00 04 0B 00 1B 5B 3F 32 30 30 34 3B 31 \
+                         24 79";
+const V27_CORRELATION: u64 = 0x0102_0304_0506_0708;
+
+#[test]
+fn v27_query_and_reply_reproduce_the_frozen_bytes() {
+    use moor::wire::Query;
+    for (kind, body, bytes, label) in [
+        (0x14u8, b"\x1b[?2004$p".as_slice(), V27_QUERY, "query"),
+        (0x0C, b"\x1b[?2004;1$y".as_slice(), V27_REPLY, "reply"),
+    ] {
+        let payload = Query {
+            correlation: V27_CORRELATION,
+            epoch: 3,
+            class: 4,
+            bytes: body.to_vec(),
+        }
+        .encode()
+        .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        let frame = hex(bytes);
+        v16_framing_assert_header(&frame);
+        assert_eq!(
+            frame[24..],
+            payload[..],
+            "{label}: frozen payload disagrees with the schema text"
+        );
+        assert_eq!(
+            v16_framing_encode_frame(3, 7, kind, &payload),
+            frame,
+            "{label}: encoder must reproduce the frozen frame at sequence 3"
+        );
+        // The correlation is little-endian, so the frozen bytes read 08..01.
+        assert_eq!(&payload[..8], &V27_CORRELATION.to_le_bytes());
+        // The body length is the plain §1.1 u16 immediately before the body.
+        assert_eq!(
+            u16::from_le_bytes(payload[13..15].try_into().unwrap()) as usize,
+            body.len(),
+            "{label}: declared body length"
+        );
+    }
+}
+
+#[test]
+fn v27_reply_echoes_the_query_tuple_and_decodes_through_controller_dispatch() {
+    use moor::session::Request;
+    use moor::wire::{ControllerRequest, Query, decode_controller, decode_query};
+    let query = decode_query(&v16_framing_feed_one(3, &hex(V27_QUERY)).payload)
+        .expect("the frozen query must decode");
+    assert_eq!(
+        (query.correlation, query.epoch, query.class),
+        (V27_CORRELATION, 3, 4)
+    );
+    assert_eq!(query.bytes, b"\x1b[?2004$p".to_vec(), "CSI7 ?2004$p");
+
+    let message = v16_framing_feed_one(3, &hex(V27_REPLY));
+    assert_eq!((message.scope, message.kind), (7, 0x0C));
+    let reply = decode_query(&message.payload).expect("the frozen reply must decode");
+    // "echoed": the reply carries the query's correlation, epoch and class
+    // unchanged. Asserted as a tuple so a single echoed field cannot drift.
+    assert_eq!(
+        (reply.correlation, reply.epoch, reply.class),
+        (query.correlation, query.epoch, query.class),
+        "the reply must echo the query's correlation, epoch and class"
+    );
+    assert_eq!(reply.bytes, b"\x1b[?2004;1$y".to_vec(), "CSI7 ?2004;1$y");
+    // The reply also decodes through the real controller dispatch, which is
+    // how the holder actually receives it.
+    assert!(
+        matches!(
+            decode_controller(0x0C, &message.payload, None),
+            Ok(ControllerRequest::Policy(Request::QueryReply(correlation, 3, 4, bytes)))
+                if correlation == V27_CORRELATION && bytes == b"\x1b[?2004;1$y"
+        ),
+        "the reply must dispatch as a QueryReply carrying the echoed tuple"
+    );
+    // Round-trip: re-encoding the decoded reply reproduces the frozen payload.
+    assert_eq!(
+        Query {
+            correlation: reply.correlation,
+            epoch: reply.epoch,
+            class: reply.class,
+            bytes: reply.bytes.clone(),
+        }
+        .encode()
+        .unwrap(),
+        message.payload
+    );
+}
+
+#[test]
+fn v27_refuses_every_invalid_query_tuple_and_inexact_length() {
+    use moor::wire::{Query, decode_query};
+    let body = b"\x1b[?2004$p".to_vec();
+    // correlation zero, epoch zero, and class outside 1..=5 are each refused by
+    // the encoder and the decoder alike.
+    for (correlation, epoch, class, label) in [
+        (0u64, 3u32, 4u8, "zero correlation"),
+        (V27_CORRELATION, 0, 4, "zero epoch"),
+        (V27_CORRELATION, 3, 0, "class zero"),
+        (V27_CORRELATION, 3, 6, "class above the frozen range"),
+        (V27_CORRELATION, 3, 0xFF, "class 0xFF"),
+    ] {
+        let query = Query {
+            correlation,
+            epoch,
+            class,
+            bytes: body.clone(),
+        };
+        assert!(query.encode().is_err(), "{label} encoded");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&correlation.to_le_bytes());
+        payload.extend_from_slice(&epoch.to_le_bytes());
+        payload.push(class);
+        payload.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&body);
+        assert!(decode_query(&payload).is_err(), "{label} decoded");
+    }
+    // The plain u16 body length is exact, not a lower bound: a trailing byte
+    // the length does not cover must be refused rather than ignored, and a
+    // length longer than the body must not over-read.
+    let good = Query {
+        correlation: V27_CORRELATION,
+        epoch: 3,
+        class: 4,
+        bytes: body.clone(),
+    }
+    .encode()
+    .unwrap();
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(
+        decode_query(&trailing).is_err(),
+        "a byte past the declared body length was ignored"
+    );
+    let mut overlong = good.clone();
+    overlong[13..15].copy_from_slice(&((body.len() + 1) as u16).to_le_bytes());
+    assert!(
+        decode_query(&overlong).is_err(),
+        "a declared length past the end of the payload was accepted"
+    );
+    assert!(decode_query(&good[..good.len() - 1]).is_err(), "short body");
+    assert!(decode_query(&[]).is_err(), "empty payload");
+}
