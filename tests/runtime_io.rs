@@ -1069,7 +1069,9 @@ fn tracked_writer_reports_progress_before_failure() {
         completed.recv_timeout(Duration::from_secs(1)).unwrap(),
         (2, Some(20))
     );
-    pump.shutdown();
+    assert_eq!(pump.pending(), 0);
+    assert_eq!(pump.try_send(vec![1]), Err(SendError::Closed));
+    assert_eq!(pump.try_send(Vec::new()), Err(SendError::Closed));
     read_gate.open();
 }
 
