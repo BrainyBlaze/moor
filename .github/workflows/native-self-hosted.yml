@@ -1,0 +1,374 @@
+# Repository runner inventory queried through the GitHub API at
+# 2026-08-06T01:56:53Z: {"total_count":0,"runners":[]}.
+#
+# The custom labels below are enrollment contracts for required release lanes.
+# They do not assert that a runner exists, that a job ran, or that Moor passed.
+# Queued, skipped, cancelled, compile-only, and unit-only results are never
+# native conformance evidence.
+# Ubuntu 24.04 arm64 is intentionally absent: the automatic hosted workflow
+# already provides that current runner, so Task 6's fallback condition is false.
+name: Self-hosted native evidence / NOT RUN — no matching runner enrolled as of inventory query
+run-name: NOT RUN — no matching runner enrolled as of inventory query / ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  inventory-declaration:
+    name: NOT RUN — no matching runner enrolled as of inventory query / hosted metadata only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Record the audited inventory boundary
+        run: |
+          {
+            printf '%s\n' '### NOT RUN — no matching runner enrolled as of inventory query'
+            printf '%s\n' '' \
+              'The authenticated repository inventory query at 2026-08-06T01:56:53Z returned {"total_count":0,"runners":[]}.' \
+              '' \
+              'This hosted metadata job is not native evidence. The labels below are required enrollment contracts only.' \
+              'Queued, skipped, cancelled, compile-only, and unit-only output is not a native pass.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  required-posix:
+    name: NOT RUN — no matching runner enrolled as of inventory query / ${{ matrix.lane }}
+    needs: inventory-declaration
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: alpine-3.20-x64
+            probe: alpine-3.20
+            expected-arch: x64
+            runner:
+              - self-hosted
+              - linux
+              - x64
+              - alpine-3.20-x64
+          - lane: alpine-3.20-arm64
+            probe: alpine-3.20
+            expected-arch: arm64
+            runner:
+              - self-hosted
+              - linux
+              - ARM64
+              - alpine-3.20-arm64
+          - lane: wsl1-ubuntu-22.04-x64
+            probe: wsl1-ubuntu-22.04
+            expected-arch: x64
+            runner:
+              - self-hosted
+              - linux
+              - x64
+              - wsl1-ubuntu-22.04-x64
+          - lane: wsl2-ubuntu-22.04-x64
+            probe: wsl2-ubuntu-22.04
+            expected-arch: x64
+            runner:
+              - self-hosted
+              - linux
+              - x64
+              - wsl2-ubuntu-22.04-x64
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Record and verify the runner identity
+        shell: sh
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected-arch }}
+          LANE: ${{ matrix.lane }}
+          PROBE: ${{ matrix.probe }}
+        run: |
+          out="ci-output/$LANE"
+          mkdir -p "$out"
+          checked_out=$(git rev-parse HEAD)
+          actual_arch=$(uname -m)
+          {
+            printf 'expected_commit=%s\n' "$GITHUB_SHA"
+            printf 'checked_out_commit=%s\n' "$checked_out"
+            printf 'runner=%s\n' "$RUNNER_NAME"
+            printf 'runner_os=%s\n' "$RUNNER_OS"
+            printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+            printf 'kernel_arch=%s\n' "$actual_arch"
+            printf 'required_lane=%s\n' "$LANE"
+            printf 'required_probe=%s\n' "$PROBE"
+            uname -a
+            if test -r /etc/os-release; then
+              sed 's/^/os_release_/' /etc/os-release
+            fi
+          } > "$out/identity.txt"
+          {
+            printf '%s\n' '### NOT RUN — no matching runner enrolled as of inventory query'
+            printf '%s\n' '' \
+              'Inventory snapshot: {"total_count":0,"runners":[]} at 2026-08-06T01:56:53Z.' \
+              '' \
+              "Required lane: $LANE." \
+              'This job can run only after its cumulative enrollment labels are installed.' \
+              'A native-pass claim requires this job and every evidence step to succeed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$checked_out" = "$GITHUB_SHA"
+          test "$RUNNER_OS" = Linux
+          case "$EXPECTED_ARCH:$RUNNER_ARCH" in
+            x64:X64 | arm64:ARM64) ;;
+            *)
+              printf 'runner metadata architecture does not satisfy %s: %s\n' "$LANE" "$RUNNER_ARCH" >&2
+              exit 1
+              ;;
+          esac
+          case "$EXPECTED_ARCH:$actual_arch" in
+            x64:x86_64 | arm64:aarch64 | arm64:arm64) ;;
+            *)
+              printf 'runner architecture does not satisfy %s: %s\n' "$LANE" "$actual_arch" >&2
+              exit 1
+              ;;
+          esac
+          case "$PROBE" in
+            alpine-3.20)
+              test -r /etc/alpine-release
+              case "$(cat /etc/alpine-release)" in
+                3.20.*) ;;
+                *)
+                  printf '%s\n' 'runner is not Alpine 3.20' >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            wsl1-ubuntu-22.04 | wsl2-ubuntu-22.04)
+              test -r /etc/os-release
+              . /etc/os-release
+              test "$ID" = ubuntu
+              test "$VERSION_ID" = 22.04
+              kernel_release=$(cat /proc/sys/kernel/osrelease)
+              printf '%s\n' "$kernel_release" | grep -qi microsoft
+              if test "$PROBE" = wsl1-ubuntu-22.04; then
+                if printf '%s\n' "$kernel_release" | grep -qi wsl2; then
+                  printf '%s\n' 'WSL1 lane resolved to WSL2' >&2
+                  exit 1
+                fi
+              elif ! printf '%s\n' "$kernel_release" | grep -qi wsl2; then
+                printf '%s\n' 'WSL2 lane did not report WSL2' >&2
+                exit 1
+              fi
+              ;;
+            *)
+              printf 'unknown platform probe: %s\n' "$PROBE" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Install stable Rust
+        shell: sh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build both release command names
+        shell: sh
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          out="ci-output/$LANE"
+          cargo build --release --bin moor --bin atch > "$out/build.log" 2>&1
+          cat "$out/build.log"
+
+      - name: Package, hash, and smoke both command names
+        shell: sh
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          out="ci-output/$LANE"
+          cp target/release/moor "$out/moor"
+          cp target/release/atch "$out/atch"
+          (
+            cd "$out"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum moor atch
+            else
+              shasum -a 256 moor atch
+            fi > SHA256SUMS
+          )
+          {
+            "$out/moor" --version
+            "$out/moor" --help
+            "$out/atch" --version
+            "$out/atch" --help
+          } >> "$out/smoke.log" 2>&1
+          cat "$out/SHA256SUMS" "$out/smoke.log"
+
+      - name: Run all applicable real-process tests
+        shell: sh
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          out="ci-output/$LANE"
+          cargo test --release --all-targets > "$out/test.log" 2>&1
+          cat "$out/test.log"
+
+      - name: Upload logs, binaries, and artifact identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: self-hosted-${{ matrix.lane }}-${{ github.sha }}
+          path: ci-output/${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 14
+
+  required-windows:
+    name: NOT RUN — no matching runner enrolled as of inventory query / ${{ matrix.lane }}
+    needs: inventory-declaration
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: windows-10-1809-x64
+            probe: windows-10-1809
+            expected-arch: X64
+            runner:
+              - self-hosted
+              - windows
+              - x64
+              - windows-10-1809-x64
+          - lane: windows-server-2019-x64
+            probe: windows-server-2019
+            expected-arch: X64
+            runner:
+              - self-hosted
+              - windows
+              - x64
+              - windows-server-2019-x64
+          - lane: windows-11-arm64
+            probe: windows-11
+            expected-arch: ARM64
+            runner:
+              - self-hosted
+              - windows
+              - ARM64
+              - windows-11-arm64
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Record and verify the runner identity
+        shell: pwsh
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected-arch }}
+          LANE: ${{ matrix.lane }}
+          PROBE: ${{ matrix.probe }}
+        run: |
+          $out = "ci-output/$env:LANE"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $checkedOut = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $platform = Get-CimInstance Win32_OperatingSystem
+          @(
+            "expected_commit=$env:GITHUB_SHA"
+            "checked_out_commit=$checkedOut"
+            "runner=$env:RUNNER_NAME"
+            "runner_os=$env:RUNNER_OS"
+            "runner_arch=$env:RUNNER_ARCH"
+            "required_lane=$env:LANE"
+            "required_probe=$env:PROBE"
+            "caption=$($platform.Caption)"
+            "version=$($platform.Version)"
+            "build=$($platform.BuildNumber)"
+            "product_type=$($platform.ProductType)"
+            "platform=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+          ) | Set-Content -Encoding utf8NoBOM "$out/identity.txt"
+          @(
+            '### NOT RUN — no matching runner enrolled as of inventory query'
+            ''
+            'Inventory snapshot: `{"total_count":0,"runners":[]}` at `2026-08-06T01:56:53Z`.'
+            ''
+            "Required lane: ``$env:LANE``."
+            'This job can run only after its cumulative enrollment labels are installed.'
+            'A native-pass claim requires this job and every evidence step to succeed.'
+          ) | Add-Content -Encoding utf8NoBOM $env:GITHUB_STEP_SUMMARY
+          if ($checkedOut -ne $env:GITHUB_SHA) { throw 'checked-out commit does not match GITHUB_SHA' }
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'runner is not native Windows' }
+          if ($env:RUNNER_ARCH -ne $env:EXPECTED_ARCH) { throw 'runner architecture does not match the lane' }
+          switch ($env:PROBE) {
+            'windows-10-1809' {
+              if ($platform.ProductType -ne 1 -or $platform.BuildNumber -ne '17763') {
+                throw 'runner is not Windows 10 version 1809'
+              }
+            }
+            'windows-server-2019' {
+              if ($platform.ProductType -eq 1 -or $platform.BuildNumber -ne '17763') {
+                throw 'runner is not Windows Server 2019'
+              }
+            }
+            'windows-11' {
+              if ($platform.ProductType -ne 1 -or [int]$platform.BuildNumber -lt 22000) {
+                throw 'runner is not Windows 11'
+              }
+            }
+            default { throw "unknown platform probe: $env:PROBE" }
+          }
+
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build both release command names
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          cargo build --release --bin moor --bin atch *>&1 | Tee-Object -FilePath "$out/build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package, hash, and smoke both command names
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          Copy-Item target/release/moor.exe "$out/moor.exe"
+          Copy-Item target/release/atch.exe "$out/atch.exe"
+          $hashes = foreach ($file in @("$out/moor.exe", "$out/atch.exe")) {
+            $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          $hashes | Set-Content -Encoding utf8NoBOM "$out/SHA256SUMS"
+          & "$out/moor.exe" --version *>> "$out/smoke.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$out/moor.exe" --help *>> "$out/smoke.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$out/atch.exe" --version *>> "$out/smoke.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$out/atch.exe" --help *>> "$out/smoke.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$out/SHA256SUMS"
+          Get-Content "$out/smoke.log"
+
+      - name: Run all applicable real-process tests
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          cargo test --release --all-targets *>&1 | Tee-Object -FilePath "$out/test.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload logs, binaries, and artifact identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: self-hosted-${{ matrix.lane }}-${{ github.sha }}
+          path: ci-output/${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 14
