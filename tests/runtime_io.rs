@@ -621,7 +621,11 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             2,
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
-        assert_eq!(first.recv().kind, 3);
+        let attach = first.recv();
+        assert_eq!(
+            (attach.kind, attach.payload.as_ref()),
+            (3, [80, 0, 24, 0, 1].as_slice())
+        );
         first.send(7, 5, &[0, 0]);
         first.send(7, 4, &status(1, 1, 0, 1, 1));
         first.send(
@@ -642,7 +646,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             6,
             &[&1_u64.to_le_bytes()[..], &0_u64.to_le_bytes(), b"x"].concat(),
         );
-        let mut saw = [false; 2];
+        let mut saw = [false; 3];
         while !saw.into_iter().all(|value| value) {
             let message = first.recv();
             match message.kind {
@@ -657,6 +661,10 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                     );
                     assert_eq!(&message.payload[13..], b"a");
                     saw[1] = true;
+                }
+                0x0b => {
+                    assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 100, 0, 30, 0]);
+                    saw[2] = true;
                 }
                 kind => panic!("unexpected initial viewer frame {kind}"),
             }
@@ -696,7 +704,10 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             .unwrap(),
         );
         let attach = second.recv();
-        assert_eq!((attach.kind, attach.payload[4] & 1), (3, 0));
+        assert_eq!(
+            (attach.kind, attach.payload.as_ref()),
+            (3, [100, 0, 30, 0, 0].as_slice())
+        );
         second.send(7, 5, &[0, 0]);
         second.send(7, 4, &status(1, 2, 0, 2, 1));
         second.send(
@@ -763,7 +774,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
     let result = io::attach_viewer_to(
         &mut client,
         &Options::default(),
-        (0, 0),
+        (24, 80),
         &mut sink,
         Duration::from_secs(15),
         |_| {
@@ -784,10 +795,10 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                         detach: None,
                         pass_suspend: true,
                         state,
-                        last_size: None,
+                        last_size: Some((24, 80)),
                     },
                     || io::InputState::Ready,
-                    || None,
+                    || Some((30, 100)),
                     || {},
                     Instant::now,
                 );
