@@ -19,10 +19,10 @@ schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending,
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
 
 struct State(AtomicU64, u64);
-type WriteJob = Option<(Vec<u8>, u64)>;
+type WriteJob = (Vec<u8>, u64);
 
 pub struct Duplex<T = Event>(
-    Mutex<Option<Sender<WriteJob>>>,
+    Arc<Mutex<Option<Sender<WriteJob>>>>,
     pub CrossReceiver<T>,
     Arc<State>,
 );
@@ -252,16 +252,14 @@ impl<T> Duplex<T> {
             .0
             .fetch_update(AcqRel, Acquire, |used| reserve(used, charge, state.1))
             .map_err(|_| SendError::Full)?;
-        sender.send(Some((bytes, charge))).map_err(|_| {
+        sender.send((bytes, charge)).map_err(|_| {
             state.0.fetch_sub(charge, AcqRel);
             SendError::Closed
         })
     }
 
     pub fn shutdown(&self) {
-        if let Some(sender) = self.0.lock().expect("duplex sender lock").take() {
-            let _ = sender.send(None);
-        }
+        self.0.lock().expect("duplex sender lock").take();
     }
 
     pub fn pending(&self) -> usize {
@@ -281,6 +279,7 @@ pub(crate) fn pump<T: Send + 'static>(
 ) -> (Duplex<T>, Receiver<(u64, Option<u16>)>) {
     let (completed, completions) = channel();
     let (out, writes) = channel::<WriteJob>();
+    let out = Arc::new(Mutex::new(Some(out)));
     let (tx, events) = bounded(8);
     let state = Arc::new(State(
         AtomicU64::new(0),
@@ -296,8 +295,9 @@ pub(crate) fn pump<T: Send + 'static>(
         let _ = tx.send(closed);
     });
     let ws = state.clone();
+    let writer_out = out.clone();
     std::thread::spawn(move || {
-        while let Ok(Some((bytes, charge))) = writes.recv() {
+        while let Ok((bytes, charge)) = writes.recv() {
             let mut written = 0;
             let error = loop {
                 match writer.write(&bytes[written..]) {
@@ -312,6 +312,10 @@ pub(crate) fn pump<T: Send + 'static>(
                     Err(_) => break Some(20),
                 }
             };
+            if error.is_some() {
+                writer_out.lock().expect("duplex sender lock").take();
+                ws.0.store(0, Release);
+            }
             let _ = completed.send((written as u64, error));
             if error.is_some() {
                 break;
@@ -320,7 +324,7 @@ pub(crate) fn pump<T: Send + 'static>(
         }
         close();
     });
-    (Duplex(Mutex::new(Some(out)), events, state), completions)
+    (Duplex(out, events, state), completions)
 }
 
 fn usage(overhead: usize, payload: usize) -> Option<u64> {
