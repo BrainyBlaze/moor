@@ -11,7 +11,7 @@
 #![cfg(unix)]
 
 // ---- vectors: V12, V21, V22 ----
-// Conformance lane: §16 platform vectors V12, V21, V22 (+ V13 supersession).
+// Conformance lane: §16 platform vectors V12, V13, V21, V22.
 // Every vector below is the EXACT hex copied from spec/moor-wire-schema.md §16.
 // Nothing here is computed from the implementation.
 
@@ -419,17 +419,25 @@ fn v16_platform_v13_frozen_body_is_137_bytes_with_frozen_sha256() {
 }
 
 #[test]
-fn v16_platform_v13_superseded_current_moorcmt1_shape() {
-    // GAP / SUPERSEDED: §16 V13 freezes a 76-byte MOOREVC2 Windows-only event
-    // commit record. That form is superseded by the ratified portable 92-byte
-    // MOORCMT1 record (consumer issue #5), so the frozen 76-byte bytes are NOT
-    // asserted. No ratified byte-exact MOORCMT1 vector exists in §16, so this
-    // test pins the CURRENT record shape through the public encoder instead,
-    // reusing the values §16 freezes for V13: generation 7, epoch 0, commit
-    // slot 0, body slot 0, commit index 1, body prefix length 137 (0x89), and
-    // the frozen SHA-256 of the 137-byte schema-v2 header body.
-    let hash = v13_hash();
-    let commit = Commit {
+fn v16_platform_v13_matches_the_ratified_portable_commit_byte_for_byte() {
+    // §16 V13, ratified form: the portable 92-byte MOORCMT1 initial event
+    // commit. The previous revision of this test could only pin the record's
+    // shape through the encoder, because the artifact still froze the
+    // superseded 76-byte MOOREVC2 record and no ratified MOORCMT1 bytes
+    // existed. Asserting an encoder against values fed to that same encoder is
+    // a tautology; these bytes come from the artifact instead.
+    let frozen = hex("4D 4F 4F 52 43 4D 54 31 01 00 00 01 07 00 00 00
+         00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+         89 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 2C 71 E9 28 70 77 41 50
+         F5 DB EE C3 4F 19 05 2D 82 87 4F 6E B4 AC 4B C9
+         F8 D4 BF 7A D7 43 ED FB 28 95 8D 91");
+    assert_eq!(frozen.len(), 92, "the ratified record is exactly 92 bytes");
+
+    // The encoder must reproduce those bytes from the values §16 states:
+    // kind event 01, generation 7, epoch and coordinates zero, commit slot 0,
+    // body slot 0, index 1, prefix length 137 (0x89) and the frozen body hash.
+    let produced = Commit {
         slot: 0,
         body: 0,
         kind: Kind::Event,
@@ -439,35 +447,22 @@ fn v16_platform_v13_superseded_current_moorcmt1_shape() {
         length: V13_BODY.len() as u64,
         start: 0,
         end: 0,
-        hash,
-    };
-    let bytes = commit.encode();
-    assert_eq!(bytes.len(), 92);
-    assert_eq!(&bytes[..8], b"MOORCMT1");
-    assert_eq!(bytes[8], 0x01, "record format");
-    assert_eq!(bytes[9], 0x00, "commit slot");
-    assert_eq!(bytes[10], 0x00, "body slot");
-    assert_eq!(bytes[11], Kind::Event as u8, "record kind");
-    assert_eq!(&bytes[12..16], 7u32.to_le_bytes().as_slice(), "generation");
-    assert_eq!(&bytes[16..20], 0u32.to_le_bytes().as_slice(), "epoch");
-    assert_eq!(&bytes[20..24], [0; 4], "reserved");
+        hash: v13_hash(),
+    }
+    .encode();
+    assert_eq!(produced.as_slice(), frozen.as_slice());
+
+    // The frozen trailing CRC-32C really is a CRC-32C over bytes 0..88, so a
+    // transcription error in the record body cannot pass unnoticed.
     assert_eq!(
-        &bytes[24..32],
-        1u64.to_le_bytes().as_slice(),
-        "commit index"
+        u32::from_le_bytes(frozen[88..92].try_into().unwrap()),
+        crc32c(&frozen[..88]),
     );
+
+    // And the frozen prefix length is the real length of the frozen body.
     assert_eq!(
-        &bytes[32..40],
-        137u64.to_le_bytes().as_slice(),
-        "body prefix length"
-    );
-    assert_eq!(&bytes[40..48], 0u64.to_le_bytes().as_slice(), "start");
-    assert_eq!(&bytes[48..56], 0u64.to_le_bytes().as_slice(), "end");
-    assert_eq!(&bytes[56..88], hash.as_slice(), "body prefix SHA-256");
-    assert_eq!(
-        &bytes[88..92],
-        crc32c(&bytes[..88]).to_le_bytes().as_slice(),
-        "CRC-32C over bytes 0..88"
+        u64::from_le_bytes(frozen[32..40].try_into().unwrap()),
+        V13_BODY.len() as u64,
     );
 }
 
