@@ -100,15 +100,15 @@ impl Scanner {
         self.episode == [false; 2]
     }
     pub fn expire(&mut self, now: u64) -> Vec<Scan> {
+        if now < self.since.saturating_add(50) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        if is_osc(&self.buf)
-            && self.buf.last() == Some(&0x1b)
-            && now >= self.since.saturating_add(50)
-        {
+        if is_osc(&self.buf) && self.buf.last() == Some(&0x1b) {
             self.buf.pop();
             self.abandon("deadline", &mut out);
             self.begin(0x1b, now, &mut out);
-        } else if self.sent < self.buf.len() && now >= self.since.saturating_add(50) {
+        } else if self.sent < self.buf.len() {
             self.abandon("deadline", &mut out);
         }
         out
@@ -324,12 +324,12 @@ fn decimal(bytes: &[u8], default: u32) -> u32 {
         .unwrap_or(u32::MAX)
 }
 fn possible_query(bytes: &[u8]) -> bool {
-    let Some((_, tail)) = csi(bytes) else {
-        return false;
-    };
     if recognize_query(bytes).is_some() {
         return true;
     }
+    let Some((_, tail)) = csi(bytes) else {
+        return false;
+    };
     match tail {
         b"" | b"0" | b">" | b">0" | b"6" | b"?" => true,
         [b'?', rest @ ..] => {
@@ -351,12 +351,7 @@ fn complete(bytes: &[u8]) -> bool {
     } else if let Some((_, tail)) = csi(bytes) {
         tail.last().is_some_and(|byte| (0x40..=0x7e).contains(byte))
     } else {
-        let needed = if matches!(bytes.get(1), Some(b'(' | b')')) {
-            3
-        } else {
-            2
-        };
-        bytes.len() >= needed
+        bytes.len() >= 2 + usize::from(matches!(bytes.get(1), Some(b'(' | b')')))
     }
 }
 fn osc_body(bytes: &[u8]) -> Option<&[u8]> {
