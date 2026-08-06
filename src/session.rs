@@ -187,19 +187,19 @@ schema!(enum ordinal pub SourceReason; None, HeartbeatTimeout, TransportClosed, 
 schema!(struct pub SourceEffect derive [Clone, Debug, Eq, PartialEq] pub fields; source: Arc<[u8]>, producer: [u8; 16], source_epoch: u32,
     status: SourceStatus, reason: SourceReason);
 impl SourceEffect {
-    fn new(
+    fn change(
         source: Arc<[u8]>,
         binding: Binding,
         status: SourceStatus,
         reason: SourceReason,
-    ) -> Self {
-        Self {
+    ) -> SemanticChange {
+        SemanticChange::Source(Self {
             source,
             producer: binding.producer,
             source_epoch: binding.epoch,
             status,
             reason,
-        }
+        })
     }
 }
 schema!(enum pub SemanticChange [Clone, Debug, Eq, PartialEq]; Source(SourceEffect), Missing(SemanticEffect));
@@ -207,16 +207,12 @@ schema!(enum pub SemanticChange [Clone, Debug, Eq, PartialEq]; Source(SourceEffe
 schema!(struct Binding derive [Clone, Copy, Eq, PartialEq] fields; conn: ConnId, epoch: u32, producer: [u8; 16]);
 schema!(struct Retained fields; id: [u8; 16], sequence: u64, kind: SemanticEventKind, digest: [u8; 32], position: EventPosition);
 schema!(struct default Source fields; binding: Binding = Binding { conn: 0, epoch: 0, producer: [0; 16] },
-    flags: u8 = ACTIVE, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected,
+    mode: SemanticMode = SemanticMode::Edge, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected,
     entries: VecDeque<Retained> = VecDeque::new(), pending: u8 = 0, last_seen: u64 = 0);
 schema!(struct PendingHello fields; name: Arc<[u8]>, source: Source, superseded: Option<ConnId>,
     missing: Vec<[u8; 16]>);
-const STATEFUL: u8 = 1;
-const ACTIVE: u8 = 2;
-const EXACT: u8 = 4;
 const COMMIT_PENDING: u8 = 1;
 const ACK_PENDING: u8 = 2;
-const SOURCE_FLAGS: [u8; 8] = [2, 2, 2, 0, 3, 7, 3, 1];
 pub const GEOMETRY_LIMIT: u16 = 32_767;
 pub const GEOMETRY_CELLS: u32 = 2_000_000;
 macro_rules! reject {
@@ -242,11 +238,17 @@ impl Retained {
     }
 }
 impl Source {
-    fn has(&self, flag: u8) -> bool {
-        self.flags & flag == flag
+    fn stateful(&self) -> bool {
+        self.mode == SemanticMode::Stateful
+    }
+    fn active(&self) -> bool {
+        self.status != SourceStatus::Disconnected
+    }
+    fn exact(&self) -> bool {
+        self.stateful() && self.status == SourceStatus::Exact
     }
     fn timed_out(&self, now: u64) -> bool {
-        self.has(STATEFUL)
+        self.stateful()
             && matches!(self.status, SourceStatus::Connected | SourceStatus::Exact)
             && now >= self.last_seen.saturating_add(15_000)
     }
@@ -255,12 +257,11 @@ impl Source {
         name: &Arc<[u8]>,
         status: SourceStatus,
         reason: SourceReason,
-    ) -> Option<SourceEffect> {
+    ) -> Option<SemanticChange> {
         return_if!(self.status == status, None);
         self.status = status;
-        self.flags = SOURCE_FLAGS[usize::from(self.has(STATEFUL)) * 4 + status as usize];
-        self.has(STATEFUL)
-            .then(|| SourceEffect::new(Arc::clone(name), self.binding, status, reason))
+        self.stateful()
+            .then(|| SourceEffect::change(Arc::clone(name), self.binding, status, reason))
     }
 
     fn admit(
@@ -275,7 +276,7 @@ impl Source {
             !writable => ResourceExhausted,
             receipt.is_some() != (event.kind == SemanticEventKind::ApplicationReceipt) => InvalidPayload,
             self.capabilities & if receipt.is_some() { 2 } else { 1 } == 0 => CapabilityAbsent,
-            !self.has(STATEFUL) && event.kind != SemanticEventKind::Transition => InvalidPayload,
+            !self.stateful() && event.kind != SemanticEventKind::Transition => InvalidPayload,
         }
         if let Some(prior) = self
             .entries
@@ -290,7 +291,7 @@ impl Source {
             )));
         }
         reject! {
-            self.has(STATEFUL) && !self.has(EXACT) && event.kind != SemanticEventKind::Snapshot => SnapshotRequired,
+            self.stateful() && !self.exact() && event.kind != SemanticEventKind::Snapshot => SnapshotRequired,
             event.exact_payload.len() > 32 * 1024
                 || event.sequence == 0
                 || event.kind != SemanticEventKind::ApplicationReceipt
@@ -319,23 +320,36 @@ pub(crate) fn valid_source_id(source: &[u8]) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(byte))
 }
 impl Application {
+    fn current(&self, source: Option<&Source>) -> bool {
+        source.is_some_and(|source| source.binding == self.binding && source.exact())
+    }
+
     fn written(&self) -> bool {
         matches!(self.state, AppState::Written)
     }
 
-    fn effect(&self, reason: MissingReason) -> SemanticEffect {
-        SemanticEffect {
+    fn effect(&self, reason: MissingReason) -> SemanticChange {
+        SemanticChange::Missing(SemanticEffect {
             receipt: self.receipt,
             source: Arc::clone(&self.source),
             source_epoch: self.binding.epoch,
             producer: self.binding.producer,
             reason,
-        }
+        })
     }
-    fn emit_once(&mut self, bit: u8, reason: MissingReason) -> Option<SemanticEffect> {
+    fn emit_once(&mut self, bit: u8, reason: MissingReason) -> Option<SemanticChange> {
         return_if!(self.emitted & bit != 0, None);
         self.emitted |= bit;
         Some(self.effect(reason))
+    }
+
+    fn status(&self, conn: ConnId, receipt: ApplicationReceipt) -> SemResult {
+        reject! {
+            (self.binding.conn, self.receipt.lease_epoch, self.receipt.request_id)
+                != (conn, receipt.lease_epoch, receipt.request_id) => SemanticRefusal::UnknownApplication,
+            !self.written() => SemanticRefusal::NotWritten,
+        }
+        Ok(())
     }
 }
 
@@ -369,11 +383,16 @@ pub type Effects = SmallVec<[Effect; 4]>;
 
 schema!(enum Peer; Controller(bool, bool), Semantic(Arc<[u8]>));
 schema!(enum Pending; Input(ConnId, OwnedInput), Application([u8; 16], InputPending),
-    Semantic(Arc<[u8]>, Binding, SemanticEvent, Option<[u8; 16]>),
+    Semantic(Arc<[u8]>, SemanticEvent, Option<[u8; 16]>),
     Sources, Hello(Box<PendingHello>), Ack(Arc<[u8]>, SemanticAck));
 schema!(struct PendingQuery fields; conn: ConnId, correlation: u64, epoch: u32, shape: QueryShape,
     fallback: Option<Vec<u8>>, deadline: u64);
 schema!(struct Termination fields; peer: Option<ConnId>, started: u64, containment: u8, method: u8, expired: bool);
+impl Termination {
+    fn reply(&self, outcome: u8, message: &'static [u8]) -> Reply {
+        Reply::Termination(outcome, self.containment, self.method, message)
+    }
+}
 schema!(enum SourceTrigger [Clone, Copy]; Timeout(u64), Closed(ConnId), Ending);
 schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8; 16] = [0; 16], allocated: u32 = 0,
     lease: Lease = Lease::default(), semantic_token: [u8; 16] = [0; 16], sources: BTreeMap<Arc<[u8]>, Source> = BTreeMap::new(),
@@ -543,17 +562,14 @@ impl Machine {
     }
 
     fn geometry(&mut self, conn: ConnId, columns: u16, rows: u16) -> bool {
-        let refusal = if (columns == 0) != (rows == 0) {
-            Some((14, b"geometry was half specified".as_slice()))
+        let (code, diagnostic) = if (columns == 0) != (rows == 0) {
+            (14, b"geometry was half specified".as_slice())
         } else if columns > GEOMETRY_LIMIT
             || rows > GEOMETRY_LIMIT
             || u32::from(columns) * u32::from(rows) > GEOMETRY_CELLS
         {
-            Some((5, b"geometry exceeded its valid range".as_slice()))
+            (5, b"geometry exceeded its valid range".as_slice())
         } else {
-            None
-        };
-        let Some((code, diagnostic)) = refusal else {
             return true;
         };
         self.send(conn, Reply::ControllerError(code, diagnostic));
@@ -562,14 +578,12 @@ impl Machine {
     }
 
     pub fn query_owner(&self) -> Option<(ConnId, u32)> {
-        (self.query_next != 0 || self.query_exhaustion_pending)
-            .then(|| self.owner())
-            .flatten()
-            .filter(|(conn, _)| {
-                self.peers
-                    .get(conn)
-                    .is_some_and(|peer| matches!(peer, Peer::Controller(true, false)))
-            })
+        return_if!(self.query_next == 0 && !self.query_exhaustion_pending, None);
+        self.owner().filter(|(conn, _)| {
+            self.peers
+                .get(conn)
+                .is_some_and(|peer| matches!(peer, Peer::Controller(true, false)))
+        })
     }
 
     fn update_sources(&mut self, trigger: SourceTrigger, now: Option<u64>) {
@@ -584,41 +598,30 @@ impl Machine {
             .filter(|(_, source)| match trigger {
                 SourceTrigger::Timeout(at) => source.timed_out(at),
                 SourceTrigger::Closed(conn) => source.binding.conn == conn,
-                SourceTrigger::Ending => source.has(STATEFUL | ACTIVE),
+                SourceTrigger::Ending => source.stateful() && source.active(),
             })
             .filter_map(|(name, source)| source.transition(name, status, reason))
-            .map(SemanticChange::Source)
             .collect();
         self.sweep_applications(now, &mut changes);
         self.persist_sources(changes);
-    }
-
-    fn current_source(&self, value: &Application) -> bool {
-        self.sources
-            .get(&value.source)
-            .is_some_and(|source| source.binding == value.binding && source.has(EXACT))
     }
 
     fn sweep_applications(&mut self, now: Option<u64>, changes: &mut Vec<SemanticChange>) {
         let sources = &self.sources;
         self.applications.retain(|_, value| {
             return_if!(!value.written(), true);
-            let current = sources
-                .get(&value.source)
-                .is_some_and(|source| source.binding == value.binding && source.has(EXACT));
+            let current = value.current(sources.get(&value.source));
             if !current && let Some(effect) = value.emit_once(2, MissingReason::SourceLost) {
-                changes.push(SemanticChange::Missing(effect));
+                changes.push(effect);
             }
             let Some(now) = now else { return true };
             if now >= value.deadline
                 && let Some(effect) = value.emit_once(1, MissingReason::Deadline)
             {
-                changes.push(SemanticChange::Missing(effect));
+                changes.push(effect);
             }
             return_if!(now < value.deadline.saturating_add(540_000), true);
-            changes.push(SemanticChange::Missing(
-                value.effect(MissingReason::RetentionExpired),
-            ));
+            changes.push(value.effect(MissingReason::RetentionExpired));
             false
         });
     }
@@ -626,10 +629,10 @@ impl Machine {
     fn semantic_flags(&self) -> u8 {
         self.sources
             .values()
-            .filter(|source| source.has(STATEFUL))
+            .filter(|source| source.stateful())
             .fold(0, |flags, source| {
                 flags
-                    | match (source.has(EXACT), source.status) {
+                    | match (source.exact(), source.status) {
                         (true, _) => 1 | u8::from(source.capabilities & 6 == 6) << 2,
                         (false, SourceStatus::Degraded | SourceStatus::Disconnected) => 2,
                         _ => 0,
@@ -640,7 +643,7 @@ impl Machine {
     pub fn status(&self, conn: ConnId) -> PolicyStatus {
         let range = self.replay.front().zip(self.replay.back());
         PolicyStatus {
-            owns_lease: self.owner().is_some_and(|owner| owner.0 == conn),
+            owns_lease: self.lease.owner == Some(conn),
             viewers: self
                 .peers
                 .values()
@@ -886,16 +889,15 @@ impl Machine {
             return self.refuse_input(conn, input, 17);
         };
         let (byte_count, digest) = (terminal.len() as u64, Sha256::digest(terminal).into());
-        let source = self
+        let Some((source, state)) = self
             .sources
             .get_key_value(source_bytes)
-            .filter(|(_, source)| {
-                source.has(EXACT) && source.capabilities & 6 == 6 && source.pending != ACK_PENDING
-            });
-        let Some((source, binding)) = source.map(|(name, source)| (name.clone(), source.binding))
+            .filter(|(_, source)| source.exact() && source.capabilities & 6 == 6)
+            .filter(|(_, source)| source.pending != ACK_PENDING)
         else {
             return self.refuse_input(conn, input, 17);
         };
+        let (source, binding) = (source.clone(), state.binding);
         let code = self
             .applications
             .contains_key(&receipt.application_id)
@@ -942,8 +944,7 @@ impl Machine {
             return self.refuse_semantic(conn, None, SemanticRefusal::SourceUnavailable);
         }
         let expired = now >= value.deadline;
-        let permitted =
-            !expired && self.current_source(value) && value.binding.conn == conn && ack.prepared;
+        let permitted = !expired && value.current(self.sources.get(&value.source)) && ack.prepared;
         if !permitted {
             let AppState::Notice(pending) =
                 self.applications.remove(&application_id).unwrap().state
@@ -986,7 +987,7 @@ impl Machine {
             self.refuse_semantic(conn, None, SemanticRefusal::ResourceExhausted);
             return self.effects.push(Effect::Close(conn));
         }
-        let snapshot_required = pending.source.has(STATEFUL);
+        let snapshot_required = pending.source.stateful();
         let epoch = pending.source.binding.epoch;
         pending.source.last_seen = now;
         self.sources.insert(pending.name.clone(), pending.source);
@@ -1034,17 +1035,15 @@ impl Machine {
             return self.fallback(fallback);
         };
         let correlation = self.query_next;
-        if self.queries.len() == 64 {
-            self.effects.push(Effect::Close(owner));
-            self.queries_gone(owner);
-            return self.fallback(fallback);
-        }
-        if correlation == 0 {
-            self.query_exhaustion_pending = false;
-            self.send(
-                owner,
-                Reply::ControllerError(13, b"query correlation exhausted"),
-            );
+        let overloaded = self.queries.len() == 64;
+        if overloaded || correlation == 0 {
+            if !overloaded {
+                self.query_exhaustion_pending = false;
+                self.send(
+                    owner,
+                    Reply::ControllerError(13, b"query correlation exhausted"),
+                );
+            }
             self.effects.push(Effect::Close(owner));
             self.queries_gone(owner);
             return self.fallback(fallback);
@@ -1079,21 +1078,19 @@ impl Machine {
             return;
         };
         let query = &self.queries[index];
-        if query.epoch != reply.1
-            || query.shape.class != reply.2
-            || !validate_query_reply(&query.shape, reply.3)
-        {
-            return;
-        }
+        return_if!(
+            query.epoch != reply.1
+                || query.shape.class != reply.2
+                || !validate_query_reply(&query.shape, reply.3)
+        );
         if now >= query.deadline {
             let query = self.queries.remove(index).unwrap();
             return self.fallback(query.fallback);
         }
-        if self.touch_lease(conn, query.epoch, None, now) {
-            self.queries.remove(index);
-            self.effects
-                .push(Effect::Write(Ticket(0), reply.3.to_vec()));
-        }
+        return_if!(!self.touch_lease(conn, query.epoch, None, now));
+        self.queries.remove(index);
+        self.effects
+            .push(Effect::Write(Ticket(0), reply.3.to_vec()));
     }
 
     fn semantic_hello(&mut self, conn: ConnId, now: u64, hello: SemanticHello) -> SemResult {
@@ -1105,15 +1102,22 @@ impl Machine {
                 hello.generation != self.generation
                     && !(self.generation == 1 && hello.generation == 0) => Generation,
             hello.capabilities & !7 != 0 || !valid_source_id(&hello.source) => InvalidPayload,
-                self.pending.values().any(|pending| {
-                    matches!(pending, Pending::Hello(pending)
-                        if pending.source.binding.conn == conn || pending.name.as_ref() == hello.source.as_ref())
-                }) => ResourceExhausted,
+        }
+        let mut pending_sources = 0;
+        for pending in self.pending.values() {
+            let Pending::Hello(pending) = pending else {
+                continue;
+            };
+            reject! {
+                pending.source.binding.conn == conn
+                    || pending.name.as_ref() == hello.source.as_ref() => ResourceExhausted,
+            }
+            pending_sources += usize::from(!self.sources.contains_key(pending.name.as_ref()));
         }
         let prior = self.sources.get(hello.source.as_ref());
         let epoch = if let Some(source) = prior {
             reject! {
-                source.has(STATEFUL) != (hello.mode == SemanticMode::Stateful) => SourceConflict,
+                source.mode != hello.mode => SourceConflict,
                 source.pending != 0 => ResourceExhausted,
             }
             source
@@ -1122,16 +1126,7 @@ impl Machine {
                 .checked_add(1)
                 .ok_or(ResourceExhausted)?
         } else {
-            let source_count = self.sources.len()
-                + self
-                    .pending
-                    .values()
-                    .filter(|pending| {
-                        matches!(pending, Pending::Hello(pending)
-                        if !self.sources.contains_key(pending.name.as_ref()))
-                    })
-                    .count();
-            reject! { source_count >= 64 => ResourceExhausted }
+            reject! { self.sources.len() + pending_sources >= 64 => ResourceExhausted }
             1
         };
         let binding = Binding {
@@ -1140,42 +1135,38 @@ impl Machine {
             producer: hello.producer,
         };
         let superseded = prior
-            .filter(|source| source.has(ACTIVE))
+            .filter(|source| source.active())
             .map(|source| source.binding.conn);
         let mut changes = Vec::with_capacity(2);
-        if let Some(source) = prior
-            .filter(|source| source.has(STATEFUL) && source.status != SourceStatus::Disconnected)
-        {
-            changes.push(SemanticChange::Source(SourceEffect::new(
+        if let Some(source) = prior.filter(|source| source.stateful() && source.active()) {
+            changes.push(SourceEffect::change(
                 Arc::clone(&hello.source),
                 source.binding,
                 SourceStatus::Disconnected,
                 SourceReason::Superseded,
-            )));
+            ));
         }
         let mut missing = Vec::new();
         for value in self.applications.values() {
             if Some(value.binding.conn) == superseded && value.written() && value.emitted & 2 == 0 {
-                changes.push(SemanticChange::Missing(
-                    value.effect(MissingReason::SourceLost),
-                ));
+                changes.push(value.effect(MissingReason::SourceLost));
                 missing.push(value.receipt.application_id);
             }
         }
         if hello.mode == SemanticMode::Stateful {
-            changes.push(SemanticChange::Source(SourceEffect::new(
+            changes.push(SourceEffect::change(
                 Arc::clone(&hello.source),
                 binding,
                 SourceStatus::Connected,
                 SourceReason::None,
-            )));
+            ));
         }
         let pending = PendingHello {
             name: hello.source,
             missing,
             source: Source {
                 binding,
-                flags: SOURCE_FLAGS[hello.mode as usize * 4],
+                mode: hello.mode,
                 capabilities: hello.capabilities,
                 ..Source::default()
             },
@@ -1213,7 +1204,7 @@ impl Machine {
         let Some(source) = self
             .sources
             .get(&name)
-            .filter(|source| source.binding.conn == conn && source.has(ACTIVE))
+            .filter(|source| source.binding.conn == conn && source.active())
         else {
             return self.refuse_semantic(conn, Some(event), Superseded);
         };
@@ -1224,21 +1215,10 @@ impl Machine {
         let binding = source.binding;
         let receipt = projection.as_ref().map(|value| value.receipt);
         let duplicate = match source.admit(&event, receipt, self.writable, |receipt| {
-            let bound = self
-                .applications
+            self.applications
                 .get(&receipt.application_id)
-                .filter(|value| {
-                    (
-                        value.binding.conn,
-                        value.receipt.lease_epoch,
-                        value.receipt.request_id,
-                    ) == (conn, receipt.lease_epoch, receipt.request_id)
-                });
-            match bound {
-                Some(value) if value.written() => Ok(()),
-                Some(_) => Err(NotWritten),
-                None => Err(UnknownApplication),
-            }
+                .ok_or(UnknownApplication)?
+                .status(conn, receipt)
         }) {
             Ok(duplicate) => duplicate,
             Err(error) => return self.refuse_semantic(conn, Some(event), error),
@@ -1248,7 +1228,6 @@ impl Machine {
         }
         let pending = Pending::Semantic(
             name.clone(),
-            binding,
             event.clone(),
             receipt.map(|receipt| receipt.application_id),
         );
@@ -1311,12 +1290,9 @@ impl Machine {
                     self.set_writable(false);
                 }
             }
-            (
-                Pending::Semantic(name, binding, event, application),
-                Completion::Semantic(position),
-            ) => {
+            (Pending::Semantic(name, event, application), Completion::Semantic(position)) => {
                 let source = self.sources.get_mut(&name).expect("pending source");
-                debug_assert!(source.binding == binding);
+                let binding = source.binding;
                 source.pending = 0;
                 let position = match position {
                     Ok(position) => position,
@@ -1325,7 +1301,7 @@ impl Machine {
                         return;
                     }
                 };
-                let change = (event.kind == SemanticEventKind::Snapshot && source.has(ACTIVE))
+                let change = (event.kind == SemanticEventKind::Snapshot && source.active())
                     .then(|| source.transition(&name, SourceStatus::Exact, SourceReason::None))
                     .flatten();
                 source.entries.push_back(Retained::new(&event, position));
@@ -1339,11 +1315,7 @@ impl Machine {
                 if let Some(change) = change {
                     source.pending = ACK_PENDING;
                     if self
-                        .commit_sources(
-                            Pending::Ack(name.clone(), ack),
-                            vec![SemanticChange::Source(change)],
-                            false,
-                        )
+                        .commit_sources(Pending::Ack(name.clone(), ack), vec![change], false)
                         .is_err()
                     {
                         self.refuse_semantic(
@@ -1381,9 +1353,7 @@ impl Machine {
                     self.request_lease(conn, &LeaseRequest::fresh(LeaseRole::Viewer), now, token)
                 });
                 let owns = resumed
-                    || result
-                        .as_ref()
-                        .is_some_and(|value| value.outcome == ResultOutcome::Granted);
+                    || matches!(&result, Some(value) if value.outcome == ResultOutcome::Granted);
                 *self.peers.get_mut(&conn).unwrap() = Peer::Controller(true, non_vt);
                 let resize = (columns != 0 && owns).then_some((rows, columns));
                 self.effects
@@ -1446,7 +1416,7 @@ impl Machine {
                     Some(Peer::Semantic(name)) => self.sources.get_mut(name),
                     _ => None,
                 }
-                .filter(|source| source.binding.conn == conn && source.has(ACTIVE));
+                .filter(|source| source.binding.conn == conn && source.active());
                 if let Some(source) = source {
                     source.last_seen = now;
                 } else {
@@ -1481,22 +1451,18 @@ impl Machine {
 
     fn tick(&mut self, now: u64) {
         self.expire_lease(now);
-        let mut force = false;
-        let mut report = None;
         if let Some(state) = self.termination.as_mut() {
             if state.method == 1 && now >= state.started.saturating_add(5_000) {
                 state.method = 2;
                 state.containment |= 4;
-                force = true;
+                self.effects.push(Effect::Terminate(true));
             }
             if !state.expired && now >= state.started.saturating_add(10_000) {
                 state.expired = true;
-                report = state.peer.take();
+                self.effects
+                    .extend(state.peer.take().map(Effect::ReportTermination));
             }
         }
-        self.effects
-            .extend(force.then_some(Effect::Terminate(true)));
-        self.effects.extend(report.map(Effect::ReportTermination));
         self.cancel_notice(19, |application| now >= application.deadline);
         self.update_sources(SourceTrigger::Timeout(now), Some(now));
         while self
@@ -1512,9 +1478,7 @@ impl Machine {
     fn disconnect(&mut self, conn: ConnId) {
         match self.peers.remove(&conn) {
             Some(Peer::Controller(..)) => {
-                if self.lease.owner == Some(conn) {
-                    self.lease.owner = None;
-                }
+                self.lease.owner = self.lease.owner.filter(|owner| *owner != conn);
                 self.queries_gone(conn);
             }
             Some(Peer::Semantic(name)) => {
@@ -1536,8 +1500,7 @@ impl Machine {
     }
 
     fn set_writable(&mut self, writable: bool) {
-        let losing = self.writable && !writable;
-        self.writable = writable;
+        let losing = std::mem::replace(&mut self.writable, writable) && !writable;
         return_if!(!losing);
         for (&conn, peer) in &self.peers {
             if matches!(peer, Peer::Semantic(..)) {
@@ -1573,10 +1536,8 @@ impl Machine {
                     if let Some(state) = self.termination.as_ref() {
                         self.send(
                             conn,
-                            Reply::Termination(
+                            state.reply(
                                 3,
-                                state.containment,
-                                state.method,
                                 b"termination outcome was not established within 10 seconds",
                             ),
                         );
@@ -1588,19 +1549,12 @@ impl Machine {
                         && let Some(peer) = state.peer
                     {
                         state.containment |= u8::from(survivor) << 3;
-                        self.send(
-                            peer,
-                            Reply::Termination(
-                                if unlinked { 0 } else { 4 },
-                                state.containment,
-                                state.method,
-                                if unlinked {
-                                    b""
-                                } else {
-                                    b"session retirement did not complete"
-                                },
-                            ),
-                        );
+                        let (outcome, message) = if unlinked {
+                            (0, b"".as_slice())
+                        } else {
+                            (4, b"session retirement did not complete".as_slice())
+                        };
+                        self.send(peer, state.reply(outcome, message));
                         self.effects
                             .push(Effect::Flush(peer, state.started.saturating_add(10_000)));
                     }

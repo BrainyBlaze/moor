@@ -52,6 +52,61 @@ mod tests {
             .unwrap();
     }
 
+    fn plain_input(request_id: u64, bytes: &[u8]) -> OwnedInput {
+        OwnedInput {
+            epoch: 1,
+            request_id,
+            exact_payload: [
+                1_u32.to_le_bytes().as_slice(),
+                request_id.to_le_bytes().as_slice(),
+                &[0],
+                bytes,
+            ]
+            .concat()
+            .into(),
+        }
+    }
+
+    #[test]
+    fn mismatched_completion_kind_does_not_consume_a_pending_write() {
+        let mut machine = attached_viewer(1);
+        let input = plain_input(1, b"pending");
+        let effects = machine
+            .transition(Transition::Peer(
+                1,
+                7,
+                Request::Input(input.clone(), None),
+            ))
+            .unwrap();
+        let [Effect::Write(ticket, bytes)] = effects.as_slice() else {
+            panic!("expected one write");
+        };
+        assert_eq!(bytes, b"pending");
+
+        assert!(machine
+            .transition(Transition::Complete(
+                2,
+                *ticket,
+                Completion::Sources(true),
+            ))
+            .unwrap()
+            .is_empty());
+        let completed = machine
+            .transition(Transition::Complete(
+                3,
+                *ticket,
+                Completion::Write(bytes.len() as u64, None),
+            ))
+            .unwrap();
+        assert!(matches!(
+            completed.as_slice(),
+            [Effect::Send(7, Reply::Input(receipt))]
+                if InputReceipt::decode(receipt).is_ok_and(|value| {
+                    value.status == 0 && value.request == input.request_id
+                })
+        ));
+    }
+
     #[test]
     fn correlation_exhaustion_reports_once_then_cancels_in_output_order() {
         let mut machine = attached_viewer(u64::MAX);
