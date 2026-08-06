@@ -80,7 +80,6 @@ mod descriptor_deadline_tests {
                 scope: 7,
                 handshaking: false,
                 deadline: 0,
-                descriptor_pending: false,
             },
         );
         runtime.machine.register_controller(id);
@@ -108,9 +107,7 @@ mod descriptor_deadline_tests {
         }
         let now = monotonic();
         runtime.peers.get_mut(&1).unwrap().deadline = now + 50;
-        runtime.peers.get_mut(&1).unwrap().descriptor_pending = true;
         runtime.peers.get_mut(&2).unwrap().deadline = now + 50;
-        runtime.peers.get_mut(&2).unwrap().descriptor_pending = true;
         runtime.descriptors.extend([
             (1, Descriptor::Attach(81, 24, true, false, Some([3; 16]))),
             (2, Descriptor::Status),
@@ -141,7 +138,6 @@ mod descriptor_deadline_tests {
         add_peer(&mut runtime, 3);
         let now = monotonic();
         runtime.peers.get_mut(&3).unwrap().deadline = now + 50;
-        runtime.peers.get_mut(&3).unwrap().descriptor_pending = true;
         runtime.descriptors.push_back((3, Descriptor::Status));
         let mut calls = 0;
         runtime.poll_descriptors_with(&mut || {
@@ -162,7 +158,6 @@ mod descriptor_deadline_tests {
         add_peer(&mut runtime, 4);
         let now = monotonic();
         runtime.peers.get_mut(&4).unwrap().deadline = now + 50;
-        runtime.peers.get_mut(&4).unwrap().descriptor_pending = true;
         runtime.descriptors.push_back((
             4,
             Descriptor::Attach(80, 24, true, false, Some([4; 16])),
@@ -182,6 +177,32 @@ mod descriptor_deadline_tests {
     }
 
     #[test]
+    fn queued_descriptor_is_authoritative_for_ingress_gating() {
+        let (mut runtime, paths) = fixture("descriptor-authority");
+        add_peer(&mut runtime, 5);
+        assert!(matches!(
+            runtime.storage.try_status_snapshot(),
+            SnapshotState::Ready(_)
+        ));
+        runtime.descriptors.push_back((5, Descriptor::Status));
+
+        let status = Message {
+            scope: 7,
+            kind: 13,
+            payload: (&[][..]).into(),
+        };
+        assert_eq!(
+            runtime.controller_message_at(5, &status, monotonic()),
+            Err(wire::WireError::Malformed),
+            "queue membership must prevent a second request from the same peer"
+        );
+
+        runtime.storage.release_status_snapshot();
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
     fn expired_identity_ingress_cannot_ack_or_cancel_the_deadline() {
         let (mut runtime, paths) = fixture("controller-ingress-deadline");
         runtime.peers.insert(
@@ -193,7 +214,6 @@ mod descriptor_deadline_tests {
                 scope: 0,
                 handshaking: true,
                 deadline: 100,
-                descriptor_pending: false,
             },
         );
         let hello = Message {
@@ -236,7 +256,6 @@ mod descriptor_deadline_tests {
                 scope: 0,
                 handshaking: true,
                 deadline: 100,
-                descriptor_pending: false,
             },
         );
         let semantic = Message {
@@ -261,7 +280,7 @@ mod descriptor_deadline_tests {
             runtime.accept(duplex(), true);
             runtime.peer_bytes(id, b"MOOR".to_vec());
         }
-        runtime.apply_with([PolicyEffect::OutputExhausted], &mut monotonic);
+        runtime.apply_with([PolicyEffect::OutputExhausted], &mut monotonic, None);
         runtime.accept(duplex(), true);
 
         assert_eq!(runtime.peers.len(), 16);

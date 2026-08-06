@@ -210,4 +210,45 @@ mod tests {
             ] if ticket.get() == 0 && bytes == b"final"
         ));
     }
+
+    #[test]
+    fn termination_timeout_reply_follows_the_forced_native_effect() {
+        let mut machine = Machine::new(7, [1; 16], [2; 16]);
+        machine.configure(b"session".to_vec(), 1024);
+        machine.register_controller(7);
+
+        assert!(matches!(
+            machine
+                .transition(Transition::Peer(
+                    0,
+                    7,
+                    Request::Terminate(b"session", 7, [1; 16], false),
+                ))
+                .unwrap()
+                .as_slice(),
+            [Effect::Terminate(false)]
+        ));
+        assert!(machine
+            .transition(Transition::TerminationApplied(3, false))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            machine
+                .transition(Transition::Tick(10_000))
+                .unwrap()
+                .as_slice(),
+            [Effect::Terminate(true), Effect::ReportTermination(7)]
+        ));
+        assert!(machine
+            .transition(Transition::TerminationApplied(2, false))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            machine
+                .transition(Transition::ReportTermination(7))
+                .unwrap()
+                .as_slice(),
+            [Effect::Send(7, Reply::Termination(3, 7, 2, _))]
+        ));
+    }
 }

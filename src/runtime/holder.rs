@@ -31,7 +31,7 @@ const QUERY_REPLIES: [[&[u8]; 2]; 3] = [
 impl<N: Native> Runtime<N> {
     fn transition<'a>(&mut self, event: Transition<'a>) -> DecodeResult {
         let effects = self.machine.transition(event)?;
-        self.apply_with(effects, &mut monotonic);
+        self.apply_with(effects, &mut monotonic, None);
         Ok(())
     }
 
@@ -39,14 +39,13 @@ impl<N: Native> Runtime<N> {
         &mut self,
         effects: impl IntoIterator<Item = PolicyEffect>,
         clock: &mut impl FnMut() -> u64,
+        attach: Option<(StatusSnapshot, u64)>,
     ) {
         for effect in effects {
             match effect {
                 PolicyEffect::Send(id, reply) => self.reply(id, reply),
                 PolicyEffect::Attached(id, non_vt, result, resize) => {
-                    let (snapshot, deadline) = self
-                        .status_snapshot
-                        .expect("attach descriptor snapshot and deadline");
+                    let (snapshot, deadline) = attach.expect("attach descriptor context");
                     if clock() >= deadline {
                         self.disconnect(id);
                         continue;
@@ -91,13 +90,11 @@ impl<N: Native> Runtime<N> {
                             .is_ok_and(|events| self.storage.commit(purpose, &events).is_ok());
                     if !submitted {
                         // A mandatory observation cannot be refused, so its
-                        // failure is a storage failure and closes the stream.
-                        // A rejectable request must fail before any state change
-                        // and disturb neither the lane nor another peer, so only
-                        // its own requester is resolved (closure §5.7).
-                        if mandatory {
-                            let _ = self.transition(Transition::Writable(false));
-                        }
+                        // completion makes the policy non-writable and closes
+                        // semantic streams. A rejectable request must fail
+                        // before any state change and disturb neither the lane
+                        // nor another peer, so only its requester is resolved
+                        // (closure §5.7).
                         self.complete(ticket, Completion::Sources(false));
                     }
                 }
@@ -314,8 +311,7 @@ pub trait Native {
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, writes: Receiver<(u64, Option<u16>)>, storage: SessionStorage,
     status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
 schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
-schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64,
-    descriptor_pending: bool);
+schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64);
 
 impl Peer {
     fn profile(&self) -> Option<Profile> {
@@ -330,7 +326,7 @@ impl Peer {
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
     writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
     frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
-    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, status_snapshot: Option<(StatusSnapshot, u64)>, machine: Machine);
+    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
     pub fn output(&mut self, bytes: Vec<u8>) {
@@ -396,7 +392,6 @@ impl<N: Native> Runtime<N> {
             heartbeat_at: 0,
             heartbeat_flags: 0,
             descriptors: VecDeque::new(),
-            status_snapshot: None,
             machine,
         }
     }
@@ -438,7 +433,6 @@ impl<N: Native> Runtime<N> {
                 scope: 0,
                 handshaking: true,
                 deadline: time.saturating_add(2_000),
-                descriptor_pending: false,
             },
         );
     }
@@ -495,7 +489,7 @@ impl<N: Native> Runtime<N> {
         for effect in self.machine.transition(Transition::Ending).unwrap() {
             match effect {
                 PolicyEffect::CommitSources(_, values, _) => changes.extend(values),
-                effect => self.apply_with([effect], &mut monotonic),
+                effect => self.apply_with([effect], &mut monotonic, None),
             }
         }
         let mut events = events::semantic_changes(now(), changes).unwrap_or_default();
@@ -649,9 +643,7 @@ impl<N: Native> Runtime<N> {
 
     fn controller_message_at(&mut self, id: u64, message: &Message, time: u64) -> DecodeResult {
         wire::require(
-            self.peers
-                .get(&id)
-                .is_some_and(|peer| !peer.descriptor_pending),
+            self.peers.contains_key(&id) && !self.descriptors.iter().any(|(peer, _)| *peer == id),
             wire::WireError::Malformed,
         )?;
         if message.kind != 1 {
@@ -917,7 +909,6 @@ impl<N: Native> Runtime<N> {
         if state.deadline == 0 {
             state.deadline = now.saturating_add(2_000);
         }
-        state.descriptor_pending = true;
         self.descriptors.push_back((peer, request));
         self.poll_descriptors_with(&mut monotonic);
     }
@@ -951,7 +942,6 @@ impl<N: Native> Runtime<N> {
                 }
             };
             let (_, request) = self.descriptors.pop_front().expect("front descriptor");
-            self.peers.get_mut(&peer).unwrap().descriptor_pending = false;
             self.storage.release_status_snapshot();
             match request {
                 Descriptor::Status => {
@@ -971,9 +961,7 @@ impl<N: Native> Runtime<N> {
                         PolicyRequest::Attach(columns, rows, lease, non_vt, token),
                     )) {
                         Ok(effects) => {
-                            self.status_snapshot = Some((snapshot, deadline));
-                            self.apply_with(effects, clock);
-                            self.status_snapshot = None;
+                            self.apply_with(effects, clock, Some((snapshot, deadline)));
                         }
                         Err(error) => self.refuse_wire(peer, error),
                     }

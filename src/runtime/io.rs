@@ -26,16 +26,16 @@ pub struct Duplex<T = Event>(Arc<Mutex<State>>, pub CrossReceiver<T>);
 
 schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(Sender<bool>), Abort);
 pub struct ViewerSender(CrossSender<Command>);
-schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>)), Attached, Reattaching);
+schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>), Arc<AtomicU8>),
+    Attached, Reattaching);
 
 impl ViewerSender {
     pub fn send(&self, bytes: &[u8]) -> bool {
         bytes.is_empty() || self.0.send(Command::Input(bytes.to_vec())).is_ok()
     }
     fn flush(&self, bytes: &mut Vec<u8>) -> bool {
-        let sent = self.send(bytes);
-        bytes.clear();
-        sent
+        let input = std::mem::take(bytes);
+        input.is_empty() || self.0.send(Command::Input(input)).is_ok()
     }
     pub fn release(&self) -> bool {
         let (send, receive) = channel();
@@ -44,9 +44,8 @@ impl ViewerSender {
 }
 
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
-    phase: ViewerPhase<'a>, commands: CrossReceiver<Command>, sender: CrossSender<Command>,
-    state: Arc<AtomicU8>, wire: ViewerStream, lease: Option<InputLease>,
-    size: Option<(u16, u16)>, release: Option<Sender<bool>>);
+    phase: ViewerPhase<'a>, commands: CrossReceiver<Command>, sender: CrossSender<Command>, wire: ViewerStream,
+    lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<Sender<bool>>);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -100,11 +99,10 @@ impl Viewer<'_> {
                 self.advance(vec![])?;
             }
             ViewerEvent::Lease(result) => {
-                if let ViewerPhase::Starting(start) =
-                    std::mem::replace(&mut self.phase, ViewerPhase::Attached)
-                {
+                let phase = std::mem::replace(&mut self.phase, ViewerPhase::Attached);
+                if let ViewerPhase::Starting(start, state) = phase {
                     self.lease = InputLease::from_result(result, LeaseRole::Viewer)?;
-                    start(ViewerSender(self.sender.clone()), self.state.clone());
+                    start(ViewerSender(self.sender.clone()), state);
                     if self.lease.is_some() {
                         match self.options.redraw {
                             Redraw::CtrlL => self.advance(b"\x0c".to_vec())?,
@@ -370,10 +368,9 @@ pub fn attach_viewer_to(
         client,
         options,
         output,
-        phase: ViewerPhase::Starting(&mut start),
+        phase: ViewerPhase::Starting(&mut start, state),
         commands,
         sender,
-        state: state.clone(),
         wire: ViewerStream {
             non_vt: options.non_vt,
             ..ViewerStream::default()
