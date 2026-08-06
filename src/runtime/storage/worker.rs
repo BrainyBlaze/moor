@@ -419,12 +419,15 @@ impl Lane {
                     _ => {}
                 }
                 let abandoned = worker_state.closed();
+                let failed = result_failed || completed >= deadline || abandoned;
+                // Make completion delivery a phase barrier: once a controller
+                // observes `next()`, the lane is already snapshottable (or
+                // terminally closed on failure).
+                worker_state.finish(failed);
                 if publishing && !abandoned {
                     published.completed.push_back((completed, result));
                 }
                 drop(published);
-                let failed = result_failed || completed >= deadline || abandoned;
-                worker_state.finish(failed);
                 if failed || worker_state.closed() {
                     break;
                 }
