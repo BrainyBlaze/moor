@@ -445,16 +445,30 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
     // half-specified is 14, out-of-range is 5. 32768 is one past the signed
     // 16-bit console ceiling; 2001x1000 is one cell past the product cap; and
     // 32767x32767 is the case a u16 product computation would silently wrap.
-    for (columns, rows, code, at_attach) in [
-        (80u16, 0u16, 14u16, true),
-        (0, 24, 14, true),
-        (32_768, 1, 5, true),
-        (1, 32_768, 5, true),
-        (2001, 1000, 5, true),
-        (32_767, 32_767, 5, true),
-        (32_768, 1, 5, false),
-        (2001, 1000, 5, false),
+    // The ratified §16 V32 geometry table, byte-for-byte. Each `bytes` value is
+    // the frozen `columns:u16-le, rows:u16-le` pair from the artifact, so the
+    // rows below are the contract rather than a restatement of the bound.
+    for (columns, rows, code, at_attach, bytes) in [
+        (80u16, 0u16, 14u16, true, None),
+        (0, 24, 14, true, None),
+        (0, 1, 14, true, Some([0x00, 0x00, 0x01, 0x00])),
+        (1, 0, 14, true, Some([0x01, 0x00, 0x00, 0x00])),
+        (2001, 1000, 5, true, Some([0xD1, 0x07, 0xE8, 0x03])),
+        (32_767, 62, 5, true, Some([0xFF, 0x7F, 0x3E, 0x00])),
+        (32_768, 1, 5, true, Some([0x00, 0x80, 0x01, 0x00])),
+        (1, 32_768, 5, true, None),
+        (32_767, 32_767, 5, true, None),
+        (32_768, 1, 5, false, None),
+        (2001, 1000, 5, false, None),
     ] {
+        // Where the artifact freezes the bytes, confirm our little-endian pair
+        // is exactly those bytes before asserting the required outcome.
+        if let Some(frozen) = bytes {
+            let mut encoded = [0; 4];
+            encoded[..2].copy_from_slice(&columns.to_le_bytes());
+            encoded[2..].copy_from_slice(&rows.to_le_bytes());
+            assert_eq!(encoded, frozen, "frozen V32 geometry bytes");
+        }
         let (mut runtime, root) = fixture();
         let mut peer = connect(&mut runtime);
         hello(&mut peer, &mut runtime);
