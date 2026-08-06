@@ -7,7 +7,7 @@ use crate::wire::{Message, ViewerEvent, ViewerStream, decode_viewer};
 use crossbeam_channel::{Receiver as CrossReceiver, Sender as CrossSender, bounded, never, select};
 use interprocess::TryClone;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicU8, Ordering::*};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,14 +18,10 @@ schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending,
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
 
-struct State(AtomicU64, u64);
 type WriteJob = (Vec<u8>, u64);
+schema!(struct State fields; sender: Option<Sender<WriteJob>>, used: u64, limit: u64);
 
-pub struct Duplex<T = Event>(
-    Arc<Mutex<Option<Sender<WriteJob>>>>,
-    pub CrossReceiver<T>,
-    Arc<State>,
-);
+pub struct Duplex<T = Event>(Arc<Mutex<State>>, pub CrossReceiver<T>);
 
 schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(Sender<bool>), Abort);
 pub struct ViewerSender(CrossSender<Command>);
@@ -238,9 +234,8 @@ impl<T> Duplex<T> {
     }
 
     pub fn try_send_payload(&self, bytes: Vec<u8>, payload: usize) -> Result<(), SendError> {
-        let state = &self.2;
-        let sender = self.0.lock().expect("duplex sender lock");
-        let sender = sender.as_ref().ok_or(SendError::Closed)?;
+        let mut state = self.0.lock().expect("duplex state lock");
+        let sender = state.sender.as_ref().cloned().ok_or(SendError::Closed)?;
         let Some(overhead) = bytes.len().checked_sub(payload) else {
             return Err(SendError::Full);
         };
@@ -248,22 +243,21 @@ impl<T> Duplex<T> {
             return Ok(());
         }
         let charge = usage(overhead, payload).ok_or(SendError::Full)?;
-        state
-            .0
-            .fetch_update(AcqRel, Acquire, |used| reserve(used, charge, state.1))
-            .map_err(|_| SendError::Full)?;
-        sender.send((bytes, charge)).map_err(|_| {
-            state.0.fetch_sub(charge, AcqRel);
-            SendError::Closed
-        })
+        state.used = reserve(state.used, charge, state.limit).ok_or(SendError::Full)?;
+        if sender.send((bytes, charge)).is_err() {
+            state.sender.take();
+            state.used = 0;
+            return Err(SendError::Closed);
+        }
+        Ok(())
     }
 
     pub fn shutdown(&self) {
-        self.0.lock().expect("duplex sender lock").take();
+        self.0.lock().expect("duplex state lock").sender.take();
     }
 
     pub fn pending(&self) -> usize {
-        let used = self.2.0.load(Acquire);
+        let used = self.0.lock().expect("duplex state lock").used;
         (used >> 32) as usize + (used as u32) as usize
     }
 }
@@ -279,12 +273,12 @@ pub(crate) fn pump<T: Send + 'static>(
 ) -> (Duplex<T>, Receiver<(u64, Option<u16>)>) {
     let (completed, completions) = channel();
     let (out, writes) = channel::<WriteJob>();
-    let out = Arc::new(Mutex::new(Some(out)));
     let (tx, events) = bounded(8);
-    let state = Arc::new(State(
-        AtomicU64::new(0),
-        usage(limit, payload_limit).unwrap(),
-    ));
+    let state = Arc::new(Mutex::new(State {
+        sender: Some(out),
+        used: 0,
+        limit: usage(limit, payload_limit).unwrap(),
+    }));
     std::thread::spawn(move || {
         let mut buf = [0; 8192];
         while let Ok(n) = reader.read(&mut buf) {
@@ -294,8 +288,7 @@ pub(crate) fn pump<T: Send + 'static>(
         }
         let _ = tx.send(closed);
     });
-    let ws = state.clone();
-    let writer_out = out.clone();
+    let writer_state = Arc::downgrade(&state);
     std::thread::spawn(move || {
         while let Ok((bytes, charge)) = writes.recv() {
             let mut written = 0;
@@ -312,19 +305,23 @@ pub(crate) fn pump<T: Send + 'static>(
                     Err(_) => break Some(20),
                 }
             };
-            if error.is_some() {
-                writer_out.lock().expect("duplex sender lock").take();
-                ws.0.store(0, Release);
+            if let Some(state) = writer_state.upgrade() {
+                let mut state = state.lock().expect("duplex state lock");
+                if error.is_some() {
+                    state.sender.take();
+                    state.used = 0;
+                } else {
+                    state.used -= charge;
+                }
             }
             let _ = completed.send((written as u64, error));
             if error.is_some() {
                 break;
             }
-            ws.0.fetch_sub(charge, AcqRel);
         }
         close();
     });
-    (Duplex(out, events, state), completions)
+    (Duplex(state, events), completions)
 }
 
 fn usage(overhead: usize, payload: usize) -> Option<u64> {

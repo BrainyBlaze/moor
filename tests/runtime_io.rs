@@ -1172,6 +1172,24 @@ fn shutdown_and_drop_do_not_wait_for_blocked_io() {
 }
 
 #[test]
+fn dropping_duplex_closes_an_idle_writer() {
+    let read_gate = Arc::new(Gate::default());
+    let (closed, await_closed) = mpsc::channel();
+    let pump = Duplex::closing(
+        BlockingReader(read_gate.clone()),
+        std::io::sink(),
+        1,
+        move || {
+            let _ = closed.send(());
+        },
+    );
+
+    drop(pump);
+    await_closed.recv_timeout(Duration::from_secs(1)).unwrap();
+    read_gate.open();
+}
+
+#[test]
 fn concurrent_shutdown_drains_every_accepted_send() {
     const SENDERS: usize = 32;
     let read_gate = Arc::new(Gate::default());
@@ -1216,6 +1234,7 @@ fn concurrent_shutdown_drains_every_accepted_send() {
             (1, None)
         );
     }
+    assert_eq!(pump.pending(), 0);
     assert_eq!(pump.try_send(vec![0]), Err(SendError::Closed));
     read_gate.open();
 }
