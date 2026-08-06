@@ -47,18 +47,13 @@ pub fn event(name: &'static str, ts: u64, fields: &[(&str, Json<'_>)]) -> Event 
     Event(name, ts, tail.into(), None)
 }
 
-fn provenance(source: &[u8], producer: [u8; 16], epoch: u32) -> Result<String, EventError> {
-    let source = std::str::from_utf8(source).map_err(|_| EventError::InvalidEvent)?;
-    Ok(format!(
-        ",\"source\":{},\"producer\":\"{}\",\"source_epoch\":{epoch}",
-        quoted(source),
-        Base64Display::new(&producer, &STANDARD)
-    ))
-}
-
 macro_rules! semantic_event {
     ($name:literal, $ts:expr, $source:expr, $producer:expr, $epoch:expr, $retention:expr; $($tail:tt)*) => {{
-        let mut tail = provenance($source, $producer, $epoch)?;
+        let source_text = std::str::from_utf8($source).map_err(|_| EventError::InvalidEvent)?;
+        let mut tail = format!(
+            ",\"source\":{},\"producer\":\"{}\",\"source_epoch\":{}",
+            quoted(source_text), Base64Display::new(&$producer, &STANDARD), $epoch
+        );
         write!(tail, $($tail)*).expect("string writes cannot fail");
         Ok(Event($name, $ts, tail.into(), $retention))
     }};
@@ -98,11 +93,9 @@ pub fn application_receipt(
     let providers = payload
         .get(projection.provider_session.clone())
         .zip(payload.get(projection.provider_turn.clone()));
-    let Some((provider_session, provider_turn)) = providers
+    let (provider_session, provider_turn) = providers
         .filter(|(session, turn)| status <= 1 && session.len() <= 4096 && turn.len() <= 4096)
-    else {
-        return Err(EventError::InvalidEvent);
-    };
+        .ok_or(EventError::InvalidEvent)?;
     let (lease, request) = (receipt.lease_epoch, receipt.request_id);
     semantic_event!("application-receipt", ts, source, producer, epoch, None;
         ",\"source_seq\":\"{}\",\"event_id\":\"{}\",\"application_request_id\":\"{}\",\"lease_epoch\":{lease},\"request_id\":\"{request}\",\"status\":\"{}\",\"provider_session\":\"{}\",\"provider_turn\":\"{}\"",
@@ -315,18 +308,17 @@ pub(crate) fn valid_stored_lifecycle(
 
 fn store_fields(fields: &Map<String, Value>, range: std::ops::Range<usize>, schema: &str) -> bool {
     schema.split('|').any(|choice| {
-        let mut rules = choice.split(',').filter(|rule| !rule.is_empty());
-        fields
-            .iter()
-            .skip(range.start)
-            .take(range.len())
-            .all(|(key, value)| {
-                rules
-                    .next()
-                    .and_then(|rule| rule.split_once(':'))
-                    .is_some_and(|(name, rule)| name == key && store_field(rule, value))
-            })
-            && rules.next().is_none()
+        let rules = choice.split(',').filter(|rule| !rule.is_empty());
+        range.end <= fields.len()
+            && rules.clone().count() == range.len()
+            && fields
+                .iter()
+                .skip(range.start)
+                .zip(rules)
+                .all(|((key, value), rule)| {
+                    rule.split_once(':')
+                        .is_some_and(|(name, rule)| name == key && store_field(rule, value))
+                })
     })
 }
 
