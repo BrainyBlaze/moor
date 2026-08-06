@@ -22,9 +22,7 @@ pub fn wtf8_decode(bytes: &[u8]) -> Result<Vec<u16>> {
 
 pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
     use time::{PrimitiveDateTime, UtcOffset, macros::format_description};
-    if value.len() != 25 {
-        return None;
-    }
+    crate::return_if!(value.len() != 25, None);
     let local = PrimitiveDateTime::parse(
         &value[..21],
         format_description!("[year][month][day][hour][minute][second].[subsecond digits:6]"),
@@ -41,7 +39,7 @@ pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
     Some(u128::from(ticks).to_le_bytes())
 }
 
-schema!(struct pub Marker derive [Clone, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46]);
+schema!(struct pub Marker derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46]);
 binary_record!(RawMarker => Marker[80] error () = ();
     fixed { magic: [u8; 12] = *b"MOORMRK3\x01\0\0\0" }
     fields { generation: U32<LE>, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46] });
@@ -62,7 +60,7 @@ impl Marker {
 
     pub fn encode(&self) -> [u8; 84] {
         let mut out = [0; 84];
-        out[..80].copy_from_slice(&self.clone().encode_raw());
+        out[..80].copy_from_slice(&(*self).encode_raw());
         let checksum = crc32c(&out[..80]);
         out[80..].copy_from_slice(&checksum.to_le_bytes());
         out
@@ -118,9 +116,7 @@ pub fn bootstrap_command(kind: u8, nonce: [u8; 16]) -> [u8; 17] {
 #[doc(hidden)]
 pub fn accept_bootstrap_command(bytes: &[u8], nonce: [u8; 16], resumed: &mut bool) -> Option<u8> {
     let kind = *bytes.first()?;
-    if bytes.len() != 17 || bytes[1..] != nonce {
-        return None;
-    }
+    crate::return_if!(bytes.len() != 17 || bytes[1..] != nonce, None);
     match (kind, *resumed) {
         (1, false) => *resumed = true,
         (2, true) => {}
@@ -1006,7 +1002,7 @@ mod native {
             command: &[OsString],
             nonce: [u8; 16],
         ) -> Result<LocalListener> {
-            let instrument = self.options.instrument.clone();
+            let instrument = self.options.instrument.take();
             let listener = self.first_protected_pipe(&marker.pipe)?;
             let (marker_stage, marker_identity) = self.stage_marker(&marker.encode())?;
             let identity = session_identity(marker_identity);
@@ -1519,11 +1515,11 @@ mod native {
             )
         };
         let mut mode = 0;
-        if unsafe { GetConsoleMode(input, &mut mode) } == 0
-            || unsafe { GetConsoleMode(output, &mut mode) } == 0
-        {
-            return Err(CommandError::output("no controlling terminal"));
-        }
+        crate::return_if!(
+            unsafe { GetConsoleMode(input, &mut mode) } == 0
+                || unsafe { GetConsoleMode(output, &mut mode) } == 0,
+            Err(CommandError::output("no controlling terminal"))
+        );
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         let geometry = if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0 {
@@ -1590,14 +1586,14 @@ mod native {
         ))
     }
     fn holder(mut host: Native, listener: LocalListener) -> Result<i32> {
-        let user = host.sid.clone();
+        let user = std::mem::take(&mut host.sid);
         let reader = std::mem::take(&mut host.output).into_file();
         let writer = std::mem::take(&mut host.input).into_file();
         let (pty, done_rx) = Duplex::tracked(reader, writer, 1 << 20);
-        let marker_path = host.marker.clone();
+        let marker_path = std::mem::take(&mut host.marker);
         let identity = host.identity;
-        let artifacts = host.artifacts.take().unwrap();
-        let running = artifacts.running.clone();
+        let mut artifacts = host.artifacts.take().unwrap();
+        let running = std::mem::take(&mut artifacts.running);
         let (authenticated, clients) = mpsc::channel::<Option<Authentication>>();
         let mut authenticating = 0;
         let synthetic = host.synthetic;
@@ -1642,9 +1638,7 @@ mod native {
         let foreground = matches!(mode, CreateMode::Run | CreateMode::LegacyRun);
         let mut ready = launch_reporter();
         let child = ready.output.is_some();
-        if !foreground && !child {
-            return Ok(detached()?);
-        }
+        crate::return_if!(!foreground && !child, Ok(detached()?));
         if command.is_empty() {
             command.push(
                 std::env::var_os("SHELL")
