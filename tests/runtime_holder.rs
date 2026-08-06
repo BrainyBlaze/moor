@@ -1412,17 +1412,13 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
 }
 
 #[test]
-fn ordinary_same_size_resize_never_uses_the_attach_redraw_exception() {
+fn attach_and_ordinary_same_size_resize_use_the_platform_resize_path() {
     use std::sync::{Arc, Mutex};
 
-    struct CountResize(Arc<Mutex<(usize, usize)>>);
+    struct CountResize(Arc<Mutex<usize>>);
     impl Native for CountResize {
         fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
-            self.0.lock().unwrap().0 += 1;
-            Ok(())
-        }
-        fn redraw(&mut self, _: u16, _: u16) -> Result<(), String> {
-            self.0.lock().unwrap().1 += 1;
+            *self.0.lock().unwrap() += 1;
             Ok(())
         }
         fn terminate(&mut self, _: bool) -> (u8, bool) {
@@ -1458,7 +1454,7 @@ fn ordinary_same_size_resize_never_uses_the_attach_redraw_exception() {
     )
     .unwrap();
     let (_, writes) = mpsc::channel();
-    let calls = Arc::new(Mutex::new((0, 0)));
+    let calls = Arc::new(Mutex::new(0));
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -1485,11 +1481,10 @@ fn ordinary_same_size_resize_never_uses_the_attach_redraw_exception() {
     let deadline = Instant::now() + Duration::from_secs(2);
     while {
         runtime.poll();
-        let calls = *calls.lock().unwrap();
-        calls.0 + calls.1 < 2 && Instant::now() < deadline
+        *calls.lock().unwrap() < 2 && Instant::now() < deadline
     } {}
 
-    assert_eq!(*calls.lock().unwrap(), (2, 0));
+    assert_eq!(*calls.lock().unwrap(), 2);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
