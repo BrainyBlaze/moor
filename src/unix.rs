@@ -16,7 +16,7 @@ use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open, openat};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::stat::{FchmodatFlags, Mode, SFlag, fchmod, fchmodat, fstatat, mkdirat};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use path_absolutize::Absolutize;
 use signal_hook::iterator::Signals;
@@ -1203,7 +1203,11 @@ fn create_directory_at(
     leaf: &OsStr,
     require_owner: bool,
 ) -> std::result::Result<(File, (u64, u64)), DirectoryFailure> {
-    if let Err(error) = os(mkdirat(parent, leaf, Mode::from_bits_retain(0o700))) {
+    // Creation dispatch is pre-thread/fork; bound the umask window to this syscall.
+    let mask = unsafe { libc::umask(0o077) };
+    let created = os(mkdirat(parent, leaf, Mode::from_bits_retain(0o700)));
+    unsafe { libc::umask(mask) };
+    if let Err(error) = created {
         return Err(if error.kind() == io::ErrorKind::AlreadyExists {
             DirectoryFailure::Identity(error)
         } else {
@@ -1215,21 +1219,16 @@ fn create_directory_at(
         .map_err(inspect)?
         .ok_or(DirectoryFailure::Changed)?;
     let opened = (|| {
-        os(fchmodat(
-            parent,
-            leaf,
-            Mode::from_bits_retain(0o700),
-            FchmodatFlags::FollowSymlink,
-        ))
-        .map_err(DirectoryFailure::Io)?;
-        let valid = entry_identity(parent, leaf, SFlag::S_IFDIR, Some(0o700)).map_err(inspect)?
-            == Some(identity);
-        crate::return_if!(!valid, Err(DirectoryFailure::Changed));
         let directory = open_directory_at(parent, leaf).map_err(inspect)?;
         let meta = directory.metadata().map_err(DirectoryFailure::Io)?;
-        let valid = meta.is_dir()
-            && file_id(&meta) == identity
-            && (!require_owner || protected(&meta, 0o700));
+        crate::return_if!(file_id(&meta) != identity, Err(DirectoryFailure::Changed));
+        os(fchmod(&directory, Mode::from_bits_retain(0o700))).map_err(DirectoryFailure::Io)?;
+        let meta = directory.metadata().map_err(DirectoryFailure::Io)?;
+        let valid = file_id(&meta) == identity
+            && meta.mode() & 0o777 == 0o700
+            && (!require_owner || owned(&meta))
+            && entry_identity(parent, leaf, SFlag::S_IFDIR, Some(0o700)).map_err(inspect)?
+                == Some(identity);
         crate::return_if!(!valid, Err(DirectoryFailure::Changed));
         Ok(directory)
     })();
