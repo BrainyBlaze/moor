@@ -133,6 +133,11 @@ struct SlowWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
 }
 
+struct BlockedFailWriter {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
 #[cfg(unix)]
 struct Peer {
     stream: UnixStream,
@@ -1020,6 +1025,18 @@ impl Write for SlowWriter {
     }
 }
 
+impl Write for BlockedFailWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        let _ = self.started.send(());
+        let _ = self.release.recv();
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn reader_emits_bytes_then_closed() {
     let pump = duplex(Cursor::new(b"hello".to_vec()), std::io::sink(), 16);
@@ -1072,6 +1089,36 @@ fn tracked_writer_reports_progress_before_failure() {
     assert_eq!(pump.pending(), 0);
     assert_eq!(pump.try_send(vec![1]), Err(SendError::Closed));
     assert_eq!(pump.try_send(Vec::new()), Err(SendError::Closed));
+    read_gate.open();
+}
+
+#[test]
+fn tracked_writer_completes_every_job_accepted_before_failure() {
+    let read_gate = Arc::new(Gate::default());
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (pump, completed) = Duplex::tracked(
+        BlockingReader(read_gate.clone()),
+        BlockedFailWriter {
+            started: started_tx,
+            release: release_rx,
+        },
+        16,
+    );
+
+    pump.try_send(vec![1]).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    pump.try_send(vec![2]).unwrap();
+    release_tx.send(()).unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(
+            completed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (0, Some(20))
+        );
+    }
+    assert_eq!(pump.pending(), 0);
+    assert_eq!(pump.try_send(vec![3]), Err(SendError::Closed));
     read_gate.open();
 }
 
