@@ -436,16 +436,20 @@ fn storage_reports_the_selected_log_commit() {
     let lifecycle =
         Store::create(&root.join("exit"), Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     let mut storage = SessionStorage::new(Some((log, 1024)), None, lifecycle, 4, 1024);
-    assert_eq!(storage.log_status(), Some((1, 1, 0, 0)));
+    let selected = || {
+        let commit = Store::read_only(&root.join("log"), Kind::Log, 7).unwrap().0;
+        (commit.epoch, commit.index, commit.start, commit.end)
+    };
+    assert_eq!(selected(), (1, 1, 0, 0));
     storage.output(b"abc".to_vec().into(), 3).unwrap();
     for _ in 0..50 {
         storage.poll();
-        if storage.log_status() == Some((1, 2, 0, 3)) {
+        if selected() == (1, 2, 0, 3) {
             break;
         }
         thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(storage.log_status(), Some((1, 2, 0, 3)));
+    assert_eq!(selected(), (1, 2, 0, 3));
     drop(storage);
     std::fs::remove_dir_all(root).unwrap();
 }
