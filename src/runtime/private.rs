@@ -447,10 +447,11 @@ pub fn session_name(name: OsString, insensitive: bool) -> Option<OsString> {
         let base = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..bytes.len() - 5]) };
         return Some(base.to_owned());
     }
-    (![b".log".as_slice(), b".events", b".instrument"]
+    (!([b".log".as_slice(), b".events", b".instrument"]
         .into_iter()
         .any(suffix)
-        && !(bytes == b".moor-stage" || insensitive && bytes.eq_ignore_ascii_case(b".moor-stage")))
+        || bytes == b".moor-stage"
+        || insensitive && bytes.eq_ignore_ascii_case(b".moor-stage")))
     .then_some(name)
 }
 

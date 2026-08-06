@@ -64,9 +64,9 @@ macro_rules! binary_record {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! return_if {
-    ($condition:expr, $value:expr) => {
+    ($condition:expr $(, $value:expr)?) => {
         if $condition {
-            return $value;
+            return $($value)?;
         }
     };
 }

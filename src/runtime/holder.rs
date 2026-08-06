@@ -456,10 +456,10 @@ impl<N: Native> Runtime<N> {
             }
         }
         while let Ok((written, error)) = self.writes.try_recv() {
-            if let Some(ticket) = self.pending_writes.pop_front() {
-                if ticket.get() != 0 {
-                    self.complete(ticket, Completion::Write(written, error));
-                }
+            if let Some(ticket) = self.pending_writes.pop_front()
+                && ticket.get() != 0
+            {
+                self.complete(ticket, Completion::Write(written, error));
             }
         }
         self.drain_storage(None);

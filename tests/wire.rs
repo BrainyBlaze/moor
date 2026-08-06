@@ -574,7 +574,7 @@ fn status_and_heartbeat_extensions_round_trip_and_reject_reserved_bits() {
         StatusExtension::decode(&bytes, false),
         Err(WireError::Malformed)
     );
-    let mut zero_epoch = status.clone();
+    let mut zero_epoch = status;
     zero_epoch.log_epoch = 0;
     assert_eq!(zero_epoch.encode(true), Err(WireError::Malformed));
 

@@ -481,7 +481,7 @@ impl Machine {
     }
 
     fn expire_lease(&mut self, now: u64) {
-        return_if!(self.lease.epoch == 0 || now < self.lease.deadline, ());
+        return_if!(self.lease.epoch == 0 || now < self.lease.deadline);
         if let Some(conn) = std::mem::take(&mut self.lease).owner {
             self.queries_gone(conn);
         }
@@ -543,9 +543,10 @@ impl Machine {
     }
 
     fn release_lease(&mut self, conn: ConnId, epoch: u32, token: [u8; 16]) -> LeaseResult {
-        let role = (self.lease.epoch != 0)
-            .then_some(self.lease.role)
-            .unwrap_or(LeaseRole::Viewer);
+        let role = match self.lease.epoch {
+            0 => LeaseRole::Viewer,
+            _ => self.lease.role,
+        };
         if self.lease.owner == Some(conn) && self.lease.epoch == epoch && self.lease.token == token
         {
             self.lease = Lease::default();
@@ -737,7 +738,7 @@ impl Machine {
         let Some(end) = self.next_offset.checked_add(bytes.len() as u64) else {
             return self.exhaust_output(now);
         };
-        return_if!(sequence == 0, ());
+        return_if!(sequence == 0);
         let record = OutputRecord {
             sequence,
             offset: self.next_offset,
@@ -1544,7 +1545,7 @@ impl Machine {
     fn set_writable(&mut self, writable: bool) {
         let losing = self.writable && !writable;
         self.writable = writable;
-        return_if!(!losing, ());
+        return_if!(!losing);
         for (&conn, peer) in &self.peers {
             if matches!(peer, Peer::Semantic(..)) {
                 self.effects.push(Effect::Send(

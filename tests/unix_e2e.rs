@@ -75,7 +75,7 @@ fn set_age(path: &Path, seconds: u64) {
 
 fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
     let (mut master, mut slave) = (-1, -1);
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: rows,
         ws_col: columns,
         ws_xpixel: 0,
@@ -88,7 +88,7 @@ fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut::<libc::termios>(),
-                &mut size,
+                &size,
             )
         },
         0
