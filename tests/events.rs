@@ -2,6 +2,19 @@ use moor::events::{
     Axis, Cursor, Event, EventKind, EventStream, Json, application_receipt, canonical_event,
     canonical_header, event, semantic_assertion, semantic_changes,
 };
+
+#[test]
+fn declarative_maps_ignore_option_names_shadowed_by_the_caller() {
+    struct Option;
+    struct Some;
+    struct None;
+    moor::schema!(map fn mapped(value: &str) -> &'static str;
+        "known" => "value",
+    );
+    let _ = (Option, Some, None);
+    assert_eq!(mapped("known"), ::core::option::Option::Some("value"));
+    assert_eq!(mapped("unknown"), ::core::option::Option::None);
+}
 use moor::session::{
     ApplicationReceipt, MissingReason, ReceiptProjection, SemanticChange, SemanticEffect,
     SemanticEvent, SemanticEventKind, SourceEffect, SourceReason, SourceStatus,
