@@ -3035,3 +3035,332 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
         "the nonempty preamble must be accepted on an ordinary stream"
     );
 }
+
+// ---------------------------------------------------------------- V29 ----
+// §16 V29 — fresh viewer lease grant followed by explicit release. Controller
+// sequences 4 then 5; holder sequences 5 then 6. Exact hex from the schema.
+
+const V29_REQUEST: &str = "4D 4F 4F 52 03 15 00 00 07 00 00 00 04 00 00 00 \
+                           28 00 00 00 F1 56 7C 4D 00 00 00 00 00 00 00 00 \
+                           00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
+                           00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+const V29_GRANT: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 05 00 00 00 \
+                         18 00 00 00 63 89 92 92 00 00 00 00 03 00 00 00 \
+                         00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
+const V29_RELEASE: &str = "4D 4F 4F 52 03 17 00 00 07 00 00 00 05 00 00 00 \
+                           14 00 00 00 77 26 7A 78 03 00 00 00 00 01 02 03 \
+                           04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
+const V29_RELEASED: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 06 00 00 00 \
+                            18 00 00 00 0A 0E D6 49 02 00 00 00 03 00 00 00 \
+                            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
+
+fn v29_token() -> [u8; 16] {
+    let mut token = [0; 16];
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    token
+}
+
+#[test]
+fn v29_all_four_frames_reproduce_the_frozen_bytes() {
+    use moor::session::{LeaseRequest, LeaseResult, LeaseRole, ResultOutcome, ResultReason};
+    let request = LeaseRequest::fresh(LeaseRole::Viewer)
+        .encode_wire()
+        .expect("the fresh request must encode");
+    let grant = LeaseResult {
+        outcome: ResultOutcome::Granted,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 3,
+        token: v29_token(),
+    }
+    .encode_wire()
+    .expect("the grant must encode");
+    let mut release = vec![3, 0, 0, 0];
+    release.extend_from_slice(&v29_token());
+    let released = LeaseResult {
+        outcome: ResultOutcome::Released,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 3,
+        token: [0; 16],
+    }
+    .encode_wire()
+    .expect("the released result must encode");
+
+    for (sequence, kind, payload, bytes, label) in [
+        (4u32, 0x15u8, request.to_vec(), V29_REQUEST, "fresh request"),
+        (5, 0x16, grant.to_vec(), V29_GRANT, "grant"),
+        (5, 0x17, release, V29_RELEASE, "release"),
+        (6, 0x16, released.to_vec(), V29_RELEASED, "released"),
+    ] {
+        let frame = hex(bytes);
+        v16_framing_assert_header(&frame);
+        assert_eq!(
+            frame[24..],
+            payload[..],
+            "{label}: frozen payload disagrees with the schema text"
+        );
+        assert_eq!(
+            v16_framing_encode_frame(sequence, 7, kind, &payload),
+            frame,
+            "{label}: encoder must reproduce the frozen frame at sequence {sequence}"
+        );
+    }
+    // The fresh request is 40 bytes: operation, role, two reserved, then the 36
+    // freshness bytes the vector names.
+    assert_eq!(request.len(), 40);
+    assert_eq!(
+        request[..4],
+        [0, 0, 0, 0],
+        "operation and role are both zero"
+    );
+    assert!(
+        request[4..].iter().all(|byte| *byte == 0),
+        "all 36 freshness bytes are zero on a fresh request"
+    );
+}
+
+#[test]
+fn v29_grant_and_release_decode_the_frozen_tuple() {
+    use moor::session::{
+        LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, Request, ResultOutcome, ResultReason,
+    };
+    use moor::wire::{ControllerRequest, decode_controller};
+    // Fresh request, through the framing layer at its frozen sequence.
+    let message = v16_framing_feed_one(4, &hex(V29_REQUEST));
+    assert_eq!((message.scope, message.kind), (7, 0x15));
+    assert_eq!(
+        LeaseRequest::decode_wire(&message.payload),
+        Ok(LeaseRequest::fresh(LeaseRole::Viewer))
+    );
+    assert_eq!(
+        LeaseRequest::decode_wire(&message.payload).map(|request| request.operation),
+        Ok(LeaseOperation::Fresh)
+    );
+
+    // Grant: outcome granted, epoch 3, token 00..0F.
+    let grant = LeaseResult::decode_wire(&v16_framing_feed_one(5, &hex(V29_GRANT)).payload)
+        .expect("the grant must decode");
+    assert_eq!(
+        (
+            grant.outcome,
+            grant.reason,
+            grant.role,
+            grant.epoch,
+            grant.token
+        ),
+        (
+            ResultOutcome::Granted,
+            ResultReason::None,
+            LeaseRole::Viewer,
+            3,
+            v29_token()
+        )
+    );
+
+    // Release echoes exactly that tuple, and decodes through the real
+    // controller dispatch rather than being inspected as bytes.
+    let release = v16_framing_feed_one(5, &hex(V29_RELEASE));
+    assert_eq!((release.scope, release.kind), (7, 0x17));
+    assert!(
+        matches!(
+            decode_controller(0x17, &release.payload, None),
+            Ok(ControllerRequest::Policy(Request::Release(3, token))) if token == v29_token()
+        ),
+        "the release must echo the granted epoch and token"
+    );
+
+    // Released result: outcome 02, epoch 3, and a zero token.
+    let released = LeaseResult::decode_wire(&v16_framing_feed_one(6, &hex(V29_RELEASED)).payload)
+        .expect("the released result must decode");
+    assert_eq!(
+        (released.outcome, released.epoch, released.token),
+        (ResultOutcome::Released, 3, [0; 16])
+    );
+}
+
+#[test]
+fn v29_refuses_every_inconsistent_lease_request_and_result() {
+    use moor::session::{
+        LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, ResultOutcome, ResultReason,
+    };
+    // A fresh request carries no epoch, no incarnation and no token; a resume
+    // carries all three. Each half of that coupling is asserted, so neither
+    // direction can be dropped.
+    for (operation, epoch, incarnation, token, label) in [
+        (
+            LeaseOperation::Fresh,
+            3u32,
+            [0u8; 16],
+            [0u8; 16],
+            "fresh with an epoch",
+        ),
+        (
+            LeaseOperation::Fresh,
+            0,
+            [9; 16],
+            [0; 16],
+            "fresh with an incarnation",
+        ),
+        (
+            LeaseOperation::Fresh,
+            0,
+            [0; 16],
+            [9; 16],
+            "fresh with a token",
+        ),
+        (
+            LeaseOperation::Resume,
+            0,
+            [9; 16],
+            [9; 16],
+            "resume without an epoch",
+        ),
+        (
+            LeaseOperation::Resume,
+            3,
+            [0; 16],
+            [9; 16],
+            "resume without an incarnation",
+        ),
+        (
+            LeaseOperation::Resume,
+            3,
+            [9; 16],
+            [0; 16],
+            "resume without a token",
+        ),
+    ] {
+        let request = LeaseRequest {
+            operation,
+            role: LeaseRole::Viewer,
+            epoch,
+            incarnation,
+            token,
+        };
+        assert_eq!(
+            request.encode_wire(),
+            Err(moor::wire::WireError::Malformed),
+            "{label} encoded"
+        );
+        let mut bytes = [0u8; 40];
+        bytes[0] = operation as u8;
+        bytes[4..8].copy_from_slice(&epoch.to_le_bytes());
+        bytes[8..24].copy_from_slice(&incarnation);
+        bytes[24..40].copy_from_slice(&token);
+        assert!(
+            LeaseRequest::decode_wire(&bytes).is_err(),
+            "{label} decoded"
+        );
+    }
+    // Reserved bytes 2 and 3 are not spare capacity, and neither operation nor
+    // role has a second bit.
+    let good_request = LeaseRequest::fresh(LeaseRole::Viewer)
+        .encode_wire()
+        .unwrap();
+    for index in [0usize, 1, 2, 3] {
+        let mut bytes = good_request;
+        bytes[index] = if index < 2 { 2 } else { 1 };
+        assert!(
+            LeaseRequest::decode_wire(&bytes).is_err(),
+            "request byte {index} accepted an out-of-range value"
+        );
+    }
+    assert!(
+        LeaseRequest::decode_wire(&good_request[..39]).is_err(),
+        "short request"
+    );
+
+    // A grant must carry a token; a release must not. Both halves asserted.
+    for (outcome, reason, epoch, token, label) in [
+        (
+            ResultOutcome::Granted,
+            ResultReason::None,
+            3u32,
+            [0u8; 16],
+            "grant with a zero token",
+        ),
+        (
+            ResultOutcome::Resumed,
+            ResultReason::None,
+            3,
+            [0; 16],
+            "resume with a zero token",
+        ),
+        (
+            ResultOutcome::Released,
+            ResultReason::None,
+            3,
+            [9; 16],
+            "release with a token",
+        ),
+        (
+            ResultOutcome::Granted,
+            ResultReason::Busy,
+            3,
+            [9; 16],
+            "grant carrying a refusal reason",
+        ),
+        (
+            ResultOutcome::Granted,
+            ResultReason::None,
+            0,
+            [9; 16],
+            "grant at epoch zero",
+        ),
+        (
+            ResultOutcome::Released,
+            ResultReason::None,
+            0,
+            [0; 16],
+            "release at epoch zero",
+        ),
+        (
+            ResultOutcome::Refused,
+            ResultReason::None,
+            3,
+            [0; 16],
+            "refusal without a reason",
+        ),
+    ] {
+        let result = LeaseResult {
+            outcome,
+            reason,
+            role: LeaseRole::Viewer,
+            epoch,
+            token,
+        };
+        assert_eq!(
+            result.encode_wire(),
+            Err(moor::wire::WireError::Malformed),
+            "{label} encoded"
+        );
+        let mut bytes = [0u8; 24];
+        bytes[0] = outcome as u8;
+        bytes[1] = reason as u8;
+        bytes[4..8].copy_from_slice(&epoch.to_le_bytes());
+        bytes[8..24].copy_from_slice(&token);
+        assert!(LeaseResult::decode_wire(&bytes).is_err(), "{label} decoded");
+    }
+    let good_result = LeaseResult {
+        outcome: ResultOutcome::Released,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 3,
+        token: [0; 16],
+    }
+    .encode_wire()
+    .unwrap();
+    let mut padded = good_result;
+    padded[3] = 1;
+    assert!(
+        LeaseResult::decode_wire(&padded).is_err(),
+        "result reserved byte 3 accepted a nonzero value"
+    );
+    assert!(
+        LeaseResult::decode_wire(&good_result[..23]).is_err(),
+        "short result"
+    );
+}
