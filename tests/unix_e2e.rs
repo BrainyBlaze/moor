@@ -254,8 +254,12 @@ fn storage_delay_shim(dir: &Path) -> PathBuf {
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#ifndef SYS_newfstatat
+#define SYS_newfstatat SYS_fstatat64
+#endif
 static void delay(int fd,const char *variable,const char *needle) {
   char link[64], path[PATH_MAX]; snprintf(link,sizeof(link),"/proc/self/fd/%d",fd);
   ssize_t n=readlink(link,path,sizeof(path)-1); if(n<0) return; path[n]=0;
@@ -274,6 +278,18 @@ static void trace_lock(int fd) {
 }
 int fsync(int fd) { delay(fd,"MOOR_TEST_FSYNC_DELAY_MS","/body.0"); return syscall(SYS_fsync,fd); }
 int flock(int fd,int operation) { trace_lock(fd); delay(fd,"MOOR_TEST_FLOCK_DELAY_MS",".exit/commit.0"); return syscall(SYS_flock,fd,operation); }
+int fstatat(int fd,const char *path,struct stat *meta,int flags) {
+  int result=syscall(SYS_newfstatat,fd,path,meta,flags); char *name=getenv("MOOR_TEST_DIRECTORY_SWAP_NAME");
+  if(!result && name && !strcmp(path,name)) {
+    unsetenv("MOOR_TEST_DIRECTORY_SWAP_NAME");
+    char *victim=getenv("MOOR_TEST_DIRECTORY_SWAP_VICTIM"), *moved=getenv("MOOR_TEST_DIRECTORY_SWAP_MOVED");
+    char *entered=getenv("MOOR_TEST_DIRECTORY_SWAP_ENTERED");
+    if(!victim || !moved || !entered || renameat(fd,path,AT_FDCWD,moved) || symlinkat(victim,fd,path)) _exit(120);
+    int marker=syscall(SYS_openat,AT_FDCWD,entered,O_WRONLY|O_CREAT|O_EXCL,0600);
+    if(marker<0) _exit(121); syscall(SYS_close,marker);
+  }
+  return result;
+}
 "#,
     )
     .unwrap();
@@ -1091,16 +1107,19 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
     let alias = dir.file_name().unwrap().to_str().unwrap();
     let root = isolated_root(alias);
     let event = root.join("events");
+    let inherited = dir.join("inherited-umask");
+    let script = format!("umask > '{}'; sleep 30", inherited.display());
     let mut command = invoked_command(alias);
-    command.args([
-        "start",
-        "restrictive-event",
-        "-T",
-        event.to_str().unwrap(),
-        "/bin/sh",
-        "-c",
-        "sleep 30",
-    ]);
+    command
+        .args([
+            "start",
+            "restrictive-event",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+        ])
+        .arg(script);
     unsafe {
         command.pre_exec(|| {
             libc::umask(0o777);
@@ -1116,6 +1135,15 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
             .ok()
             .map(|meta| meta.permissions().mode() & 0o777)
     });
+    let until = Instant::now() + Duration::from_secs(2);
+    while output.status.success()
+        && !fs::symlink_metadata(&inherited).is_ok_and(|meta| meta.len() != 0)
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = fs::set_permissions(&inherited, fs::Permissions::from_mode(0o600));
+    let inherited = fs::read_to_string(inherited).ok();
     if output.status.success() {
         let _ = invoked(alias, &["kill", "-f", "restrictive-event"]);
         let _ = invoked(alias, &["rm", "restrictive-event"]);
@@ -1123,8 +1151,55 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(event_mode, Some(0o700));
     assert_eq!(slot_modes, [Some(0o600); 4]);
+    assert_eq!(inherited.as_deref().map(str::trim), Some("0777"));
     let _ = fs::remove_dir_all(root);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_mode_setting_never_follows_a_substituted_symlink() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let event = root.join(format!("{alias}-mode-race"));
+    let victim = dir.join("victim");
+    let moved = dir.join("created-directory");
+    let entered = dir.join("swap-entered");
+    fs::write(&victim, b"caller-owned").unwrap();
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+    let shim = storage_delay_shim(&dir);
+
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "mode-race",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/true",
+        ])
+        .env("LD_PRELOAD", shim)
+        .env("MOOR_TEST_DIRECTORY_SWAP_NAME", event.file_name().unwrap())
+        .env("MOOR_TEST_DIRECTORY_SWAP_VICTIM", &victim)
+        .env("MOOR_TEST_DIRECTORY_SWAP_MOVED", &moved)
+        .env("MOOR_TEST_DIRECTORY_SWAP_ENTERED", &entered)
+        .output()
+        .unwrap();
+    let mode = fs::symlink_metadata(&victim).unwrap().permissions().mode() & 0o777;
+    let swapped = fs::symlink_metadata(&event).is_ok_and(|meta| meta.file_type().is_symlink());
+    let created = moved.is_dir();
+    let triggered = entered.is_file();
+    let _ = fs::remove_file(&event);
+    let _ = fs::remove_dir_all(&root);
+    fs::remove_dir_all(&dir).unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        swapped && created && triggered,
+        "fault injection did not run"
+    );
+    assert_eq!(mode, 0o600, "directory mode setting followed the symlink");
 }
 
 #[test]
