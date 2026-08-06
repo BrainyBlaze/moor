@@ -77,6 +77,8 @@ mod descriptor_deadline_tests {
                 scope: 7,
                 handshaking: false,
                 deadline: 0,
+                pid: None,
+                refusal: None,
             },
         );
         runtime.machine.register_controller(id);
@@ -211,6 +213,8 @@ mod descriptor_deadline_tests {
                 scope: 0,
                 handshaking: true,
                 deadline: 100,
+                pid: None,
+                refusal: None,
             },
         );
         let hello = Message {
@@ -253,6 +257,8 @@ mod descriptor_deadline_tests {
                 scope: 0,
                 handshaking: true,
                 deadline: 100,
+                pid: None,
+                refusal: None,
             },
         );
         let semantic = Message {
@@ -274,13 +280,30 @@ mod descriptor_deadline_tests {
         let (mut runtime, paths) = fixture("output-exhaustion-handshakes");
         for _ in 0..16 {
             let id = runtime.next_peer;
-            runtime.accept(duplex(), true);
+            runtime.accept(duplex(), true, None, false);
             runtime.peer_bytes(id, b"MOOR".to_vec());
         }
         runtime.apply_with([PolicyEffect::OutputExhausted], &mut monotonic, None);
-        runtime.accept(duplex(), true);
+        let overflow = runtime.next_peer;
+        runtime.accept(duplex(), true, None, false);
+        runtime.peer_bytes(overflow, b"MOOR".to_vec());
 
         assert_eq!(runtime.peers.len(), 16);
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn maximum_peer_id_is_never_inserted_or_wrapped() {
+        let (mut runtime, paths) = fixture("peer-id-exhaustion");
+        runtime.next_peer = u64::MAX - 1;
+        runtime.accept(duplex(), true, Some(1), false);
+        runtime.accept(duplex(), true, Some(1), false);
+
+        assert_eq!(runtime.next_peer, u64::MAX);
+        assert!(runtime.peers.contains_key(&(u64::MAX - 1)));
+        assert!(!runtime.peers.contains_key(&u64::MAX));
+        assert_eq!(runtime.peers.len(), 1);
         drop(runtime);
         cleanup(paths);
     }

@@ -303,6 +303,9 @@ pub trait Native {
     fn redraw(&mut self, rows: u16, columns: u16) -> Result<()> {
         self.resize(rows, columns)
     }
+    fn holder_ancestor(&self, _pid: u32) -> bool {
+        false
+    }
     fn terminate(&mut self, force: bool) -> (u8, bool);
     fn exited(&mut self) -> Result<Option<NativeExit>>;
 }
@@ -310,7 +313,8 @@ pub trait Native {
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage,
     status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
 schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
-schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64);
+schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64,
+    pid: Option<u32>, refusal: Option<Refusal>);
 
 impl Peer {
     fn profile(&self) -> Option<Profile> {
@@ -410,26 +414,50 @@ impl<N: Native> Runtime<N> {
         (exit, self.finish(records.0, records.1))
     }
 
-    pub fn accept(&mut self, pipe: Duplex, same_user: bool) {
+    fn initial_admission(&self) -> (usize, bool) {
+        self.peers.values().filter(|peer| peer.handshaking).fold(
+            (0, false),
+            |(pending, overflow), peer| {
+                if peer.refusal.is_some_and(|refusal| refusal.0 == 13) {
+                    (pending, true)
+                } else {
+                    (pending + 1, overflow)
+                }
+            },
+        )
+    }
+
+    pub fn accept(&mut self, pipe: Duplex, same_user: bool, pid: Option<u32>, exhausted: bool) {
         let time = monotonic();
         self.tick(time);
-        if !same_user
-            || self.peers.values().filter(|peer| peer.handshaking).count() >= 16
-            || self.next_peer == u64::MAX
-        {
+        let Some(next) = self.next_peer.checked_add(1) else {
+            return pipe.shutdown();
+        };
+        let (pending, overflow) = self.initial_admission();
+        let exhausted = exhausted || pending >= 16;
+        if exhausted && overflow {
             return pipe.shutdown();
         }
+        let refusal = if exhausted {
+            Some((13, 12, &b"connection limit exhausted"[..]))
+        } else if !same_user {
+            Some((11, 4, &b"unauthorised peer"[..]))
+        } else {
+            None
+        };
         let id = self.next_peer;
-        self.next_peer += 1;
+        self.next_peer = next;
         self.peers.insert(
             id,
             Peer {
                 pipe,
                 codec: None,
-                preface: Vec::new(),
+                preface: Vec::with_capacity(4),
                 scope: 0,
                 handshaking: true,
                 deadline: time.saturating_add(2_000),
+                pid: pid.filter(|_| same_user),
+                refusal,
             },
         );
     }
@@ -497,14 +525,19 @@ impl<N: Native> Runtime<N> {
 
     pub fn drive(
         &mut self,
-        mut accept: impl FnMut() -> Option<(Duplex, bool)>,
+        mut accept: impl FnMut(usize, bool) -> Option<(Duplex, bool, Option<u32>, bool)>,
         mut signal: impl FnMut() -> Option<bool>,
     ) -> Result<Option<NativeExit>> {
         let mut exited = None;
         loop {
             if exited.is_none() {
-                while let Some((transport, same_user)) = accept() {
-                    self.accept(transport, same_user);
+                loop {
+                    let (pending, overflow) = self.initial_admission();
+                    let Some((transport, same_user, pid, exhausted)) = accept(pending, overflow)
+                    else {
+                        break;
+                    };
+                    self.accept(transport, same_user, pid, exhausted);
                 }
                 if let Some(force) = signal() {
                     self.shutdown_requested(monotonic(), force);
@@ -535,23 +568,34 @@ impl<N: Native> Runtime<N> {
     }
 
     fn peer_bytes(&mut self, id: u64, bytes: Vec<u8>) {
-        let profile = {
+        let (profile, refusal, bytes) = {
             let Some(peer) = self.peers.get_mut(&id) else {
                 return;
             };
             if peer.codec.is_some() {
                 return self.decode(id, &bytes);
             }
-            peer.preface.extend(bytes);
+            let take = (4 - peer.preface.len()).min(bytes.len());
+            peer.preface.extend_from_slice(&bytes[..take]);
             if peer.preface.len() < 4 {
                 return;
             }
-            match &peer.preface[..4] {
+            let profile = match &peer.preface[..4] {
                 b"MOOR" => Profile::Controller,
                 b"MOOS" => Profile::Semantic,
                 _ => return self.disconnect(id),
+            };
+            peer.codec = Some(Codec::new(profile));
+            let refusal = peer.refusal;
+            let mut framed = std::mem::take(&mut peer.preface);
+            if refusal.is_none() {
+                framed.extend_from_slice(&bytes[take..]);
             }
+            (profile, refusal, framed)
         };
+        if let Some(refusal) = refusal {
+            return self.refuse(id, refusal);
+        }
         if self
             .peers
             .values()
@@ -561,9 +605,6 @@ impl<N: Native> Runtime<N> {
         {
             return self.refuse(id, (13, 12, b"connection limit exhausted"));
         }
-        let peer = self.peers.get_mut(&id).unwrap();
-        peer.codec = Some(Codec::new(profile));
-        let bytes = std::mem::take(&mut peer.preface);
         self.decode(id, &bytes);
     }
 
@@ -652,6 +693,18 @@ impl<N: Native> Runtime<N> {
             .then(|| random_array().ok())
             .flatten();
         let request = wire::decode_controller(message.kind, &message.payload, token)?;
+        let ancestry = matches!(
+            &request,
+            ControllerRequest::Policy(PolicyRequest::Attach(..))
+        ) && self
+            .peers
+            .get(&id)
+            .and_then(|peer| peer.pid)
+            .is_some_and(|pid| self.native.holder_ancestor(pid));
+        if ancestry {
+            self.refuse(id, (11, 4, b"holder is an ancestor of attaching process"));
+            return Ok(());
+        }
         // Any other request closes the immediate attach-redraw window.
         if message.kind != 0x0b && self.redraw.is_some_and(|redraw| redraw.0 == id) {
             self.redraw = None;

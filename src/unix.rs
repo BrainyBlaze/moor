@@ -441,6 +441,10 @@ impl Native for UnixNative {
         Ok(())
     }
 
+    fn holder_ancestor(&self, pid: u32) -> bool {
+        live_holder_ancestor(pid)
+    }
+
     fn terminate(&mut self, force: bool) -> (u8, bool) {
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
         let foreground = unsafe { libc::tcgetpgrp(self.control.as_raw_fd()) };
@@ -520,13 +524,18 @@ fn holder(
         }
     }
     let Some(status) = state.drive(
-        || {
+        |_, _| {
             let stream = listener.accept().ok()?;
-            let trusted = peer_owned(&stream);
+            let (trusted, pid) = peer_identity(&stream);
             stream
                 .set_send_timeout(Some(Duration::from_millis(250)))
                 .ok()?;
-            Some((Duplex::socket(stream, [], cancel).ok()?, trusted))
+            Some((
+                Duplex::socket(stream, [], cancel).ok()?,
+                trusted,
+                pid,
+                false,
+            ))
         },
         || {
             let received = signals.pending().count();
@@ -552,7 +561,7 @@ fn finalize_unpublished_exit(
     config: &mut Config<'_>,
     ready: &mut shared::LaunchReporter<UnixStream>,
 ) -> Result<i32> {
-    let status = state.drive(|| None, || None)?.unwrap_or(observed);
+    let status = state.drive(|_, _| None, || None)?.unwrap_or(observed);
     let (exit, durable) = state.finish_exit(running, status, None);
     if durable {
         config.retain_stores();
@@ -588,7 +597,7 @@ fn abort_unpublished(
         return finalize_unpublished_exit(&mut state, running, observed, config, ready);
     }
     let mut signal = Some(true);
-    let _ = state.drive(|| None, || signal.take())?;
+    let _ = state.drive(|_, _| None, || signal.take())?;
     drop(state);
     if diagnose && ready.output.is_some() {
         eprintln!("{}: {error}", name::program(config.invoked));
@@ -1632,12 +1641,90 @@ fn socket_at<T, E: std::fmt::Display>(
     Ok((parent, open(name).text()?))
 }
 
+fn peer_identity(stream: &LocalStream) -> (bool, Option<u32>) {
+    let Ok(credentials) = stream.peer_creds() else {
+        return (false, None);
+    };
+    let same_user = credentials.euid() == Some(uid());
+    #[cfg(target_os = "macos")]
+    let pid = socket_peer_pid(stream);
+    #[cfg(not(target_os = "macos"))]
+    let pid = credentials
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0);
+    let pid = pid.filter(|_| same_user);
+    (pid.is_some(), pid)
+}
+
 fn peer_owned(stream: &LocalStream) -> bool {
-    stream
-        .peer_creds()
-        .ok()
-        .and_then(|credentials| credentials.euid())
-        == Some(uid())
+    peer_identity(stream).0
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_pid(stream: &LocalStream) -> Option<u32> {
+    let LocalStream::UdSocket(socket) = stream;
+    let mut pid = 0i32;
+    let mut length = std::mem::size_of_val(&pid) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.inner().as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            std::ptr::from_mut(&mut pid).cast(),
+            &mut length,
+        )
+    };
+    (result == 0 && length as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+}
+
+fn live_holder_ancestor(mut pid: u32) -> bool {
+    let holder = std::process::id();
+    for _ in 0..4096 {
+        if pid == holder {
+            return true;
+        }
+        let Some(parent) = process_parent(pid) else {
+            return false;
+        };
+        if parent == 0 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_parent(pid: u32) -> Option<u32> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.iter().rposition(|byte| *byte == b')')?;
+    let mut fields = stat[end + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    (fields.next()?.len() == 1).then_some(())?;
+    std::str::from_utf8(fields.next()?).ok()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info);
+    let read = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size as i32,
+        )
+    };
+    (read == size as i32).then_some(info.pbi_ppid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn process_parent(_: u32) -> Option<u32> {
+    None
 }
 
 pub(crate) fn cleanup(path: &Path) -> Result<()> {

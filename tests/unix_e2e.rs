@@ -1684,6 +1684,8 @@ fn a_second_holder_signal_escalates_without_resetting_the_deadline() {
 
 #[test]
 fn attach_replays_and_detaches_without_stopping_the_session() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
     let dir = temp();
     let socket = dir.join("attachable");
     let name = socket.to_str().unwrap();
@@ -1701,6 +1703,8 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
     let (mut master, slave) = terminal_pair(24, 80);
     let mut attach = terminal_command(&slave)
         .args(["attach", name])
+        .env("MOOR_SESSION", name)
+        .env("MOOR_SESSION_V2", format!("v2:{}", STANDARD.encode(name)))
         .spawn()
         .unwrap();
     terminal_output(&mut master, b"attached", Duration::from_secs(5));
@@ -1716,6 +1720,54 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
     assert!(status.success(), "attach: {status:?}");
     assert!(socket.exists());
     assert!(moor(&["kill", "-f", name]).status.success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shipped_binary_refuses_attach_when_the_live_holder_is_an_ancestor() {
+    let dir = temp();
+    let socket = dir.join("self-attach");
+    let alias = dir.join("peer) name");
+    symlink(env!("CARGO_BIN_EXE_moor"), &alias).unwrap();
+    let name = socket.to_str().unwrap();
+    let mut holder = Command::new(env!("CARGO_BIN_EXE_moor"))
+        .args([
+            "run",
+            name,
+            "/bin/sh",
+            "-c",
+            "while [ ! -S \"$1\" ]; do sleep .01; done; exec \"$2\" attach \"$1\"",
+            "self-attach",
+            name,
+            alias.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while holder.try_wait().unwrap().is_none() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if holder.try_wait().unwrap().is_none() {
+        holder.kill().unwrap();
+    }
+    let output = holder.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let logged = tail(&socket);
+    assert!(logged.status.success(), "{logged:?}");
+    assert!(
+        logged
+            .stdout
+            .windows(
+                b"holder refused request (11): holder is an ancestor of attaching process\r\n"
+                    .len()
+            )
+            .any(|part| part
+                == b"holder refused request (11): holder is an ancestor of attaching process\r\n"),
+        "{logged:?}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

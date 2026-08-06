@@ -860,19 +860,24 @@ mod native {
             .map_err(string)
     }
 
-    fn same_user(stream: &LocalStream, user: &str) -> bool {
+    fn same_user(stream: &LocalStream, user: &str) -> std::result::Result<bool, ()> {
         unsafe {
             if ImpersonateNamedPipeClient(stream_handle(stream)) == 0 {
-                return false;
+                return Err(());
             }
             let mut token = ptr::null_mut();
-            let same = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) != 0
-                && token_user(Handle::owned(token)).is_ok_and(|sid| sid == user);
-            RevertToSelf() != 0 && same
+            let same = if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) != 0 {
+                token_user(Handle::owned(token))
+                    .map(|sid| sid == user)
+                    .map_err(|_| ())
+            } else {
+                Err(())
+            };
+            if RevertToSelf() == 0 { Err(()) } else { same }
         }
     }
 
-    type Authentication = (LocalStream, [u8; 4]);
+    type Authentication = (LocalStream, [u8; 4], bool, Option<u32>);
     fn authenticate(mut stream: LocalStream, user: &str) -> Option<Authentication> {
         let handle = stream_handle(&stream);
         let preface = fixed_record(
@@ -883,7 +888,64 @@ mod native {
             |_| pipe_available(handle),
         )
         .ok()?;
-        same_user(&stream, user).then_some((stream, preface))
+        let owner = same_user(&stream, user).ok()?;
+        let pid = if owner {
+            Some(stream.peer_creds().ok()?.pid().filter(|pid| *pid != 0)?)
+        } else {
+            None
+        };
+        Some((stream, preface, owner, pid))
+    }
+
+    fn live_holder_ancestor(mut pid: u32) -> bool {
+        let holder = unsafe { GetCurrentProcessId() };
+        if pid == 0 || holder == 0 {
+            return false;
+        }
+        if pid == holder {
+            return true;
+        }
+        let Ok(snapshot) = Handle::checked(
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) },
+            "enumerate process ancestry",
+        ) else {
+            return false;
+        };
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Process32FirstW(snapshot.raw(), &mut entry) } == 0 {
+            return false;
+        }
+        let mut entries = Vec::with_capacity(4096);
+        loop {
+            if entries.len() == 4096 {
+                return false;
+            }
+            entries.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
+                if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
+                    return false;
+                }
+                break;
+            }
+        }
+        entries.sort_unstable_by_key(|entry| entry.0);
+        for _ in 0..entries.len() {
+            let Ok(index) = entries.binary_search_by_key(&pid, |entry| entry.0) else {
+                return false;
+            };
+            let parent = entries[index].1;
+            if parent == holder {
+                return true;
+            }
+            if parent == 0 || parent == pid {
+                return false;
+            }
+            pid = parent;
+        }
+        false
     }
 
     fn cancel(stream: &LocalStream) {
@@ -1284,6 +1346,9 @@ mod native {
                 "resize ConPTY",
             )
         }
+        fn holder_ancestor(&self, pid: u32) -> bool {
+            live_holder_ancestor(pid)
+        }
         fn terminate(&mut self, force: bool) -> (u8, bool) {
             if !force && self.bootstrap.exchange(2).is_ok() {
                 return (0, false);
@@ -1528,24 +1593,40 @@ mod native {
         let identity = host.identity;
         let mut artifacts = host.artifacts.take().unwrap();
         let running = std::mem::take(&mut artifacts.running);
-        let (authenticated, clients) = mpsc::channel::<Option<Authentication>>();
+        let (authenticated, clients) = mpsc::channel::<(bool, Option<Authentication>)>();
         let mut authenticating = 0;
+        let mut overflow_authenticating = false;
         let synthetic = host.synthetic;
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
         let Some(NativeExit::Code(code)) = runtime.drive(
-            || {
-                while let Ok(client) = clients.try_recv() {
-                    authenticating -= 1;
-                    let Some((stream, preface)) = client else {
+            |pending, overflow| {
+                while let Ok((exhausted, client)) = clients.try_recv() {
+                    if exhausted {
+                        overflow_authenticating = false;
+                    } else {
+                        authenticating -= 1;
+                    }
+                    let Some((stream, preface, trusted, pid)) = client else {
                         continue;
                     };
-                    return Some((Duplex::socket(stream, preface, cancel).ok()?, true));
+                    return Some((
+                        Duplex::socket(stream, preface, cancel).ok()?,
+                        trusted,
+                        pid,
+                        exhausted,
+                    ));
                 }
-                while authenticating < 16 {
+                while authenticating + pending < 16 {
                     let stream = listener.accept().ok()?;
                     let (send, user) = (authenticated.clone(), user.clone());
-                    thread::spawn(move || send.send(authenticate(stream, &user)).ok());
+                    thread::spawn(move || send.send((false, authenticate(stream, &user))).ok());
                     authenticating += 1;
+                }
+                if !overflow && !overflow_authenticating {
+                    let stream = listener.accept().ok()?;
+                    let (send, user) = (authenticated.clone(), user.clone());
+                    thread::spawn(move || send.send((true, authenticate(stream, &user))).ok());
+                    overflow_authenticating = true;
                 }
                 None
             },
@@ -1603,11 +1684,11 @@ mod native {
             random[..16].try_into().unwrap(),
             random[16..32].try_into().unwrap(),
         )?;
-        let semantic = options
-            .events
-            .is_some()
-            .then(|| random[48..64].try_into().unwrap())
-            .unwrap_or_default();
+        let semantic = if options.events.is_some() {
+            random[48..64].try_into().unwrap()
+        } else {
+            Default::default()
+        };
         let mut host = Native {
             marker: path.to_owned(),
             stage_root,
