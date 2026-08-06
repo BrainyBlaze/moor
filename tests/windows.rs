@@ -203,7 +203,7 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
     use moor::wire::{Codec, Profile, put_wide};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -258,7 +258,6 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
         Store::create(&root.join("exit"), Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     let (pty, child) = UnixStream::pair().unwrap();
     let sizes = Arc::new(Mutex::new(Vec::new()));
-    let (_, writes) = mpsc::channel();
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -268,7 +267,6 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
             replay_limit: 1024,
         },
         pty: Duplex::closing(pty.try_clone().unwrap(), pty, 1024, || {}),
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 4, 1024),
         status: Vec::new(),
         commit_at: 0,
@@ -292,8 +290,8 @@ fn holder_reports_exact_log_clear_barriers_and_keeps_validated_handles() {
     use moor::wire::log_clear_payload;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::Duration;
 
@@ -358,7 +356,6 @@ fn holder_reports_exact_log_clear_barriers_and_keeps_validated_handles() {
     client_stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let (_writes_tx, writes) = mpsc::channel();
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -368,7 +365,6 @@ fn holder_reports_exact_log_clear_barriers_and_keeps_validated_handles() {
             replay_limit: 1024,
         },
         pty: Duplex::closing(pty.try_clone().unwrap(), pty, 1024, || {}),
-        writes,
         storage: SessionStorage::new(Some((log, 1024)), None, lifecycle, 4, 1024),
         status: Vec::new(),
         commit_at: 0,

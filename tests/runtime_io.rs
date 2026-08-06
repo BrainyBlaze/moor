@@ -9,7 +9,7 @@ use std::io::{Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{
     Arc, Barrier, Condvar, Mutex,
-    atomic::{AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -216,7 +216,7 @@ fn viewer_pair(
 }
 
 #[test]
-fn attach_owns_input_state_api() {
+fn attach_starts_one_input_sender() {
     fn compiles(client: &mut Client, options: &Options) {
         let _ = io::attach_viewer_to(
             client,
@@ -225,9 +225,7 @@ fn attach_owns_input_state_api() {
             &mut std::io::sink(),
             Duration::from_secs(15),
             |_| Err("reconnect unavailable".into()),
-            |_: ViewerSender, state: Arc<AtomicU8>| {
-                assert_eq!(state.load(std::sync::atomic::Ordering::Relaxed), 0)
-            },
+            |_: ViewerSender| {},
         );
     }
     let _ = compiles;
@@ -268,7 +266,7 @@ fn attach_acknowledges_each_applied_output_record() {
             &mut output,
             Duration::from_secs(15),
             |_| Err("reconnect unavailable".into()),
-            |_, _| {},
+            |_| {},
         )
         .is_err()
     );
@@ -335,7 +333,7 @@ fn idle_viewer_renews_then_releases_its_lease() {
         &mut std::io::sink(),
         Duration::from_secs(15),
         |_| Err("reconnect unavailable".into()),
-        |sender, state| {
+        |sender| {
             started = true;
             thread = Some(std::thread::spawn(move || {
                 let base = Instant::now();
@@ -346,7 +344,6 @@ fn idle_viewer_renews_then_releases_its_lease() {
                     io::InputConfig {
                         detach: None,
                         pass_suspend: true,
-                        state,
                         last_size: None,
                     },
                     || io::InputState::Closed,
@@ -448,7 +445,7 @@ fn viewer_allows_only_one_input_until_its_exact_receipt() {
         &mut std::io::sink(),
         Duration::from_secs(15),
         |_| Err("reconnect unavailable".into()),
-        |sender, state| {
+        |sender| {
             thread = Some(std::thread::spawn(move || {
                 io::run_viewer_input(
                     Chunks(VecDeque::from([b"a".to_vec(), b"b".to_vec()])),
@@ -456,7 +453,6 @@ fn viewer_allows_only_one_input_until_its_exact_receipt() {
                     io::InputConfig {
                         detach: None,
                         pass_suspend: true,
-                        state,
                         last_size: None,
                     },
                     || io::InputState::Ready,
@@ -577,7 +573,7 @@ fn viewer_routes_terminal_query_replies_without_altering_ordinary_input() {
         &mut sink,
         Duration::from_secs(15),
         |_| Err("reconnect unavailable".into()),
-        |sender, state| {
+        |sender| {
             let gate = gate.clone();
             thread = Some(std::thread::spawn(move || {
                 io::run_viewer_input(
@@ -589,7 +585,6 @@ fn viewer_routes_terminal_query_replies_without_altering_ordinary_input() {
                     io::InputConfig {
                         detach: None,
                         pass_suspend: true,
-                        state,
                         last_size: None,
                     },
                     || io::InputState::Ready,
@@ -810,7 +805,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                 identity.clone(),
             )
         },
-        |sender, state| {
+        |sender| {
             let gate = gate.clone();
             input = Some(std::thread::spawn(move || {
                 io::run_viewer_input(
@@ -819,7 +814,6 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                     io::InputConfig {
                         detach: None,
                         pass_suspend: true,
-                        state,
                         last_size: Some((24, 80)),
                     },
                     || io::InputState::Ready,
@@ -872,7 +866,7 @@ fn transport_loss_after_release_request_is_not_a_successful_detach() {
         &mut std::io::sink(),
         Duration::from_secs(15),
         |_| Err("reconnect refused".into()),
-        |sender, state| {
+        |sender| {
             input = Some(std::thread::spawn(move || {
                 io::run_viewer_input(
                     Cursor::new(Vec::<u8>::new()),
@@ -880,7 +874,6 @@ fn transport_loss_after_release_request_is_not_a_successful_detach() {
                     io::InputConfig {
                         detach: None,
                         pass_suspend: true,
-                        state,
                         last_size: None,
                     },
                     || io::InputState::Closed,
@@ -962,7 +955,7 @@ fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
         &mut std::io::sink(),
         Duration::from_secs(15),
         |_| Err("reconnect unavailable".into()),
-        |sender, _| {
+        |sender| {
             let await_observed = await_observed.take().unwrap();
             let sender = Arc::new(sender);
             let release = Arc::clone(&sender);
@@ -1021,10 +1014,16 @@ fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
         }
         std::thread::sleep(Duration::from_millis(100));
     });
-    let mut client = handshake(reader, stream, b"\x01/session".to_vec()).unwrap();
-    client.set_cancel(move || {
-        let _ = close.shutdown(std::net::Shutdown::Both);
-    });
+    let mut client = Client::handshake_until(
+        reader,
+        stream,
+        b"\x01/session".to_vec(),
+        Instant::now() + Duration::from_secs(2),
+        move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        },
+    )
+    .unwrap();
     let started = Instant::now();
     let probed = Arc::new(Mutex::new(None));
     let observed = probed.clone();
@@ -1041,7 +1040,7 @@ fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
                 .get_or_insert_with(|| started.elapsed());
             Err("probe indeterminate".into())
         },
-        |_, _| {},
+        |_| {},
     );
     assert!(result.is_err());
     assert!(probed.lock().unwrap().unwrap() < Duration::from_millis(80));
@@ -1102,11 +1101,11 @@ fn unread_input_is_backpressured_to_a_bounded_burst() {
 #[test]
 fn tracked_writer_reports_completed_bytes() {
     let read_gate = Arc::new(Gate::default());
-    let (pump, completed) = Duplex::tracked(BlockingReader(read_gate.clone()), std::io::sink(), 16);
-    pump.try_send(b"hello".to_vec()).unwrap();
+    let pump = Duplex::tracked(BlockingReader(read_gate.clone()), std::io::sink(), 16);
+    pump.try_send_payload(7, b"hello".to_vec(), 0).unwrap();
     assert_eq!(
-        completed.recv_timeout(Duration::from_secs(1)).unwrap(),
-        (5, None)
+        pump.2.recv_timeout(Duration::from_secs(1)).unwrap(),
+        (7, 5, None)
     );
     pump.shutdown();
     read_gate.open();
@@ -1115,12 +1114,11 @@ fn tracked_writer_reports_completed_bytes() {
 #[test]
 fn tracked_writer_reports_progress_before_failure() {
     let read_gate = Arc::new(Gate::default());
-    let (pump, completed) =
-        Duplex::tracked(BlockingReader(read_gate.clone()), PartialFail(true), 16);
+    let pump = Duplex::tracked(BlockingReader(read_gate.clone()), PartialFail(true), 16);
     pump.try_send(b"hello".to_vec()).unwrap();
     assert_eq!(
-        completed.recv_timeout(Duration::from_secs(1)).unwrap(),
-        (2, Some(20))
+        pump.2.recv_timeout(Duration::from_secs(1)).unwrap(),
+        (0, 2, Some(20))
     );
     assert_eq!(pump.pending(), 0);
     assert_eq!(pump.try_send(vec![1]), Err(SendError::Closed));
@@ -1133,7 +1131,7 @@ fn tracked_writer_completes_every_job_accepted_before_failure() {
     let read_gate = Arc::new(Gate::default());
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    let (pump, completed) = Duplex::tracked(
+    let pump = Duplex::tracked(
         BlockingReader(read_gate.clone()),
         BlockedFailWriter {
             started: started_tx,
@@ -1142,15 +1140,15 @@ fn tracked_writer_completes_every_job_accepted_before_failure() {
         16,
     );
 
-    pump.try_send(vec![1]).unwrap();
+    pump.try_send_payload(11, vec![1], 0).unwrap();
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    pump.try_send(vec![2]).unwrap();
+    pump.try_send_payload(12, vec![2], 0).unwrap();
     release_tx.send(()).unwrap();
 
-    for _ in 0..2 {
+    for tag in [11, 12] {
         assert_eq!(
-            completed.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (0, Some(20))
+            pump.2.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (tag, 0, Some(20))
         );
     }
     assert_eq!(pump.pending(), 0);
@@ -1202,11 +1200,11 @@ fn viewer_payload_and_control_overhead_have_independent_limits() {
         1,
     );
     assert_eq!(
-        pump.try_send_payload(vec![0; (4 << 20) + 1], 4 << 20),
+        pump.try_send_payload(0, vec![0; (4 << 20) + 1], 4 << 20),
         Ok(())
     );
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(pump.try_send_payload(vec![0], 1), Err(SendError::Full));
+    assert_eq!(pump.try_send_payload(0, vec![0], 1), Err(SendError::Full));
     assert_eq!(pump.try_send(vec![0]), Err(SendError::Full));
     release_tx.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -1273,11 +1271,33 @@ fn dropping_duplex_closes_an_idle_writer() {
 }
 
 #[test]
+fn untracked_duplex_discards_write_completions() {
+    let read_gate = Arc::new(Gate::default());
+    let pump = Duplex::closing(
+        BlockingReader(read_gate.clone()),
+        std::io::sink(),
+        16,
+        || {},
+    );
+    pump.try_send(b"hello".to_vec()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while pump.pending() != 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(pump.pending(), 0);
+    assert_eq!(
+        pump.2.recv_timeout(Duration::from_millis(50)),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+    );
+    pump.shutdown();
+    read_gate.open();
+}
+
+#[test]
 fn concurrent_shutdown_drains_every_accepted_send() {
     const SENDERS: usize = 32;
     let read_gate = Arc::new(Gate::default());
-    let (pump, completed) =
-        Duplex::tracked(BlockingReader(read_gate.clone()), std::io::sink(), SENDERS);
+    let pump = Duplex::tracked(BlockingReader(read_gate.clone()), std::io::sink(), SENDERS);
     let pump = Arc::new(pump);
     let start = Arc::new(Barrier::new(SENDERS + 2));
     let sends = (0..SENDERS)
@@ -1313,8 +1333,8 @@ fn concurrent_shutdown_drains_every_accepted_send() {
     );
     for _ in 0..accepted {
         assert_eq!(
-            completed.recv_timeout(Duration::from_secs(1)).unwrap(),
-            (1, None)
+            pump.2.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (0, 1, None)
         );
     }
     assert_eq!(pump.pending(), 0);

@@ -4,11 +4,10 @@ use crate::runtime::client::{Client, InputLease};
 use crate::schema;
 use crate::session::{LeaseRole, ResultOutcome};
 use crate::wire::{Message, ViewerEvent, ViewerStream, decode_viewer};
-use crossbeam_channel::{Receiver as CrossReceiver, Sender as CrossSender, bounded, never, select};
+use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
 use interprocess::TryClone;
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicU8, Ordering::*};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Sender as SyncSender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,18 +15,20 @@ schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
 schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Closed);
 
-schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
+schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
 type Charge = (usize, usize);
-type WriteJob = (Vec<u8>, Charge);
-schema!(struct State fields; sender: Option<Sender<WriteJob>>, used: Charge, limit: Charge);
+pub type SendResult = Result<(), SendError>;
+pub type WriteResult = (u64, u64, Option<u16>);
+type WriteJob = (Vec<u8>, Charge, u64);
+schema!(struct State fields; sender: Option<SyncSender<WriteJob>>, used: Charge, limit: Charge);
+type SharedState = Arc<Mutex<State>>;
 
-pub struct Duplex<T = Event>(Arc<Mutex<State>>, pub CrossReceiver<T>);
+pub struct Duplex<T = Event>(SharedState, pub Receiver<T>, pub Receiver<WriteResult>);
 
-schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(Sender<bool>), Abort);
-pub struct ViewerSender(CrossSender<Command>);
-schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>), Arc<AtomicU8>),
-    Attached, Reattaching);
+schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(SyncSender<bool>), Abort);
+pub struct ViewerSender(Sender<Command>);
+schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender)), Attached, Reattaching);
 
 impl ViewerSender {
     pub fn send(&self, bytes: &[u8]) -> bool {
@@ -44,8 +45,8 @@ impl ViewerSender {
 }
 
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
-    phase: ViewerPhase<'a>, commands: CrossReceiver<Command>, sender: CrossSender<Command>, wire: ViewerStream,
-    lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<Sender<bool>>);
+    phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream,
+    lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -100,9 +101,9 @@ impl Viewer<'_> {
             }
             ViewerEvent::Lease(result) => {
                 let phase = std::mem::replace(&mut self.phase, ViewerPhase::Attached);
-                if let ViewerPhase::Starting(start, state) = phase {
+                if let ViewerPhase::Starting(start) = phase {
                     self.lease = InputLease::from_result(result, LeaseRole::Viewer)?;
-                    start(ViewerSender(self.sender.clone()), state);
+                    start(ViewerSender(self.sender.clone()));
                     if self.lease.is_some() {
                         match self.options.redraw {
                             Redraw::CtrlL => self.advance(b"\x0c".to_vec())?,
@@ -179,9 +180,7 @@ impl Viewer<'_> {
     }
 
     fn fail<T>(&mut self, error: impl Into<String>) -> Result<T, String> {
-        if let Some(done) = self.release.take() {
-            let _ = done.send(false);
-        }
+        let _ = self.release.take().map(|done| done.send(false));
         Err(error.into())
     }
 }
@@ -208,14 +207,15 @@ impl Duplex {
         limit: usize,
         close: impl FnOnce() + Send + 'static,
     ) -> Self {
-        raw(reader, writer, limit, 4 << 20, close).0
+        let transport = raw(reader, writer, limit, 4 << 20, close);
+        Duplex(transport.0, transport.1, never())
     }
 
     pub fn tracked(
         reader: impl Read + Send + 'static,
         writer: impl Write + Send + 'static,
         limit: usize,
-    ) -> (Self, Receiver<(u64, Option<u16>)>) {
+    ) -> Self {
         raw(reader, writer, limit, 16 << 20, || {})
     }
 }
@@ -226,7 +226,7 @@ fn raw(
     limit: usize,
     payload_limit: usize,
     close: impl FnOnce() + Send + 'static,
-) -> (Duplex, Receiver<(u64, Option<u16>)>) {
+) -> Duplex {
     pump(
         reader,
         writer,
@@ -239,11 +239,11 @@ fn raw(
 }
 
 impl<T> Duplex<T> {
-    pub fn try_send(&self, bytes: Vec<u8>) -> Result<(), SendError> {
-        self.try_send_payload(bytes, 0)
+    pub fn try_send(&self, bytes: Vec<u8>) -> SendResult {
+        self.try_send_payload(0, bytes, 0)
     }
 
-    pub fn try_send_payload(&self, bytes: Vec<u8>, payload: usize) -> Result<(), SendError> {
+    pub fn try_send_payload(&self, tag: u64, bytes: Vec<u8>, payload: usize) -> SendResult {
         let mut state = self.0.lock().expect("duplex state lock");
         let sender = state.sender.as_ref().cloned().ok_or(SendError::Closed)?;
         let charge = (
@@ -254,7 +254,7 @@ impl<T> Duplex<T> {
             return Ok(());
         }
         state.used = reserve(state.used, charge, state.limit).ok_or(SendError::Full)?;
-        if sender.send((bytes, charge)).is_err() {
+        if sender.send((bytes, charge, tag)).is_err() {
             state.sender.take();
             state.used = (0, 0);
             return Err(SendError::Closed);
@@ -277,11 +277,11 @@ pub(crate) fn pump<T: Send + 'static>(
     mut writer: impl Write + Send + 'static,
     limit: usize,
     payload_limit: usize,
-    mut emit: impl FnMut(&[u8], &CrossSender<T>) -> bool + Send + 'static,
+    mut emit: impl FnMut(&[u8], &Sender<T>) -> bool + Send + 'static,
     closed: T,
     close: impl FnOnce() + Send + 'static,
-) -> (Duplex<T>, Receiver<(u64, Option<u16>)>) {
-    let (completed, completions) = channel();
+) -> Duplex<T> {
+    let (completed, completions) = unbounded();
     let (out, writes) = channel::<WriteJob>();
     let (tx, events) = bounded(8);
     let state = Arc::new(Mutex::new(State {
@@ -300,7 +300,7 @@ pub(crate) fn pump<T: Send + 'static>(
     });
     let writer_state = Arc::downgrade(&state);
     std::thread::spawn(move || {
-        while let Ok((bytes, charge)) = writes.recv() {
+        while let Ok((bytes, charge, tag)) = writes.recv() {
             let mut written = 0;
             let error = loop {
                 match writer.write(&bytes[written..]) {
@@ -325,17 +325,17 @@ pub(crate) fn pump<T: Send + 'static>(
                     state.used.1 -= charge.1;
                 }
             }
-            let _ = completed.send((written as u64, error));
+            let _ = completed.send((tag, written as u64, error));
             if let Some(error) = error {
-                while writes.recv().is_ok() {
-                    let _ = completed.send((0, Some(error)));
+                while let Ok((_, _, tag)) = writes.recv() {
+                    let _ = completed.send((tag, 0, Some(error)));
                 }
                 break;
             }
         }
         close();
     });
-    (Duplex(state, events), completions)
+    Duplex(state, events, completions)
 }
 
 fn reserve(used: Charge, charge: Charge, limit: Charge) -> Option<Charge> {
@@ -356,9 +356,8 @@ pub fn attach_viewer_to(
     output: &mut dyn Write,
     liveness: Duration,
     mut reconnect: impl FnMut(Duration) -> Result<Client, String>,
-    mut start: impl FnMut(ViewerSender, Arc<AtomicU8>),
+    mut start: impl FnMut(ViewerSender),
 ) -> Result<i32, String> {
-    let state = Arc::new(AtomicU8::new(0));
     let (sender, commands) = bounded(1);
     let mut request = [0; 5];
     request[..2].copy_from_slice(&geometry.1.to_le_bytes());
@@ -368,7 +367,7 @@ pub fn attach_viewer_to(
         client,
         options,
         output,
-        phase: ViewerPhase::Starting(&mut start, state),
+        phase: ViewerPhase::Starting(&mut start),
         commands,
         sender,
         wire: ViewerStream {
@@ -461,7 +460,6 @@ pub fn run_viewer_input(
     let InputConfig {
         detach,
         pass_suspend,
-        state,
         mut last_size,
     } = config;
     let mut armed = None;
@@ -469,9 +467,6 @@ pub fn run_viewer_input(
     let mut output = Vec::with_capacity(bytes.len());
     let mut renewed = now();
     let graceful = 'input: loop {
-        if state.load(Acquire) != 0 {
-            return;
-        }
         let current = now();
         if current.saturating_duration_since(renewed) >= Duration::from_secs(3) {
             if sender.0.send(Command::Keepalive).is_err() {
@@ -531,5 +526,4 @@ pub fn run_viewer_input(
     if !released {
         let _ = sender.0.send(Command::Abort);
     }
-    state.store(if released { 1 } else { 2 }, Release);
 }

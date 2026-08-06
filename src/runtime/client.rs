@@ -63,9 +63,7 @@ fn announce(session: &OsStr, quiet: bool, verb: &str) {
 
 pub struct Client {
     pub(crate) transport: Duplex<Inbound>,
-    writes: std::sync::mpsc::Receiver<(u64, Option<u16>)>,
     outgoing: Codec,
-    close: Option<Box<dyn Fn() + Send>>,
     pub generation: u32,
     pub incarnation: [u8; 16],
     pub identity: Vec<u8>,
@@ -104,12 +102,8 @@ impl Client {
         T: Read + Write + TryClone + Send + 'static,
     {
         let writer = stream.try_clone().map_err(|error| error.to_string())?;
-        let failed = stream.try_clone().map_err(|error| error.to_string())?;
-        let persistent = stream.try_clone().map_err(|error| error.to_string())?;
-        let mut client =
-            Self::handshake_until(stream, writer, identity, deadline, move || cancel(&failed))?;
-        client.set_cancel(move || cancel(&persistent));
-        Ok(client)
+        let closer = stream.try_clone().map_err(|error| error.to_string())?;
+        Self::handshake_until(stream, writer, identity, deadline, move || cancel(&closer))
     }
 
     pub fn handshake_until(
@@ -117,11 +111,11 @@ impl Client {
         writer: impl Write + Send + 'static,
         identity: Vec<u8>,
         deadline: Instant,
-        close: impl FnOnce(),
+        close: impl FnOnce() + Send + 'static,
     ) -> Result<Self> {
         let mut incoming = Codec::new(Profile::Controller);
         let mut messages = Vec::with_capacity(8);
-        let (transport, writes) = pump(
+        let transport = pump(
             reader,
             writer,
             4 << 20,
@@ -145,13 +139,11 @@ impl Client {
                 })
             },
             Err(("connection closed".into(), true)),
-            || {},
+            close,
         );
         let mut client = Self {
             transport,
-            writes,
             outgoing: Codec::new(Profile::Controller),
-            close: None,
             generation: 0,
             incarnation: [0; 16],
             identity,
@@ -169,7 +161,7 @@ impl Client {
                 crossbeam_channel::RecvTimeoutError::Disconnected => "connection closed".into(),
             })
             .and_then(|event| event.map_err(|failure| failure.0))
-            .inspect_err(|_| close())?;
+            .inspect_err(|_| client.cancel())?;
         let (generation, incarnation) = (reply.kind == 2)
             .then(|| decode_controller_hello_ack(reply.scope, &reply.payload, &client.identity))
             .flatten()
@@ -186,10 +178,6 @@ impl Client {
             .map_err(|failure| failure.0)
     }
 
-    pub fn set_cancel(&mut self, close: impl Fn() + Send + 'static) {
-        self.close = Some(Box::new(close));
-    }
-
     pub fn send(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
         let mut output = Vec::new();
         self.outgoing
@@ -198,15 +186,13 @@ impl Client {
         self.transport
             .try_send(output)
             .map_err(|_| "connection closed".to_string())?;
-        matches!(self.writes.recv(), Ok((_, None)))
+        matches!(self.transport.2.recv(), Ok((0, _, None)))
             .then_some(())
             .ok_or_else(|| "connection write failed".into())
     }
 
     pub(crate) fn cancel(&self) {
-        if let Some(close) = &self.close {
-            close();
-        }
+        self.transport.shutdown();
     }
 
     pub fn receive_kind(&mut self, kind: u8) -> Result<Message> {
