@@ -60,13 +60,6 @@ fn window(rows: u16, columns: u16) -> libc::winsize {
     size
 }
 
-fn private_dir(path: &Path, invalid: impl FnOnce() -> String) -> Result<()> {
-    crate::store::private_directory(path, true)
-        .text()?
-        .then_some(())
-        .ok_or_else(invalid)
-}
-
 macro_rules! syscall {
     ($valid:expr) => {
         crate::ensure!($valid, io::Error::last_os_error().to_string())
@@ -78,36 +71,13 @@ crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: 
 crate::schema!(struct UnixNative fields; control: File, group: i32, child: Child);
 crate::schema!(struct ViewerTerminal derive [Clone, Copy] fields; fd: i32, saved: libc::termios);
 crate::schema!(struct LaunchSeed fields; generation: u32, supervised: bool, incarnation: [u8; 16], semantic_token: [u8; 16], identity: Vec<u8>, start: (u64, u64, [u8; 16]));
-crate::schema!(struct Instrument fields; read: File, write: File, stage: File, parent: File, leaf: OsString, identity: (u64, u64), hash: [u8; 32],
-    nonce: [u8; 16]);
-struct PreparedInstrument {
-    source: File,
-    stage: File,
-    parent: File,
-    leaf: OsString,
-    path: PathBuf,
-    identity: (u64, u64),
-    armed: bool,
-}
-
+crate::schema!(struct Instrument fields; read: File, write: File, stage: File, parent: File, leaf: OsString, identity: (u64, u64), hash: [u8; 32], nonce: [u8; 16]);
+crate::schema!(struct PreparedInstrument fields; source: File, stage: File, parent: File, leaf: OsString, path: PathBuf, identity: (u64, u64), armed: bool);
+crate::schema!(struct EventTarget fields; operand: PathBuf, target: StoreTarget);
+crate::schema!(struct StoreTarget fields; parent: File, leaf: OsString, directory: File, identity: (u64, u64), prepared: PreparedStore, validator: Option<Store>, exact_selection: bool, owned: bool, armed: bool);
 struct RawTerminal(ViewerTerminal);
 struct ChildGuard(Option<Child>);
 struct PendingEvent(PathBuf, File, OsString, Option<File>);
-struct EventTarget {
-    operand: PathBuf,
-    target: StoreTarget,
-}
-struct StoreTarget {
-    parent: File,
-    leaf: OsString,
-    directory: File,
-    identity: (u64, u64),
-    prepared: PreparedStore,
-    validator: Option<Store>,
-    exact_selection: bool,
-    owned: bool,
-    armed: bool,
-}
 struct Stage(File, OsString, Option<(u64, u64)>, bool);
 struct SetupError(String, bool);
 
@@ -155,6 +125,17 @@ impl Config<'_> {
         self.store_targets().rev().for_each(StoreTarget::rollback);
         self.stage.rollback();
     }
+
+    fn revalidate_stores(&self) -> Result<()> {
+        self.lifecycle.revalidate()?;
+        if let Some(event) = &self.event {
+            event.revalidate(&self.root)?;
+        }
+        if let Some(log) = &self.log {
+            log.revalidate()?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ChildGuard {
@@ -197,13 +178,7 @@ pub(crate) fn preflight_create(
             resolved != root && resolved.starts_with(&root),
             event_rejection(event, "outside-root")
         );
-        for other in [
-            marker.clone(),
-            shared::companion(&marker, ".log"),
-            shared::companion(&marker, ".exit"),
-        ] {
-            validate_event_alias(event, &other)?;
-        }
+        validate_event_aliases(event, &marker)?;
     }
     Ok(marker)
 }
@@ -211,7 +186,7 @@ pub(crate) fn preflight_create(
 pub(crate) fn create(
     mode: CreateMode,
     path: &Path,
-    command: Vec<OsString>,
+    mut command: Vec<OsString>,
     options: &Options,
     invoked: &OsStr,
 ) -> CommandResult<i32> {
@@ -255,8 +230,8 @@ pub(crate) fn create(
         identity,
         start: (start_wall, start_mono, boot),
     };
-    let command = if command.is_empty() {
-        vec![
+    if command.is_empty() {
+        command.push(
             std::env::var_os("SHELL")
                 .filter(|shell| !shell.is_empty())
                 .or_else(|| {
@@ -267,10 +242,8 @@ pub(crate) fn create(
                         .filter(|shell| !shell.is_empty())
                 })
                 .unwrap_or_else(|| "/bin/sh".into()),
-        ]
-    } else {
-        command
-    };
+        );
+    }
     let (parent, publish) = socket_alias(path)?;
     let stage = Stage(
         parent,
@@ -513,55 +486,11 @@ fn holder(
             return if child { Ok(127) } else { Err(error) };
         }
     };
-    let artifacts_valid = config
-        .lifecycle
-        .revalidate()
-        .and_then(|()| {
-            config
-                .event
-                .as_ref()
-                .map(|event| event.revalidate(&config.root))
-                .transpose()
-                .map(|_| ())
-        })
-        .and_then(|()| {
-            config
-                .log
-                .as_ref()
-                .map(StoreTarget::revalidate)
-                .transpose()
-                .map(|_| ())
-        });
-    if let Err(error) = artifacts_valid {
-        if let Some(observed) = wait_natural_exit(&mut state, Duration::from_millis(25))? {
-            return finalize_unpublished_exit(
-                &mut state,
-                &running,
-                observed,
-                &mut config,
-                &mut ready,
-                invoked,
-            );
-        }
-        let mut signal = Some(true);
-        let stopped = state.drive(|| None, || signal.take())?.is_some();
-        drop(state);
-        let _ = stopped;
-        if ready.output.is_some() {
-            eprintln!("{}: {error}", name::program(invoked));
-        }
-        ready.notice(3, 1);
-        return Err(error);
+    if let Err(error) = config.revalidate_stores() {
+        return abort_unpublished(state, &running, &mut config, &mut ready, error, true);
     }
     if let Some(observed) = early.or(state.observe_exit()?) {
-        return finalize_unpublished_exit(
-            &mut state,
-            &running,
-            observed,
-            &mut config,
-            &mut ready,
-            invoked,
-        );
+        return finalize_unpublished_exit(&mut state, &running, observed, &mut config, &mut ready);
     }
     let destination = path.file_name().ok_or("rendezvous has no name")?;
     let publication = config.stage.revalidate().and_then(|()| {
@@ -572,22 +501,7 @@ fn holder(
         Ok(marker) => marker,
         Err(error) => {
             config.stage.rollback_published(destination);
-            if let Some(observed) = wait_natural_exit(&mut state, Duration::from_millis(25))? {
-                return finalize_unpublished_exit(
-                    &mut state,
-                    &running,
-                    observed,
-                    &mut config,
-                    &mut ready,
-                    invoked,
-                );
-            }
-            let mut signal = Some(true);
-            let stopped = state.drive(|| None, || signal.take())?.is_some();
-            drop(state);
-            let _ = stopped;
-            ready.notice(3, 1);
-            return Err(error);
+            return abort_unpublished(state, &running, &mut config, &mut ready, error, false);
         }
     };
     config.retain_artifacts();
@@ -634,38 +548,50 @@ fn finalize_unpublished_exit(
     observed: NativeExit,
     config: &mut Config<'_>,
     ready: &mut shared::LaunchReporter<UnixStream>,
-    invoked: &OsStr,
 ) -> Result<i32> {
     let status = state.drive(|| None, || None)?.unwrap_or(observed);
     let (exit, durable) = state.finish_exit(running, status, None);
     if durable {
         config.retain_stores();
     }
-    if ready.output.is_none() {
-        return Ok(exit);
-    }
+    crate::return_if!(ready.output.is_none(), Ok(exit));
     eprintln!(
         "{}: child exited before session publication",
-        name::program(invoked)
+        name::program(config.invoked)
     );
     ready.notice(3, 1);
     Ok(1)
 }
 
-fn wait_natural_exit(
-    state: &mut Runtime<UnixNative>,
-    timeout: Duration,
-) -> Result<Option<NativeExit>> {
-    let deadline = Instant::now() + timeout;
-    loop {
+fn abort_unpublished(
+    mut state: Runtime<UnixNative>,
+    running: &str,
+    config: &mut Config<'_>,
+    ready: &mut shared::LaunchReporter<UnixStream>,
+    error: String,
+    diagnose: bool,
+) -> Result<i32> {
+    let deadline = Instant::now() + Duration::from_millis(25);
+    let observed = loop {
         if let Some(observed) = state.observe_exit()? {
-            return Ok(Some(observed));
+            break Some(observed);
         }
         if Instant::now() >= deadline {
-            return Ok(None);
+            break None;
         }
         thread::sleep(Duration::from_millis(1));
+    };
+    if let Some(observed) = observed {
+        return finalize_unpublished_exit(&mut state, running, observed, config, ready);
     }
+    let mut signal = Some(true);
+    let _ = state.drive(|| None, || signal.take())?;
+    drop(state);
+    if diagnose && ready.output.is_some() {
+        eprintln!("{}: {error}", name::program(config.invoked));
+    }
+    ready.notice(3, 1);
+    Err(error)
 }
 
 struct InitialStore<'a>(&'a StoreTarget, &'a Store, &'a [u8]);
@@ -757,7 +683,7 @@ fn holder_setup(
     let generation = config.launch.generation;
     let supervised = config.launch.supervised;
     let incarnation = config.launch.incarnation;
-    let identity = config.launch.identity.clone();
+    let identity = std::mem::take(&mut config.launch.identity);
     let semantic_token = config.launch.semantic_token;
     let modes = config.terminal.0.map(nix::sys::termios::Termios::from);
     let pair = nix::pty::openpty(Some(&config.terminal.1), modes.as_ref()).text()?;
@@ -802,27 +728,21 @@ fn holder_setup(
     }
     let (start_wall, start_mono, boot) = config.launch.start;
     let event_path = options.events.as_deref();
-    let event_manifest = event_path.map(|path| path.as_os_str().as_bytes().to_vec());
+    let event_manifest = event_path.map(|path| path.as_os_str().as_bytes());
     let instrument_path = config
         .instrument
         .as_ref()
-        .map(|instrument| instrument.path.clone());
-    if let (Some(event), Some(instrument)) = (event_path, instrument_path.as_deref()) {
+        .map(|instrument| instrument.path.as_path());
+    if let (Some(event), Some(instrument)) = (event_path, instrument_path) {
         validate_event_alias(event, instrument)?;
     }
-    let instrument_manifest = instrument_path
-        .as_deref()
-        .map(|path| path.as_os_str().as_bytes().to_vec());
+    let instrument_manifest = instrument_path.map(|path| path.as_os_str().as_bytes());
     let running = shared::lifecycle_running(
         &identity,
         (supervised.then_some(generation), generation),
         incarnation,
         (start_wall, start_mono, boot),
-        (
-            "posix-bytes",
-            event_manifest.as_deref(),
-            instrument_manifest.as_deref(),
-        ),
+        ("posix-bytes", event_manifest, instrument_manifest),
     );
     let event_initial = event_path.map(|_| {
         crate::events::canonical_header(
@@ -883,8 +803,8 @@ fn holder_setup(
             marker: path,
             event_path,
             encoding: "posix-bytes",
-            event_identity: event_manifest.as_deref(),
-            instrument_identity: instrument_manifest.as_deref(),
+            event_identity: event_manifest,
+            instrument_identity: instrument_manifest,
             event_store: None,
             stores: Some(shared::ArtifactStores {
                 lifecycle: lifecycle_store,
@@ -895,7 +815,11 @@ fn holder_setup(
             log_cap: options.log_cap,
         },
     )?;
-    let instrument = instrument_setup(config.instrument.as_mut(), &mut process)?;
+    let instrument = config
+        .instrument
+        .as_mut()
+        .map(|source| source.configure(&mut process))
+        .transpose()?;
     if let Some(event) = config.event.as_ref() {
         event.revalidate(&config.root)?;
     }
@@ -926,7 +850,7 @@ fn holder_setup(
         .status
         .extend_from_slice(&shared::random_array::<16>()?);
     let exited = child.child().try_wait().text()?.map(native_exit);
-    let running = artifacts.running.clone();
+    let running = std::mem::take(&mut artifacts.running);
     let mut holder = artifacts.runtime(
         (pty, done_rx),
         (
@@ -1106,9 +1030,10 @@ fn root(invoked: &OsStr) -> Result<PathBuf> {
     directory.push(base);
     directory.push(format!("-{}", uid()));
     let root = std::env::temp_dir().join(directory);
-    private_dir(&root, || {
+    crate::ensure!(
+        crate::store::private_directory(&root, true).text()?,
         format!("session root '{}' is not owner-only", root.display())
-    })?;
+    );
     Ok(root)
 }
 
@@ -1128,6 +1053,14 @@ fn validate_event_alias(event: &Path, other: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_event_aliases(event: &Path, marker: &Path) -> Result<()> {
+    validate_event_alias(event, marker)?;
+    for suffix in [".log", ".exit"] {
+        validate_event_alias(event, &shared::companion(marker, suffix))?;
+    }
+    Ok(())
+}
+
 fn validate_event_target(
     path: Option<&Path>,
     root: &Path,
@@ -1142,13 +1075,7 @@ fn validate_event_target(
         resolved != root && resolved.starts_with(root),
         reject("outside-root")
     );
-    for other in [
-        marker.to_owned(),
-        shared::companion(marker, ".log"),
-        shared::companion(marker, ".exit"),
-    ] {
-        validate_event_alias(path, &other)?;
-    }
+    validate_event_aliases(path, marker)?;
     let (parent, leaf, opened) = open_event_target(root, &resolved, path)?;
     if let Some(opened) = &opened {
         validate_event_directory(opened, path)?;
@@ -1224,9 +1151,7 @@ where
 {
     use std::ffi::CStr;
     let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    crate::return_if!(descriptor < 0, Err(io::Error::last_os_error().into()));
     let duplicate = unsafe { File::from_raw_fd(descriptor) };
     let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
     if flags < 0
@@ -1284,10 +1209,7 @@ fn event_store_error(operand: &Path, error: StoreError) -> String {
     event_rejection(operand, cause)
 }
 
-enum DirectoryFailure {
-    Io(io::Error),
-    Identity(Option<io::Error>),
-}
+crate::schema!(enum DirectoryFailure; Io(io::Error), Identity(Option<io::Error>));
 
 impl DirectoryFailure {
     fn artifact(self) -> String {
@@ -1549,23 +1471,22 @@ impl PreparedInstrument {
         };
         syscall!(descriptor >= 0);
         let stage = unsafe { File::from_raw_fd(descriptor) };
-        if unsafe { libc::fchmod(stage.as_raw_fd(), 0o500) } != 0 {
-            let error = io::Error::last_os_error();
-            let _ = unlink_at(&parent, &leaf);
-            return Err(error.to_string());
-        }
-        let meta = match stage.metadata() {
-            Ok(meta) => meta,
+        let identity = (|| {
+            syscall!(unsafe { libc::fchmod(stage.as_raw_fd(), 0o500) } == 0);
+            let meta = stage.metadata().text()?;
+            crate::ensure!(
+                meta.is_file() && protected(&meta, 0o500),
+                "instrumentation stage identity changed"
+            );
+            Ok(file_id(&meta))
+        })();
+        let identity = match identity {
+            Ok(identity) => identity,
             Err(error) => {
                 let _ = unlink_at(&parent, &leaf);
-                return Err(error.to_string());
+                return Err(error);
             }
         };
-        let identity = file_id(&meta);
-        if !meta.is_file() || !protected(&meta, 0o500) {
-            let _ = unlink_at(&parent, &leaf);
-            return Err("instrumentation stage identity changed".into());
-        }
         Ok(Self {
             source,
             stage,
@@ -1641,11 +1562,9 @@ impl Drop for PreparedInstrument {
 fn chmod_at(parent: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<()> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    (unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) } == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
 }
 
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
@@ -1669,11 +1588,9 @@ fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
                 | libc::O_NONBLOCK,
         )
     };
-    if descriptor < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
+    (descriptor >= 0)
+        .then(|| unsafe { File::from_raw_fd(descriptor) })
+        .ok_or_else(io::Error::last_os_error)
 }
 
 fn component_cause(
@@ -1711,19 +1628,15 @@ fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
 
 pub(crate) fn stat_cstr_at(parent: &File, name: &std::ffi::CStr) -> io::Result<libc::stat> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe {
+    let valid = unsafe {
         libc::fstatat(
             parent.as_raw_fd(),
             name.as_ptr(),
             &mut stat,
             libc::AT_SYMLINK_NOFOLLOW,
         )
-    } == 0
-    {
-        Ok(stat)
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    } == 0;
+    valid.then_some(stat).ok_or_else(io::Error::last_os_error)
 }
 
 pub(crate) fn stat_identity(stat: &libc::stat) -> (u64, u64) {
@@ -1842,10 +1755,6 @@ fn peer_owned(stream: &LocalStream) -> bool {
 }
 
 pub(crate) fn cleanup(path: &Path) -> Result<()> {
-    cleanup_excluding(path, None)
-}
-
-fn cleanup_excluding(path: &Path, event: Option<&Path>) -> Result<()> {
     let observed = match fs::symlink_metadata(path) {
         Ok(meta) => Some(file_id(&meta)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1872,17 +1781,9 @@ fn cleanup_excluding(path: &Path, event: Option<&Path>) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound && observed.is_none() => {}
         Err(error) => return Err(error.to_string()),
     }
-    rollback_companions(path, &expected_identity, event)
-}
-
-fn rollback_companions(path: &Path, expected_identity: &[u8], event: Option<&Path>) -> Result<()> {
-    let (mut external, expected) =
-        shared::cleanup_artifacts(path, Some(expected_identity), |bytes| {
-            Some(PathBuf::from(OsString::from_vec(bytes)))
-        });
-    if event.is_some() {
-        external[0] = None;
-    }
+    let (external, expected) = shared::cleanup_artifacts(path, Some(&expected_identity), |bytes| {
+        Some(PathBuf::from(OsString::from_vec(bytes)))
+    });
     shared::cleanup_companions(path, external, true, |target| {
         Store::read_only(target, Kind::Event, None).is_ok()
             || fs::symlink_metadata(target).is_ok_and(|meta| {
@@ -2017,13 +1918,6 @@ fn open_instrument(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn instrument_setup(
-    source: Option<&mut PreparedInstrument>,
-    process: &mut Command,
-) -> Result<Option<Instrument>> {
-    source.map(|source| source.configure(process)).transpose()
-}
-
 fn instrument_ack(instrument: Option<Instrument>, pid: u32, generation: u32) -> Result<()> {
     let Some(mut instrument) = instrument else {
         return Ok(());
@@ -2041,7 +1935,7 @@ fn instrument_ack(instrument: Option<Instrument>, pid: u32, generation: u32) -> 
             &instrument.parent,
             &instrument.leaf,
             instrument.identity,
-            0o500
+            0o500,
         ) && shared::copy_digest(&mut instrument.stage, None)? == instrument.hash,
         "instrumentation stage identity changed"
     );
