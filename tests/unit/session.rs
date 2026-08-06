@@ -67,6 +67,28 @@ mod tests {
         }
     }
 
+    fn fresh_lease(
+        machine: &mut Machine,
+        now: u64,
+        conn: ConnId,
+        token: Option<[u8; 16]>,
+    ) -> LeaseResult {
+        machine.register_controller(conn);
+        machine
+            .transition(Transition::Peer(
+                now,
+                conn,
+                Request::Lease(LeaseRequest::fresh(LeaseRole::InputOnly), token),
+            ))
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                _ => None,
+            })
+            .expect("lease result")
+    }
+
     #[test]
     fn mismatched_completion_kind_does_not_consume_a_pending_write() {
         let mut machine = attached_viewer(1);
@@ -209,6 +231,32 @@ mod tests {
                 Effect::Write(ticket, bytes),
             ] if ticket.get() == 0 && bytes == b"final"
         ));
+    }
+
+    #[test]
+    fn maximum_epoch_is_granted_once_and_token_failure_consumes_nothing() {
+        let mut machine = Machine::new(7, [9; 16], [8; 16]);
+        machine.allocated = u32::MAX - 1;
+
+        let failed = fresh_lease(&mut machine, 0, 1, None);
+        assert_eq!(
+            (failed.outcome, failed.reason),
+            (ResultOutcome::Refused, ResultReason::Exhausted)
+        );
+        let final_grant = fresh_lease(&mut machine, 1, 1, Some([1; 16]));
+        assert_eq!(final_grant.epoch, u32::MAX);
+        machine
+            .transition(Transition::Peer(
+                2,
+                1,
+                Request::Release(u32::MAX, [1; 16]),
+            ))
+            .unwrap();
+        let exhausted = fresh_lease(&mut machine, 2, 2, Some([2; 16]));
+        assert_eq!(
+            (exhausted.outcome, exhausted.reason),
+            (ResultOutcome::Refused, ResultReason::Exhausted)
+        );
     }
 
     #[test]

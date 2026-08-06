@@ -34,6 +34,71 @@ fn hex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+fn progressed_codec(
+    profile: moor::wire::Profile,
+    next_in: u32,
+    next_out: u32,
+) -> moor::wire::Codec {
+    assert!(next_in != 0 && next_out != 0);
+    let mut codec = moor::wire::Codec::new(profile);
+    if next_in > 1 {
+        let mut sender = moor::wire::Codec::new(profile);
+        let mut frames = Vec::new();
+        for _ in 1..next_in {
+            sender
+                .encode(1, 1, &[], &mut frames)
+                .expect("sequence fixture frame must encode");
+        }
+        let mut discarded = Vec::new();
+        codec
+            .feed(0, &frames, &mut discarded)
+            .expect("sequence fixture frames must decode");
+        assert_eq!(discarded.len(), (next_in - 1) as usize);
+    }
+    let mut discarded = Vec::new();
+    for _ in 1..next_out {
+        codec
+            .encode(1, 1, &[], &mut discarded)
+            .expect("sequence fixture frame must encode");
+        discarded.clear();
+    }
+    codec
+}
+
+fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: u32) {
+    use moor::session::{
+        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
+    };
+
+    for epoch in 1..=count {
+        let token = [epoch as u8; 16];
+        let grant = machine
+            .transition(Transition::Peer(
+                u64::from(epoch) * 2,
+                conn,
+                Request::Lease(LeaseRequest::fresh(LeaseRole::InputOnly), Some(token)),
+            ))
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                _ => None,
+            })
+            .expect("lease grant");
+        assert_eq!(
+            (grant.outcome, grant.epoch),
+            (ResultOutcome::Granted, epoch)
+        );
+        machine
+            .transition(Transition::Peer(
+                u64::from(epoch) * 2 + 1,
+                conn,
+                Request::Release(epoch, token),
+            ))
+            .unwrap();
+    }
+}
+
 // §16 V12 — Windows rendezvous marker, generation 7, holder incarnation
 // 00..0F, local pipe \\.\pipe\moor-000102030405060708090a0b0c0d0e0f.
 fn v12() -> Vec<u8> {
@@ -539,7 +604,7 @@ const V16_SEMANTIC_SHA256_HELLO: &str = "
 
 /// Feeds one frozen frame stream through the real reassembly entrypoint.
 fn v16_semantic_feed(next_in: u32, stream: &[u8]) -> Vec<moor::wire::Message> {
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, next_in, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Semantic, next_in, 1);
     let mut out = Vec::new();
     codec
         .feed(0, stream, &mut out)
@@ -555,7 +620,7 @@ fn v16_semantic_feed(next_in: u32, stream: &[u8]) -> Vec<moor::wire::Message> {
 /// Encodes one payload through the real framing encoder at a given outbound
 /// frame sequence and returns the emitted bytes (header + CRC included).
 fn v16_semantic_encode(next_out: u32, scope: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, 1, next_out);
+    let mut codec = progressed_codec(moor::wire::Profile::Semantic, 1, next_out);
     let mut out = Vec::new();
     codec
         .encode(scope, kind, payload, &mut out)
@@ -928,7 +993,7 @@ fn v16_semantic_v17_v19_v20_stream_reencodes_byte_for_byte() {
     // One outbound codec starting at frame sequence 4 must reproduce V17,
     // V19 and V20 — headers, advancing sequences and CRCs — from the frozen
     // payloads alone.
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Semantic, 1, 4);
+    let mut codec = progressed_codec(moor::wire::Profile::Semantic, 1, 4);
     for (kind, vector) in [
         (5, V16_SEMANTIC_V17),
         (7, V16_SEMANTIC_V19),
@@ -1072,8 +1137,9 @@ fn v16_input_machine() -> moor::session::Machine {
     use moor::session::{
         Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
     };
-    let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]).allocated(2);
+    let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]);
     machine.register_controller(1);
+    allocate_and_release(&mut machine, 1, 2);
     let effects = machine
         .transition(Transition::Peer(
             0,
@@ -1193,7 +1259,7 @@ fn v16_input_v7_reassembles_at_every_split_boundary() {
     let v7 = v16_input_hex(V16_INPUT_V7);
     let expected = v16_input_hex("03 00 00 00 01 00 00 00 00 00 00 00 00 41 41 41 41 42 42");
     for split in 0..=v7.len() {
-        let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+        let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
         let mut messages = v16_input_feed(&mut codec, &v7[..split]);
         messages.extend(v16_input_feed(&mut codec, &v7[split..]));
         assert_eq!(messages.len(), 1, "exactly one message at split {split}");
@@ -1206,7 +1272,7 @@ fn v16_input_v7_reassembles_at_every_split_boundary() {
 #[test]
 fn v16_input_v7_fed_one_byte_at_a_time_yields_one_message() {
     let v7 = v16_input_hex(V16_INPUT_V7);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let mut messages = Vec::new();
     for byte in &v7 {
         messages.extend(v16_input_feed(&mut codec, std::slice::from_ref(byte)));
@@ -1219,7 +1285,7 @@ fn v16_input_v7_fed_one_byte_at_a_time_yields_one_message() {
 #[test]
 fn v16_input_v7_decodes_to_plain_input_request() {
     let v7 = v16_input_hex(V16_INPUT_V7);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let messages = v16_input_feed(&mut codec, &v7);
     let (input, application) = v16_input_decode(&messages[0].payload);
     assert_eq!((input.epoch, input.request_id), (3, 1));
@@ -1237,9 +1303,9 @@ fn v16_input_v7_single_frame_encoding_matches_frozen_v9() {
     // V9 byte-for-byte; V7's framing itself is asserted decoder-side above.
     let v7 = v16_input_hex(V16_INPUT_V7);
     let v9 = v16_input_hex(V16_INPUT_V9);
-    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut decode = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let messages = v16_input_feed(&mut decode, &v7);
-    let mut encode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 22);
+    let mut encode = progressed_codec(moor::wire::Profile::Controller, 1, 22);
     let mut out = Vec::new();
     encode.encode(7, 9, &messages[0].payload, &mut out).unwrap();
     assert_eq!(out, v9);
@@ -1257,7 +1323,7 @@ fn v16_input_v8_receipt_encoder_matches_frozen_payload() {
 #[test]
 fn v16_input_v8_frame_encoder_matches_frozen_bytes() {
     let v8 = v16_input_hex(V16_INPUT_V8);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 10);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 1, 10);
     let mut out = Vec::new();
     codec.encode(7, 10, &v8[24..], &mut out).unwrap();
     assert_eq!(out, v8, "header, CRC and payload all frozen");
@@ -1266,7 +1332,7 @@ fn v16_input_v8_frame_encoder_matches_frozen_bytes() {
 #[test]
 fn v16_input_v8_decodes_back_from_frozen_bytes() {
     let v8 = v16_input_hex(V16_INPUT_V8);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 10, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 10, 1);
     let messages = v16_input_feed(&mut codec, &v8);
     assert_eq!(messages.len(), 1);
     assert_eq!((messages[0].scope, messages[0].kind), (7, 10));
@@ -1322,7 +1388,7 @@ fn v16_input_v18_payload_is_byte_identical_to_v8() {
     assert_eq!(u32::from_le_bytes(v8[12..16].try_into().unwrap()), 10);
     assert_eq!(u32::from_le_bytes(v18[12..16].try_into().unwrap()), 11);
     // Decoding V8 then V18 through one controller-side codec accepts both.
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 10, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 10, 1);
     let first = v16_input_feed(&mut codec, &v8);
     let second = v16_input_feed(&mut codec, &v18);
     assert_eq!(first[0].payload, second[0].payload);
@@ -1334,7 +1400,7 @@ fn v16_input_v18_payload_is_byte_identical_to_v8() {
 fn v16_input_v9_is_byte_identical_replay_of_v7() {
     let v7 = v16_input_hex(V16_INPUT_V7);
     let v9 = v16_input_hex(V16_INPUT_V9);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let reassembled = v16_input_feed(&mut codec, &v7);
     let replay = v16_input_feed(&mut codec, &v9);
     assert_eq!(reassembled[0].payload, replay[0].payload);
@@ -1348,7 +1414,7 @@ fn v16_input_v9_is_byte_identical_replay_of_v7() {
 fn v16_input_v9_v10_frame_encoder_matches_frozen_bytes() {
     let v9 = v16_input_hex(V16_INPUT_V9);
     let v10 = v16_input_hex(V16_INPUT_V10);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 22);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 1, 22);
     let mut out = Vec::new();
     codec.encode(7, 9, &v9[24..], &mut out).unwrap();
     assert_eq!(out, v9);
@@ -1362,7 +1428,7 @@ fn v16_input_v10_carries_same_id_with_different_bytes() {
     let v10 = v16_input_hex(V16_INPUT_V10);
     assert_eq!(v16_input_declared_length(&v10), 22);
     assert_eq!(v10.len() - 24, 22, "body length equals the declared length");
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 23, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 23, 1);
     let messages = v16_input_feed(&mut codec, &v10);
     let (input, application) = v16_input_decode(&messages[0].payload);
     assert_eq!((input.epoch, input.request_id), (3, 1), "V7's identity");
@@ -1379,7 +1445,7 @@ fn v16_input_replay_run_writes_once_and_replays_cached_v8_receipt() {
     let v9 = v16_input_hex(V16_INPUT_V9);
     let v10 = v16_input_hex(V16_INPUT_V10);
     let v18 = v16_input_hex(V16_INPUT_V18);
-    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut decode = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let m7 = v16_input_feed(&mut decode, &v7).remove(0);
     let m9 = v16_input_feed(&mut decode, &v9).remove(0);
     let m10 = v16_input_feed(&mut decode, &v10).remove(0);
@@ -1404,7 +1470,7 @@ fn v16_input_replay_run_writes_once_and_replays_cached_v8_receipt() {
 
     // The holder-to-controller framing of that cached payload at sequence 10
     // is V8; the replay answer at sequence 11 is V18 — same payload, new frame.
-    let mut encode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 10);
+    let mut encode = progressed_codec(moor::wire::Profile::Controller, 1, 10);
     let mut out = Vec::new();
     encode.encode(7, 10, &receipt, &mut out).unwrap();
     assert_eq!(out, v8);
@@ -1435,7 +1501,7 @@ fn v16_input_replay_run_writes_once_and_replays_cached_v8_receipt() {
     );
 
     // The refusal did not disturb the high-water entry: V9 replays again.
-    let mut decode = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 22, 1);
+    let mut decode = progressed_codec(moor::wire::Profile::Controller, 22, 1);
     let m9_again = v16_input_feed(&mut decode, &v9).remove(0);
     let (input9, _) = v16_input_decode(&m9_again.payload);
     let replayed = v16_input_receipt_only(v16_input_request(&mut machine, 6, input9, None));
@@ -1557,7 +1623,7 @@ fn v16_input_v16_wide_prefixed_source_is_not_a_valid_input_payload() {
 #[test]
 fn v16_input_v16_decodes_source_and_application_id() {
     let v16 = v16_input_hex(V16_INPUT_V16);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 30, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 30, 1);
     let messages = v16_input_feed(&mut codec, &v16);
     assert_eq!(messages.len(), 1);
     assert_eq!((messages[0].scope, messages[0].kind), (7, 9));
@@ -1581,7 +1647,7 @@ fn v16_input_v16_decodes_source_and_application_id() {
 #[test]
 fn v16_input_v16_frame_encoder_matches_frozen_bytes() {
     let v16 = v16_input_hex(V16_INPUT_V16);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 30);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 1, 30);
     let mut out = Vec::new();
     codec.encode(7, 9, &v16[24..], &mut out).unwrap();
     assert_eq!(out, v16);
@@ -1596,9 +1662,9 @@ fn v16_input_v16_without_matching_source_is_refused_cached_and_replayed() {
     // entry and an identical retry replays the cached refusal.
     let v7 = v16_input_hex(V16_INPUT_V7);
     let v16 = v16_input_hex(V16_INPUT_V16);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let m7 = v16_input_feed(&mut codec, &v7).remove(0);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 30, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 30, 1);
     let m16 = v16_input_feed(&mut codec, &v16).remove(0);
 
     let mut machine = v16_input_machine();
@@ -1733,7 +1799,7 @@ fn v16_framing_assert_header(frame: &[u8]) {
 /// positioned at the vector's frozen sequence) and returns the one decoded
 /// message.
 fn v16_framing_feed_one(next_in: u32, frame: &[u8]) -> moor::wire::Message {
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, next_in, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, next_in, 1);
     let mut out = Vec::new();
     codec
         .feed(0, frame, &mut out)
@@ -1745,7 +1811,7 @@ fn v16_framing_feed_one(next_in: u32, frame: &[u8]) -> moor::wire::Message {
 /// Encodes one frame through the real Codec (with `next_out` positioned at the
 /// vector's frozen sequence) for byte-comparison against the frozen vector.
 fn v16_framing_encode_frame(next_out: u32, scope: u32, kind: u8, payload: &[u8]) -> Vec<u8> {
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, next_out);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 1, next_out);
     let mut out = Vec::new();
     codec
         .encode(scope, kind, payload, &mut out)
@@ -1757,8 +1823,9 @@ fn v16_framing_encode_frame(next_out: u32, scope: u32, kind: u8, payload: &[u8])
 /// granted lease epoch.
 fn v16_framing_machine_with_lease(allocated: u32) -> (moor::session::Machine, u32) {
     use moor::session::{Effect, Machine, Request, Transition};
-    let mut machine = Machine::new(7, [1; 16], [2; 16]).allocated(allocated);
+    let mut machine = Machine::new(7, [1; 16], [2; 16]);
     machine.register_controller(1);
+    allocate_and_release(&mut machine, 1, allocated);
     let effects = machine
         .transition(Transition::Peer(
             0,
@@ -2099,7 +2166,7 @@ fn v16_framing_v6_generation_zero_on_non_hello_is_refused() {
         "frozen OUTPUT_ACK of record 1"
     );
     // next_in = 3 matches the frozen sequence.
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 3, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 3, 1);
     let mut out = Vec::new();
     let result = codec.feed(0, &frame, &mut out);
     assert!(
@@ -2114,7 +2181,7 @@ fn v16_framing_v6_generation_zero_on_non_hello_is_refused() {
     assert_eq!(result, Err(moor::wire::WireError::GenerationMismatch));
 
     // Encoding a generation-0 non-HELLO frame must be equally impossible.
-    let mut encoder = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 3);
+    let mut encoder = progressed_codec(moor::wire::Profile::Controller, 1, 3);
     let mut bytes = Vec::new();
     assert!(
         encoder.encode(0, 7, &frame[24..], &mut bytes).is_err(),
@@ -2365,7 +2432,7 @@ fn v16_extra_framing_sequence_gap_mid_run_is_refused() {
     let mut bytes = v16_extra_hex(V16_EXTRA_V7);
     bytes[41 + 12] = 0x16;
     v16_extra_patch_crc(&mut bytes, 41);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let mut out = Vec::new();
     assert_eq!(
         codec.feed(0, &bytes, &mut out),
@@ -2384,7 +2451,7 @@ fn v16_extra_framing_type_change_mid_run_aborts_reassembly() {
     let mut bytes = v16_extra_hex(V16_EXTRA_V7);
     bytes[41 + 5] = 0x07;
     v16_extra_patch_crc(&mut bytes, 41);
-    let mut codec = moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 20, 1);
+    let mut codec = progressed_codec(moor::wire::Profile::Controller, 20, 1);
     let mut out = Vec::new();
     assert_eq!(
         codec.feed(0, &bytes, &mut out),
@@ -2641,7 +2708,7 @@ fn v16_status_v28_heartbeat_round_trips_and_encodes_exactly() {
     // frame must reproduce byte for byte once framed at the frozen sequence.
     assert_eq!(beat.encode().unwrap().as_slice(), &frame[24..]);
     let mut framed = Vec::new();
-    moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 4)
+    progressed_codec(moor::wire::Profile::Controller, 1, 4)
         .encode(7, 0x12, &frame[24..], &mut framed)
         .expect("frame the frozen heartbeat");
     assert_eq!(
