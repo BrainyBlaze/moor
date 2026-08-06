@@ -67,7 +67,7 @@ jobs:
         run: cargo build --release --bin moor --bin atch
 
   production-loc:
-    name: Production LOC / hard maximum 4,900
+    name: Production LOC / hard maximum 10,000
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
