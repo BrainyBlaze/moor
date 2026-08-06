@@ -23,6 +23,13 @@ mod descriptor_deadline_tests {
         }
     }
 
+    #[test]
+    fn native_redraw_defaults_to_the_platform_resize_contract() {
+        let mut native = SlowNative(false);
+        native.redraw(24, 80).unwrap();
+        assert!(native.0);
+    }
+
     fn duplex() -> Duplex {
         Duplex::closing(Cursor::new(Vec::new()), std::io::sink(), 1024, || {})
     }

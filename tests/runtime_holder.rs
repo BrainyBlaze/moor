@@ -1415,15 +1415,19 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
 fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     use std::sync::{Arc, Mutex};
 
-    struct CountResize(Arc<Mutex<Vec<(u16, u16)>>>);
+    struct CountResize(Arc<Mutex<Vec<(bool, u16, u16)>>>);
     impl Native for CountResize {
         fn resize(&mut self, rows: u16, columns: u16) -> Result<(), String> {
-            self.0.lock().unwrap().push((rows, columns));
+            self.0.lock().unwrap().push((false, rows, columns));
             if (rows, columns) == (40, 120) {
                 Err("injected resize failure".into())
             } else {
                 Ok(())
             }
+        }
+        fn redraw(&mut self, rows: u16, columns: u16) -> Result<(), String> {
+            self.0.lock().unwrap().push((true, rows, columns));
+            Ok(())
         }
         fn terminate(&mut self, _: bool) -> (u8, bool) {
             (0, false)
@@ -1539,7 +1543,12 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     redraw_owner.recv_kind(&mut runtime, 14);
     assert_eq!(
         *calls.lock().unwrap(),
-        [(24, 80), (30, 100), (40, 120), (40, 120)]
+        [
+            (true, 24, 80),
+            (false, 30, 100),
+            (false, 40, 120),
+            (false, 40, 120)
+        ]
     );
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
