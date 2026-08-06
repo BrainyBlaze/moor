@@ -1,4 +1,4 @@
-use crate::wire::{decimal as parse_decimal, recognize_query};
+use crate::wire::{csi, decimal as parse_decimal, recognize_query};
 use std::io::Write as _;
 
 const PRIVATE: [u32; 12] = [1, 6, 7, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1049, 2004];
@@ -215,7 +215,7 @@ impl Scanner {
         let osc = is_osc(&self.buf);
         if self.buf.starts_with(b"\x1b(")
             || self.buf.starts_with(b"\x1b)")
-            || csi_tail(&self.buf).is_some()
+            || csi(&self.buf).is_some()
         {
             self.modes.inexact = true;
         }
@@ -250,7 +250,7 @@ impl Scanner {
                 _ => self.modes.inexact = true,
             },
             _ => {
-                if let Some(tail) = csi_tail(sequence) {
+                if let Some((_, tail)) = csi(sequence) {
                     self.csi(tail)
                 }
             }
@@ -323,13 +323,8 @@ fn decimal(bytes: &[u8], default: u32) -> u32 {
         .or_else(|| parse_decimal(bytes, u32::MAX as u64, false).map(|value| value as u32))
         .unwrap_or(u32::MAX)
 }
-fn csi_tail(bytes: &[u8]) -> Option<&[u8]> {
-    bytes
-        .strip_prefix(b"\x1b[")
-        .or_else(|| bytes.strip_prefix(&[0x9b]))
-}
 fn possible_query(bytes: &[u8]) -> bool {
-    let Some(tail) = csi_tail(bytes) else {
+    let Some((_, tail)) = csi(bytes) else {
         return false;
     };
     if recognize_query(bytes).is_some() {
@@ -353,7 +348,7 @@ fn is_intro(byte: u8) -> bool {
 fn complete(bytes: &[u8]) -> bool {
     if is_osc(bytes) {
         matches!(bytes.last(), Some(7 | 0x9c)) || bytes.ends_with(b"\x1b\\")
-    } else if let Some(tail) = csi_tail(bytes) {
+    } else if let Some((_, tail)) = csi(bytes) {
         tail.last().is_some_and(|byte| (0x40..=0x7e).contains(byte))
     } else {
         let needed = if matches!(bytes.get(1), Some(b'(' | b')')) {

@@ -446,20 +446,15 @@ crate::schema!(enum ordinal pub SessionState; Missing, Live, Attached, Stale, Ex
 
 pub fn session_name(name: OsString, insensitive: bool) -> Option<OsString> {
     let bytes = name.as_encoded_bytes();
-    let suffix = |value: &[u8]| {
-        let at = bytes.len().saturating_sub(value.len());
-        bytes
-            .get(at..)
-            .is_some_and(|tail| tail == value || insensitive && tail.eq_ignore_ascii_case(value))
-    };
-    if suffix(b".exit") {
-        let base = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..bytes.len() - 5]) };
-        return Some(base.to_owned());
+    match name::artifact_suffix_len(bytes, insensitive) {
+        Some(length) if length == b".exit".len() => {
+            let at = bytes.len() - length;
+            let base = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..at]) };
+            Some(base.to_owned())
+        }
+        Some(_) => None,
+        None => Some(name),
     }
-    (![b".log".as_slice(), b".events", b".instrument"]
-        .into_iter()
-        .any(suffix))
-    .then_some(name)
 }
 
 pub fn discover_sessions(
@@ -609,9 +604,6 @@ pub fn holder_artifacts(
         ),
     );
     let session = STANDARD.encode(identity);
-    let event_header = config
-        .event_path
-        .map(|_| events::canonical_header(start.0, &session, generation.0, Cursor(0, 0, 0, 1)));
     let ArtifactStores {
         lifecycle,
         event,
@@ -620,15 +612,12 @@ pub fn holder_artifacts(
         stores
     } else {
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut create = |path: &Path, kind, body: &[u8]| {
-            if kind == Kind::Event
-                && let Some(store) = config.event_store.take()
-            {
-                return Ok(store);
-            }
+        let create = |path: &Path, kind, body: &[u8]| {
             Store::create(path, kind, generation.1, body, 0, 0)
                 .map_err(|error| format!("store initialization failed: {error:?}"))
         };
+        let event_header =
+            || events::canonical_header(start.0, &session, generation.0, Cursor(0, 0, 0, 1));
         let lifecycle = create(
             &companion(config.marker, ".exit"),
             Kind::Exit,
@@ -636,8 +625,12 @@ pub fn holder_artifacts(
         )?;
         let event = config
             .event_path
-            .zip(event_header.as_deref())
-            .map(|(path, header)| create(path, Kind::Event, header.as_bytes()))
+            .map(|path| {
+                config
+                    .event_store
+                    .take()
+                    .map_or_else(|| create(path, Kind::Event, event_header().as_bytes()), Ok)
+            })
             .transpose()?;
         let log = (config.log_cap != 0)
             .then(|| create(&companion(config.marker, ".log"), Kind::Log, &[]))
