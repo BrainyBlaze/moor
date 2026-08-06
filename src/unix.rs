@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
@@ -1218,11 +1218,7 @@ fn open_event_target(
     let relative = resolved
         .strip_prefix(root)
         .map_err(|_| reject("outside-root"))?;
-    let mut directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(root)
-        .map_err(|_| reject("io-error"))?;
+    let mut directory = open_directory(root).map_err(|_| reject("io-error"))?;
     let leaf = relative
         .file_name()
         .ok_or_else(|| reject("outside-root"))?
@@ -1267,16 +1263,42 @@ fn validate_event_directory(directory: &File, operand: &Path) -> Result<()> {
 }
 
 fn first_directory_entry(directory: &File) -> io::Result<Option<OsString>> {
-    use std::ffi::CStr;
+    directory_entries(directory, |name| {
+        Ok(Some(OsString::from_vec(name.to_vec())))
+    })
+}
 
+pub(crate) fn directory_entries<T, E>(
+    directory: &File,
+    mut visit: impl FnMut(&[u8]) -> std::result::Result<Option<T>, E>,
+) -> std::result::Result<Option<T>, E>
+where
+    E: From<io::Error>,
+{
+    use std::ffi::CStr;
     let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
     if descriptor < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::last_os_error().into());
     }
+    let duplicate = unsafe { File::from_raw_fd(descriptor) };
+    let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::O_NONBLOCK == 0
+            && unsafe {
+                libc::fcntl(
+                    duplicate.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            } < 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let descriptor = duplicate.into_raw_fd();
     let stream = unsafe { libc::fdopendir(descriptor) };
     if stream.is_null() {
         drop(unsafe { File::from_raw_fd(descriptor) });
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::last_os_error().into());
     }
     struct Stream(*mut libc::DIR);
     impl Drop for Stream {
@@ -1294,12 +1316,14 @@ fn first_directory_entry(directory: &File) -> io::Result<Option<OsString>> {
             return if errno == 0 {
                 Ok(None)
             } else {
-                Err(io::Error::from_raw_os_error(errno))
+                Err(io::Error::from_raw_os_error(errno).into())
             };
         }
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-        if !matches!(name, b"." | b"..") {
-            return Ok(Some(OsString::from_vec(name.to_vec())));
+        if !matches!(name, b"." | b"..")
+            && let Some(value) = visit(name)?
+        {
+            return Ok(Some(value));
         }
     }
 }
@@ -1600,11 +1624,7 @@ impl PreparedInstrument {
             .file_name()
             .ok_or("instrumentation stage has no name")?
             .to_owned();
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(root)
-            .text()?;
+        let parent = open_directory(root).text()?;
         let name = native_name(&leaf)?;
         let descriptor = unsafe {
             libc::openat(
@@ -1728,6 +1748,13 @@ fn chmod_at(parent: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<()> {
     }
 }
 
+pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
 fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
@@ -1779,6 +1806,10 @@ fn component_cause(
 fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    stat_cstr_at(parent, &name)
+}
+
+pub(crate) fn stat_cstr_at(parent: &File, name: &std::ffi::CStr) -> io::Result<libc::stat> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe {
         libc::fstatat(
@@ -1795,7 +1826,7 @@ fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
     }
 }
 
-fn stat_identity(stat: &libc::stat) -> (u64, u64) {
+pub(crate) fn stat_identity(stat: &libc::stat) -> (u64, u64) {
     #[cfg(target_os = "macos")]
     let device = u64::try_from(stat.st_dev).unwrap_or(u64::MAX);
     #[cfg(not(target_os = "macos"))]

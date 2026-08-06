@@ -1,9 +1,13 @@
-use crate::session::{
-    ReceiptProjection, SemanticChange, SemanticEffect, SemanticEvent, SemanticEventKind,
-    SourceEffect,
+use crate::{
+    canonical_u64 as decimal,
+    session::{
+        ReceiptProjection, SemanticChange, SemanticEffect, SemanticEvent, SemanticEventKind,
+        SourceEffect,
+    },
 };
-use base64::{display::Base64Display, engine::general_purpose::STANDARD};
+use base64::{Engine as _, display::Base64Display, engine::general_purpose::STANDARD};
 use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Value};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -22,6 +26,13 @@ schema!(enum pub Axis [Clone, Copy, Debug, Eq, PartialEq]; Sequence, Epoch, Comm
 schema!(enum pub EventError [Debug, Eq, PartialEq]; Closed, EmptyTransaction, InvalidState, InvalidEvent);
 
 schema!(tuple pub Cursor [Clone, Copy, Debug, Eq, PartialEq]; fields pub; u32, u64, u64, u64);
+schema!(tuple pub(crate) Stored [Clone, Copy]; fields pub; u32, u32, u64, u64, u64);
+const STORE_EVENT_END: u64 = 1 << 53;
+const STORE_EVENT_CAP: u64 = 256 << 10;
+const STORE_HEADER: &str =
+    "v:2,type:=header,ts:*,session:*,generation:*,epoch:u,next_seq:*,first_retained:*";
+const STORE_LIFECYCLE: &str = "v:1,type:=lifecycle,phase:t,session:*,generation:*,wire_generation:u,incarnation:b16,start_wall_ms:D,start_mono_ms:D,boot_id:b16,path_encoding:=posix-bytes/windows-wtf8,event_path:n,instrument_path:n";
+const STORE_LIFECYCLE_END: &str = "|end_wall_ms:D,output_end:D,ended:=exited,code:u|end_wall_ms:D,output_end:D,ended:=signalled,signal:p|end_wall_ms:D,output_end:D,ended:=terminated,code:u,method:=graceful/forced";
 
 pub fn event(name: &'static str, ts: u64, fields: &[(&str, Json<'_>)]) -> Event {
     let mut tail = String::with_capacity(fields.len().saturating_mul(32));
@@ -165,6 +176,195 @@ pub(crate) fn schema(name: &str) -> Option<&'static str> {
         "observer-degraded" => "scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
         _ => return None,
     })
+}
+
+pub(crate) fn valid_stored_event(
+    body: &[u8],
+    Stored(generation, expected_epoch, index, start, expected_end): Stored,
+) -> Option<()> {
+    let body = body.strip_suffix(b"\n")?;
+    let mut lines = body.split(|byte| *byte == b'\n');
+    let header = lines.next()?;
+    let (epoch, first, end) = stored_header(header, generation)?;
+    let (mut sequence, mut transitions, mut last, mut retained) = (first, 0u64, 0u8, false);
+    for line in lines {
+        (last & 2 == 0).then_some(())?;
+        let flags = stored_line(line, epoch, sequence)?;
+        if flags & 1 != 0 {
+            (transitions == 0).then_some(())?;
+        } else {
+            transitions += 1;
+            last = flags;
+            retained |= flags & 4 != 0;
+        }
+        sequence = sequence.checked_add(1)?;
+    }
+    let overage = last & 2 != 0 || epoch != 0 && !retained && transitions == 1;
+    let frontier = match last & (8 | 16 | 32) {
+        8 => end <= STORE_EVENT_END,
+        16 => epoch == u32::MAX && end < STORE_EVENT_END,
+        32 => index == u64::MAX && end < STORE_EVENT_END,
+        0 => end < STORE_EVENT_END,
+        _ => false,
+    };
+    ((epoch, first, end, sequence) == (expected_epoch, start, expected_end, end)
+        && (body.len() < STORE_EVENT_CAP as usize || overage)
+        && frontier)
+        .then_some(())
+}
+
+fn stored_header(line: &[u8], generation: u32) -> Option<(u32, u64, u64)> {
+    let fields = canonical_object(line, 16)?;
+    (store_fields(&fields, 0..fields.len(), STORE_HEADER)
+        && stored_generation(&fields["generation"], generation))
+    .then_some(())?;
+    let session = stored_base64(fields["session"].as_str()?)?;
+    (session.starts_with(&[1, b'/']) || session.len() == 25 && session.first() == Some(&2))
+        .then_some(())?;
+    let epoch = u32::try_from(fields["epoch"].as_u64()?).ok()?;
+    let (end, first) = (
+        fields["next_seq"].as_u64()?,
+        fields["first_retained"].as_u64()?,
+    );
+    (first <= end && end <= STORE_EVENT_END).then_some((epoch, first, end))
+}
+
+fn stored_line(line: &[u8], epoch: u32, sequence: u64) -> Option<u8> {
+    let fields = canonical_object(line, 32)?;
+    let kind = fields.get("type")?.as_str()?;
+    let record = fields.get("kind")?.as_str()?;
+    let snapshot = record == "snapshot";
+    let assertion = fields.get("assertion_kind").and_then(Value::as_str) == Some("snapshot");
+    let source_state = match (
+        fields.get("status").and_then(Value::as_str),
+        fields.get("reason").and_then(Value::as_str),
+    ) {
+        (Some("connected" | "exact"), Some(""))
+        | (Some("degraded"), Some("heartbeat-timeout"))
+        | (Some("disconnected"), Some("transport-closed" | "superseded" | "session-ending")) => {
+            true
+        }
+        _ => kind != "semantic-source",
+    };
+    let shape = fields
+        .keys()
+        .take(5)
+        .map(String::as_str)
+        .eq(["type", "ts", "epoch", "seq", "kind"])
+        && store_fields(&fields, 5..fields.len(), schema(kind)?)
+        && fields["epoch"].as_u64() == Some(u64::from(epoch))
+        && sequence < STORE_EVENT_END
+        && fields["seq"].as_u64() == Some(sequence)
+        && matches!(record, "transition" | "snapshot")
+        && (!snapshot
+            || matches!(
+                kind,
+                "ready" | "state" | "link" | "semantic-source" | "semantic-assertion"
+            ))
+        && (!snapshot || kind != "semantic-assertion" || assertion)
+        && source_state;
+    shape.then(|| {
+        u8::from(snapshot)
+            | (u8::from(kind == "stream-exhausted") * 2)
+            | (u8::from(kind == "semantic-source" || kind == "semantic-assertion" && assertion) * 4)
+            | (u8::from(kind == "stream-exhausted" && fields["axis"] == "seq") * 8)
+            | (u8::from(kind == "stream-exhausted" && fields["axis"] == "epoch") * 16)
+            | (u8::from(kind == "stream-exhausted" && fields["axis"] == "commit") * 32)
+    })
+}
+
+pub(crate) fn valid_stored_lifecycle(
+    body: &[u8],
+    Stored(generation, epoch, index, start, end): Stored,
+) -> Option<()> {
+    let line = body.strip_suffix(b"\n")?;
+    (!line.contains(&b'\n') && epoch == 1 && index <= 2 && start == end).then_some(())?;
+    let fields = canonical_object(line, 20)?;
+    let text = |key| fields.get(key).and_then(Value::as_str);
+    let number = |key| text(key).and_then(decimal);
+    let encoding = text("path_encoding");
+    let session = text("session")
+        .and_then(stored_base64)
+        .is_some_and(|bytes| match encoding {
+            Some("posix-bytes") => bytes.starts_with(&[1, b'/']),
+            Some("windows-wtf8") => bytes.len() == 25 && bytes.first() == Some(&2),
+            _ => false,
+        });
+    let common = store_fields(&fields, 0..13, STORE_LIFECYCLE)
+        && store_fields(&fields, 13..fields.len(), STORE_LIFECYCLE_END)
+        && session
+        && stored_generation(&fields["generation"], generation)
+        && fields["wire_generation"].as_u64() == Some(u64::from(generation));
+    let windows = encoding == Some("windows-wtf8");
+    let closed = index == 2 && number("output_end") == Some(end);
+    (common
+        && match (text("phase"), text("ended")) {
+            (Some("running"), None) => index == 1 && start == 0 && end == 0,
+            (Some("exited"), Some("exited")) => {
+                closed
+                    && fields["code"]
+                        .as_u64()
+                        .is_some_and(|code| windows || code <= 255)
+            }
+            (Some("exited"), Some("signalled")) => closed && !windows,
+            (Some("exited"), Some("terminated")) => closed && windows,
+            _ => false,
+        })
+    .then_some(())
+}
+
+fn store_fields(fields: &Map<String, Value>, range: std::ops::Range<usize>, schema: &str) -> bool {
+    schema.split('|').any(|choice| {
+        let mut rules = choice.split(',').filter(|rule| !rule.is_empty());
+        fields
+            .iter()
+            .skip(range.start)
+            .take(range.len())
+            .all(|(key, value)| {
+                rules
+                    .next()
+                    .and_then(|rule| rule.split_once(':'))
+                    .is_some_and(|(name, rule)| name == key && store_field(rule, value))
+            })
+            && rules.next().is_none()
+    })
+}
+
+fn store_field(rule: &str, value: &Value) -> bool {
+    let (text, number) = (value.as_str(), value.as_u64());
+    if let Some(choices) = rule.strip_prefix('=') {
+        return text.is_some_and(|text| choices.split('/').any(|choice| choice == text));
+    }
+    let decoded = || text.and_then(stored_base64);
+    match rule {
+        "t" => text.is_some(),
+        "*" => true,
+        "1" | "2" => number == Some(u64::from(rule.as_bytes()[0] - b'0')),
+        "?" => value.is_boolean(),
+        "u" => number.is_some_and(|n| u32::try_from(n).is_ok()),
+        "p" => number.is_some_and(|n| u32::try_from(n).is_ok() && n != 0),
+        "d" => text.and_then(decimal).is_some_and(|n| n != 0),
+        "s" => text.is_some_and(|text| crate::session::valid_source_id(text.as_bytes())),
+        "b16" => decoded().is_some_and(|bytes| bytes.len() == 16),
+        "b4096" => decoded().is_some_and(|bytes| bytes.len() <= 4096),
+        "D" => text.and_then(decimal).is_some(),
+        "n" => value.is_null() || decoded().is_some_and(|bytes| !bytes.is_empty()),
+        "j" => decoded()
+            .is_some_and(|bytes| bytes.len() <= 32768 && json_object(&bytes, 64, 1024).is_some()),
+        _ => rule
+            .strip_prefix('t')
+            .and_then(|cap| cap.parse().ok())
+            .is_some_and(|cap| text.is_some_and(|text| text.len() <= cap)),
+    }
+}
+
+fn stored_base64(text: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(text).ok()
+}
+
+fn stored_generation(value: &Value, generation: u32) -> bool {
+    generation == 1 && value.is_null()
+        || generation != 1 && value.as_u64() == Some(u64::from(generation))
 }
 
 schema!(tuple Bounded [Clone, Copy]; fields; usize, usize);
