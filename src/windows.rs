@@ -168,8 +168,8 @@ mod native {
         },
         path::{Path, PathBuf},
         ptr,
+        sync::OnceLock,
         sync::mpsc,
-        sync::{Arc, OnceLock, atomic::AtomicU8},
         thread,
         time::{Duration, Instant},
     };
@@ -1509,10 +1509,10 @@ mod native {
             &mut output,
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
-            |sender, state| viewer_input(sender, options.detach, state),
+            |sender| viewer_input(sender, options.detach),
         )?)
     }
-    fn viewer_input(sender: ViewerSender, detach: Option<u8>, state: Arc<AtomicU8>) {
+    fn viewer_input(sender: ViewerSender, detach: Option<u8>) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
             run_viewer_input(
@@ -1521,7 +1521,6 @@ mod native {
                 InputConfig {
                     detach,
                     pass_suspend: true,
-                    state,
                     last_size: None,
                 },
                 move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
@@ -1560,7 +1559,7 @@ mod native {
         let user = std::mem::take(&mut host.sid);
         let reader = std::mem::take(&mut host.output).into_file();
         let writer = std::mem::take(&mut host.input).into_file();
-        let (pty, done_rx) = Duplex::tracked(reader, writer, 1 << 20);
+        let pty = Duplex::tracked(reader, writer, 1 << 20);
         let marker_path = std::mem::take(&mut host.marker);
         let identity = host.identity;
         let mut artifacts = host.artifacts.take().unwrap();
@@ -1568,7 +1567,7 @@ mod native {
         let (authenticated, clients) = mpsc::channel::<Option<Authentication>>();
         let mut authenticating = 0;
         let synthetic = host.synthetic;
-        let mut runtime = artifacts.runtime((pty, done_rx), (synthetic, host));
+        let mut runtime = artifacts.runtime(pty, (synthetic, host));
         let Some(NativeExit::Code(code)) = runtime.drive(
             || {
                 while let Ok(client) = clients.try_recv() {

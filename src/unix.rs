@@ -854,7 +854,7 @@ fn holder_setup(
     let mut child = ChildGuard(Some(child));
     instrument_ack(instrument, child.child().id(), generation)?;
     let reader = master.try_clone().text()?;
-    let (pty, done_rx) = Duplex::tracked(reader, master.try_clone().text()?, 1 << 20);
+    let pty = Duplex::tracked(reader, master.try_clone().text()?, 1 << 20);
     let cwd = absolute(options.directory.as_deref().unwrap_or(Path::new(".")))?;
     let pid = child.child().id();
     crate::wire::put_wide(&mut artifacts.status, cwd.as_os_str().as_bytes())
@@ -867,7 +867,7 @@ fn holder_setup(
     let exited = child.child().try_wait().text()?.map(native_exit);
     let running = std::mem::take(&mut artifacts.running);
     let mut holder = artifacts.runtime(
-        (pty, done_rx),
+        pty,
         (
             synthetic,
             UnixNative {
@@ -964,7 +964,7 @@ pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
         &mut output,
         Duration::from_secs(15),
         |_| connect(path),
-        |sender, detached| {
+        |sender| {
             thread::spawn(move || {
                 run_viewer_input(
                     io::stdin(),
@@ -972,7 +972,6 @@ pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
                     InputConfig {
                         detach,
                         pass_suspend,
-                        state: detached,
                         last_size: terminal.and_then(|terminal| terminal.size()),
                     },
                     || match readable(libc::STDIN_FILENO, Duration::from_millis(50)) {

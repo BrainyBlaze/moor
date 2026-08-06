@@ -13,7 +13,6 @@ use std::fs;
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn duplex<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -139,7 +138,6 @@ fn fixture() -> (Runtime<FakeNative>, PathBuf) {
     );
     let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     let storage = SessionStorage::new(None, None, lifecycle, 8, 1 << 20);
-    let (_, writes) = mpsc::channel();
     let runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -149,7 +147,6 @@ fn fixture() -> (Runtime<FakeNative>, PathBuf) {
             replay_limit: 1024,
         },
         pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
-        writes,
         storage,
         status: Vec::new(),
         commit_at: 0,
@@ -182,7 +179,6 @@ fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathB
         ("posix-bytes", None, None),
     );
     let lifecycle = Store::create(&exit_path, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
-    let (_, writes) = mpsc::channel();
     let runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -192,7 +188,6 @@ fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathB
             replay_limit: 1024,
         },
         pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
-        writes,
         storage: SessionStorage::new(
             None,
             Some(EventConfig {
@@ -294,7 +289,7 @@ fn maximum_valid_controller_input_crosses_the_pty_queue_without_local_refusal() 
     );
     let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     let (pty, child) = UnixStream::pair().unwrap();
-    let (pty, writes) = Duplex::tracked(pty.try_clone().unwrap(), std::io::sink(), 1 << 20);
+    let pty = Duplex::tracked(pty.try_clone().unwrap(), std::io::sink(), 1 << 20);
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -304,7 +299,6 @@ fn maximum_valid_controller_input_crosses_the_pty_queue_without_local_refusal() 
             replay_limit: 1024,
         },
         pty,
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
         commit_at: 0,
@@ -685,7 +679,6 @@ fn c1_queries_receive_matching_c1_synthetic_replies_for_all_identity_classes() {
     let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     let (reader, child) = UnixStream::pair().unwrap();
     let capture = Arc::new(Mutex::new(Vec::new()));
-    let (_, writes) = mpsc::channel();
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -695,7 +688,6 @@ fn c1_queries_receive_matching_c1_synthetic_replies_for_all_identity_classes() {
             replay_limit: 1024,
         },
         pty: duplex(reader, Capture(capture.clone()), 1024),
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
         commit_at: 0,
@@ -1143,7 +1135,6 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
         ("posix-bytes", None, None),
     );
     let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
-    let (_, writes) = mpsc::channel();
     let exited = Arc::new(AtomicBool::new(false));
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
@@ -1158,7 +1149,6 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
             std::io::sink(),
             1024,
         ),
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
         commit_at: 0,
@@ -1302,12 +1292,8 @@ fn status_drains_a_completed_event_commit_before_copying_its_frontier() {
     .unwrap();
     let commit_at = artifacts.commit_at;
     let initial = Store::read_only(&event, Kind::Event, 7).unwrap().0;
-    let (_, writes) = mpsc::channel();
     let mut runtime = artifacts.runtime(
-        (
-            duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
-            writes,
-        ),
+        duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
         (0, FakeNative),
     );
     let mut peer = connect(&mut runtime);
@@ -1371,7 +1357,6 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
         ("posix-bytes", None, None),
     );
     let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
-    let (_, writes) = mpsc::channel();
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -1381,7 +1366,6 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
             replay_limit: 1024,
         },
         pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
         commit_at: 0,
@@ -1461,7 +1445,7 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
         0,
     )
     .unwrap();
-    let (pty, writes) = Duplex::tracked(Cursor::new(Vec::new()), std::io::sink(), 1024);
+    let pty = Duplex::tracked(Cursor::new(Vec::new()), std::io::sink(), 1024);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
@@ -1472,7 +1456,6 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
             replay_limit: 1024,
         },
         pty,
-        writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
         commit_at: 0,

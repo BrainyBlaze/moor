@@ -195,7 +195,7 @@ fn handshake_has_one_absolute_deadline_across_fragmented_reads() {
 }
 
 #[test]
-fn completed_handshake_promptly_releases_the_watchdog_transport() {
+fn client_drop_runs_transport_cancellation_once() {
     struct Dropped(Arc<AtomicBool>);
     impl Drop for Dropped {
         fn drop(&mut self) {
@@ -210,7 +210,7 @@ fn completed_handshake_promptly_releases_the_watchdog_transport() {
         .unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
     let guard = Dropped(dropped.clone());
-    Client::handshake_until(
+    let client = Client::handshake_until(
         Cursor::new(inbound),
         Vec::new(),
         identity,
@@ -218,6 +218,8 @@ fn completed_handshake_promptly_releases_the_watchdog_transport() {
         move || drop(guard),
     )
     .unwrap();
+    assert!(!dropped.load(Ordering::Acquire));
+    drop(client);
     let deadline = Instant::now() + Duration::from_millis(100);
     while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::yield_now();
@@ -539,7 +541,7 @@ fn attach_fences_gap_duplicates_offsets_and_empty_output() {
             &mut output,
             Duration::from_secs(15),
             |_| Err("reconnect unavailable".into()),
-            |_, _| {},
+            |_| {},
         )
         .is_err()
     );

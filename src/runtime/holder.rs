@@ -12,7 +12,6 @@ use crate::session::{
 use crate::terminal::{Observation, Scan, Scanner};
 use crate::wire::{self, Codec, ControllerRequest, Message, Profile, StatusExtension, StatusTail};
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::Receiver;
 use std::thread;
 use std::time::Duration;
 
@@ -308,7 +307,7 @@ pub trait Native {
     fn exited(&mut self) -> Result<Option<NativeExit>>;
 }
 
-schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, writes: Receiver<(u64, Option<u16>)>, storage: SessionStorage,
+schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage,
     status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
 schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
 schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64);
@@ -324,7 +323,7 @@ impl Peer {
 }
 
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
-    writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
+    peers: HashMap<u64, Peer>, recipients: Vec<u64>,
     frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
     heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
 
@@ -374,8 +373,6 @@ impl<N: Native> Runtime<N> {
             pty: config.pty,
             pty_open: true,
             child_running: true,
-            writes: config.writes,
-            pending_writes: VecDeque::new(),
             peers: HashMap::new(),
             recipients: Vec::with_capacity(64),
             frames: Vec::with_capacity(8),
@@ -457,10 +454,8 @@ impl<N: Native> Runtime<N> {
                 IoEvent::Closed => self.pty_open = false,
             }
         }
-        while let Ok((written, error)) = self.writes.try_recv() {
-            if let Some(ticket) = self.pending_writes.pop_front()
-                && ticket.get() != 0
-            {
+        while let Ok((tag, written, error)) = self.pty.2.try_recv() {
+            if let Some(ticket) = Ticket::from_raw(tag) {
                 self.complete(ticket, Completion::Write(written, error));
             }
         }
@@ -735,7 +730,7 @@ impl<N: Native> Runtime<N> {
                 * payload.len().saturating_sub(16);
             peer.codec.as_mut().is_none_or(|codec| {
                 codec.encode(peer.scope, kind, payload, &mut bytes).is_err()
-                    || peer.pipe.try_send_payload(bytes, output).is_err()
+                    || peer.pipe.try_send_payload(0, bytes, output).is_err()
             })
         });
         if failed {
@@ -795,8 +790,7 @@ impl<N: Native> Runtime<N> {
         let size = bytes.len();
         let error = if bytes.is_empty() {
             None
-        } else if self.pty.try_send_payload(bytes, size).is_ok() {
-            self.pending_writes.push_back(ticket);
+        } else if self.pty.try_send_payload(ticket.get(), bytes, size).is_ok() {
             return;
         } else {
             Some(20)
@@ -1036,11 +1030,7 @@ impl<N: Native> Runtime<N> {
 }
 
 impl PreparedArtifacts {
-    pub fn runtime<N: Native>(
-        self,
-        (pty, writes): (Duplex, Receiver<(u64, Option<u16>)>),
-        (synthetic, native): (u8, N),
-    ) -> Runtime<N> {
+    pub fn runtime<N: Native>(self, pty: Duplex, (synthetic, native): (u8, N)) -> Runtime<N> {
         let storage = SessionStorage::new(
             self.storage.log,
             self.storage.events,
@@ -1051,7 +1041,6 @@ impl PreparedArtifacts {
         Runtime::new(HolderConfig {
             core: self.core,
             pty,
-            writes,
             storage,
             status: self.status,
             commit_at: self.commit_at,

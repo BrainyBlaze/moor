@@ -5,7 +5,6 @@ mod descriptor_deadline_tests {
     use crate::runtime::private::lifecycle_running;
     use crate::store::{Commit, Kind, Store, StoreError};
     use std::io::Cursor;
-    use std::sync::mpsc;
     use std::time::Instant;
 
     struct SlowNative(bool);
@@ -50,7 +49,6 @@ mod descriptor_deadline_tests {
         );
         let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
         let log = Store::create(&log_path, Kind::Log, 7, b"old", 0, 3).unwrap();
-        let (_, writes) = mpsc::channel();
         let runtime = Runtime::new(HolderConfig {
             core: CoreConfig {
                 generation: 7,
@@ -60,7 +58,6 @@ mod descriptor_deadline_tests {
                 replay_limit: 1024,
             },
             pty: duplex(),
-            writes,
             storage: SessionStorage::new(Some((log, 64)), None, lifecycle, 1, 1024),
             status: Vec::new(),
             commit_at: 0,
