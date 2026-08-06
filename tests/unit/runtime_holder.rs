@@ -78,8 +78,9 @@ mod descriptor_deadline_tests {
                 codec: Some(Codec::new(Profile::Controller)),
                 preface: Vec::new(),
                 scope: 7,
-                handshake: 0,
+                handshaking: false,
                 deadline: 0,
+                descriptor_pending: false,
             },
         );
         runtime.machine.register_controller(id);
@@ -106,17 +107,13 @@ mod descriptor_deadline_tests {
             add_peer(&mut runtime, id);
         }
         let now = monotonic();
+        runtime.peers.get_mut(&1).unwrap().deadline = now + 50;
+        runtime.peers.get_mut(&1).unwrap().descriptor_pending = true;
+        runtime.peers.get_mut(&2).unwrap().deadline = now + 50;
+        runtime.peers.get_mut(&2).unwrap().descriptor_pending = true;
         runtime.descriptors.extend([
-            PendingDescriptor {
-                peer: 1,
-                deadline: now + 50,
-                request: Descriptor::Attach(81, 24, true, false, Some([3; 16])),
-            },
-            PendingDescriptor {
-                peer: 2,
-                deadline: now + 50,
-                request: Descriptor::Status,
-            },
+            (1, Descriptor::Attach(81, 24, true, false, Some([3; 16]))),
+            (2, Descriptor::Status),
         ]);
 
         let mut calls = 0;
@@ -143,11 +140,9 @@ mod descriptor_deadline_tests {
         let (mut runtime, paths) = fixture("status-output-deadline");
         add_peer(&mut runtime, 3);
         let now = monotonic();
-        runtime.descriptors.push_back(PendingDescriptor {
-            peer: 3,
-            deadline: now + 50,
-            request: Descriptor::Status,
-        });
+        runtime.peers.get_mut(&3).unwrap().deadline = now + 50;
+        runtime.peers.get_mut(&3).unwrap().descriptor_pending = true;
+        runtime.descriptors.push_back((3, Descriptor::Status));
         let mut calls = 0;
         runtime.poll_descriptors_with(&mut || {
             calls += 1;
@@ -166,11 +161,12 @@ mod descriptor_deadline_tests {
         let (mut runtime, paths) = fixture("attach-output-deadline");
         add_peer(&mut runtime, 4);
         let now = monotonic();
-        runtime.descriptors.push_back(PendingDescriptor {
-            peer: 4,
-            deadline: now + 50,
-            request: Descriptor::Attach(80, 24, true, false, Some([4; 16])),
-        });
+        runtime.peers.get_mut(&4).unwrap().deadline = now + 50;
+        runtime.peers.get_mut(&4).unwrap().descriptor_pending = true;
+        runtime.descriptors.push_back((
+            4,
+            Descriptor::Attach(80, 24, true, false, Some([4; 16])),
+        ));
         let mut calls = 0;
         runtime.poll_descriptors_with(&mut || {
             calls += 1;
@@ -195,8 +191,9 @@ mod descriptor_deadline_tests {
                 codec: Some(Codec::new(Profile::Controller)),
                 preface: Vec::new(),
                 scope: 0,
-                handshake: 100,
+                handshaking: true,
                 deadline: 100,
+                descriptor_pending: false,
             },
         );
         let hello = Message {
@@ -237,8 +234,9 @@ mod descriptor_deadline_tests {
                 codec: Some(Codec::new(Profile::Semantic)),
                 preface: Vec::new(),
                 scope: 0,
-                handshake: 100,
+                handshaking: true,
                 deadline: 100,
+                descriptor_pending: false,
             },
         );
         let semantic = Message {
@@ -251,6 +249,22 @@ mod descriptor_deadline_tests {
             !runtime.peers.contains_key(&7),
             "expired semantic HELLO reached decoding"
         );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn output_exhaustion_does_not_authenticate_silent_controller_dialects() {
+        let (mut runtime, paths) = fixture("output-exhaustion-handshakes");
+        for _ in 0..16 {
+            let id = runtime.next_peer;
+            runtime.accept(duplex(), true);
+            runtime.peer_bytes(id, b"MOOR".to_vec());
+        }
+        runtime.apply_with([PolicyEffect::OutputExhausted], &mut monotonic);
+        runtime.accept(duplex(), true);
+
+        assert_eq!(runtime.peers.len(), 16);
         drop(runtime);
         cleanup(paths);
     }

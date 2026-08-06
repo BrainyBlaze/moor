@@ -1,10 +1,9 @@
 #[test]
 fn accounting_preserves_the_full_u32_overhead_domain() {
-    let limit = usage(u32::MAX as usize, u32::MAX as usize).unwrap();
-    let high_bit = usage(1usize << 31, 1).unwrap();
-    let reserved = reserve(high_bit, usage(0, 1).unwrap(), limit).unwrap();
+    let limit = (u32::MAX as usize, u32::MAX as usize);
+    let high_bit = (1usize << 31, 1);
+    let reserved = reserve(high_bit, (0, 1), limit).unwrap();
 
-    assert_eq!(reserved >> 32, 1 << 31);
-    assert_eq!(reserved as u32, 2);
-    assert_eq!(reserve(limit, usage(1, 0).unwrap(), limit), None);
+    assert_eq!(reserved, (1 << 31, 2));
+    assert_eq!(reserve(limit, (1, 0), limit), None);
 }

@@ -18,13 +18,15 @@ schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending,
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
 
-type WriteJob = (Vec<u8>, u64);
-schema!(struct State fields; sender: Option<Sender<WriteJob>>, used: u64, limit: u64);
+type Charge = (usize, usize);
+type WriteJob = (Vec<u8>, Charge);
+schema!(struct State fields; sender: Option<Sender<WriteJob>>, used: Charge, limit: Charge);
 
 pub struct Duplex<T = Event>(Arc<Mutex<State>>, pub CrossReceiver<T>);
 
 schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(Sender<bool>), Abort);
 pub struct ViewerSender(CrossSender<Command>);
+schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>)), Attached, Reattaching);
 
 impl ViewerSender {
     pub fn send(&self, bytes: &[u8]) -> bool {
@@ -42,9 +44,9 @@ impl ViewerSender {
 }
 
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
-    start: Option<&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>)>, commands: CrossReceiver<Command>, sender: CrossSender<Command>,
+    phase: ViewerPhase<'a>, commands: CrossReceiver<Command>, sender: CrossSender<Command>,
     state: Arc<AtomicU8>, wire: ViewerStream, lease: Option<InputLease>,
-    size: Option<(u16, u16)>, release: Option<Sender<bool>>, reattaching: bool);
+    size: Option<(u16, u16)>, release: Option<Sender<bool>>);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -65,7 +67,8 @@ impl Viewer<'_> {
             ),
         )
         .map_err(crate::protocol)?;
-        if message.kind == 4 && std::mem::take(&mut self.reattaching) {
+        if message.kind == 4 && matches!(self.phase, ViewerPhase::Reattaching) {
+            self.phase = ViewerPhase::Attached;
             if self.options.redraw == Redraw::Winch {
                 let (rows, columns) = self.size.unwrap();
                 self.command(Command::Resize(rows, columns))?;
@@ -97,7 +100,9 @@ impl Viewer<'_> {
                 self.advance(vec![])?;
             }
             ViewerEvent::Lease(result) => {
-                if let Some(start) = self.start.take() {
+                if let ViewerPhase::Starting(start) =
+                    std::mem::replace(&mut self.phase, ViewerPhase::Attached)
+                {
                     self.lease = InputLease::from_result(result, LeaseRole::Viewer)?;
                     start(ViewerSender(self.sender.clone()), self.state.clone());
                     if self.lease.is_some() {
@@ -243,17 +248,17 @@ impl<T> Duplex<T> {
     pub fn try_send_payload(&self, bytes: Vec<u8>, payload: usize) -> Result<(), SendError> {
         let mut state = self.0.lock().expect("duplex state lock");
         let sender = state.sender.as_ref().cloned().ok_or(SendError::Closed)?;
-        let Some(overhead) = bytes.len().checked_sub(payload) else {
-            return Err(SendError::Full);
-        };
+        let charge = (
+            bytes.len().checked_sub(payload).ok_or(SendError::Full)?,
+            payload,
+        );
         if bytes.is_empty() {
             return Ok(());
         }
-        let charge = usage(overhead, payload).ok_or(SendError::Full)?;
         state.used = reserve(state.used, charge, state.limit).ok_or(SendError::Full)?;
         if sender.send((bytes, charge)).is_err() {
             state.sender.take();
-            state.used = 0;
+            state.used = (0, 0);
             return Err(SendError::Closed);
         }
         Ok(())
@@ -264,8 +269,8 @@ impl<T> Duplex<T> {
     }
 
     pub fn pending(&self) -> usize {
-        let used = self.0.lock().expect("duplex state lock").used;
-        (used >> 32) as usize + (used as u32) as usize
+        let (overhead, payload) = self.0.lock().expect("duplex state lock").used;
+        overhead + payload
     }
 }
 
@@ -283,8 +288,8 @@ pub(crate) fn pump<T: Send + 'static>(
     let (tx, events) = bounded(8);
     let state = Arc::new(Mutex::new(State {
         sender: Some(out),
-        used: 0,
-        limit: usage(limit, payload_limit).unwrap(),
+        used: (0, 0),
+        limit: (limit, payload_limit),
     }));
     std::thread::spawn(move || {
         let mut buf = [0; 8192];
@@ -316,9 +321,10 @@ pub(crate) fn pump<T: Send + 'static>(
                 let mut state = state.lock().expect("duplex state lock");
                 if error.is_some() {
                     state.sender.take();
-                    state.used = 0;
+                    state.used = (0, 0);
                 } else {
-                    state.used -= charge;
+                    state.used.0 -= charge.0;
+                    state.used.1 -= charge.1;
                 }
             }
             let _ = completed.send((written as u64, error));
@@ -334,15 +340,9 @@ pub(crate) fn pump<T: Send + 'static>(
     (Duplex(state, events), completions)
 }
 
-fn usage(overhead: usize, payload: usize) -> Option<u64> {
-    Some((u64::from(u32::try_from(overhead).ok()?) << 32) | u64::from(u32::try_from(payload).ok()?))
-}
-
-fn reserve(used: u64, charge: u64, limit: u64) -> Option<u64> {
-    let overhead = (used >> 32).checked_add(charge >> 32)?;
-    let payload = u64::from(used as u32).checked_add(u64::from(charge as u32))?;
-    (overhead <= limit >> 32 && payload <= u64::from(limit as u32))
-        .then_some(overhead << 32 | payload)
+fn reserve(used: Charge, charge: Charge, limit: Charge) -> Option<Charge> {
+    let next = (used.0.checked_add(charge.0)?, used.1.checked_add(charge.1)?);
+    (next.0 <= limit.0 && next.1 <= limit.1).then_some(next)
 }
 
 #[cfg(test)]
@@ -370,7 +370,7 @@ pub fn attach_viewer_to(
         client,
         options,
         output,
-        start: Some(&mut start),
+        phase: ViewerPhase::Starting(&mut start),
         commands,
         sender,
         state: state.clone(),
@@ -381,14 +381,13 @@ pub fn attach_viewer_to(
         lease: None,
         size: (options.redraw == Redraw::Winch).then_some(geometry),
         release: None,
-        reattaching: false,
     };
     let mut heartbeat = Instant::now() + liveness;
     stream.client.send(3, &request)?;
     let paused = never();
     loop {
         let wait = heartbeat.saturating_duration_since(Instant::now());
-        let commands = if stream.reattaching
+        let commands = if matches!(stream.phase, ViewerPhase::Reattaching)
             || stream.release.is_some()
             || stream.lease.as_ref().is_some_and(InputLease::pending)
         {
@@ -442,7 +441,7 @@ pub fn attach_viewer_to(
                 request[4] &= !1;
                 stream.client.send(3, &request)?;
                 stream.lease = Some(lease);
-                stream.reattaching = true;
+                stream.phase = ViewerPhase::Reattaching;
                 Ok(())
             })();
             if let Err(error) = recovered {

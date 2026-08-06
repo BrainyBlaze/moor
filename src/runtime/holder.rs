@@ -205,7 +205,7 @@ impl<N: Native> Runtime<N> {
             }
             wire::RuntimeReply::Scoped(scope, kind, payload) => {
                 if let Some(peer) = self.peers.get_mut(&id) {
-                    peer.handshake = 0;
+                    peer.handshaking = false;
                     peer.deadline = 0;
                     peer.scope = scope;
                 }
@@ -234,7 +234,7 @@ impl<N: Native> Runtime<N> {
         self.buffered -= released;
         while let Some(id) = self.recipients.pop() {
             let reassembly = self.peers.get(&id).is_some_and(|peer| {
-                peer.handshake == 0 && (peer.deadline == 0 || now < peer.deadline)
+                !peer.handshaking && (peer.deadline == 0 || now < peer.deadline)
             });
             if reassembly {
                 self.refuse_wire(id, wire::WireError::ReassemblyTimeout);
@@ -288,7 +288,7 @@ impl<N: Native> Runtime<N> {
     }
 
     pub(super) fn disconnect(&mut self, id: ConnId) {
-        self.descriptors.retain(|pending| pending.peer != id);
+        self.descriptors.retain(|(peer, _)| *peer != id);
         self.storage.abandon_clear(id);
         if let Some(peer) = self.peers.remove(&id) {
             self.buffered -= peer.codec.as_ref().map_or(0, Codec::buffered_len);
@@ -313,9 +313,9 @@ pub trait Native {
 
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, writes: Receiver<(u64, Option<u16>)>, storage: SessionStorage,
     status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
-schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshake: u64, deadline: u64);
 schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
-schema!(struct PendingDescriptor fields; peer: ConnId, deadline: u64, request: Descriptor);
+schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64,
+    descriptor_pending: bool);
 
 impl Peer {
     fn profile(&self) -> Option<Profile> {
@@ -330,7 +330,7 @@ impl Peer {
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
     writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
     frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
-    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<PendingDescriptor>, status_snapshot: Option<(StatusSnapshot, u64)>, machine: Machine);
+    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, status_snapshot: Option<(StatusSnapshot, u64)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
     pub fn output(&mut self, bytes: Vec<u8>) {
@@ -432,12 +432,7 @@ impl<N: Native> Runtime<N> {
         let time = monotonic();
         self.tick(time);
         if !same_user
-            || self
-                .peers
-                .values()
-                .filter(|peer| peer.handshake != 0)
-                .count()
-                >= 16
+            || self.peers.values().filter(|peer| peer.handshaking).count() >= 16
             || self.next_peer == u64::MAX
         {
             return pipe.shutdown();
@@ -451,8 +446,9 @@ impl<N: Native> Runtime<N> {
                 codec: None,
                 preface: Vec::new(),
                 scope: 0,
-                handshake: time.saturating_add(2_000),
+                handshaking: true,
                 deadline: time.saturating_add(2_000),
+                descriptor_pending: false,
             },
         );
     }
@@ -583,7 +579,7 @@ impl<N: Native> Runtime<N> {
         if self
             .peers
             .values()
-            .filter(|peer| peer.is(profile) && peer.handshake == 0)
+            .filter(|peer| peer.is(profile) && !peer.handshaking)
             .count()
             >= 64
         {
@@ -647,7 +643,7 @@ impl<N: Native> Runtime<N> {
             && message.kind == 1
             && (message.scope == 0 || message.scope == self.config.generation);
         if message.scope != peer.scope && !first_controller {
-            let refusal = if peer.is(Profile::Semantic) && peer.handshake != 0 {
+            let refusal = if peer.is(Profile::Semantic) && peer.handshaking {
                 (5, 3, &b"semantic frame preceded hello"[..])
             } else {
                 (9, 5, &b"generation or source epoch did not match"[..])
@@ -666,7 +662,9 @@ impl<N: Native> Runtime<N> {
 
     fn controller_message_at(&mut self, id: u64, message: &Message, time: u64) -> DecodeResult {
         wire::require(
-            !self.descriptors.iter().any(|pending| pending.peer == id),
+            self.peers
+                .get(&id)
+                .is_some_and(|peer| !peer.descriptor_pending),
             wire::WireError::Malformed,
         )?;
         if message.kind != 1 {
@@ -706,7 +704,7 @@ impl<N: Native> Runtime<N> {
                 )?;
                 self.machine.register_controller(id);
                 let peer = self.peers.get_mut(&id).unwrap();
-                peer.handshake = 0;
+                peer.handshaking = false;
                 peer.scope = self.config.generation;
                 let payload = wire::controller_hello_ack(
                     self.config.generation,
@@ -939,20 +937,12 @@ impl<N: Native> Runtime<N> {
         if self.descriptors.len() == DESCRIPTOR_LIMIT {
             return self.refuse_wire(peer, wire::WireError::ResourceExhausted);
         }
-        self.descriptors.push_back(PendingDescriptor {
-            peer,
-            deadline: self
-                .peers
-                .get(&peer)
-                .map_or(now.saturating_add(2_000), |peer| {
-                    if peer.deadline == 0 {
-                        now.saturating_add(2_000)
-                    } else {
-                        peer.deadline
-                    }
-                }),
-            request,
-        });
+        let state = self.peers.get_mut(&peer).expect("descriptor peer");
+        if state.deadline == 0 {
+            state.deadline = now.saturating_add(2_000);
+        }
+        state.descriptor_pending = true;
+        self.descriptors.push_back((peer, request));
         self.poll_descriptors_with(&mut monotonic);
     }
 
@@ -962,15 +952,15 @@ impl<N: Native> Runtime<N> {
     fn poll_descriptors_with(&mut self, clock: &mut impl FnMut() -> u64) {
         loop {
             let now = clock();
-            let Some(pending) = self.descriptors.front() else {
+            let Some(&(peer, _)) = self.descriptors.front() else {
                 return;
             };
-            if !self.peers.contains_key(&pending.peer) {
+            let Some(state) = self.peers.get(&peer) else {
                 self.descriptors.pop_front();
                 continue;
-            }
-            if now >= pending.deadline {
-                let peer = pending.peer;
+            };
+            let deadline = state.deadline;
+            if now >= deadline {
                 self.descriptors.pop_front();
                 self.refuse(peer, (12, 13, b"identity exchange deadline exceeded"));
                 continue;
@@ -979,18 +969,18 @@ impl<N: Native> Runtime<N> {
                 SnapshotState::Ready(snapshot) => snapshot,
                 SnapshotState::Busy => return,
                 SnapshotState::Failed => {
-                    let peer = pending.peer;
                     self.descriptors.pop_front();
                     self.refuse_wire(peer, wire::WireError::ResourceExhausted);
                     continue;
                 }
             };
-            let pending = self.descriptors.pop_front().expect("front descriptor");
-            let result = match pending.request {
+            let (_, request) = self.descriptors.pop_front().expect("front descriptor");
+            self.peers.get_mut(&peer).unwrap().descriptor_pending = false;
+            let result = match request {
                 Descriptor::Status => {
                     self.storage.release_status_snapshot();
-                    if self.send_status(pending.peer, false, snapshot, pending.deadline, clock)
-                        && let Some(peer) = self.peers.get_mut(&pending.peer)
+                    if self.send_status(peer, false, snapshot, deadline, clock)
+                        && let Some(peer) = self.peers.get_mut(&peer)
                     {
                         peer.deadline = 0;
                     }
@@ -1003,18 +993,18 @@ impl<N: Native> Runtime<N> {
                     self.storage.release_status_snapshot();
                     let effects = self.machine.transition(Transition::Peer(
                         now,
-                        pending.peer,
+                        peer,
                         PolicyRequest::Attach(columns, rows, lease, non_vt, token),
                     ));
                     effects.map(|effects| {
-                        self.status_snapshot = Some((snapshot, pending.deadline));
+                        self.status_snapshot = Some((snapshot, deadline));
                         self.apply_with(effects, clock);
                         self.status_snapshot = None;
                     })
                 }
             };
             if let Err(error) = result {
-                self.refuse_wire(pending.peer, error);
+                self.refuse_wire(peer, error);
             }
         }
     }
