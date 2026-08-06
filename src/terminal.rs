@@ -105,9 +105,9 @@ impl Scanner {
             && self.buf.last() == Some(&0x1b)
             && now >= self.since.saturating_add(50)
         {
-            self.degraded(false, "deadline", &mut out);
-            release(&mut out, &[0x1b]);
             self.buf.pop();
+            self.abandon("deadline", &mut out);
+            self.begin(0x1b, now, &mut out);
         } else if self.sent < self.buf.len() && now >= self.since.saturating_add(50) {
             self.abandon("deadline", &mut out);
         }
@@ -155,11 +155,10 @@ impl Scanner {
             if is_osc(&self.buf) && byte == 0x1b {
                 self.since = now;
             }
-            self.emit_safe(&mut out);
             let osc = is_osc(&self.buf);
             let cap = if osc { 65536 } else { 32 };
             if self.buf.len() > cap {
-                let reprocess = csi_tail(&self.buf).is_some() && is_intro(byte);
+                let reprocess = is_intro(byte);
                 if reprocess {
                     self.buf.pop();
                 }
@@ -167,18 +166,21 @@ impl Scanner {
                 if reprocess {
                     self.begin(byte, now, &mut out);
                 }
-            } else if complete(&self.buf) {
-                let mut sequence = std::mem::take(&mut self.buf);
-                let emitted = std::mem::take(&mut self.sent);
-                let osc = is_osc(&sequence);
-                if self.process(&sequence, &mut out) {
-                    self.episode[usize::from(!osc)] = false;
-                } else {
-                    self.degraded(osc, "malformed", &mut out);
+            } else {
+                self.emit_safe(&mut out);
+                if complete(&self.buf) {
+                    let mut sequence = std::mem::take(&mut self.buf);
+                    let emitted = std::mem::take(&mut self.sent);
+                    let osc = is_osc(&sequence);
+                    if self.process(&sequence, &mut out) {
+                        self.episode[usize::from(!osc)] = false;
+                    } else {
+                        self.degraded(osc, "malformed", &mut out);
+                    }
+                    release(&mut out, &sequence[emitted..]);
+                    sequence.clear();
+                    self.buf = sequence;
                 }
-                release(&mut out, &sequence[emitted..]);
-                sequence.clear();
-                self.buf = sequence;
             }
         }
         out
@@ -194,7 +196,7 @@ impl Scanner {
     fn emit_safe(&mut self, out: &mut Vec<Scan>) {
         let safe = if is_osc(&self.buf) {
             self.buf.len() - usize::from(self.buf.last() == Some(&0x1b))
-        } else if self.buf.len() == 1 || csi_tail(&self.buf).is_some() {
+        } else if self.buf.len() == 1 || possible_query(&self.buf) {
             0
         } else {
             self.buf.len()
@@ -325,6 +327,22 @@ fn csi_tail(bytes: &[u8]) -> Option<&[u8]> {
     bytes
         .strip_prefix(b"\x1b[")
         .or_else(|| bytes.strip_prefix(&[0x9b]))
+}
+fn possible_query(bytes: &[u8]) -> bool {
+    let Some(tail) = csi_tail(bytes) else {
+        return false;
+    };
+    if recognize_query(bytes).is_some() {
+        return true;
+    }
+    match tail {
+        b"" | b"0" | b">" | b">0" | b"6" | b"?" => true,
+        [b'?', rest @ ..] => {
+            let digits = rest.strip_suffix(b"$").unwrap_or(rest);
+            parse_decimal(digits, u32::MAX as u64, true).is_some()
+        }
+        _ => false,
+    }
 }
 fn is_osc(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x1b]") || bytes.starts_with(&[0x9d])

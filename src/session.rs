@@ -444,6 +444,11 @@ impl Machine {
         self
     }
 
+    pub fn correlation(mut self, next: u64) -> Self {
+        self.query_next = next;
+        self
+    }
+
     pub fn register_controller(&mut self, conn: ConnId) {
         self.peers.insert(conn, Peer::Controller(false, false));
     }
@@ -1054,7 +1059,14 @@ impl Machine {
         };
         let correlation = self.query_next;
         if self.queries.len() == 64 || correlation == 0 {
+            if correlation == 0 {
+                self.send(
+                    owner,
+                    Reply::ControllerError(13, b"query correlation exhausted"),
+                );
+            }
             self.effects.push(Effect::Close(owner));
+            self.queries_gone(owner);
             return self.fallback(fallback);
         }
         self.query_next = correlation.wrapping_add(1);

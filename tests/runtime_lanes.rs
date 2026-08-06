@@ -311,9 +311,7 @@ fn a_completion_selected_after_its_deadline_is_rejected_even_when_already_queued
         std::thread::yield_now();
     }
     assert!(!lane.writable(), "both FIFO results were not queued");
-    let done = lane
-        .try_complete(Instant::now())
-        .expect("missing first result");
+    let done = next(&mut lane);
     assert!(
         matches!(done.result, Err(StoreError::Io(ref error)) if error.kind() == std::io::ErrorKind::TimedOut),
         "late queued completion was accepted: {:?}",

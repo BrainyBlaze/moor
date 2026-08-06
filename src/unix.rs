@@ -194,6 +194,24 @@ impl Native for UnixNative {
         Ok(())
     }
 
+    fn redraw(&mut self, rows: u16, columns: u16) -> Result<()> {
+        let mut prior = window(0, 0);
+        syscall!(
+            unsafe { libc::ioctl(self.control.as_raw_fd(), libc::TIOCGWINSZ, &mut prior) } >= 0
+        );
+        let unchanged = (prior.ws_row, prior.ws_col) == (rows, columns);
+        self.resize(rows, columns)?;
+        if unchanged {
+            let foreground = unsafe { libc::tcgetpgrp(self.control.as_raw_fd()) };
+            syscall!(
+                [foreground, self.group].into_iter().any(|group| {
+                    group > 0 && unsafe { libc::kill(-group, libc::SIGWINCH) } == 0
+                })
+            );
+        }
+        Ok(())
+    }
+
     fn terminate(&mut self, force: bool) -> (u8, bool) {
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
         let foreground = unsafe { libc::tcgetpgrp(self.control.as_raw_fd()) };

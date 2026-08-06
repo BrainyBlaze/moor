@@ -161,10 +161,7 @@ fn quiet_query_candidates_expire_but_osc_bytes_are_never_buffered() {
     assert!(scanner.expire(49).is_empty());
     assert_eq!(
         scanner.expire(50),
-        vec![
-            Scan::Observation(Observation::Degraded("query", "deadline")),
-            Scan::Release(vec![0x1b])
-        ]
+        vec![Scan::Observation(Observation::Degraded("osc", "deadline"))]
     );
 }
 
@@ -244,6 +241,62 @@ fn osc_rejects_the_byte_past_its_bound_and_a_missing_selector() {
         observations,
         vec![Observation::Degraded("osc", "malformed")]
     );
+}
+
+#[test]
+fn osc_limit_reprocesses_an_escape_as_the_next_control_sequence() {
+    let mut scanner = Scanner::new(24);
+    let mut full = b"\x1b]2;".to_vec();
+    full.extend(vec![b'x'; 65_532]);
+    assert!(scanner.feed(0, &full).is_empty());
+
+    let observations = scanner.feed(1, b"\x1b]2;recovered\x07");
+    assert_eq!(
+        observations,
+        vec![
+            Observation::Degraded("osc", "limit"),
+            Observation::State("idle", "recovered".into(), false),
+        ]
+    );
+}
+
+#[test]
+fn osc_deadline_abandons_the_old_sequence_and_reuses_its_trailing_escape() {
+    let mut scanner = Scanner::new(24);
+    let prefix = b"\x1b]2;discarded\x1b";
+    let mut effects = scanner.scan(0, prefix);
+    assert_eq!(raw(&effects), &prefix[..prefix.len() - 1]);
+
+    effects.extend(scanner.expire(50));
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Scan::Observation(Observation::Degraded("osc", "deadline"))
+        )
+    }));
+    assert_eq!(raw(&effects), &prefix[..prefix.len() - 1]);
+
+    effects.extend(scanner.scan(51, b"]2;recovered\x07"));
+    assert!(effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Scan::Observation(Observation::State("idle", title, false)) if title == "recovered"
+        )
+    }));
+    assert_eq!(raw(&effects), b"\x1b]2;discarded\x1b]2;recovered\x07");
+}
+
+#[test]
+fn impossible_query_prefix_is_released_without_waiting_for_a_final_byte() {
+    let mut scanner = Scanner::new(24);
+    assert_eq!(
+        scanner.scan(0, b"\x1b[3"),
+        vec![Scan::Release(b"\x1b[3".to_vec())]
+    );
+    assert!(scanner.expire(50).is_empty());
+
+    let effects = scanner.scan(51, b"1m");
+    assert_eq!(effects, vec![Scan::Release(b"1m".to_vec())]);
 }
 
 #[test]
