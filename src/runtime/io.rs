@@ -315,7 +315,10 @@ pub(crate) fn pump<T: Send + 'static>(
                 }
             }
             let _ = completed.send((written as u64, error));
-            if error.is_some() {
+            if let Some(error) = error {
+                while writes.recv().is_ok() {
+                    let _ = completed.send((0, Some(error)));
+                }
                 break;
             }
         }
