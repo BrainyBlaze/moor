@@ -2606,3 +2606,118 @@ fn v16_status_v25_pins_the_selected_event_commit_fields() {
     let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(V25_HEADER).into();
     assert_eq!(&body[at + 17..at + 49], &digest);
 }
+
+// ===== §16 V28 — expanded HEARTBEAT =====
+
+#[test]
+fn v16_status_v28_heartbeat_round_trips_and_encodes_exactly() {
+    // Drives the real encoder and the real decoder against the frozen bytes,
+    // so this is an end-to-end check of the five defined health bits rather
+    // than an inspection of the vector.
+    let frame = hex("4D 4F 4F 52 03 12 00 00 07 00 00 00 04 00 00 00
+         09 00 00 00 34 6D 58 74 08 07 06 05 04 03 02 01
+         1F");
+    assert_eq!(frame[5], 0x12, "HEARTBEAT type");
+    assert_eq!(
+        u32::from_le_bytes(frame[16..20].try_into().unwrap()),
+        9,
+        "declared payload length"
+    );
+    assert_eq!(frame.len() - 24, 9, "actual body length");
+    assert_eq!(
+        moor::wire::crc32c(&frame[..20]),
+        u32::from_le_bytes(frame[20..24].try_into().unwrap()),
+        "frozen header CRC-32C"
+    );
+
+    let beat = moor::wire::Heartbeat::decode(&frame[24..]).expect("frozen heartbeat decodes");
+    assert_eq!(beat.monotonic_ms, 0x0102_0304_0506_0708);
+    assert_eq!(beat.flags, 0x1F, "all five defined health bits set");
+
+    // The encoder must reproduce the frozen payload byte for byte, and the
+    // frame must reproduce byte for byte once framed at the frozen sequence.
+    assert_eq!(beat.encode().unwrap().as_slice(), &frame[24..]);
+    let mut framed = Vec::new();
+    moor::wire::Codec::with_sequences(moor::wire::Profile::Controller, 1, 4)
+        .encode(7, 0x12, &frame[24..], &mut framed)
+        .expect("frame the frozen heartbeat");
+    assert_eq!(
+        framed, frame,
+        "framed heartbeat must equal the frozen vector"
+    );
+}
+
+#[test]
+fn v16_status_v28_reserved_heartbeat_bits_are_refused() {
+    // §16 states the reserved bits are clear; bits 5-7 must not be accepted as
+    // a forward-compatible extension (§2).
+    for reserved in [0x20u8, 0x40, 0x80] {
+        let mut payload = hex("08 07 06 05 04 03 02 01 1F");
+        payload[8] |= reserved;
+        assert!(
+            moor::wire::Heartbeat::decode(&payload).is_err(),
+            "reserved bit {reserved:#04x} must be refused"
+        );
+    }
+}
+
+// ===== §16 V30 — ordered clear request and every LOG_CLEAR_RESULT row =====
+
+#[test]
+fn v16_status_v30_clear_request_encodes_exactly() {
+    let frame = hex("4D 4F 4F 52 03 19 00 00 07 00 00 00 06 00 00 00
+         18 00 00 00 E7 F8 D1 48 00 01 02 03 04 05 06 07
+         08 09 0A 0B 0C 0D 0E 0F 05 00 00 00 00 00 00 00");
+    assert_eq!(frame[5], 0x19, "LOG_CLEAR type");
+    assert_eq!(frame.len() - 24, 0x18, "declared 24-byte payload");
+    let incarnation: [u8; 16] = (0u8..16).collect::<Vec<_>>().try_into().unwrap();
+    // The real builder must reproduce the frozen payload for incarnation
+    // 00..0F and observed index P=5.
+    assert_eq!(
+        moor::wire::log_clear_payload(incarnation, 5)
+            .unwrap()
+            .as_slice(),
+        &frame[24..]
+    );
+}
+
+#[test]
+fn v16_status_v30_every_result_row_round_trips_byte_for_byte() {
+    // The six independent fixtures in the artifact's stated order. Each is
+    // (outcome, reason, epoch, prior P, resulting index, cleared-through E),
+    // and each must both encode to and decode from the frozen bytes — so a
+    // refusal row that carried the wrong reason or a zeroed coordinate fails.
+    let rows: [(u8, u8, u32, u64, u64, u64, &str); 6] = [
+        (0, 0, 3, 5, 7, 9, "cleared"),
+        (1, 0, 2, 5, 6, 9, "already empty"),
+        (1, 0, 0, 0, 0, 0, "disabled"),
+        (2, 1, 2, 5, 6, 8, "stale status"),
+        (2, 2, 0, 5, 0, 0, "unavailable"),
+        (2, 3, 0, 5, 0, 0, "corrupt"),
+    ];
+    let frozen = [
+        "00 00 00 00 03 00 00 00 05 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00 09 00 00 00 00 00 00 00",
+        "01 00 00 00 02 00 00 00 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 09 00 00 00 00 00 00 00",
+        "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+        "02 01 00 00 02 00 00 00 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00 08 00 00 00 00 00 00 00",
+        "02 02 00 00 00 00 00 00 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+        "02 03 00 00 00 00 00 00 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00",
+    ];
+    for ((outcome, reason, epoch, prior, resulting, cleared, label), bytes) in
+        rows.into_iter().zip(frozen)
+    {
+        let expected = hex(bytes);
+        let produced =
+            moor::wire::log_clear_result_payload(outcome, reason, epoch, prior, resulting, cleared)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        assert_eq!(produced.as_slice(), expected.as_slice(), "{label} encode");
+        let (decoded_outcome, decoded_reason, decoded_prior) =
+            moor::wire::decode_log_clear_result(&expected)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        assert_eq!(
+            (decoded_outcome, decoded_reason, decoded_prior),
+            (outcome, reason, prior),
+            "{label} decode"
+        );
+    }
+}
