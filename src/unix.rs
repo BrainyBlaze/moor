@@ -1417,12 +1417,12 @@ impl PreparedInstrument {
             .ok_or("instrumentation stage has no name")?
             .to_owned();
         let parent = open_directory(root).text()?;
-        let stage = file(openat(
+        let stage = open_file_at(
             &parent,
             leaf.as_os_str(),
             INSTRUMENT_FLAGS,
             Mode::from_bits_retain(0o500),
-        ))
+        )
         .text()?;
         let identity = (|| -> Result<_> {
             os(fchmod(&stage, Mode::from_bits_retain(0o500))).text()?;
@@ -1513,7 +1513,16 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    file(openat(parent, name, DIRECTORY_FLAGS, Mode::empty()))
+    open_file_at(parent, name, DIRECTORY_FLAGS, Mode::empty())
+}
+
+pub(crate) fn open_file_at(
+    parent: &File,
+    name: &OsStr,
+    flags: OFlag,
+    mode: Mode,
+) -> io::Result<File> {
+    file(openat(parent, name, flags, mode))
 }
 
 fn component_cause(
@@ -1538,11 +1547,7 @@ fn component_cause(
     }
 }
 
-fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-    os(fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW))
-}
-
-pub(crate) fn stat_cstr_at(parent: &File, name: &std::ffi::CStr) -> io::Result<libc::stat> {
+pub(crate) fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
     os(fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW))
 }
 
@@ -1612,7 +1617,7 @@ fn native_name(name: &OsStr) -> Result<CString> {
     CString::new(name.as_bytes()).map_err(|_| "native path contains NUL".into())
 }
 
-fn unlink_at(parent: &File, name: &OsStr) -> Result<()> {
+pub(crate) fn unlink_at(parent: &File, name: &OsStr) -> Result<()> {
     os(unlinkat(parent, name, UnlinkatFlags::NoRemoveDir)).text()
 }
 
