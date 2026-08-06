@@ -880,6 +880,57 @@ fn hello_cannot_restart_the_whole_status_exchange_deadline() {
 }
 
 #[test]
+fn viewer_resume_cannot_restart_the_whole_attach_exchange_deadline() {
+    let (mut runtime, root) = fixture();
+    let mut owner = connect(&mut runtime);
+    hello(&mut owner, &mut runtime);
+    owner.send(7, 3, &[0, 0, 0, 0, 1]);
+    owner.recv_kind(&mut runtime, 5);
+    owner.recv_kind(&mut runtime, 4);
+    let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(owner);
+    for _ in 0..10 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let mut resumed = connect(&mut runtime);
+    std::thread::sleep(Duration::from_millis(1_100));
+    hello(&mut resumed, &mut runtime);
+    resumed.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::Viewer,
+            epoch: lease.epoch,
+            incarnation: [1; 16],
+            token: lease.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    assert_eq!(
+        LeaseResult::decode_wire(&resumed.recv_kind(&mut runtime, 0x16).payload)
+            .unwrap()
+            .outcome,
+        ResultOutcome::Resumed
+    );
+    std::thread::sleep(Duration::from_millis(950));
+    resumed.send(7, 3, &[0; 5]);
+    let error = resumed.recv(&mut runtime);
+    assert_eq!(error.kind, 0x13, "resumed ATTACH restarted the deadline");
+    assert_eq!(
+        u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+        12
+    );
+    assert!(resumed.closed(&mut runtime));
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn dialect_only_peers_still_consume_the_sixteen_initial_hello_slots() {
     let (mut runtime, root) = fixture();
     let mut stalled = (0..16).map(|_| connect(&mut runtime)).collect::<Vec<_>>();
