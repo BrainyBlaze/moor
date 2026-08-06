@@ -7,8 +7,8 @@
 # native conformance evidence.
 # Ubuntu 24.04 arm64 is intentionally absent: the automatic hosted workflow
 # already provides that current runner, so Task 6's fallback condition is false.
-name: Self-hosted native evidence / NOT RUN — no matching runner enrolled as of inventory query
-run-name: NOT RUN — no matching runner enrolled as of inventory query / ${{ github.sha }}
+name: Self-hosted native evidence / native lanes NOT RUN as of 2026-08-06 inventory query
+run-name: Candidate self-hosted native execution / ${{ github.sha }}
 
 on:
   workflow_dispatch:
@@ -37,7 +37,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   required-posix:
-    name: NOT RUN — no matching runner enrolled as of inventory query / ${{ matrix.lane }}
+    name: Candidate native execution / ${{ matrix.lane }}
     needs: inventory-declaration
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -109,12 +109,11 @@ jobs:
             fi
           } > "$out/identity.txt"
           {
-            printf '%s\n' '### NOT RUN — no matching runner enrolled as of inventory query'
+            printf '### Candidate native execution: %s\n' "$LANE"
             printf '%s\n' '' \
-              'Inventory snapshot: {"total_count":0,"runners":[]} at 2026-08-06T01:56:53Z.' \
+              'Historical inventory snapshot: {"total_count":0,"runners":[]} at 2026-08-06T01:56:53Z.' \
               '' \
-              "Required lane: $LANE." \
-              'This job can run only after its cumulative enrollment labels are installed.' \
+              'This job acquired a runner matching the cumulative enrollment labels.' \
               'A native-pass claim requires this job and every evidence step to succeed.'
           } >> "$GITHUB_STEP_SUMMARY"
           test "$checked_out" = "$GITHUB_SHA"
@@ -191,7 +190,7 @@ jobs:
           cp target/release/moor "$out/moor"
           cp target/release/atch "$out/atch"
           (
-            cd "$out"
+            cd "$out" || exit 1
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum moor atch
             else
@@ -225,7 +224,7 @@ jobs:
           retention-days: 14
 
   required-windows:
-    name: NOT RUN — no matching runner enrolled as of inventory query / ${{ matrix.lane }}
+    name: Candidate native execution / ${{ matrix.lane }}
     needs: inventory-declaration
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -275,12 +274,16 @@ jobs:
           $checkedOut = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $platform = Get-CimInstance Win32_OperatingSystem
+          $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()
+          $processArch = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToUpperInvariant()
           @(
             "expected_commit=$env:GITHUB_SHA"
             "checked_out_commit=$checkedOut"
             "runner=$env:RUNNER_NAME"
             "runner_os=$env:RUNNER_OS"
             "runner_arch=$env:RUNNER_ARCH"
+            "os_arch=$osArch"
+            "process_arch=$processArch"
             "required_lane=$env:LANE"
             "required_probe=$env:PROBE"
             "caption=$($platform.Caption)"
@@ -290,17 +293,18 @@ jobs:
             "platform=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
           ) | Set-Content -Encoding utf8NoBOM "$out/identity.txt"
           @(
-            '### NOT RUN — no matching runner enrolled as of inventory query'
+            "### Candidate native execution: ``$env:LANE``"
             ''
-            'Inventory snapshot: `{"total_count":0,"runners":[]}` at `2026-08-06T01:56:53Z`.'
+            'Historical inventory snapshot: `{"total_count":0,"runners":[]}` at `2026-08-06T01:56:53Z`.'
             ''
-            "Required lane: ``$env:LANE``."
-            'This job can run only after its cumulative enrollment labels are installed.'
+            'This job acquired a runner matching the cumulative enrollment labels.'
             'A native-pass claim requires this job and every evidence step to succeed.'
           ) | Add-Content -Encoding utf8NoBOM $env:GITHUB_STEP_SUMMARY
           if ($checkedOut -ne $env:GITHUB_SHA) { throw 'checked-out commit does not match GITHUB_SHA' }
           if ($env:RUNNER_OS -ne 'Windows') { throw 'runner is not native Windows' }
           if ($env:RUNNER_ARCH -ne $env:EXPECTED_ARCH) { throw 'runner architecture does not match the lane' }
+          if ($osArch -ne $env:EXPECTED_ARCH) { throw 'Windows OS architecture does not match the lane' }
+          if ($processArch -ne $env:EXPECTED_ARCH) { throw 'runner process architecture does not match the lane' }
           switch ($env:PROBE) {
             'windows-10-1809' {
               if ($platform.ProductType -ne 1 -or $platform.BuildNumber -ne '17763') {
