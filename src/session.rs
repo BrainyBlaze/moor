@@ -80,12 +80,6 @@ impl LeaseResult {
             token,
         }
     }
-    fn refused(reason: ResultReason, role: LeaseRole, epoch: u32) -> Self {
-        Self {
-            reason,
-            ..Self::success(ResultOutcome::Refused, role, epoch, [0; 16])
-        }
-    }
 }
 
 schema!(struct pub OwnedInput derive [Clone, Debug, Eq, PartialEq] pub fields; epoch: u32, request_id: u64,
@@ -186,17 +180,18 @@ schema!(enum ordinal pub SourceStatus; Connected, Exact, Degraded, Disconnected)
 schema!(enum ordinal pub SourceReason; None, HeartbeatTimeout, TransportClosed, Superseded, SessionEnding);
 schema!(struct pub SourceEffect derive [Clone, Debug, Eq, PartialEq] pub fields; source: Arc<[u8]>, producer: [u8; 16], source_epoch: u32,
     status: SourceStatus, reason: SourceReason);
-impl SourceEffect {
+schema!(struct Binding derive [Clone, Copy, Eq, PartialEq] fields; conn: ConnId, epoch: u32, producer: [u8; 16]);
+impl Binding {
     fn change(
-        source: Arc<[u8]>,
-        binding: Binding,
+        self,
+        source: &Arc<[u8]>,
         status: SourceStatus,
         reason: SourceReason,
     ) -> SemanticChange {
-        SemanticChange::Source(Self {
-            source,
-            producer: binding.producer,
-            source_epoch: binding.epoch,
+        SemanticChange::Source(SourceEffect {
+            source: Arc::clone(source),
+            producer: self.producer,
+            source_epoch: self.epoch,
             status,
             reason,
         })
@@ -204,7 +199,6 @@ impl SourceEffect {
 }
 schema!(enum pub SemanticChange [Clone, Debug, Eq, PartialEq]; Source(SourceEffect), Missing(SemanticEffect));
 
-schema!(struct Binding derive [Clone, Copy, Eq, PartialEq] fields; conn: ConnId, epoch: u32, producer: [u8; 16]);
 schema!(struct Retained fields; id: [u8; 16], sequence: u64, kind: SemanticEventKind, digest: [u8; 32], position: EventPosition);
 schema!(struct default Source fields; binding: Binding = Binding { conn: 0, epoch: 0, producer: [0; 16] },
     mode: SemanticMode = SemanticMode::Edge, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected,
@@ -261,7 +255,7 @@ impl Source {
         return_if!(self.status == status, None);
         self.status = status;
         self.stateful()
-            .then(|| SourceEffect::change(Arc::clone(name), self.binding, status, reason))
+            .then(|| self.binding.change(name, status, reason))
     }
 
     fn admit(
@@ -404,10 +398,6 @@ schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8
     next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(),
     termination: Option<Termination> = None, effects: Effects = Effects::new());
 
-fn input_refusal(reason: ResultReason) -> u16 {
-    [6, 6, 6, 6, 6, 15, 13, 6, 6][reason as usize]
-}
-
 impl Machine {
     fn send(&mut self, conn: ConnId, reply: Reply) {
         self.effects.push(Effect::Send(conn, reply));
@@ -420,6 +410,11 @@ impl Machine {
         error: SemanticRefusal,
     ) {
         self.send(conn, Reply::SemanticRefused(event, error));
+    }
+
+    fn semantic_storage_failed(&mut self, conn: ConnId) {
+        self.refuse_semantic(conn, None, SemanticRefusal::ResourceExhausted);
+        self.set_writable(false);
     }
 
     pub fn new(generation: u32, incarnation: [u8; 16], semantic_token: [u8; 16]) -> Self {
@@ -469,12 +464,11 @@ impl Machine {
             .is_some_and(|phase| legal_in_phase(phase, kind))
     }
 
-    fn owner(&self) -> Option<(ConnId, u32)> {
-        self.lease.owner.map(|owner| (owner, self.lease.epoch))
-    }
-
     fn lease_refusal(&self, role: LeaseRole, reason: ResultReason) -> LeaseResult {
-        LeaseResult::refused(reason, role, self.allocated)
+        LeaseResult {
+            reason,
+            ..LeaseResult::success(ResultOutcome::Refused, role, self.allocated, [0; 16])
+        }
     }
 
     fn expire_lease(&mut self, now: u64) {
@@ -547,6 +541,7 @@ impl Machine {
         if self.lease.owner == Some(conn) && self.lease.epoch == epoch && self.lease.token == token
         {
             self.lease = Lease::default();
+            self.queries_gone(conn);
             LeaseResult::success(ResultOutcome::Released, role, epoch, [0; 16])
         } else {
             self.lease_refusal(role, ResultReason::NotHeld)
@@ -579,11 +574,9 @@ impl Machine {
 
     pub fn query_owner(&self) -> Option<(ConnId, u32)> {
         return_if!(self.query_next == 0 && !self.query_exhaustion_pending, None);
-        self.owner().filter(|(conn, _)| {
-            self.peers
-                .get(conn)
-                .is_some_and(|peer| matches!(peer, Peer::Controller(true, false)))
-        })
+        let owner = self.lease.owner?;
+        matches!(self.peers.get(&owner), Some(Peer::Controller(true, false)))
+            .then_some((owner, self.lease.epoch))
     }
 
     fn update_sources(&mut self, trigger: SourceTrigger, now: Option<u64>) {
@@ -697,10 +690,8 @@ impl Machine {
         }
         let state = self.termination.as_mut().unwrap();
         if let Some((peer, _)) = peer.zip(state.peer).filter(|(left, right)| left != right) {
-            self.send(
-                peer,
-                Reply::Termination(4, 0, 0, b"termination is already in progress"),
-            );
+            let reply = Reply::Termination(4, 0, 0, b"termination is already in progress");
+            self.send(peer, reply);
             return;
         }
         state.peer = state.peer.or(peer);
@@ -764,7 +755,8 @@ impl Machine {
     }
 
     fn reject_input(&mut self, conn: ConnId, input: &OwnedInput, reason: ResultReason) {
-        let receipt = self.receipt(input, 0, Some(input_refusal(reason)));
+        let code = [6, 6, 6, 6, 6, 15, 13, 6, 6][reason as usize];
+        let receipt = self.receipt(input, 0, Some(code));
         self.send(conn, Reply::Input(receipt.into()));
     }
 
@@ -818,10 +810,10 @@ impl Machine {
     }
 
     fn persist_sources(&mut self, changes: Vec<SemanticChange>) {
-        if !changes.is_empty()
-            && self
-                .commit_sources(Pending::Sources, changes, true)
-                .is_err()
+        return_if!(changes.is_empty());
+        if self
+            .commit_sources(Pending::Sources, changes, true)
+            .is_err()
         {
             self.set_writable(false);
         }
@@ -846,21 +838,19 @@ impl Machine {
             }
             return self.reject_input(conn, &input, ResultReason::BadSequence);
         }
-        let high = lease
+        if let Some(receipt) = lease
             .cached
             .as_ref()
-            .map_or(0, |(prior, _)| prior.request_id);
-        if input.request_id == high
-            && high != 0
-            && let Some(receipt) = lease
-                .cached
-                .as_ref()
-                .filter(|(prior, _)| prior == &input)
-                .map(|(_, receipt)| *receipt)
+            .filter(|(prior, _)| prior.request_id != 0 && prior == &input)
+            .map(|(_, receipt)| *receipt)
         {
             lease.deadline = now.saturating_add(10_000);
             return self.send(conn, Reply::Input(receipt.into()));
         }
+        let high = lease
+            .cached
+            .as_ref()
+            .map_or(0, |(prior, _)| prior.request_id);
         let Some(next) = high.checked_add(1) else {
             return self.reject_input(conn, &input, ResultReason::Exhausted);
         };
@@ -898,13 +888,11 @@ impl Machine {
             return self.refuse_input(conn, input, 17);
         };
         let (source, binding) = (source.clone(), state.binding);
-        let code = self
-            .applications
-            .contains_key(&receipt.application_id)
-            .then_some(18)
-            .or((self.applications.len() >= 512).then_some(13));
-        if let Some(code) = code {
-            return self.refuse_input(conn, input, code);
+        if self.applications.contains_key(&receipt.application_id) {
+            return self.refuse_input(conn, input, 18);
+        }
+        if self.applications.len() >= 512 {
+            return self.refuse_input(conn, input, 13);
         }
         let notice = InputNotice {
             receipt,
@@ -987,34 +975,28 @@ impl Machine {
             self.refuse_semantic(conn, None, SemanticRefusal::ResourceExhausted);
             return self.effects.push(Effect::Close(conn));
         }
-        let snapshot_required = pending.source.stateful();
-        let epoch = pending.source.binding.epoch;
+        let ack = SemanticHelloAck {
+            epoch: pending.source.binding.epoch,
+            snapshot_required: pending.source.stateful(),
+        };
         pending.source.last_seen = now;
         self.sources.insert(pending.name.clone(), pending.source);
-        if let Some(old) = pending.superseded {
-            // Only the ids this committed batch actually carried may be marked
-            // reported. A write that completed while the batch was in flight was
-            // never part of it, so suppressing it here would drop its
-            // source-lost record permanently (§10.3.4).
-            for id in &pending.missing {
-                if let Some(application) = self.applications.get_mut(id) {
-                    application.emitted |= 2;
-                }
-            }
-            if old != conn {
-                self.peers.remove(&old);
-                self.cancel_notice(17, |application| application.binding.conn == old);
-                self.effects.push(Effect::Replaced(old));
+        // Only the ids this committed batch actually carried may be marked
+        // reported. A write that completed while the batch was in flight was
+        // never part of it, so suppressing it here would drop its source-lost
+        // record permanently (§10.3.4).
+        for id in &pending.missing {
+            if let Some(application) = self.applications.get_mut(id) {
+                application.emitted |= 2;
             }
         }
+        if let Some(old) = pending.superseded.filter(|old| *old != conn) {
+            self.peers.remove(&old);
+            self.cancel_notice(17, |application| application.binding.conn == old);
+            self.effects.push(Effect::Replaced(old));
+        }
         self.peers.insert(conn, Peer::Semantic(pending.name));
-        self.send(
-            conn,
-            Reply::SemanticHello(SemanticHelloAck {
-                epoch,
-                snapshot_required,
-            }),
-        );
+        self.send(conn, Reply::SemanticHello(ack));
     }
 
     fn fallback(&mut self, fallback: Option<Vec<u8>>) {
@@ -1023,10 +1005,9 @@ impl Machine {
     }
 
     fn queries_gone(&mut self, conn: ConnId) {
-        if self.queries.front().is_some_and(|query| query.conn == conn) {
-            for query in std::mem::take(&mut self.queries) {
-                self.fallback(query.fallback);
-            }
+        return_if!(self.queries.front().is_none_or(|query| query.conn != conn));
+        for query in std::mem::take(&mut self.queries) {
+            self.fallback(query.fallback);
         }
     }
 
@@ -1039,10 +1020,8 @@ impl Machine {
         if overloaded || correlation == 0 {
             if !overloaded {
                 self.query_exhaustion_pending = false;
-                self.send(
-                    owner,
-                    Reply::ControllerError(13, b"query correlation exhausted"),
-                );
+                let error = Reply::ControllerError(13, b"query correlation exhausted");
+                self.send(owner, error);
             }
             self.effects.push(Effect::Close(owner));
             self.queries_gone(owner);
@@ -1083,14 +1062,10 @@ impl Machine {
                 || query.shape.class != reply.2
                 || !validate_query_reply(&query.shape, reply.3)
         );
-        if now >= query.deadline {
-            let query = self.queries.remove(index).unwrap();
-            return self.fallback(query.fallback);
-        }
-        return_if!(!self.touch_lease(conn, query.epoch, None, now));
-        self.queries.remove(index);
-        self.effects
-            .push(Effect::Write(Ticket(0), reply.3.to_vec()));
+        let expired = now >= query.deadline;
+        return_if!(!expired && !self.touch_lease(conn, query.epoch, None, now));
+        let fallback = self.queries.remove(index).unwrap().fallback;
+        self.fallback((!expired).then(|| reply.3.to_vec()).or(fallback));
     }
 
     fn semantic_hello(&mut self, conn: ConnId, now: u64, hello: SemanticHello) -> SemResult {
@@ -1115,19 +1090,16 @@ impl Machine {
             pending_sources += usize::from(!self.sources.contains_key(pending.name.as_ref()));
         }
         let prior = self.sources.get(hello.source.as_ref());
-        let epoch = if let Some(source) = prior {
-            reject! {
-                source.mode != hello.mode => SourceConflict,
-                source.pending != 0 => ResourceExhausted,
-            }
-            source
+        let epoch = match prior {
+            Some(source) if source.mode != hello.mode => return Err(SourceConflict),
+            Some(source) if source.pending != 0 => return Err(ResourceExhausted),
+            Some(source) => source
                 .binding
                 .epoch
                 .checked_add(1)
-                .ok_or(ResourceExhausted)?
-        } else {
-            reject! { self.sources.len() + pending_sources >= 64 => ResourceExhausted }
-            1
+                .ok_or(ResourceExhausted)?,
+            None if self.sources.len() + pending_sources >= 64 => return Err(ResourceExhausted),
+            None => 1,
         };
         let binding = Binding {
             conn,
@@ -1139,9 +1111,8 @@ impl Machine {
             .map(|source| source.binding.conn);
         let mut changes = Vec::with_capacity(2);
         if let Some(source) = prior.filter(|source| source.stateful() && source.active()) {
-            changes.push(SourceEffect::change(
-                Arc::clone(&hello.source),
-                source.binding,
+            changes.push(source.binding.change(
+                &hello.source,
                 SourceStatus::Disconnected,
                 SourceReason::Superseded,
             ));
@@ -1154,9 +1125,8 @@ impl Machine {
             }
         }
         if hello.mode == SemanticMode::Stateful {
-            changes.push(SourceEffect::change(
-                Arc::clone(&hello.source),
-                binding,
+            changes.push(binding.change(
+                &hello.source,
                 SourceStatus::Connected,
                 SourceReason::None,
             ));
@@ -1176,16 +1146,16 @@ impl Machine {
             .insert(conn, Peer::Semantic(pending.name.clone()));
         if changes.is_empty() {
             self.finish_hello(pending, now, true);
-        } else {
-            if let Some(source) = self.sources.get_mut(&pending.name) {
-                source.pending = COMMIT_PENDING;
-            }
-            if let Err(Pending::Hello(pending)) =
-                self.commit_sources(Pending::Hello(Box::new(pending)), changes, false)
-            {
-                self.finish_hello(*pending, now, false);
-                self.set_writable(false);
-            }
+            return Ok(());
+        }
+        if let Some(source) = self.sources.get_mut(&pending.name) {
+            source.pending = COMMIT_PENDING;
+        }
+        if let Err(Pending::Hello(pending)) =
+            self.commit_sources(Pending::Hello(Box::new(pending)), changes, false)
+        {
+            self.finish_hello(*pending, now, false);
+            self.set_writable(false);
         }
         Ok(())
     }
@@ -1281,8 +1251,7 @@ impl Machine {
                 if success {
                     self.send(conn, Reply::SemanticAck(ack));
                 } else {
-                    self.refuse_semantic(conn, None, SemanticRefusal::ResourceExhausted);
-                    self.set_writable(false);
+                    self.semantic_storage_failed(conn);
                 }
             }
             (Pending::Sources, Completion::Sources(success)) => {
@@ -1318,12 +1287,7 @@ impl Machine {
                         .commit_sources(Pending::Ack(name.clone(), ack), vec![change], false)
                         .is_err()
                     {
-                        self.refuse_semantic(
-                            binding.conn,
-                            None,
-                            SemanticRefusal::ResourceExhausted,
-                        );
-                        self.set_writable(false);
+                        self.semantic_storage_failed(binding.conn);
                     }
                 } else {
                     self.send(binding.conn, Reply::SemanticAck(ack));
@@ -1345,9 +1309,7 @@ impl Machine {
             Request::Attach(columns, rows, lease, non_vt, token) => {
                 return_if!(!self.geometry(conn, columns, rows), Ok(()));
                 let phase = self.phase(conn).ok_or(WireError::Malformed)?;
-                let resumed = phase == Phase::Resumed
-                    && !lease
-                    && self.owner().is_some_and(|owner| owner.0 == conn);
+                let resumed = phase == Phase::Resumed && !lease && self.lease.owner == Some(conn);
                 require_policy(resumed || phase == Phase::Unattached && (columns == 0 || lease))?;
                 let result = lease.then(|| {
                     self.request_lease(conn, &LeaseRequest::fresh(LeaseRole::Viewer), now, token)
@@ -1378,9 +1340,6 @@ impl Machine {
             Request::Release(epoch, token) => {
                 self.expire_lease(now);
                 let result = self.release_lease(conn, epoch, token);
-                if result.outcome == ResultOutcome::Released {
-                    self.queries_gone(conn);
-                }
                 self.send(conn, Reply::Lease(result));
             }
             Request::Keepalive(epoch, token) => {
@@ -1404,24 +1363,22 @@ impl Machine {
             }
             Request::Input(input, application) => self.input(conn, now, input, application),
             Request::NoticeAck(ack) => self.notice_ack(conn, now, ack),
-            Request::SemanticHello(hello) => {
-                self.semantic_hello(conn, now, hello)
-                    .unwrap_or_else(|error| self.refuse_semantic(conn, None, error));
-            }
+            Request::SemanticHello(hello) => self
+                .semantic_hello(conn, now, hello)
+                .unwrap_or_else(|error| self.refuse_semantic(conn, None, error)),
             Request::SemanticEvent(event, projection) => {
                 self.semantic_event(conn, event, projection)
             }
             Request::SemanticHeartbeat => {
-                let source = match self.peers.get(&conn) {
+                let Some(source) = (match self.peers.get(&conn) {
                     Some(Peer::Semantic(name)) => self.sources.get_mut(name),
                     _ => None,
-                }
-                .filter(|source| source.binding.conn == conn && source.active());
-                if let Some(source) = source {
-                    source.last_seen = now;
-                } else {
+                })
+                .filter(|source| source.binding.conn == conn && source.active()) else {
                     self.refuse_semantic(conn, None, SemanticRefusal::Superseded);
-                }
+                    return Ok(());
+                };
+                source.last_seen = now;
             }
             Request::QueryReply(correlation, epoch, class, bytes) => {
                 self.query_reply(conn, now, (correlation, epoch, class, bytes))
@@ -1437,10 +1394,8 @@ impl Machine {
                 if (identity, generation, incarnation)
                     != (&self.identity, self.generation, self.incarnation)
                 {
-                    self.send(
-                        conn,
-                        Reply::Termination(2, 0, 0, b"session identity did not match"),
-                    );
+                    let reply = Reply::Termination(2, 0, 0, b"session identity did not match");
+                    self.send(conn, reply);
                 } else {
                     self.terminate(Some(conn), now, force);
                 }
@@ -1476,26 +1431,24 @@ impl Machine {
     }
 
     fn disconnect(&mut self, conn: ConnId) {
-        match self.peers.remove(&conn) {
-            Some(Peer::Controller(..)) => {
-                self.lease.owner = self.lease.owner.filter(|owner| *owner != conn);
-                self.queries_gone(conn);
-            }
-            Some(Peer::Semantic(name)) => {
-                if self
-                    .sources
-                    .get(&name)
-                    .is_some_and(|source| source.binding.conn == conn)
-                {
-                    self.update_sources(SourceTrigger::Closed(conn), None);
-                    self.cancel_notice(17, |application| application.binding.conn == conn);
-                } else {
-                    self.pending.retain(
-                        |_, pending| !matches!(pending, Pending::Hello(hello) if hello.source.binding.conn == conn),
-                    );
-                }
-            }
-            None => {}
+        let Some(peer) = self.peers.remove(&conn) else {
+            return;
+        };
+        let Peer::Semantic(name) = peer else {
+            self.lease.owner = self.lease.owner.filter(|owner| *owner != conn);
+            return self.queries_gone(conn);
+        };
+        if self
+            .sources
+            .get(&name)
+            .is_some_and(|source| source.binding.conn == conn)
+        {
+            self.update_sources(SourceTrigger::Closed(conn), None);
+            self.cancel_notice(17, |application| application.binding.conn == conn);
+        } else {
+            self.pending.retain(
+                |_, pending| !matches!(pending, Pending::Hello(hello) if hello.source.binding.conn == conn),
+            );
         }
     }
 
@@ -1534,13 +1487,11 @@ impl Machine {
                 }
                 Transition::ReportTermination(conn) => {
                     if let Some(state) = self.termination.as_ref() {
-                        self.send(
-                            conn,
-                            state.reply(
-                                3,
-                                b"termination outcome was not established within 10 seconds",
-                            ),
+                        let reply = state.reply(
+                            3,
+                            b"termination outcome was not established within 10 seconds",
                         );
+                        self.send(conn, reply);
                     }
                 }
                 Transition::Retired(unlinked, survivor) => {
