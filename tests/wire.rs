@@ -307,6 +307,10 @@ fn status_prefix() -> Vec<u8> {
     payload
 }
 
+fn decode_status(payload: &[u8]) -> Result<StatusTail, WireError> {
+    StatusTail::decode_for(payload, b"\x01/tmp/session", 1, [1; 16])
+}
+
 const V1: &str = "
 4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
 21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
@@ -409,7 +413,7 @@ fn status_tail_round_trips_replay_and_health_as_one_shape() {
         },
     };
     payload.extend_from_slice(&tail.encode().unwrap());
-    assert_eq!(StatusTail::decode(&payload).unwrap(), tail);
+    assert_eq!(decode_status(&payload).unwrap(), tail);
     assert_eq!(
         StatusTail::decode_for(&payload, b"\x01/tmp/session", 1, [1; 16]).unwrap(),
         tail
@@ -426,14 +430,14 @@ fn status_tail_round_trips_replay_and_health_as_one_shape() {
     for range in [17..21, 21..37] {
         let mut malformed = payload.clone();
         malformed[range].fill(0);
-        assert_eq!(StatusTail::decode(&malformed), Err(WireError::Malformed));
+        assert_eq!(decode_status(&malformed), Err(WireError::Malformed));
     }
     let mut malformed = payload.clone();
     malformed[37] = 3;
-    assert_eq!(StatusTail::decode(&malformed), Err(WireError::Malformed));
+    assert_eq!(decode_status(&malformed), Err(WireError::Malformed));
     malformed = payload;
     malformed[42] = 0;
-    assert_eq!(StatusTail::decode(&malformed), Err(WireError::Malformed));
+    assert_eq!(decode_status(&malformed), Err(WireError::Malformed));
 }
 
 #[test]
@@ -754,11 +758,7 @@ fn status_and_heartbeat_extensions_round_trip_and_reject_reserved_bits() {
     };
     let bytes = status.encode(true).unwrap();
     assert_eq!(bytes.len(), 29);
-    assert_eq!(StatusExtension::decode(&bytes, true).unwrap(), status);
-    assert_eq!(
-        StatusExtension::decode(&bytes, false),
-        Err(WireError::Malformed)
-    );
+    assert_eq!(status.encode(false), Err(WireError::Malformed));
     let mut zero_epoch = status;
     zero_epoch.log_epoch = 0;
     assert_eq!(zero_epoch.encode(true), Err(WireError::Malformed));
@@ -810,7 +810,7 @@ fn configured_log_keeps_its_frontier_when_the_lane_is_unwritable() {
     };
     let mut payload = status_prefix();
     payload.extend(tail.encode().unwrap());
-    assert_eq!(StatusTail::decode(&payload).unwrap().extension, extension);
+    assert_eq!(decode_status(&payload).unwrap().extension, extension);
 }
 
 #[test]

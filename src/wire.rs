@@ -568,9 +568,6 @@ impl StatusExtension {
     pub fn encode(&self, logging: bool) -> Result<[u8; 29], WireError> {
         Ok(validated(self.valid(logging), *self)?.encode_raw())
     }
-    pub fn decode(bytes: &[u8], logging: bool) -> Result<Self, WireError> {
-        wire_rules!(checked Self::decode_raw(bytes)?; |value: &Self| value.valid(logging))
-    }
 }
 
 schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields;
@@ -601,7 +598,6 @@ impl StatusTail {
         let value = wire_rules!(value Self; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
         validated(value.valid(), value)
     });
-    wire_rules!(pure pub fn decode(payload: &[u8]) -> Result<Self, WireError> = Self::decode_with(payload, None));
     wire_rules!(pure pub fn decode_for(payload: &[u8], identity: &[u8], generation: u32, incarnation: [u8; 16]) -> Result<Self, WireError> = Self::decode_with(payload, Some((identity, generation, incarnation))));
 }
 

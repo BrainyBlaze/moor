@@ -27,13 +27,10 @@ type SharedState = Arc<Mutex<State>>;
 pub struct Duplex<T = Event>(SharedState, pub Receiver<T>, pub Receiver<WriteResult>);
 
 schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(SyncSender<bool>), Abort);
-pub struct ViewerSender(Sender<Command>);
+schema!(tuple pub ViewerSender [Clone]; fields; Sender<Command>);
 schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender)), Attached, Reattaching);
 
 impl ViewerSender {
-    pub fn send(&self, bytes: &[u8]) -> bool {
-        bytes.is_empty() || self.0.send(Command::Input(bytes.to_vec())).is_ok()
-    }
     fn flush(&self, bytes: &mut Vec<u8>) -> bool {
         let input = std::mem::take(bytes);
         input.is_empty() || self.0.send(Command::Input(input)).is_ok()

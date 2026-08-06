@@ -228,7 +228,7 @@ fn resumed_exact_input_waits_for_the_original_write_and_receives_its_result() {
 fn owner_activity_refreshes_deadline() {
     let mut machine = new_machine(token(9));
     let grant = fresh(&mut machine, 0, 1, Some(token(1)));
-    request(&mut machine, 9_000, 1, Request::Touch(grant.epoch));
+    request(&mut machine, 9_000, 1, Request::Resize(grant.epoch, 0, 0));
     transition(&mut machine, Transition::Tick(10_001));
     assert!(machine.status(1).owns_lease);
     assert!(matches!(
@@ -256,7 +256,7 @@ fn expiry_reports_and_clears_the_current_owner_once() {
 }
 
 #[test]
-fn late_keepalive_touch_and_input_cannot_revive_an_expired_lease() {
+fn late_keepalive_resize_and_input_cannot_revive_an_expired_lease() {
     let mut machine = new_machine(token(9));
     let grant = fresh(&mut machine, 0, 1, Some(token(1)));
     let effects = request(
@@ -277,7 +277,11 @@ fn late_keepalive_touch_and_input_cannot_revive_an_expired_lease() {
     let grant = fresh(&mut machine, 0, 1, Some(token(1)));
     assert!(
         machine
-            .transition(Transition::Peer(10_000, 1, Request::Touch(grant.epoch)))
+            .transition(Transition::Peer(
+                10_000,
+                1,
+                Request::Resize(grant.epoch, 0, 0),
+            ))
             .is_err()
     );
 

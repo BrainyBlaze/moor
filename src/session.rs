@@ -365,7 +365,7 @@ schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<Leas
     OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
 schema!(enum pub Completion; Write(u64, Option<u16>), Sources(bool), Semantic(Result<EventPosition, SemanticRefusal>));
 schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>),
-    Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Touch(u32), Resize(u32, u16, u16),
+    Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16),
     Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello),
     SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat,
     QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
@@ -1343,10 +1343,6 @@ impl Machine {
                     self.send(conn, Reply::ControllerError(15, b"lease not held"));
                     self.effects.push(Effect::Close(conn));
                 }
-            }
-            Request::Touch(epoch) => {
-                self.expire_lease(now);
-                require_policy(self.touch_lease(conn, epoch, None, now))?;
             }
             Request::Resize(epoch, columns, rows) => {
                 return_if!(!self.geometry(conn, columns, rows), Ok(()));

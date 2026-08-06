@@ -1,6 +1,4 @@
-use crate::require;
-pub use crate::runtime::private::{instrument_ack, validate_instrument_ack};
-use crate::wire::crc32c;
+use crate::{require, wire::crc32c};
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use zerocopy::byteorder::{LE, U32, U64};
 
