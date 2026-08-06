@@ -1,6 +1,9 @@
 #[doc(hidden)]
 #[macro_export]
 macro_rules! schema {
+    (map fn $name:ident($key:ident: $kind:ty) -> $value:ty; $($pattern:literal => $result:expr),+ $(,)?) => {
+        fn $name($key: $kind) -> Option<$value> { Some(match $key { $($pattern => $result,)+ _ => return None }) }
+    };
     (struct default $vis:vis $name:ident $field_vis:vis fields; $($field:ident: $kind:ty = $value:expr),* $(,)?) => {
         $vis struct $name { $($field_vis $field: $kind),* }
         impl Default for $name {

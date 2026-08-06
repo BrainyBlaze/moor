@@ -33,18 +33,6 @@ const STORE_HEADER: &str =
     "v:2,type:=header,ts:*,session:*,generation:*,epoch:u,next_seq:*,first_retained:*";
 const STORE_LIFECYCLE: &str = "v:1,type:=lifecycle,phase:t,session:*,generation:*,wire_generation:u,incarnation:b16,start_wall_ms:D,start_mono_ms:D,boot_id:b16,path_encoding:=posix-bytes/windows-wtf8,event_path:n,instrument_path:n";
 const STORE_LIFECYCLE_END: &str = "|end_wall_ms:D,output_end:D,ended:=exited,code:u|end_wall_ms:D,output_end:D,ended:=signalled,signal:p|end_wall_ms:D,output_end:D,ended:=terminated,code:u,method:=graceful/forced";
-const STORE_EVENTS: &str = concat!(
-    "ready:type:=ready,ts:*,epoch:u,seq:*,kind:=transition/snapshot\n",
-    "state:type:=state,ts:*,epoch:u,seq:*,kind:=transition/snapshot,state:=idle/busy,title:t255,truncated:?\n",
-    "link:type:=link,ts:*,epoch:u,seq:*,kind:=transition/snapshot,uri:t2048,truncated:?\n",
-    "semantic-source:type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=connected,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=exact,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=degraded,reason:=heartbeat-timeout|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=disconnected,reason:=transport-closed/superseded/session-ending\n",
-    "semantic-assertion:type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=transition/snapshot,payload:j|type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=snapshot,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=snapshot,payload:j\n",
-    "application-receipt:type:=application-receipt,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,application_request_id:b16,lease_epoch:p,request_id:d,status:=accepted/refused,provider_session:b4096,provider_turn:b4096\n",
-    "application-receipt-missing:type:=application-receipt-missing,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,application_request_id:b16,lease_epoch:p,request_id:d,reason:=deadline/source-lost/retention-expired\n",
-    "stream-exhausted:type:=stream-exhausted,ts:*,epoch:u,seq:*,kind:=transition,axis:=seq/epoch/commit\n",
-    "exit:type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=exited,code:u|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=signalled,signal:p|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=terminated,code:u,method:=graceful/forced\n",
-    "observer-degraded:type:=observer-degraded,ts:*,epoch:u,seq:*,kind:=transition,scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
-);
 
 pub fn event(name: &'static str, ts: u64, fields: &[(&str, Json<'_>)]) -> Event {
     let mut tail = String::with_capacity(fields.len().saturating_mul(32));
@@ -159,12 +147,18 @@ pub fn semantic_changes(ts: u64, changes: Vec<SemanticChange>) -> Result<Vec<Eve
         .collect()
 }
 
-fn event_schema(name: &str) -> Option<&'static str> {
-    STORE_EVENTS.lines().find_map(|row| {
-        let (candidate, schema) = row.split_once(':')?;
-        (candidate == name).then_some(schema)
-    })
-}
+schema!(map fn event_schema(name: &str) -> &'static str;
+    "ready" => "type:=ready,ts:*,epoch:u,seq:*,kind:=transition/snapshot",
+    "state" => "type:=state,ts:*,epoch:u,seq:*,kind:=transition/snapshot,state:=idle/busy,title:t255,truncated:?",
+    "link" => "type:=link,ts:*,epoch:u,seq:*,kind:=transition/snapshot,uri:t2048,truncated:?",
+    "semantic-source" => "type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=connected,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=exact,reason:=|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=degraded,reason:=heartbeat-timeout|type:=semantic-source,ts:*,epoch:u,seq:*,kind:=transition/snapshot,source:s,producer:b16,source_epoch:p,status:=disconnected,reason:=transport-closed/superseded/session-ending",
+    "semantic-assertion" => "type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=transition/snapshot,payload:j|type:=semantic-assertion,ts:*,epoch:u,seq:*,kind:=snapshot,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,assertion_kind:=snapshot,payload:j",
+    "application-receipt" => "type:=application-receipt,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,application_request_id:b16,lease_epoch:p,request_id:d,status:=accepted/refused,provider_session:b4096,provider_turn:b4096",
+    "application-receipt-missing" => "type:=application-receipt-missing,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,application_request_id:b16,lease_epoch:p,request_id:d,reason:=deadline/source-lost/retention-expired",
+    "stream-exhausted" => "type:=stream-exhausted,ts:*,epoch:u,seq:*,kind:=transition,axis:=seq/epoch/commit",
+    "exit" => "type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=exited,code:u|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=signalled,signal:p|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=terminated,code:u,method:=graceful/forced",
+    "observer-degraded" => "type:=observer-degraded,ts:*,epoch:u,seq:*,kind:=transition,scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
+);
 
 pub(crate) fn valid_stored_event(
     body: &[u8],
