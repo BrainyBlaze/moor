@@ -5,8 +5,9 @@ use crate::events::{self, Event};
 #[allow(unused_imports)]
 use crate::schema;
 use crate::session::{
-    CommitTicket, Completion, ConnId, Effect as PolicyEffect, EventPosition, Machine, Reply,
-    Request as PolicyRequest, SemanticRefusal, Transition, WriteTicket as Ticket,
+    CommitTicket, Completion, ConnId, Effect as PolicyEffect, EventPosition, LeaseOperation,
+    LeaseRole, Machine, Reply, Request as PolicyRequest, SemanticRefusal, Transition,
+    WriteTicket as Ticket,
 };
 use crate::terminal::{Observation, Scan, Scanner};
 use crate::wire::{self, Codec, ControllerRequest, Message, Profile, StatusExtension, StatusTail};
@@ -713,7 +714,13 @@ impl<N: Native> Runtime<N> {
                 Descriptor::Attach(columns, rows, lease, non_vt, token),
             ),
             ControllerRequest::Policy(request) => {
-                if let Some(peer) = self.peers.get_mut(&id) {
+                let resumed_viewer = matches!(
+                    &request,
+                    PolicyRequest::Lease(lease, _)
+                        if lease.operation == LeaseOperation::Resume
+                            && lease.role == LeaseRole::Viewer
+                );
+                if !resumed_viewer && let Some(peer) = self.peers.get_mut(&id) {
                     peer.deadline = 0;
                 }
                 self.transition(Transition::Peer(time, id, request))?
