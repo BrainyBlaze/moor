@@ -957,16 +957,34 @@ fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
         |_| Err("reconnect unavailable".into()),
         |sender| {
             let await_observed = await_observed.take().unwrap();
-            let sender = Arc::new(sender);
-            let release = Arc::clone(&sender);
+            let release = sender.clone();
             let queued = queued.clone();
             workers = Some((
                 std::thread::spawn(move || release.release()),
                 std::thread::spawn(move || {
-                    await_observed.recv().unwrap();
-                    let sent = sender.send(b"late");
-                    queued.send(()).unwrap();
-                    sent
+                    let mut first = true;
+                    io::run_viewer_input(
+                        Cursor::new(b"late".to_vec()),
+                        sender,
+                        io::InputConfig {
+                            detach: None,
+                            pass_suspend: true,
+                            last_size: None,
+                        },
+                        move || {
+                            if first {
+                                await_observed.recv().unwrap();
+                                first = false;
+                                io::InputState::Ready
+                            } else {
+                                queued.send(()).unwrap();
+                                io::InputState::Closed
+                            }
+                        },
+                        || None,
+                        || {},
+                        Instant::now,
+                    );
                 }),
             ));
         },
@@ -974,7 +992,7 @@ fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
     assert_eq!(result, Ok(0));
     let (release, late) = workers.unwrap();
     assert!(release.join().unwrap());
-    assert!(late.join().unwrap());
+    late.join().unwrap();
     server.join().unwrap();
 }
 

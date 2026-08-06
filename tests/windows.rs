@@ -1,7 +1,9 @@
-use moor::runtime::private::{exit_records as shared_exit_records, lifecycle_running};
+use moor::runtime::private::{
+    exit_records as shared_exit_records, instrument_ack, lifecycle_running, validate_instrument_ack,
+};
 use moor::windows::{
     BootstrapRecord, Marker, accept_bootstrap_command, bootstrap_command, cim_boot_identity,
-    instrument_ack, validate_instrument_ack, wtf8_decode, wtf8_encode,
+    wtf8_decode, wtf8_encode,
 };
 
 fn exit_records(
