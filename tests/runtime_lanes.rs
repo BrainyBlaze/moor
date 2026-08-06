@@ -575,13 +575,21 @@ fn an_on_time_completion_claims_publication_before_deadline_expiry() {
     let (mut lane, path) = staged_lane("publication-deadline");
     let (announce, entered) = mpsc::channel();
     let (release, gate) = mpsc::channel();
-    lane.delay_publication(announce, gate);
+    lane.block_publication(announce, gate);
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
     lane.submit(
         Purpose::Test(1),
         Work::Staged(b"kept".to_vec(), 2, 0, 4, None, false),
     )
     .unwrap();
-    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    let claim_deadline = Instant::now() + Duration::from_secs(2);
+    while !lane.publication_claimed() && Instant::now() < claim_deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        lane.publication_claimed(),
+        "the on-time worker did not claim publication"
+    );
     std::thread::sleep(Duration::from_millis(2_010));
     assert!(
         lane.try_complete(Instant::now()).is_none(),

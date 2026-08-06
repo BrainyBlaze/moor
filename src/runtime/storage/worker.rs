@@ -25,8 +25,6 @@ const PUBLISHING: u8 = 16;
 struct State {
     bits: AtomicU8,
     published: Mutex<Published>,
-    #[cfg(test)]
-    publication_gate: Mutex<Option<TestGate>>,
 }
 
 impl State {
@@ -174,8 +172,6 @@ impl Lane {
                 frontier: Some(*store.selected()),
                 completed: VecDeque::new(),
             }),
-            #[cfg(test)]
-            publication_gate: Mutex::new(None),
         });
         let worker_state = Arc::clone(&state);
         std::thread::spawn(move || {
@@ -199,10 +195,6 @@ impl Lane {
                 };
                 let completed = Instant::now();
                 let publishing = completed < deadline && worker_state.publish();
-                #[cfg(test)]
-                if publishing {
-                    worker_state.pause_publication();
-                }
                 let result_failed = result.is_err();
                 let mut published = worker_state.published.lock().expect("published lock");
                 match (&mut published.frontier, selected) {

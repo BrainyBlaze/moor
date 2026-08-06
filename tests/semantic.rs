@@ -1,9 +1,9 @@
 use moor::session::{
     ApplicationInput, ApplicationReceipt, CommitTicket, Completion, Effect, Effects, EventPosition,
     InputNotice, InputNoticeAck, LeaseRequest, LeaseRole, Machine, MissingReason, OwnedInput,
-    ReceiptProjection, Reply, Request, SemanticAck, SemanticAckStatus, SemanticChange,
-    SemanticEvent, SemanticEventKind, SemanticHello, SemanticHelloAck, SemanticMode,
-    SemanticRefusal, SourceEffect, SourceReason, SourceStatus, Ticket, Transition,
+    ReceiptProjection, Reply, Request, ResultOutcome, SemanticAck, SemanticAckStatus,
+    SemanticChange, SemanticEvent, SemanticEventKind, SemanticHello, SemanticHelloAck,
+    SemanticMode, SemanticRefusal, SourceEffect, SourceReason, SourceStatus, Ticket, Transition,
     next_semantic_sequence,
 };
 use moor::wire::InputReceipt;
@@ -54,8 +54,9 @@ struct SemanticMachine {
 
 impl SemanticMachine {
     fn new(token: [u8; 16], generation: u32) -> Self {
-        let mut inner = Machine::new(generation, id(6), token).allocated(2);
+        let mut inner = Machine::new(generation, id(6), token);
         inner.register_controller(CONTROLLER);
+        allocate_and_release(&mut inner, CONTROLLER, 2);
         inner
             .transition(Transition::Peer(
                 0,
@@ -415,6 +416,36 @@ impl SemanticMachine {
                 _ => None,
             })
             .collect()
+    }
+}
+
+fn allocate_and_release(machine: &mut Machine, conn: u64, count: u32) {
+    for epoch in 1..=count {
+        let token = id(8 + epoch as u8);
+        let grant = machine
+            .transition(Transition::Peer(
+                u64::from(epoch) * 2,
+                conn,
+                Request::Lease(LeaseRequest::fresh(LeaseRole::InputOnly), Some(token)),
+            ))
+            .unwrap()
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                _ => None,
+            })
+            .expect("lease grant");
+        assert_eq!(
+            (grant.outcome, grant.epoch),
+            (ResultOutcome::Granted, epoch)
+        );
+        machine
+            .transition(Transition::Peer(
+                u64::from(epoch) * 2 + 1,
+                conn,
+                Request::Release(epoch, token),
+            ))
+            .unwrap();
     }
 }
 

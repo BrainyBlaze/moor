@@ -206,20 +206,6 @@ impl Work {
     }
 }
 
-impl State {
-    fn pause_publication(&self) {
-        let gate = self
-            .publication_gate
-            .lock()
-            .expect("publication gate")
-            .take();
-        if let Some((entered, release)) = gate {
-            let _ = entered.send(());
-            let _ = release.recv();
-        }
-    }
-}
-
 impl Lane {
     #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<Commit> {
@@ -241,11 +227,7 @@ impl Lane {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn delay_publication(&self, entered: Sender<()>, release: Receiver<()>) {
-        *self
-            .state
-            .publication_gate
-            .lock()
-            .expect("publication gate") = Some((entered, release));
+    pub(crate) fn publication_claimed(&self) -> bool {
+        self.state.bits.load(Ordering::Acquire) & PUBLISHING != 0
     }
 }

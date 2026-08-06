@@ -222,21 +222,13 @@ fn frame_header(
     Ok((bytes.len() >= 24 + header.length as usize).then_some(header))
 }
 
-schema!(struct pub Codec fields; profile: Profile, buffer: BytesMut, next_in: u32, next_out: u32, run: Option<Message>, deadline: Option<u64>);
+schema!(struct default pub Codec fields; profile: Profile = Profile::Controller, buffer: BytesMut = BytesMut::new(), next_in: u32 = 1, next_out: u32 = 1, run: Option<Message> = None, deadline: Option<u64> = None);
 
 impl Codec {
     pub fn new(profile: Profile) -> Self {
-        Self::with_sequences(profile, 1, 1)
-    }
-
-    pub fn with_sequences(profile: Profile, next_in: u32, next_out: u32) -> Self {
         Self {
             profile,
-            buffer: BytesMut::new(),
-            next_in,
-            next_out,
-            run: None,
-            deadline: None,
+            ..Self::default()
         }
     }
 
@@ -647,3 +639,5 @@ wire_rules!(pure fn numbers(bytes: &[u8], count: std::ops::RangeInclusive<usize>
 
 wire_rules!(pure pub fn recognize_query(bytes: &[u8]) -> Option<QueryShape> = { let (csi8, tail) = csi(bytes)?; let (class, mode) = match tail { b"c" | b"0c" => (1, None), b">c" | b">0c" => (2, None), b">0q" => (3, None), b"6n" => (5, None), _ if tail.starts_with(b"?") && tail.ends_with(b"$p") => (4, Some(decimal(&tail[1..tail.len() - 2], u32::MAX as u64, true)? as u32)), _ => return None }; Some(wire_rules!(value QueryShape; class = class; csi8 = csi8; mode = mode)) });
 wire_rules!(pure pub fn validate_query_reply(query: &QueryShape, bytes: &[u8]) -> bool = match query.class { 1 => csi_body(bytes, b"?", b"c").is_some_and(|body| numbers(body, 1..=16, u16::MAX as u64, false)), 2 => csi_body(bytes, b">", b"c").is_some_and(|body| numbers(body, 3..=3, u32::MAX as u64, false)), 3 => [(b"\x1bP>|".as_slice(), b"\x1b\\".as_slice()), (&[0x90, b'>', b'|'], &[0x9c])].into_iter().find_map(|(head, tail)| bytes.strip_prefix(head)?.strip_suffix(tail)).is_some_and(|text| !text.is_empty() && text.len() <= 128 && text.iter().all(|b| (0x20..=0x7e).contains(b))), 4 => csi_body(bytes, b"?", b"$y").is_some_and(|body| { let Some(split) = body.iter().rposition(|byte| *byte == b';') else { return false }; decimal(&body[..split], u32::MAX as u64, true).map(|mode| mode as u32) == query.mode && matches!(&body[split + 1..], [b'0'..=b'4']) }), 5 => csi_body(bytes, b"", b"R").is_some_and(|body| numbers(body, 2..=2, u16::MAX as u64, true)), _ => false });
+
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/wire.rs"));
