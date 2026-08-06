@@ -382,9 +382,6 @@ impl Lane {
         })
     }
 
-    pub(crate) fn selected(&self) -> Option<Commit> {
-        self.published.lock().expect("published lock").frontier
-    }
     pub(crate) fn hold(&self) -> bool {
         self.state.hold()
     }

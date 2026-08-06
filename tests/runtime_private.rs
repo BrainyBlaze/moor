@@ -362,20 +362,19 @@ fn portable_event_status_advertises_the_selected_commit_frontier() {
     // which is what OB-39 means by "the commit a reader would select".
     storage.observe(moor::terminal::Observation::Ready).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while storage.event_commit().map(|selected| selected.1) == Some(commit.index)
-        && std::time::Instant::now() < deadline
-    {
+    let selected = || Store::read_only(&event, Kind::Event, 1).unwrap().0;
+    while selected().index == commit.index && std::time::Instant::now() < deadline {
         storage.poll();
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let live = storage.event_commit().expect("an enabled event lane");
+    let live = selected();
     assert!(
-        live.1 > commit.index,
+        live.index > commit.index,
         "selected commit must advance past the launch commit: {} vs {}",
-        live.1,
+        live.index,
         commit.index
     );
-    assert_ne!(live.3, commit.hash, "committed body hash must change");
+    assert_ne!(live.hash, commit.hash, "committed body hash must change");
     drop(storage);
     fs::remove_dir_all(root).unwrap();
 }

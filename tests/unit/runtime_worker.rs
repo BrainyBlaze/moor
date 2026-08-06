@@ -220,6 +220,10 @@ impl State {
 }
 
 impl Lane {
+    pub(crate) fn selected(&self) -> Option<Commit> {
+        self.published.lock().expect("published lock").frontier
+    }
+
     #[allow(dead_code)]
     pub(crate) fn block_publication(&self, entered: Sender<()>, release: Receiver<()>) {
         let published = Arc::clone(&self.published);

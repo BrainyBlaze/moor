@@ -241,23 +241,6 @@ impl SessionStorage {
         })
     }
 
-    pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
-        let selected = self.lanes[Self::EVENT_LANE].as_ref()?.selected()?;
-        Some((
-            selected.body,
-            selected.index,
-            selected.length,
-            selected.hash,
-        ))
-    }
-
-    pub fn log_status(&self) -> Option<(u32, u64, u64, u64)> {
-        self.lanes[0].as_ref().and_then(|lane| {
-            let commit = lane.selected()?;
-            Some((commit.epoch, commit.index, commit.start, commit.end))
-        })
-    }
-
     /// Acquire a nonblocking memory-only status linearization point across all
     /// configured lanes. A worker sets its commit phase before the alternate
     /// commit can become selectable and publishes the selected frontier before
