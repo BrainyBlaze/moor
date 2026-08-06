@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod worker;
-use worker::{Lane, Work};
+use worker::{Frontier, Lane, Work};
 
 const TERMINAL_RESERVATION: usize = 14_210;
 
@@ -17,7 +17,20 @@ schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Resul
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);
 schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
     generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
-schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, event_view: Option<Store>, events: Option<Events>);
+schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, events: Option<Events>);
+
+#[derive(Clone, Copy)]
+pub(crate) struct StatusSnapshot {
+    pub(crate) health: u8,
+    pub(crate) event: Option<Commit>,
+    pub(crate) log: Option<Commit>,
+}
+
+pub(crate) enum SnapshotState {
+    Ready(StatusSnapshot),
+    Busy,
+    Failed,
+}
 
 impl Events {
     fn body(&self, cursor: Cursor, history: bool, records: &str) -> String {
@@ -42,10 +55,8 @@ impl SessionStorage {
     ) -> Self {
         let log_cap = log.as_ref().map_or(0, |(_, cap)| *cap);
         let log = log.map(|(store, _)| Lane::new(store, jobs.min(64), bytes.min(1 << 20)));
-        let mut event_view = None;
         let (event_lane, events) = events
             .map(|config| {
-                event_view = config.store.duplicate().ok();
                 let reserved = events::canonical_header(
                     config.created,
                     &config.session,
@@ -77,7 +88,6 @@ impl SessionStorage {
                 Some(Lane::new(lifecycle, jobs.min(1), bytes.min(4 << 20))),
             ],
             log_cap,
-            event_view,
             events,
         }
     }
@@ -231,30 +241,8 @@ impl SessionStorage {
         })
     }
 
-    /// The event lane's currently selected commit, which is what a reader
-    /// would select. §5 of the schema requires the status descriptor to carry
-    /// this rather than uncommitted writer state or a stale launch value.
-    /// The event lane's selected commit. Callers must drain completions first,
-    /// which `Runtime::send_status` does, so this reflects every commit whose
-    /// completion has been observed. A commit issued by a worker that was then
-    /// quarantined can validate afterwards without a completion to observe; that
-    /// residual case needs a handle-bound refresh rather than a re-open by
-    /// pathname, which would reintroduce §11.4's check/use window.
     pub fn event_commit(&self) -> Option<(u8, u64, u64, [u8; 32])> {
-        // Two monotone sources, combined by taking the greater. The worker
-        // publishes after every operation from a recovery read on its own
-        // handles, covering the Ok and reported-error paths; the holder-side view
-        // covers the interval between run() flushing a commit — when an external
-        // reader can already validate it — and the worker publishing it. Neither
-        // can regress, so the descriptor can neither lag a reader nor go
-        // backwards.
-        let published = self.lanes[Self::EVENT_LANE].as_ref()?.selected();
-        let selected = self
-            .event_view
-            .as_ref()
-            .and_then(Store::selected_now)
-            .filter(|commit| commit.index > published.index)
-            .unwrap_or(published);
+        let selected = self.lanes[Self::EVENT_LANE].as_ref()?.selected()?;
         Some((
             selected.body,
             selected.index,
@@ -264,14 +252,82 @@ impl SessionStorage {
     }
 
     pub fn log_status(&self) -> Option<(u32, u64, u64, u64)> {
-        self.lanes[0].as_ref().map(|lane| {
-            let commit = lane.selected();
-            (commit.epoch, commit.index, commit.start, commit.end)
+        self.lanes[0].as_ref().and_then(|lane| {
+            let commit = lane.selected()?;
+            Some((commit.epoch, commit.index, commit.start, commit.end))
         })
+    }
+
+    /// Acquire a nonblocking memory-only status linearization point across all
+    /// configured lanes. A worker sets its commit phase before the alternate
+    /// commit can become selectable and publishes the selected frontier before
+    /// clearing it. Holding every idle lane therefore freezes exact event/log
+    /// metadata without reading or hashing a store on the holder thread.
+    pub(crate) fn try_status_snapshot(&self) -> SnapshotState {
+        let mut held = 0u8;
+        for (at, lane) in self.lanes.iter().enumerate() {
+            let Some(lane) = lane else { continue };
+            if lane.hold() {
+                held |= 1 << at;
+            } else {
+                self.release_held(held);
+                return SnapshotState::Busy;
+            }
+        }
+        let event = self.lanes[Self::EVENT_LANE].as_ref().map(Lane::snapshot);
+        let log = self.lanes[0].as_ref().map(Lane::snapshot);
+        if matches!(event, Some(Frontier::Busy)) || matches!(log, Some(Frontier::Busy)) {
+            self.release_held(held);
+            return SnapshotState::Busy;
+        }
+        if matches!(event, Some(Frontier::Ready(None) | Frontier::Failed))
+            || matches!(log, Some(Frontier::Ready(None) | Frontier::Failed))
+        {
+            self.release_held(held);
+            return SnapshotState::Failed;
+        }
+        let commit = |frontier| match frontier {
+            Some(Frontier::Ready(commit)) => commit,
+            _ => None,
+        };
+        SnapshotState::Ready(StatusSnapshot {
+            health: self.health(),
+            event: commit(event),
+            log: commit(log),
+        })
+    }
+
+    pub(crate) fn release_status_snapshot(&self) {
+        self.release_held(u8::MAX);
+    }
+
+    fn release_held(&self, held: u8) {
+        for (at, lane) in self.lanes.iter().enumerate() {
+            if held & (1 << at) != 0
+                && let Some(lane) = lane
+            {
+                lane.release();
+            }
+        }
     }
 
     pub fn pending(&self) -> usize {
         self.lanes.iter().flatten().map(Lane::pending).sum()
+    }
+
+    pub(crate) fn abandon_clear(&mut self, tag: u64) {
+        let Some(lane) = self.lanes[0].as_mut() else {
+            return;
+        };
+        if lane.pending_matches(|purpose| matches!(purpose, Purpose::Clear(id, _) if id == tag)) {
+            lane.close();
+        }
+    }
+
+    pub(crate) fn quarantine_log(&mut self) {
+        if let Some(lane) = self.lanes[0].as_mut() {
+            lane.close();
+        }
     }
 }
 

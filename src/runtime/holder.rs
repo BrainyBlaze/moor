@@ -1,12 +1,12 @@
 use super::io::{Duplex, Event as IoEvent};
 use super::private::{PreparedArtifacts, exit_records, monotonic, now, random_array};
-use super::storage::{Done, Purpose, SessionStorage, StorageError};
+use super::storage::{Done, Purpose, SessionStorage, SnapshotState, StatusSnapshot, StorageError};
 use crate::events::{self, Event};
 #[allow(unused_imports)]
 use crate::schema;
 use crate::session::{
     CommitTicket, Completion, ConnId, Effect as PolicyEffect, EventPosition, Machine, Reply,
-    SemanticRefusal, Transition, WriteTicket as Ticket,
+    Request as PolicyRequest, SemanticRefusal, Transition, WriteTicket as Ticket,
 };
 use crate::terminal::{Observation, Scan, Scanner};
 use crate::wire::{self, Codec, ControllerRequest, Message, Profile, StatusExtension, StatusTail};
@@ -20,6 +20,7 @@ schema!(struct pub CoreConfig derive [Debug] pub fields; generation: u32, identi
 type DecodeResult = std::result::Result<(), wire::WireError>;
 type ClearResult = (u8, u8, Option<(u32, u64, u64)>);
 type Refusal = (u16, u16, &'static [u8]);
+const DESCRIPTOR_LIMIT: usize = 64;
 const QUERY_REPLIES: [[&[u8]; 2]; 3] = [
     [b"\x1b[?62;4c", b"\x9b?62;4c"],
     [b"\x1b[>1;47;0c", b"\x9b>1;47;0c"],
@@ -34,10 +35,25 @@ impl<N: Native> Runtime<N> {
     }
 
     fn apply(&mut self, effects: impl IntoIterator<Item = PolicyEffect>) {
+        self.apply_with(effects, &mut monotonic);
+    }
+
+    fn apply_with(
+        &mut self,
+        effects: impl IntoIterator<Item = PolicyEffect>,
+        clock: &mut impl FnMut() -> u64,
+    ) {
         for effect in effects {
             match effect {
                 PolicyEffect::Send(id, reply) => self.reply(id, reply),
                 PolicyEffect::Attached(id, non_vt, result, resize) => {
+                    let (snapshot, deadline) = self
+                        .status_snapshot
+                        .expect("attach descriptor snapshot and deadline");
+                    if clock() >= deadline {
+                        self.disconnect(id);
+                        continue;
+                    }
                     let mut state = if non_vt {
                         Vec::new()
                     } else {
@@ -45,13 +61,23 @@ impl<N: Native> Runtime<N> {
                     };
                     let size = (state.len() as u16).to_le_bytes();
                     state.splice(..0, size);
-                    self.send(id, 5, &state);
+                    if clock() >= deadline {
+                        self.disconnect(id);
+                        continue;
+                    }
+                    if !self.send(id, 5, &state) {
+                        continue;
+                    }
                     if let Some((rows, columns)) = resize {
                         self.resize(rows, columns);
                     }
-                    self.send_status(id, true);
-                    if let Some(result) = result {
-                        self.reply(id, Reply::Lease(result));
+                    if self.send_status(id, true, snapshot, deadline, clock) {
+                        if let Some(peer) = self.peers.get_mut(&id) {
+                            peer.deadline = 0;
+                        }
+                        if let Some(result) = result {
+                            self.reply(id, Reply::Lease(result));
+                        }
                     }
                 }
                 PolicyEffect::Resize(rows, columns) => self.resize(rows, columns),
@@ -96,7 +122,7 @@ impl<N: Native> Runtime<N> {
                     }
                 }
                 PolicyEffect::QuerySend(id, query) => {
-                    self.send(id, 0x14, &query.encode().expect("valid delegated query"))
+                    self.send(id, 0x14, &query.encode().expect("valid delegated query"));
                 }
                 PolicyEffect::Output(target, record) => {
                     let payload = wire::join(&[
@@ -163,10 +189,13 @@ impl<N: Native> Runtime<N> {
 
     fn reply(&mut self, id: ConnId, reply: Reply) {
         match wire::encode_reply(reply, self.config.incarnation) {
-            wire::RuntimeReply::Frame(kind, payload) => self.send(id, kind, &payload),
+            wire::RuntimeReply::Frame(kind, payload) => {
+                self.send(id, kind, &payload);
+            }
             wire::RuntimeReply::Scoped(scope, kind, payload) => {
                 if let Some(peer) = self.peers.get_mut(&id) {
                     peer.handshake = 0;
+                    peer.deadline = 0;
                     peer.scope = scope;
                 }
                 self.send(id, kind, &payload);
@@ -180,7 +209,7 @@ impl<N: Native> Runtime<N> {
         let mut released = 0;
         self.recipients
             .extend(self.peers.iter_mut().filter_map(|(id, peer)| {
-                if peer.handshake != 0 && now >= peer.handshake {
+                if peer.deadline != 0 && now >= peer.deadline {
                     Some(*id)
                 } else {
                     peer.codec.as_mut().and_then(|codec| {
@@ -193,7 +222,13 @@ impl<N: Native> Runtime<N> {
             }));
         self.buffered -= released;
         while let Some(id) = self.recipients.pop() {
-            if self.peers.get(&id).is_some_and(|peer| peer.handshake == 0) {
+            if self
+                .peers
+                .get(&id)
+                .is_some_and(|peer| peer.deadline != 0 && now >= peer.deadline)
+            {
+                self.refuse(id, (12, 13, b"identity exchange deadline exceeded"));
+            } else if self.peers.get(&id).is_some_and(|peer| peer.handshake == 0) {
                 self.refuse_wire(id, wire::WireError::ReassemblyTimeout);
             } else {
                 self.refuse(id, (12, 13, b"identity exchange deadline exceeded"));
@@ -245,6 +280,8 @@ impl<N: Native> Runtime<N> {
     }
 
     pub(super) fn disconnect(&mut self, id: ConnId) {
+        self.descriptors.retain(|pending| pending.peer != id);
+        self.storage.abandon_clear(id);
         if let Some(peer) = self.peers.remove(&id) {
             self.buffered -= peer.codec.as_ref().map_or(0, Codec::buffered_len);
             peer.pipe.shutdown();
@@ -265,7 +302,9 @@ pub trait Native {
 
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, writes: Receiver<(u64, Option<u16>)>, storage: SessionStorage,
     status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
-schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshake: u64);
+schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshake: u64, deadline: u64);
+schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
+schema!(struct PendingDescriptor fields; peer: ConnId, deadline: u64, request: Descriptor);
 
 impl Peer {
     fn profile(&self) -> Option<Profile> {
@@ -280,7 +319,7 @@ impl Peer {
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
     writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
     frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
-    heartbeat_at: u64, heartbeat_flags: u8, machine: Machine);
+    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<PendingDescriptor>, status_snapshot: Option<(StatusSnapshot, u64)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
     pub fn output(&mut self, bytes: Vec<u8>) {
@@ -297,12 +336,12 @@ impl<N: Native> Runtime<N> {
     pub fn set_rows(&mut self, rows: u16) {
         self.scanner.set_rows(rows);
     }
-    fn clear_result(&mut self, id: u64, prior: u64, result: ClearResult) {
+    fn clear_result(&mut self, id: u64, prior: u64, result: ClearResult) -> bool {
         let (outcome, reason, commit) = result;
         let (epoch, resulting, end) = commit.unwrap_or_default();
         let payload = wire::log_clear_result_payload(outcome, reason, epoch, prior, resulting, end)
             .expect("valid log-clear result");
-        self.send(id, 0x1a, &payload);
+        self.send(id, 0x1a, &payload)
     }
     pub fn shutdown_requested(&mut self, now: u64, force: bool) {
         let _ = self.transition(Transition::Shutdown(now, force));
@@ -337,6 +376,8 @@ impl<N: Native> Runtime<N> {
             native: config.native,
             heartbeat_at: 0,
             heartbeat_flags: 0,
+            descriptors: VecDeque::new(),
+            status_snapshot: None,
             machine,
         }
     }
@@ -389,6 +430,7 @@ impl<N: Native> Runtime<N> {
                 preface: Vec::new(),
                 scope: 0,
                 handshake: time.saturating_add(2_000),
+                deadline: time.saturating_add(2_000),
             },
         );
     }
@@ -421,6 +463,7 @@ impl<N: Native> Runtime<N> {
             }
         }
         self.drain_storage(None);
+        self.poll_descriptors();
         let _ = self.transition(Transition::Writable(self.storage.health() & 2 != 0));
         self.tick(monotonic());
     }
@@ -568,6 +611,18 @@ impl<N: Native> Runtime<N> {
     }
 
     fn message(&mut self, id: u64, message: &Message) -> DecodeResult {
+        self.message_at(id, message, monotonic())
+    }
+
+    fn message_at(&mut self, id: u64, message: &Message, time: u64) -> DecodeResult {
+        if self
+            .peers
+            .get(&id)
+            .is_some_and(|peer| peer.deadline != 0 && time >= peer.deadline)
+        {
+            self.refuse(id, (12, 13, b"identity exchange deadline exceeded"));
+            return Ok(());
+        }
         let peer = self.peers.get(&id).ok_or(wire::WireError::Malformed)?;
         let first_controller = peer.is(Profile::Controller)
             && self.machine.phase(id).is_none()
@@ -584,15 +639,18 @@ impl<N: Native> Runtime<N> {
         }
         if peer.is(Profile::Semantic) {
             let request = wire::decode_semantic(message.scope, message.kind, &message.payload)?;
-            self.transition(Transition::Peer(monotonic(), id, request))?
+            self.transition(Transition::Peer(time, id, request))?
         } else {
-            self.controller_message(id, &message)?
+            self.controller_message_at(id, message, time)?
         }
         Ok(())
     }
 
-    fn controller_message(&mut self, id: u64, message: &Message) -> DecodeResult {
-        let time = monotonic();
+    fn controller_message_at(&mut self, id: u64, message: &Message, time: u64) -> DecodeResult {
+        wire::require(
+            !self.descriptors.iter().any(|pending| pending.peer == id),
+            wire::WireError::Malformed,
+        )?;
         if message.kind != 1 {
             let _ = self.transition(Transition::Tick(time));
             wire::require(
@@ -635,19 +693,40 @@ impl<N: Native> Runtime<N> {
                 .expect("bounded identity");
                 self.send(id, 2, &payload);
             }
+            ControllerRequest::Policy(PolicyRequest::Attach(
+                columns,
+                rows,
+                lease,
+                non_vt,
+                token,
+            )) => self.queue_descriptor(
+                id,
+                time,
+                Descriptor::Attach(columns, rows, lease, non_vt, token),
+            ),
             ControllerRequest::Policy(request) => {
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.deadline = 0;
+                }
                 self.transition(Transition::Peer(time, id, request))?
             }
-            ControllerRequest::Status => self.send_status(id, false),
+            ControllerRequest::Status => self.queue_descriptor(id, time, Descriptor::Status),
             ControllerRequest::LogClear(incarnation, observed) => {
+                if let Some(peer) = self.peers.get_mut(&id) {
+                    peer.deadline = 0;
+                }
                 if incarnation != self.config.incarnation {
-                    self.clear_result(id, observed, (2, 1, None));
+                    let _ = self.clear_result(id, observed, (2, 1, None));
                     return Ok(());
                 }
                 match self.storage.clear(id, observed, self.machine.output_end()) {
                     Ok(()) => {}
-                    Err(StorageError::Disabled) => self.clear_result(id, observed, (1, 0, None)),
-                    Err(StorageError::Busy) => self.clear_result(id, observed, (2, 2, None)),
+                    Err(StorageError::Disabled) => {
+                        let _ = self.clear_result(id, observed, (1, 0, None));
+                    }
+                    Err(StorageError::Busy) => {
+                        let _ = self.clear_result(id, observed, (2, 2, None));
+                    }
                 }
                 return Ok(());
             }
@@ -655,7 +734,7 @@ impl<N: Native> Runtime<N> {
         Ok(())
     }
 
-    pub(super) fn send(&mut self, id: u64, kind: u8, payload: &[u8]) {
+    pub(super) fn send(&mut self, id: u64, kind: u8, payload: &[u8]) -> bool {
         let failed = self.peers.get_mut(&id).is_none_or(|peer| {
             let mut bytes = Vec::new();
             let output = usize::from(peer.is(Profile::Controller) && kind == 6)
@@ -668,6 +747,7 @@ impl<N: Native> Runtime<N> {
         if failed {
             self.disconnect(id);
         }
+        !failed
     }
 
     fn broadcast(&mut self, kind: u8, payload: &[u8], attached: bool) {
@@ -795,9 +875,12 @@ impl<N: Native> Runtime<N> {
                         Some((commit.epoch, commit.index, commit.end)),
                     ),
                     Err(crate::store::StoreError::Corrupt) => (2, 3, None),
-                    Err(_) => (2, 2, None),
+                    Err(crate::store::StoreError::Exhausted) => (2, 2, None),
+                    Err(crate::store::StoreError::Io(_)) => return self.disconnect(tag),
                 };
-                self.clear_result(tag, prior, result);
+                if !self.clear_result(tag, prior, result) {
+                    self.storage.quarantine_log();
+                }
             }
             Purpose::Semantic(tag, terminal) => {
                 if let Some(ticket) = CommitTicket::from_raw(tag) {
@@ -823,26 +906,119 @@ impl<N: Native> Runtime<N> {
         }
     }
 
-    pub(super) fn send_status(&mut self, id: u64, attach: bool) {
-        // §5/OB-39: the descriptor must name the commit a reader would select,
-        // so any completion already available is applied before it is copied.
-        self.drain_storage(None);
+    fn queue_descriptor(&mut self, peer: ConnId, now: u64, request: Descriptor) {
+        if self.descriptors.len() == DESCRIPTOR_LIMIT {
+            return self.refuse_wire(peer, wire::WireError::ResourceExhausted);
+        }
+        self.descriptors.push_back(PendingDescriptor {
+            peer,
+            deadline: self
+                .peers
+                .get(&peer)
+                .map_or(now.saturating_add(2_000), |peer| {
+                    if peer.deadline == 0 {
+                        now.saturating_add(2_000)
+                    } else {
+                        peer.deadline
+                    }
+                }),
+            request,
+        });
+        self.poll_descriptors();
+    }
+
+    /// STATUS and ATTACH copy event/log metadata at one memory-only
+    /// linearization point. A lane in BODY/COMMIT phase makes the request wait,
+    /// but never makes the holder read, hash, join, or spin on storage I/O.
+    fn poll_descriptors(&mut self) {
+        self.poll_descriptors_with(&mut monotonic);
+    }
+
+    fn poll_descriptors_with(&mut self, clock: &mut impl FnMut() -> u64) {
+        loop {
+            let now = clock();
+            let Some(pending) = self.descriptors.front() else {
+                return;
+            };
+            if !self.peers.contains_key(&pending.peer) {
+                self.descriptors.pop_front();
+                continue;
+            }
+            if now >= pending.deadline {
+                let peer = pending.peer;
+                self.descriptors.pop_front();
+                self.refuse(peer, (12, 13, b"identity exchange deadline exceeded"));
+                continue;
+            }
+            let snapshot = match self.storage.try_status_snapshot() {
+                SnapshotState::Ready(snapshot) => snapshot,
+                SnapshotState::Busy => return,
+                SnapshotState::Failed => {
+                    let peer = pending.peer;
+                    self.descriptors.pop_front();
+                    self.refuse_wire(peer, wire::WireError::ResourceExhausted);
+                    continue;
+                }
+            };
+            let pending = self.descriptors.pop_front().expect("front descriptor");
+            let result = match pending.request {
+                Descriptor::Status => {
+                    self.storage.release_status_snapshot();
+                    if self.send_status(pending.peer, false, snapshot, pending.deadline, clock)
+                        && let Some(peer) = self.peers.get_mut(&pending.peer)
+                    {
+                        peer.deadline = 0;
+                    }
+                    Ok(())
+                }
+                Descriptor::Attach(columns, rows, lease, non_vt, token) => {
+                    // The copied store frontier is the descriptor's storage
+                    // linearization point. Release before policy materializes
+                    // a potentially large replay effect list.
+                    self.storage.release_status_snapshot();
+                    let effects = self.machine.transition(Transition::Peer(
+                        now,
+                        pending.peer,
+                        PolicyRequest::Attach(columns, rows, lease, non_vt, token),
+                    ));
+                    effects.map(|effects| {
+                        self.status_snapshot = Some((snapshot, pending.deadline));
+                        self.apply_with(effects, clock);
+                        self.status_snapshot = None;
+                    })
+                }
+            };
+            if let Err(error) = result {
+                self.refuse_wire(pending.peer, error);
+            }
+        }
+    }
+
+    pub(super) fn send_status(
+        &mut self,
+        id: u64,
+        attach: bool,
+        snapshot: StatusSnapshot,
+        deadline: u64,
+        clock: &mut impl FnMut() -> u64,
+    ) -> bool {
         let policy = self.machine.status(id);
         let mut replay = policy.replay;
         replay.modes_exact = self.scanner.modes().exact();
-        let health = self.storage.health();
-        let (epoch, index, start, end) = self.storage.log_status().unwrap_or_default();
+        let health = snapshot.health;
+        let (epoch, index, start, end) = snapshot
+            .log
+            .map(|commit| (commit.epoch, commit.index, commit.start, commit.end))
+            .unwrap_or_default();
         let mut payload = Vec::with_capacity(self.status.len() + 69);
         payload.extend_from_slice(&self.status);
-        // §5/OB-39: these must name the commit a reader would select, so they
-        // are refreshed per send instead of replaying the launch commit.
-        if let Some((body, index, length, hash)) = self.storage.event_commit()
+        if let Some(commit) = snapshot.event
             && let Some(fields) = payload.get_mut(self.commit_at..self.commit_at + 49)
         {
-            fields[0] = body;
-            fields[1..9].copy_from_slice(&index.to_le_bytes());
-            fields[9..17].copy_from_slice(&length.to_le_bytes());
-            fields[17..49].copy_from_slice(&hash);
+            fields[0] = commit.body;
+            fields[1..9].copy_from_slice(&commit.index.to_le_bytes());
+            fields[9..17].copy_from_slice(&commit.length.to_le_bytes());
+            fields[17..49].copy_from_slice(&commit.hash);
         }
         payload.extend(
             StatusTail {
@@ -868,7 +1044,12 @@ impl<N: Native> Runtime<N> {
             .encode()
             .expect("valid runtime status"),
         );
-        self.send(id, if attach { 4 } else { 14 }, &payload);
+        if clock() >= deadline {
+            self.disconnect(id);
+            false
+        } else {
+            self.send(id, if attach { 4 } else { 14 }, &payload)
+        }
     }
 
     pub fn retired(&mut self, unlinked: bool, survivor: bool) {
@@ -894,5 +1075,348 @@ impl PreparedArtifacts {
             synthetic: platform.0,
             native: platform.1,
         })
+    }
+}
+
+#[cfg(test)]
+mod descriptor_deadline_tests {
+    use super::*;
+    use crate::runtime::io::Duplex;
+    use crate::runtime::private::lifecycle_running;
+    use crate::store::{Commit, Kind, Store, StoreError};
+    use std::io::Cursor;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    struct SlowNative(bool);
+
+    impl Native for SlowNative {
+        fn resize(&mut self, _: u16, _: u16) -> Result<()> {
+            self.0 = true;
+            Ok(())
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>> {
+            Ok(None)
+        }
+    }
+
+    fn duplex() -> Duplex {
+        Duplex::closing(Cursor::new(Vec::new()), std::io::sink(), 1024, || {})
+    }
+
+    fn fixture(name: &str) -> (Runtime<SlowNative>, [std::path::PathBuf; 2]) {
+        let root = std::env::temp_dir().join(format!(
+            "moor-{name}-{}-{}",
+            std::process::id(),
+            monotonic()
+        ));
+        let log_path = root.with_extension("log");
+        let running = lifecycle_running(
+            b"\x01/session",
+            (Some(7), 7),
+            [1; 16],
+            (1, 1, [2; 16]),
+            ("posix-bytes", None, None),
+        );
+        let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+        let log = Store::create(&log_path, Kind::Log, 7, b"old", 0, 3).unwrap();
+        let (_, writes) = mpsc::channel();
+        let runtime = Runtime::new(HolderConfig {
+            core: CoreConfig {
+                generation: 7,
+                identity: b"session".to_vec(),
+                incarnation: [1; 16],
+                semantic_token: [0; 16],
+                replay_limit: 1024,
+            },
+            pty: duplex(),
+            writes,
+            storage: SessionStorage::new(Some((log, 64)), None, lifecycle, 1, 1024),
+            status: Vec::new(),
+            commit_at: 0,
+            synthetic: 0,
+            native: SlowNative(false),
+        });
+        (runtime, [root, log_path])
+    }
+
+    fn add_peer(runtime: &mut Runtime<SlowNative>, id: ConnId) {
+        runtime.peers.insert(
+            id,
+            Peer {
+                pipe: duplex(),
+                codec: Some(Codec::new(Profile::Controller)),
+                preface: Vec::new(),
+                scope: 7,
+                handshake: 0,
+                deadline: 0,
+            },
+        );
+        runtime.machine.register_controller(id);
+    }
+
+    fn cleanup(paths: [std::path::PathBuf; 2]) {
+        for path in paths {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => panic!("remove {}: {error}", path.display()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_deferred_descriptor_rechecks_its_absolute_deadline() {
+        let (mut runtime, paths) = fixture("descriptor-deadline");
+        for id in [1, 2] {
+            add_peer(&mut runtime, id);
+        }
+        let now = monotonic();
+        runtime.descriptors.extend([
+            PendingDescriptor {
+                peer: 1,
+                deadline: now + 50,
+                request: Descriptor::Attach(80, 24, true, false, Some([3; 16])),
+            },
+            PendingDescriptor {
+                peer: 2,
+                deadline: now + 50,
+                request: Descriptor::Status,
+            },
+        ]);
+
+        let mut calls = 0;
+        runtime.poll_descriptors_with(&mut || {
+            calls += 1;
+            if calls < 4 { now } else { now + 51 }
+        });
+
+        assert!(runtime.native.0, "the first descriptor did not run slowly");
+        assert!(
+            !runtime.peers.contains_key(&1),
+            "the first descriptor acknowledged after its whole-exchange deadline"
+        );
+        assert!(
+            !runtime.peers.contains_key(&2),
+            "the later descriptor was admitted after its absolute deadline"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn status_rechecks_its_deadline_at_output_issuance() {
+        let (mut runtime, paths) = fixture("status-output-deadline");
+        add_peer(&mut runtime, 3);
+        let now = monotonic();
+        runtime.descriptors.push_back(PendingDescriptor {
+            peer: 3,
+            deadline: now + 50,
+            request: Descriptor::Status,
+        });
+        let mut calls = 0;
+        runtime.poll_descriptors_with(&mut || {
+            calls += 1;
+            if calls == 1 { now } else { now + 51 }
+        });
+        assert!(
+            !runtime.peers.contains_key(&3),
+            "STATUS was issued after its whole-exchange deadline"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn attach_rechecks_its_deadline_before_terminal_output() {
+        let (mut runtime, paths) = fixture("attach-output-deadline");
+        add_peer(&mut runtime, 4);
+        let now = monotonic();
+        runtime.descriptors.push_back(PendingDescriptor {
+            peer: 4,
+            deadline: now + 50,
+            request: Descriptor::Attach(80, 24, true, false, Some([4; 16])),
+        });
+        let mut calls = 0;
+        runtime.poll_descriptors_with(&mut || {
+            calls += 1;
+            if calls < 3 { now } else { now + 51 }
+        });
+        assert!(!runtime.peers.contains_key(&4));
+        assert!(
+            !runtime.native.0,
+            "terminal output was issued before the final deadline check"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn expired_identity_ingress_cannot_ack_or_cancel_the_deadline() {
+        let (mut runtime, paths) = fixture("controller-ingress-deadline");
+        runtime.peers.insert(
+            5,
+            Peer {
+                pipe: duplex(),
+                codec: Some(Codec::new(Profile::Controller)),
+                preface: Vec::new(),
+                scope: 0,
+                handshake: 100,
+                deadline: 100,
+            },
+        );
+        let hello = Message {
+            scope: 0,
+            kind: 1,
+            payload: wire::controller_hello(b"session")
+                .unwrap()
+                .as_slice()
+                .into(),
+        };
+        runtime.message_at(5, &hello, 100).unwrap();
+        assert!(
+            !runtime.peers.contains_key(&5),
+            "expired HELLO was acknowledged"
+        );
+
+        add_peer(&mut runtime, 6);
+        runtime.peers.get_mut(&6).unwrap().deadline = 100;
+        let clear = Message {
+            scope: 7,
+            kind: 0x19,
+            payload: wire::log_clear_payload([1; 16], 1)
+                .unwrap()
+                .as_slice()
+                .into(),
+        };
+        runtime.message_at(6, &clear, 100).unwrap();
+        assert!(
+            !runtime.peers.contains_key(&6),
+            "expired first request canceled the whole-exchange deadline"
+        );
+        assert_eq!(runtime.storage.pending(), 0);
+
+        runtime.peers.insert(
+            7,
+            Peer {
+                pipe: duplex(),
+                codec: Some(Codec::new(Profile::Semantic)),
+                preface: Vec::new(),
+                scope: 0,
+                handshake: 100,
+                deadline: 100,
+            },
+        );
+        let semantic = Message {
+            scope: 0,
+            kind: 1,
+            payload: (&[][..]).into(),
+        };
+        runtime.message_at(7, &semantic, 100).unwrap();
+        assert!(
+            !runtime.peers.contains_key(&7),
+            "expired semantic HELLO reached decoding"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn an_asynchronous_clear_io_failure_closes_without_a_result() {
+        let (mut runtime, paths) = fixture("clear-failure");
+        add_peer(&mut runtime, 9);
+
+        runtime.storage_done(Done {
+            lane: 0,
+            purpose: Purpose::Clear(9, 3),
+            result: Err(StoreError::Io(std::io::ErrorKind::TimedOut.into())),
+        });
+
+        assert!(
+            !runtime.peers.contains_key(&9),
+            "an indeterminate submitted clear sent a result instead of closing"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn a_pre_mutation_exhausted_clear_returns_unavailable() {
+        let (mut runtime, paths) = fixture("clear-exhausted");
+        add_peer(&mut runtime, 10);
+
+        runtime.storage_done(Done {
+            lane: 0,
+            purpose: Purpose::Clear(10, 3),
+            result: Err(StoreError::Exhausted),
+        });
+
+        assert!(
+            runtime.peers.contains_key(&10),
+            "a definite pre-mutation refusal was treated as indeterminate"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn failed_clear_result_delivery_quarantines_the_log_lane() {
+        let (mut runtime, paths) = fixture("clear-result-loss");
+        add_peer(&mut runtime, 12);
+        runtime.peers.get_mut(&12).unwrap().pipe.shutdown();
+
+        runtime.storage_done(Done {
+            lane: 0,
+            purpose: Purpose::Clear(12, 1),
+            result: Ok((
+                Commit {
+                    slot: 0,
+                    body: 0,
+                    kind: Kind::Log,
+                    generation: 7,
+                    epoch: 2,
+                    index: 2,
+                    length: 0,
+                    start: 3,
+                    end: 3,
+                    hash: [0; 32],
+                },
+                true,
+            )),
+        });
+
+        assert_eq!(
+            runtime.storage.health() & 1,
+            0,
+            "result loss did not quarantine the submitted clear"
+        );
+        drop(runtime);
+        cleanup(paths);
+    }
+
+    #[test]
+    fn disconnecting_a_submitted_clear_quarantines_its_log_lane() {
+        let (mut runtime, paths) = fixture("clear-disconnect");
+        add_peer(&mut runtime, 11);
+        assert!(matches!(
+            runtime.storage.try_status_snapshot(),
+            SnapshotState::Ready(_)
+        ));
+        runtime.storage.clear(11, 1, 3).unwrap();
+
+        runtime.disconnect(11);
+
+        assert_eq!(runtime.storage.health() & 1, 0);
+        assert_eq!(runtime.storage.clear(12, 1, 3), Err(StorageError::Disabled));
+        runtime.storage.release_status_snapshot();
+        drop(runtime);
+        cleanup(paths);
     }
 }

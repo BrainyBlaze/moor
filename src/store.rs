@@ -39,6 +39,14 @@ impl From<std::io::Error> for StoreError {
     }
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreStep {
+    Body,
+    Commit,
+    Flush,
+}
+
 schema!(struct pub Commit derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; slot: u8, body: u8, kind: Kind, generation: u32, epoch: u32,
     index: u64, length: u64, start: u64, end: u64, hash: [u8; 32]);
 
@@ -180,18 +188,19 @@ impl Store {
     /// pathname, so it admits no substitution between check and use (§11.4
     /// item 5) and keeps the generation fenced.
     ///
-    /// `None` means no valid commit is selectable through these handles at this
-    /// instant. That is never treated as a frontier: every caller keeps its
-    /// last known valid commit, so an unreadable or torn moment can only delay
-    /// the frontier, never regress or zero it.
-    pub fn selected_now(&self) -> Option<Commit> {
+    pub fn selected_result(&self) -> Result<Commit, StoreError> {
         recover(
             &self.slots,
             self.selected.kind,
             Some(self.selected.generation),
         )
-        .ok()
         .map(|(commit, _, _)| commit)
+    }
+
+    /// Compatibility convenience for callers that do not need to distinguish
+    /// an unavailable frontier from disabled storage.
+    pub fn selected_now(&self) -> Option<Commit> {
+        self.selected_result().ok()
     }
     pub fn append_capped(
         &mut self,
@@ -199,6 +208,19 @@ impl Store {
         cap: u64,
         end: u64,
     ) -> Result<&Commit, StoreError> {
+        self.append_capped_with(bytes, cap, end, |_| Ok(()))
+    }
+    #[doc(hidden)]
+    pub fn append_capped_with<F>(
+        &mut self,
+        bytes: &[u8],
+        cap: u64,
+        end: u64,
+        mut gate: F,
+    ) -> Result<&Commit, StoreError>
+    where
+        F: FnMut(StoreStep) -> Result<(), StoreError>,
+    {
         let prior = self.selected;
         let added = bytes.len() as u64;
         corrupt_if(prior.kind != Kind::Log || prior.end.checked_add(added) != Some(end))?;
@@ -208,7 +230,15 @@ impl Store {
             .ok_or(StoreError::Exhausted)?;
         if length <= cap {
             let index = prior.index.checked_add(1).ok_or(StoreError::Exhausted)?;
-            update(&self.slots[prior.body as usize], prior.length, bytes)?;
+            rewrite(
+                &self.slots[prior.body as usize],
+                prior.length,
+                bytes,
+                true,
+                &mut gate,
+                StoreStep::Body,
+                StoreStep::Body,
+            )?;
             let hash = self.hash.clone().chain_update(bytes);
             let commit = Commit {
                 slot: 1 - prior.slot,
@@ -218,7 +248,7 @@ impl Store {
                 hash: hash.clone().finalize().into(),
                 ..prior
             };
-            return self.install(commit, hash);
+            return self.install(commit, hash, &mut gate);
         }
         let keep = length.min(cap);
         let fresh = usize::try_from(added.min(keep)).map_err(|_| StoreError::Exhausted)?;
@@ -229,7 +259,7 @@ impl Store {
             .map_err(|_| StoreError::Exhausted)?;
         retained.extend_from_slice(&bytes[bytes.len() - fresh..]);
         let epoch = prior.epoch.checked_add(1).ok_or(StoreError::Exhausted)?;
-        self.replace(&retained, epoch, end - keep, end)
+        self.replace_with(&retained, epoch, end - keep, end, gate)
     }
     pub fn replace(
         &mut self,
@@ -238,6 +268,20 @@ impl Store {
         start: u64,
         end: u64,
     ) -> Result<&Commit, StoreError> {
+        self.replace_with(bytes, epoch, start, end, |_| Ok(()))
+    }
+    #[doc(hidden)]
+    pub fn replace_with<F>(
+        &mut self,
+        bytes: &[u8],
+        epoch: u32,
+        start: u64,
+        end: u64,
+        mut gate: F,
+    ) -> Result<&Commit, StoreError>
+    where
+        F: FnMut(StoreStep) -> Result<(), StoreError>,
+    {
         let prior = &self.selected;
         let (slot, body) = (1 - prior.slot, 1 - prior.body);
         let index = prior.index.checked_add(1).ok_or(StoreError::Exhausted)?;
@@ -250,15 +294,36 @@ impl Store {
         corrupt_if(epoch != expected_epoch)?;
         let meta = (slot, body, epoch, index, start, end);
         let (commit, hash) = make_commit(prior.kind, prior.generation, meta, bytes)?;
-        update(&self.slots[body as usize], 0, bytes)?;
-        self.install(commit, hash)
-    }
-    fn write_commit(&self, commit: &Commit) -> Result<(), StoreError> {
-        update(&self.slots[2 + commit.slot as usize], 0, &commit.encode())
+        rewrite(
+            &self.slots[body as usize],
+            0,
+            bytes,
+            false,
+            &mut gate,
+            StoreStep::Body,
+            StoreStep::Body,
+        )?;
+        self.install(commit, hash, &mut gate)
     }
 
-    fn install(&mut self, commit: Commit, hash: Sha256) -> Result<&Commit, StoreError> {
-        self.write_commit(&commit)?;
+    fn install<F>(
+        &mut self,
+        commit: Commit,
+        hash: Sha256,
+        gate: &mut F,
+    ) -> Result<&Commit, StoreError>
+    where
+        F: FnMut(StoreStep) -> Result<(), StoreError>,
+    {
+        rewrite(
+            &self.slots[2 + commit.slot as usize],
+            0,
+            &commit.encode(),
+            false,
+            gate,
+            StoreStep::Commit,
+            StoreStep::Flush,
+        )?;
         self.selected = commit;
         self.hash = hash;
         Ok(&self.selected)
@@ -519,8 +584,19 @@ fn recover(
     // index wins. A slot that cannot be read is therefore not selectable, not
     // fatal: its length can change between the metadata check and the read, and
     // propagating that error hid an independently valid alternate candidate.
-    let candidate = |slot| read_commit(slots, slot, kind, generation).unwrap_or(None);
-    match (candidate(0), candidate(1)) {
+    select_candidates(
+        read_commit(slots, 0, kind, generation),
+        read_commit(slots, 1, kind, generation),
+    )
+}
+
+type Candidate = (Commit, Sha256, Vec<u8>);
+
+fn select_candidates(
+    left: Result<Option<Candidate>, StoreError>,
+    right: Result<Option<Candidate>, StoreError>,
+) -> Result<Candidate, StoreError> {
+    match (left.unwrap_or(None), right.unwrap_or(None)) {
         (Some(a), Some(b)) if a.0.index == b.0.index || a.0.generation != b.0.generation => {
             Err(StoreError::Corrupt)
         }
@@ -660,11 +736,19 @@ fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
 fn write_all_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         match std::os::windows::fs::FileExt::seek_write(file, bytes, offset)? {
-            0 => return Err(io::ErrorKind::WriteZero.into()),
+            0 => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
             count => (bytes, offset) = (&bytes[count..], offset + count as u64),
         }
     }
     Ok(())
+}
+#[cfg(unix)]
+fn write_some_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, bytes, offset)
+}
+#[cfg(windows)]
+fn write_some_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, bytes, offset)
 }
 fn read_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
     let size: usize = length.try_into().map_err(|_| StoreError::Corrupt)?;
@@ -678,6 +762,40 @@ fn read_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, StoreErr
 fn update(file: &File, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
     file.set_len(offset)?;
     write_all_at(file, offset, bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+fn rewrite<F>(
+    file: &File,
+    mut offset: u64,
+    mut bytes: &[u8],
+    truncate_first: bool,
+    gate: &mut F,
+    mutation: StoreStep,
+    flush: StoreStep,
+) -> Result<(), StoreError>
+where
+    F: FnMut(StoreStep) -> Result<(), StoreError>,
+{
+    if truncate_first {
+        gate(mutation)?;
+        file.set_len(offset)?;
+    }
+    let end = offset
+        .checked_add(bytes.len() as u64)
+        .ok_or(StoreError::Exhausted)?;
+    while !bytes.is_empty() {
+        gate(mutation)?;
+        match write_some_at(file, offset, bytes)? {
+            0 => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
+            count => (bytes, offset) = (&bytes[count..], offset + count as u64),
+        }
+    }
+    if !truncate_first {
+        gate(mutation)?;
+        file.set_len(end)?;
+    }
+    gate(flush)?;
     file.sync_all()?;
     Ok(())
 }
@@ -731,4 +849,35 @@ fn sync_dir(path: &Path) -> io::Result<()> {
             .sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn candidate(index: u64) -> Candidate {
+        (
+            Commit {
+                slot: 0,
+                body: 0,
+                kind: Kind::Log,
+                generation: 7,
+                epoch: 1,
+                index,
+                length: 0,
+                start: 0,
+                end: 0,
+                hash: [0; 32],
+            },
+            Sha256::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn one_unreadable_candidate_cannot_hide_an_independently_valid_alternate() {
+        let torn = Err(StoreError::Io(io::ErrorKind::UnexpectedEof.into()));
+        let selected = select_candidates(torn, Ok(Some(candidate(9)))).unwrap();
+        assert_eq!(selected.0.index, 9);
+    }
 }

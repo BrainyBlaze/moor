@@ -256,6 +256,8 @@ fn compiled_wire_keepalive_then_release_consumes_each_field_once() {
     peer.send(7, 0x15, &request.encode_wire().unwrap());
     let granted = LeaseResult::decode_wire(&peer.recv(&mut runtime).payload).unwrap();
     assert_eq!(granted.outcome, ResultOutcome::Granted);
+    std::thread::sleep(Duration::from_millis(2_010));
+    runtime.poll();
     let payload = [
         granted.epoch.to_le_bytes().as_slice(),
         granted.token.as_slice(),
@@ -852,6 +854,28 @@ fn silent_handshakes_expire_before_the_admission_limit_is_checked() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     drop((silent, runtime));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn hello_cannot_restart_the_whole_status_exchange_deadline() {
+    let (mut runtime, root) = fixture();
+    let mut peer = connect(&mut runtime);
+    std::thread::sleep(Duration::from_millis(1_100));
+    hello(&mut peer, &mut runtime);
+    std::thread::sleep(Duration::from_millis(950));
+    peer.send(7, 13, &[]);
+    let reply = peer.recv(&mut runtime);
+    assert_eq!(
+        reply.kind, 0x13,
+        "STATUS restarted the accept-time deadline"
+    );
+    assert_eq!(
+        u16::from_le_bytes(reply.payload[..2].try_into().unwrap()),
+        12
+    );
+    assert!(peer.closed(&mut runtime));
+    drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
 
