@@ -187,7 +187,12 @@ impl<N: Native> Runtime<N> {
         if !redraw && self.geometry == (rows, columns) {
             return;
         }
-        if self.native.resize(rows, columns).is_ok() {
+        let applied = if redraw {
+            self.native.redraw(rows, columns)
+        } else {
+            self.native.resize(rows, columns)
+        };
+        if applied.is_ok() {
             self.geometry = (rows, columns);
             self.scanner.set_rows(rows);
         }
@@ -299,6 +304,9 @@ schema!(enum pub NativeExit [Clone, Copy, Debug, Eq, PartialEq]; Code(u32), Sign
 
 pub trait Native {
     fn resize(&mut self, rows: u16, columns: u16) -> Result<()>;
+    fn redraw(&mut self, rows: u16, columns: u16) -> Result<()> {
+        self.resize(rows, columns)
+    }
     fn terminate(&mut self, force: bool) -> (u8, bool);
     fn exited(&mut self) -> Result<Option<NativeExit>>;
 }
