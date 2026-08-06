@@ -7,9 +7,9 @@ use crate::wire::{Message, ViewerEvent, ViewerStream, decode_viewer};
 use crossbeam_channel::{Receiver as CrossReceiver, Sender as CrossSender, bounded, never, select};
 use interprocess::TryClone;
 use std::io::{self, Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::*};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
@@ -19,9 +19,10 @@ schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending,
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, state: Arc<AtomicU8>, last_size: Option<(u16, u16)>);
 
 struct State(AtomicU64, u64);
+type WriteJob = Option<(Vec<u8>, u64)>;
 
 pub struct Duplex<T = Event>(
-    Sender<Option<(Vec<u8>, u64)>>,
+    Mutex<Option<Sender<WriteJob>>>,
     pub CrossReceiver<T>,
     Arc<State>,
 );
@@ -238,9 +239,8 @@ impl<T> Duplex<T> {
 
     pub fn try_send_payload(&self, bytes: Vec<u8>, payload: usize) -> Result<(), SendError> {
         let state = &self.2;
-        if state.0.load(Acquire) >> 63 != 0 {
-            return Err(SendError::Closed);
-        }
+        let sender = self.0.lock().expect("duplex sender lock");
+        let sender = sender.as_ref().ok_or(SendError::Closed)?;
         let Some(overhead) = bytes.len().checked_sub(payload) else {
             return Err(SendError::Full);
         };
@@ -252,19 +252,20 @@ impl<T> Duplex<T> {
             .0
             .fetch_update(AcqRel, Acquire, |used| reserve(used, charge, state.1))
             .map_err(|_| SendError::Full)?;
-        self.0.send(Some((bytes, charge))).map_err(|_| {
+        sender.send(Some((bytes, charge))).map_err(|_| {
             state.0.fetch_sub(charge, AcqRel);
             SendError::Closed
         })
     }
 
     pub fn shutdown(&self) {
-        self.2.0.fetch_or(1 << 63, Release);
-        let _ = self.0.send(None);
+        if let Some(sender) = self.0.lock().expect("duplex sender lock").take() {
+            let _ = sender.send(None);
+        }
     }
 
     pub fn pending(&self) -> usize {
-        let used = self.2.0.load(Acquire) & !(1 << 63);
+        let used = self.2.0.load(Acquire);
         (used >> 32) as usize + (used as u32) as usize
     }
 }
@@ -279,7 +280,7 @@ pub(crate) fn pump<T: Send + 'static>(
     close: impl FnOnce() + Send + 'static,
 ) -> (Duplex<T>, Receiver<(u64, Option<u16>)>) {
     let (completed, completions) = channel();
-    let (out, writes) = channel::<Option<(Vec<u8>, u64)>>();
+    let (out, writes) = channel::<WriteJob>();
     let (tx, events) = bounded(8);
     let state = Arc::new(State(
         AtomicU64::new(0),
@@ -313,14 +314,13 @@ pub(crate) fn pump<T: Send + 'static>(
             };
             let _ = completed.send((written as u64, error));
             if error.is_some() {
-                ws.0.fetch_or(1 << 63, Release);
                 break;
             }
             ws.0.fetch_sub(charge, AcqRel);
         }
         close();
     });
-    (Duplex(out, events, state), completions)
+    (Duplex(Mutex::new(Some(out)), events, state), completions)
 }
 
 fn usage(overhead: usize, payload: usize) -> Option<u64> {
@@ -328,12 +328,17 @@ fn usage(overhead: usize, payload: usize) -> Option<u64> {
 }
 
 fn reserve(used: u64, charge: u64, limit: u64) -> Option<u64> {
-    crate::return_if!(used >> 63 != 0, None);
     let overhead = (used >> 32).checked_add(charge >> 32)?;
     let payload = u64::from(used as u32).checked_add(u64::from(charge as u32))?;
     (overhead <= limit >> 32 && payload <= u64::from(limit as u32))
         .then_some(overhead << 32 | payload)
 }
+
+#[cfg(test)]
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/unit/runtime_io.rs"
+));
 
 pub fn attach_viewer_to(
     client: &mut Client,
@@ -371,11 +376,12 @@ pub fn attach_viewer_to(
     let paused = never();
     loop {
         let wait = heartbeat.saturating_duration_since(Instant::now());
-        let commands = if stream.lease.as_ref().is_some_and(InputLease::pending) {
-            &paused
-        } else {
-            &stream.commands
-        };
+        let commands =
+            if stream.release.is_some() || stream.lease.as_ref().is_some_and(InputLease::pending) {
+                &paused
+            } else {
+                &stream.commands
+            };
         let failure = select! {
             recv(commands) -> command => match command {
                 Ok(Command::Abort) => {

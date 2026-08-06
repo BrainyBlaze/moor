@@ -8,7 +8,7 @@ use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Barrier, Condvar, Mutex,
     atomic::{AtomicU8, AtomicUsize, Ordering},
     mpsc,
 };
@@ -857,6 +857,95 @@ fn transport_loss_after_release_request_is_not_a_successful_detach() {
 
 #[test]
 #[cfg(unix)]
+fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
+    let (observed, await_observed) = mpsc::channel();
+    let (queued, await_queued) = mpsc::channel();
+    let mut await_observed = Some(await_observed);
+    let (mut client, server) = viewer_pair(move |mut peer| {
+        assert_eq!(peer.recv().kind, 1);
+        peer.send(
+            7,
+            2,
+            &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
+        );
+        assert_eq!(peer.recv().kind, 3);
+        peer.send(7, 5, &[0, 0]);
+        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(
+            7,
+            0x16,
+            &LeaseResult {
+                outcome: ResultOutcome::Granted,
+                reason: ResultReason::None,
+                role: LeaseRole::Viewer,
+                epoch: 3,
+                token: [4; 16],
+            }
+            .encode_wire()
+            .unwrap(),
+        );
+        assert_eq!(peer.recv().kind, 0x17);
+        observed.send(()).unwrap();
+        await_queued.recv_timeout(Duration::from_secs(1)).unwrap();
+        peer.stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut bytes = [0; 256];
+        assert!(matches!(
+            peer.stream.read(&mut bytes),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+        ));
+        peer.send(
+            7,
+            0x16,
+            &LeaseResult {
+                outcome: ResultOutcome::Released,
+                reason: ResultReason::None,
+                role: LeaseRole::Viewer,
+                epoch: 3,
+                token: [0; 16],
+            }
+            .encode_wire()
+            .unwrap(),
+        );
+    });
+    let mut workers = None;
+    let result = io::attach_viewer_to(
+        &mut client,
+        &Options::default(),
+        (0, 0),
+        &mut std::io::sink(),
+        Duration::from_secs(15),
+        |_| Err("reconnect unavailable".into()),
+        |sender, _| {
+            let await_observed = await_observed.take().unwrap();
+            let sender = Arc::new(sender);
+            let release = Arc::clone(&sender);
+            let queued = queued.clone();
+            workers = Some((
+                std::thread::spawn(move || release.release()),
+                std::thread::spawn(move || {
+                    await_observed.recv().unwrap();
+                    let sent = sender.send(b"late");
+                    queued.send(()).unwrap();
+                    sent
+                }),
+            ));
+        },
+    );
+    assert_eq!(result, Ok(0));
+    let (release, late) = workers.unwrap();
+    assert!(release.join().unwrap());
+    assert!(late.join().unwrap());
+    server.join().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
 fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
     let (stream, server) = UnixStream::pair().unwrap();
     let reader = stream.try_clone().unwrap();
@@ -1078,4 +1167,53 @@ fn shutdown_and_drop_do_not_wait_for_blocked_io() {
         vec![1],
         "shutdown must drain accepted output before cancellation"
     );
+}
+
+#[test]
+fn concurrent_shutdown_drains_every_accepted_send() {
+    const SENDERS: usize = 32;
+    let read_gate = Arc::new(Gate::default());
+    let (pump, completed) =
+        Duplex::tracked(BlockingReader(read_gate.clone()), std::io::sink(), SENDERS);
+    let pump = Arc::new(pump);
+    let start = Arc::new(Barrier::new(SENDERS + 2));
+    let sends = (0..SENDERS)
+        .map(|byte| {
+            let pump = pump.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                pump.try_send(vec![byte as u8])
+            })
+        })
+        .collect::<Vec<_>>();
+    let close = {
+        let pump = pump.clone();
+        let start = start.clone();
+        std::thread::spawn(move || {
+            start.wait();
+            pump.shutdown();
+        })
+    };
+
+    start.wait();
+    let outcomes = sends
+        .into_iter()
+        .map(|send| send.join().unwrap())
+        .collect::<Vec<_>>();
+    close.join().unwrap();
+    let accepted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Ok(()) | Err(SendError::Closed)))
+    );
+    for _ in 0..accepted {
+        assert_eq!(
+            completed.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (1, None)
+        );
+    }
+    assert_eq!(pump.try_send(vec![0]), Err(SendError::Closed));
+    read_gate.open();
 }
