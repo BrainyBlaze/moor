@@ -1863,6 +1863,7 @@ fn v16_framing_v2_output_coordinates_apply_through_viewer_decoder() {
             modes_exact: false,
         }),
         next: Some((42, 4096)),
+        received: Some((42, 4096)),
         ..ViewerStream::default()
     };
     assert_eq!(

@@ -403,6 +403,7 @@ schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8
     applications: BTreeMap<[u8; 16], Application> = BTreeMap::new(), writable: bool = true,
     peers: BTreeMap<ConnId, Peer> = BTreeMap::new(), pending: HashMap<Ticket, Pending> = HashMap::new(),
     next_ticket: u64 = 1, queries: VecDeque<PendingQuery> = VecDeque::new(), query_next: u64 = 1,
+    query_exhaustion_pending: bool = false,
     replay: VecDeque<OutputRecord> = VecDeque::new(), replay_limit: u64 = u64::MAX,
     next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(),
     termination: Option<Termination> = None, effects: Effects = Effects::new());
@@ -441,11 +442,6 @@ impl Machine {
 
     pub fn allocated(mut self, allocated: u32) -> Self {
         self.allocated = allocated;
-        self
-    }
-
-    pub fn correlation(mut self, next: u64) -> Self {
-        self.query_next = next;
         self
     }
 
@@ -589,11 +585,14 @@ impl Machine {
     }
 
     pub fn query_owner(&self) -> Option<(ConnId, u32)> {
-        self.owner().filter(|(conn, _)| {
-            self.peers
-                .get(conn)
-                .is_some_and(|peer| matches!(peer, Peer::Controller(true, false)))
-        })
+        (self.query_next != 0 || self.query_exhaustion_pending)
+            .then(|| self.owner())
+            .flatten()
+            .filter(|(conn, _)| {
+                self.peers
+                    .get(conn)
+                    .is_some_and(|peer| matches!(peer, Peer::Controller(true, false)))
+            })
     }
 
     fn update_sources(&mut self, trigger: SourceTrigger, now: Option<u64>) {
@@ -1058,18 +1057,23 @@ impl Machine {
             return self.fallback(fallback);
         };
         let correlation = self.query_next;
-        if self.queries.len() == 64 || correlation == 0 {
-            if correlation == 0 {
-                self.send(
-                    owner,
-                    Reply::ControllerError(13, b"query correlation exhausted"),
-                );
-            }
+        if self.queries.len() == 64 {
+            self.effects.push(Effect::Close(owner));
+            self.queries_gone(owner);
+            return self.fallback(fallback);
+        }
+        if correlation == 0 {
+            self.query_exhaustion_pending = false;
+            self.send(
+                owner,
+                Reply::ControllerError(13, b"query correlation exhausted"),
+            );
             self.effects.push(Effect::Close(owner));
             self.queries_gone(owner);
             return self.fallback(fallback);
         }
         self.query_next = correlation.wrapping_add(1);
+        self.query_exhaustion_pending = self.query_next == 0;
         self.queries.push_back(PendingQuery {
             conn: owner,
             correlation,
@@ -1640,4 +1644,163 @@ impl Machine {
 
 fn require_policy(valid: bool) -> Result<(), WireError> {
     valid.then_some(()).ok_or(WireError::Malformed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query_shape() -> QueryShape {
+        QueryShape {
+            class: 1,
+            csi8: false,
+            mode: None,
+        }
+    }
+
+    fn attached_viewer(next: u64) -> Machine {
+        let mut machine = Machine::new(7, [1; 16], [2; 16]);
+        machine.query_next = next;
+        machine.register_controller(7);
+        machine
+            .transition(Transition::Peer(
+                0,
+                7,
+                Request::Attach(0, 0, true, false, Some([3; 16])),
+            ))
+            .unwrap();
+        machine
+    }
+
+    fn resume_viewer(machine: &mut Machine, conn: ConnId) {
+        machine.transition(Transition::Disconnect(7)).unwrap();
+        machine.register_controller(conn);
+        machine
+            .transition(Transition::Peer(
+                3,
+                conn,
+                Request::Lease(
+                    LeaseRequest {
+                        operation: LeaseOperation::Resume,
+                        role: LeaseRole::Viewer,
+                        epoch: 1,
+                        incarnation: [1; 16],
+                        token: [3; 16],
+                    },
+                    Some([4; 16]),
+                ),
+            ))
+            .unwrap();
+        machine
+            .transition(Transition::Peer(
+                4,
+                conn,
+                Request::Attach(0, 0, false, false, None),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn correlation_exhaustion_reports_once_then_cancels_in_output_order() {
+        let mut machine = attached_viewer(u64::MAX);
+        let first = machine
+            .transition(Transition::Query(
+                1,
+                Arc::from(b"\x1b[c".as_slice()),
+                query_shape(),
+                Some(b"old".to_vec()),
+            ))
+            .unwrap();
+        assert!(matches!(
+            first.as_slice(),
+            [Effect::QuerySend(7, query)] if query.correlation == u64::MAX
+        ));
+
+        let exhausted = machine
+            .transition(Transition::Query(
+                2,
+                Arc::from(b"\x1b[c".as_slice()),
+                query_shape(),
+                Some(b"new".to_vec()),
+            ))
+            .unwrap();
+        assert!(matches!(
+            exhausted.as_slice(),
+            [
+                Effect::Send(7, Reply::ControllerError(13, _)),
+                Effect::Close(7),
+                Effect::Write(old, old_bytes),
+                Effect::Write(new, new_bytes),
+            ] if old.get() == 0 && new.get() == 0 && old_bytes == b"old" && new_bytes == b"new"
+        ));
+        assert!(!machine.status(7).query_available);
+
+        resume_viewer(&mut machine, 8);
+        let later = machine
+            .transition(Transition::Query(
+                5,
+                Arc::from(b"\x1b[c".as_slice()),
+                query_shape(),
+                Some(b"later".to_vec()),
+            ))
+            .unwrap();
+        assert!(matches!(
+            later.as_slice(),
+            [Effect::Write(ticket, bytes)] if ticket.get() == 0 && bytes == b"later"
+        ));
+    }
+
+    #[test]
+    fn outstanding_limit_wins_when_the_correlation_space_ends_at_the_same_boundary() {
+        let mut machine = attached_viewer(u64::MAX - 63);
+        for index in 0_u8..64 {
+            let effects = machine
+                .transition(Transition::Query(
+                    u64::from(index),
+                    Arc::from(b"\x1b[c".as_slice()),
+                    query_shape(),
+                    Some(vec![index]),
+                ))
+                .unwrap();
+            assert!(matches!(effects.as_slice(), [Effect::QuerySend(7, _)]));
+        }
+
+        let overloaded = machine
+            .transition(Transition::Query(
+                64,
+                Arc::from(b"\x1b[c".as_slice()),
+                query_shape(),
+                Some(vec![64]),
+            ))
+            .unwrap();
+        assert!(matches!(overloaded.first(), Some(Effect::Close(7))));
+        assert_eq!(overloaded.len(), 66);
+        assert!(
+            !overloaded
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send(_, Reply::ControllerError(..))))
+        );
+        for (index, effect) in overloaded[1..].iter().enumerate() {
+            assert!(matches!(effect, Effect::Write(ticket, bytes)
+                if ticket.get() == 0 && bytes.as_slice() == [index as u8]));
+        }
+
+        resume_viewer(&mut machine, 8);
+        let exhausted = machine
+            .transition(Transition::Query(
+                65,
+                Arc::from(b"\x1b[c".as_slice()),
+                query_shape(),
+                Some(b"final".to_vec()),
+            ))
+            .unwrap();
+        assert!(matches!(
+            exhausted.as_slice(),
+            [
+                Effect::Send(8, Reply::ControllerError(13, _)),
+                Effect::Close(8),
+                Effect::Write(ticket, bytes),
+            ] if ticket.get() == 0 && bytes == b"final"
+        ));
+    }
 }

@@ -81,7 +81,7 @@ impl<N: Native> Runtime<N> {
                         }
                     }
                 }
-                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns, true),
+                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns, false),
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
                 PolicyEffect::CommitSources(ticket, changes, mandatory) => {
                     let purpose = Purpose::Sources(ticket.get(), mandatory);
@@ -344,6 +344,14 @@ impl<N: Native> Runtime<N> {
     /// creation geometry rather than a fixed 24.
     pub fn set_rows(&mut self, rows: u16) {
         self.scanner.set_rows(rows);
+    }
+    #[cfg(unix)]
+    pub(crate) fn observe_exit(&mut self) -> Result<Option<NativeExit>> {
+        let status = self.native.exited()?;
+        if status.is_some() {
+            self.child_running = false;
+        }
+        Ok(status)
     }
     fn clear_result(&mut self, id: u64, prior: u64, result: ClearResult) -> bool {
         let (outcome, reason, commit) = result;
@@ -1080,11 +1088,18 @@ impl PreparedArtifacts {
         io: (Duplex, Receiver<(u64, Option<u16>)>),
         platform: (u8, N),
     ) -> Runtime<N> {
+        let storage = SessionStorage::new(
+            self.storage.log,
+            self.storage.events,
+            self.storage.lifecycle,
+            64,
+            4 << 20,
+        );
         Runtime::new(HolderConfig {
             core: self.core,
             pty: io.0,
             writes: io.1,
-            storage: self.storage,
+            storage,
             status: self.status,
             commit_at: self.commit_at,
             synthetic: platform.0,

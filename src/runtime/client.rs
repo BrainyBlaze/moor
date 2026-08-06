@@ -511,6 +511,10 @@ fn decide(session: &OsStr, path: &Path, table: [Decision; 6]) -> CommandResult<D
     }
 }
 
+/// Internal binary dispatch. Creation assumes the process has not started any
+/// application threads; callers must invoke the shipped executable rather than
+/// embedding this entry point in a multithreaded host.
+#[doc(hidden)]
 pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> CommandResult<i32> {
     let resolve = |session: &OsStr| platform::resolve(session, invoked);
     // §13.3 freezes three states and three messages, so the diagnostic has to
@@ -535,7 +539,7 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
             command,
             options,
         } => {
-            let path = resolve(&session)?;
+            let path = platform::preflight_create(&options, &session, invoked)?;
             let (live, attach_after, verb) = match mode {
                 CreateMode::Bare => (Attach, true, Some("created")),
                 CreateMode::New => (Already, true, Some("created")),
@@ -666,6 +670,8 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
     }
 }
 
+/// Internal entry point for `src/main.rs`; not a supported library interface.
+#[doc(hidden)]
 pub fn run(action: Action, invoked: &OsStr, program: &str) -> i32 {
     execute_commands(action, program, invoked).unwrap_or_else(|error| error.report(program))
 }

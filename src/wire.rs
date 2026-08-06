@@ -572,7 +572,7 @@ pub fn decode_query(payload: &[u8]) -> Result<Query, WireError> {
 schema!(enum pub ViewerEvent<'a> [Debug, Eq, PartialEq]; Terminal(&'a [u8]), Output(u64, bool, &'a [u8]),
     Receipt(InputReceipt), Lease(LeaseResult));
 schema!(struct pub ViewerStream derive [Default] pub fields; non_vt: bool, terminal: bool,
-    replay: Option<ReplayDescriptor>, next: Option<(u64, u64)>, lease_epoch: Option<u32>,
+    replay: Option<ReplayDescriptor>, next: Option<(u64, u64)>, received: Option<(u64, u64)>, lease_epoch: Option<u32>,
     queries: SmallVec<[(Query, QueryShape); 4]>, probe: Vec<u8>);
 
 pub fn decode_viewer<'a>(
@@ -597,7 +597,12 @@ pub fn decode_viewer<'a>(
                         && (sequence != replay.last.saturating_add(1) || offset == replay.end)
                 }
             });
-            well_formed(stream.replay.is_none() && stream.terminal && consistent)?;
+            well_formed(
+                stream.replay.is_none()
+                    && stream.received.is_none()
+                    && stream.terminal
+                    && consistent,
+            )?;
             if stream.next.is_none() && replay.first <= 1 {
                 let offset = if replay.first == 0 {
                     replay.end
@@ -606,6 +611,11 @@ pub fn decode_viewer<'a>(
                 };
                 stream.next = Some((1, offset));
             }
+            stream.received = Some(if replay.first == 0 {
+                (1, replay.end)
+            } else {
+                (replay.first, replay.start)
+            });
             stream.replay = Some(replay);
             None
         }
@@ -631,6 +641,7 @@ pub fn decode_viewer<'a>(
                 .ok_or(WireError::Malformed)?;
             let replay = stream.replay.ok_or(WireError::Malformed)?;
             let (expected, expected_offset) = stream.next.ok_or(WireError::Malformed)?;
+            let (received, received_offset) = stream.received.ok_or(WireError::Malformed)?;
             let apply = sequence >= expected;
             let baseline = (replay.first..=replay.last).contains(&sequence)
                 && offset >= replay.start
@@ -638,14 +649,15 @@ pub fn decode_viewer<'a>(
                 && (sequence != replay.first || offset == replay.start)
                 && (sequence != replay.last || end == replay.end);
             let live = apply && sequence > replay.last && offset >= replay.end;
-            let contiguous = if apply {
+            let contiguous = sequence == received && offset == received_offset;
+            let applicable = if apply {
                 sequence == expected && offset == expected_offset
             } else {
-                end <= expected_offset
-                    && (sequence.checked_add(1) != Some(expected) || end == expected_offset)
+                sequence < expected && end <= expected_offset
             };
-            let valid = (baseline || live) && contiguous;
+            let valid = (baseline || live) && contiguous && applicable;
             well_formed(valid)?;
+            stream.received = sequence.checked_add(1).map(|next| (next, end));
             if apply {
                 stream.next = sequence.checked_add(1).map(|next| (next, end));
             }
@@ -725,6 +737,9 @@ impl ViewerStream {
 
     pub fn disconnected(&mut self) {
         self.queries.clear();
+        self.terminal = false;
+        self.replay = None;
+        self.received = None;
     }
 }
 

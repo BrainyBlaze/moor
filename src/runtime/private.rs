@@ -1,7 +1,7 @@
 use crate::events::{self, Cursor, Event, EventStream, Json};
 use crate::name;
 use crate::runtime::holder::CoreConfig;
-use crate::runtime::storage::{EventConfig, SessionStorage};
+use crate::runtime::storage::EventConfig;
 use crate::store::{Kind, Store};
 use crate::wire::put_wide;
 use base64::{Engine as _, display::Base64Display, engine::general_purpose::STANDARD};
@@ -28,8 +28,10 @@ fn text_error(value: impl ToString) -> String {
 
 crate::schema!(struct pub SessionEntry pub fields; name: OsString, path: PathBuf, state: SessionState);
 crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str,
-    event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_layout: u8, log_cap: u64);
-crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: SessionStorage, status: Vec<u8>, commit_at: usize, running: String);
+    event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_store: Option<Store>, stores: Option<ArtifactStores>, event_layout: u8, log_cap: u64);
+crate::schema!(struct pub ArtifactStores pub fields; lifecycle: Store, event: Option<Store>, log: Option<Store>);
+crate::schema!(struct pub PreparedStorage pub fields; log: Option<(Store, u64)>, events: Option<EventConfig>, lifecycle: Store);
+crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: PreparedStorage, status: Vec<u8>, commit_at: usize, running: String);
 crate::schema!(struct Lifecycle derive [Deserialize] fields; session: String, wire_generation: u32, incarnation: String,
     start_mono_ms: String, boot_id: String, event_path: Option<String>, instrument_path: Option<String>);
 
@@ -104,12 +106,13 @@ impl<W: Write> Drop for LaunchReporter<W> {
 }
 
 pub fn await_launch(mut input: impl Read) -> Result<(u16, u32)> {
-    await_launch_probe(&mut input, |_| false)
+    await_launch_probe(&mut input, |_| false, |_| {})
 }
 
 pub fn await_launch_probe(
     mut input: impl Read,
     published: impl FnOnce(u32) -> bool,
+    adopted: impl FnOnce(u32),
 ) -> Result<(u16, u32)> {
     let mut next = || {
         let mut record = [0; 12];
@@ -119,12 +122,18 @@ pub fn await_launch_probe(
         decode_launch_result(&record).ok_or("holder returned an invalid launch result")
     };
     match next()? {
-        (1, 0, generation) => match next() {
-            Ok((2, 0, same)) if same == generation => Ok((0, generation)),
-            Err(_) if published(generation) => Ok((0, generation)),
-            Ok(_) => Err("holder returned an invalid launch result".into()),
-            Err(error) => Err(error.into()),
-        },
+        (1, 0, generation) => {
+            adopted(generation);
+            match next() {
+                Ok((2, 0, same)) if same == generation => Ok((0, generation)),
+                Ok((3, result, same)) if same == generation && result != 0 => {
+                    Ok((result, generation))
+                }
+                Err(_) if published(generation) => Ok((0, generation)),
+                Ok(_) => Err("holder returned an invalid launch result".into()),
+                Err(error) => Err(error.into()),
+            }
+        }
         (3, result, generation) => Ok((result, generation)),
         _ => Err("holder returned an invalid launch result".into()),
     }
@@ -447,11 +456,9 @@ pub fn session_name(name: OsString, insensitive: bool) -> Option<OsString> {
         let base = unsafe { OsStr::from_encoded_bytes_unchecked(&bytes[..bytes.len() - 5]) };
         return Some(base.to_owned());
     }
-    (!([b".log".as_slice(), b".events", b".instrument"]
+    (![b".log".as_slice(), b".events", b".instrument"]
         .into_iter()
-        .any(suffix)
-        || bytes == b".moor-stage"
-        || insensitive && bytes.eq_ignore_ascii_case(b".moor-stage")))
+        .any(suffix))
     .then_some(name)
 }
 
@@ -588,7 +595,7 @@ pub fn holder_artifacts(
     incarnation: [u8; 16],
     semantic_token: [u8; 16],
     start: Start,
-    config: ArtifactConfig<'_>,
+    mut config: ArtifactConfig<'_>,
 ) -> Result<PreparedArtifacts> {
     let running = lifecycle_running(
         identity,
@@ -601,29 +608,47 @@ pub fn holder_artifacts(
             config.instrument_identity,
         ),
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let create = |path: &Path, kind, body: &[u8]| {
-        Store::create(path, kind, generation.1, body, 0, 0)
-            .map_err(|error| format!("store initialization failed: {error:?}"))
-    };
-    let lifecycle = create(
-        &companion(config.marker, ".exit"),
-        Kind::Exit,
-        running.as_bytes(),
-    )?;
     let session = STANDARD.encode(identity);
-    let event = config
+    let event_header = config
         .event_path
-        .map(|path| {
-            let header =
-                events::canonical_header(start.0, &session, generation.0, Cursor(0, 0, 0, 1));
-            create(path, Kind::Event, header.as_bytes())
-        })
-        .transpose()?;
-    let log = (config.log_cap != 0)
-        .then(|| create(&companion(config.marker, ".log"), Kind::Log, &[]))
-        .transpose()?;
-    crate::ensure!(Instant::now() <= deadline, "store initialization timed out");
+        .map(|_| events::canonical_header(start.0, &session, generation.0, Cursor(0, 0, 0, 1)));
+    let ArtifactStores {
+        lifecycle,
+        event,
+        log,
+    } = if let Some(stores) = config.stores.take() {
+        stores
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut create = |path: &Path, kind, body: &[u8]| {
+            if kind == Kind::Event
+                && let Some(store) = config.event_store.take()
+            {
+                return Ok(store);
+            }
+            Store::create(path, kind, generation.1, body, 0, 0)
+                .map_err(|error| format!("store initialization failed: {error:?}"))
+        };
+        let lifecycle = create(
+            &companion(config.marker, ".exit"),
+            Kind::Exit,
+            running.as_bytes(),
+        )?;
+        let event = config
+            .event_path
+            .zip(event_header.as_deref())
+            .map(|(path, header)| create(path, Kind::Event, header.as_bytes()))
+            .transpose()?;
+        let log = (config.log_cap != 0)
+            .then(|| create(&companion(config.marker, ".log"), Kind::Log, &[]))
+            .transpose()?;
+        crate::ensure!(Instant::now() <= deadline, "store initialization timed out");
+        ArtifactStores {
+            lifecycle,
+            event,
+            log,
+        }
+    };
     let commit = event.as_ref().map(|store| *store.selected());
     let events = event.map(|store| EventConfig {
         store,
@@ -633,7 +658,11 @@ pub fn holder_artifacts(
         generation: generation.0,
     });
     let log = log.map(|store| (store, config.log_cap));
-    let storage = SessionStorage::new(log, events, lifecycle, 64, 4 << 20);
+    let storage = PreparedStorage {
+        log,
+        events,
+        lifecycle,
+    };
     let event_len = config.event_identity.map_or(0, <[u8]>::len);
     let mut status = Vec::with_capacity(identity.len() + event_len + 110);
     put_wide(&mut status, identity).map_err(crate::protocol)?;
