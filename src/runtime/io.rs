@@ -44,7 +44,7 @@ impl ViewerSender {
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
     start: Option<&'a mut dyn FnMut(ViewerSender, Arc<AtomicU8>)>, commands: CrossReceiver<Command>, sender: CrossSender<Command>,
     state: Arc<AtomicU8>, wire: ViewerStream, lease: Option<InputLease>,
-    size: Option<(u16, u16)>, release: Option<Sender<bool>>);
+    size: Option<(u16, u16)>, release: Option<Sender<bool>>, reattaching: bool);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -55,7 +55,7 @@ impl Viewer<'_> {
 
     fn accept(&mut self, message: &Message) -> Result<bool, String> {
         self.wire.lease_epoch = self.lease.as_ref().map(|lease| lease.epoch);
-        let Some(event) = decode_viewer(
+        let event = decode_viewer(
             &mut self.wire,
             message,
             (
@@ -64,8 +64,15 @@ impl Viewer<'_> {
                 self.client.incarnation,
             ),
         )
-        .map_err(crate::protocol)?
-        else {
+        .map_err(crate::protocol)?;
+        if message.kind == 4 && std::mem::take(&mut self.reattaching) {
+            if self.options.redraw == Redraw::Winch {
+                let (rows, columns) = self.size.unwrap();
+                self.command(Command::Resize(rows, columns))?;
+            }
+            self.advance(vec![])?;
+        }
+        let Some(event) = event else {
             return Ok(false);
         };
         match event {
@@ -374,18 +381,21 @@ pub fn attach_viewer_to(
         lease: None,
         size: (options.redraw == Redraw::Winch).then_some(geometry),
         release: None,
+        reattaching: false,
     };
     let mut heartbeat = Instant::now() + liveness;
     stream.client.send(3, &request)?;
     let paused = never();
     loop {
         let wait = heartbeat.saturating_duration_since(Instant::now());
-        let commands =
-            if stream.release.is_some() || stream.lease.as_ref().is_some_and(InputLease::pending) {
-                &paused
-            } else {
-                &stream.commands
-            };
+        let commands = if stream.reattaching
+            || stream.release.is_some()
+            || stream.lease.as_ref().is_some_and(InputLease::pending)
+        {
+            &paused
+        } else {
+            &stream.commands
+        };
         let failure = select! {
             recv(commands) -> command => match command {
                 Ok(Command::Abort) => {
@@ -423,7 +433,7 @@ pub fn attach_viewer_to(
             let Some(mut lease) = stream.lease.take() else {
                 return stream.fail(error);
             };
-            let recovered = (|| {
+            let recovered: Result<(), String> = (|| {
                 lease.resume(stream.client, &mut reconnect)?;
                 if let Some((rows, columns)) = stream.size {
                     request[..2].copy_from_slice(&columns.to_le_bytes());
@@ -431,12 +441,9 @@ pub fn attach_viewer_to(
                 }
                 request[4] &= !1;
                 stream.client.send(3, &request)?;
-                if stream.options.redraw == Redraw::Winch {
-                    let (rows, columns) = stream.size.unwrap_or(geometry);
-                    lease.resize(stream.client, rows, columns)?;
-                }
                 stream.lease = Some(lease);
-                stream.advance(vec![])
+                stream.reattaching = true;
+                Ok(())
             })();
             if let Err(error) = recovered {
                 return stream.fail(error);
