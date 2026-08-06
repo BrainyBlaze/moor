@@ -2,8 +2,6 @@ use super::{Done, Purpose, StorageError};
 use crate::store::{Commit, Store, StoreError, StoreStep};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-#[cfg(test)]
-use std::sync::mpsc::Receiver;
 use std::sync::{
     Arc, Mutex, TryLockError,
     atomic::{AtomicU8, Ordering},
@@ -35,7 +33,7 @@ const PUBLISHING: u8 = 16;
 struct State {
     bits: AtomicU8,
     #[cfg(test)]
-    publication_gate: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    publication_gate: Mutex<Option<TestGate>>,
 }
 
 impl State {
@@ -189,54 +187,8 @@ impl State {
     fn release(&self) {
         self.bits.fetch_and(!PHASE, Ordering::Release);
     }
-
-    #[cfg(test)]
-    fn pause_publication(&self) {
-        let gate = self
-            .publication_gate
-            .lock()
-            .expect("publication gate")
-            .take();
-        if let Some((entered, release)) = gate {
-            let _ = entered.send(());
-            let _ = release.recv();
-        }
-    }
 }
-schema!(enum pub(crate) Work; Append(Arc<[u8]>, u64, u64), Replace(Vec<u8>, u32, u64, u64), Clear(u64, u64), #[cfg(test)] #[allow(dead_code)] Hold(Receiver<()>),
-    #[cfg(test)] Staged(Vec<u8>, u32, u64, u64, Option<(Sender<()>, Receiver<()>)>, bool),
-    #[cfg(test)] #[allow(dead_code)] Phased(Vec<u8>, u32, u64, u64, u8, Sender<()>, Receiver<()>, bool),
-    #[cfg(test)] #[allow(dead_code)] AppendPhased(Vec<u8>, u64, u64, u8, Sender<()>, Receiver<()>),
-    #[cfg(test)] #[allow(dead_code)] ClearPhased(u64, u64, u8, Sender<()>, Receiver<()>),
-    #[cfg(test)] #[allow(dead_code)] Recover(Vec<u8>, u32, u64, u64, Sender<()>, Receiver<()>));
-
-#[cfg(test)]
-fn phased_io(
-    state: &State,
-    deadline: Instant,
-    stage: u8,
-    step: StoreStep,
-    entered: &Sender<()>,
-    gate: &Receiver<()>,
-    announced: &mut bool,
-) -> Result<(), StoreError> {
-    if matches!(
-        (stage, step),
-        (1, StoreStep::Commit) | (3, StoreStep::Flush)
-    ) && !*announced
-    {
-        *announced = true;
-        let _ = entered.send(());
-        let _ = gate.recv();
-    }
-    state.io(deadline, step)?;
-    if stage == 2 && step == StoreStep::Flush && !*announced {
-        *announced = true;
-        let _ = entered.send(());
-        let _ = gate.recv();
-    }
-    Ok(())
-}
+schema!(enum pub(crate) Work; Append(Arc<[u8]>, u64, u64), Replace(Vec<u8>, u32, u64, u64), Clear(u64, u64), #[cfg(test)] Test(TestWork));
 
 impl Work {
     fn size(&self) -> usize {
@@ -244,20 +196,13 @@ impl Work {
             Self::Append(bytes, ..) => bytes.len(),
             Self::Replace(bytes, ..) => bytes.len(),
             #[cfg(test)]
-            Self::Recover(bytes, ..) | Self::AppendPhased(bytes, ..) => bytes.len(),
+            Self::Test(work) => work.size(),
             _ => 0,
         }
     }
     fn run(self, store: &mut Store, state: &State, deadline: Instant) -> Outcome {
         #[cfg(test)]
-        let operation = match self {
-            Self::Staged(bytes, epoch, start, end, Some((entered, gate)), fail) => {
-                let _ = entered.send(());
-                let _ = gate.recv();
-                Self::Staged(bytes, epoch, start, end, None, fail)
-            }
-            operation => operation,
-        };
+        let operation = self.prepare_test();
         #[cfg(not(test))]
         let operation = self;
         state.begin_body(deadline)?;
@@ -276,87 +221,8 @@ impl Work {
                 let epoch = selected.epoch.checked_add(1).ok_or(StoreError::Exhausted)?;
                 store.replace_with(&[], epoch, end, end, |step| state.io(deadline, step))
             }
-            // Commits, then either blocks past the caller's deadline or reports
-            // an error, so the two ambiguous-durability paths become testable:
-            // a commit that lands after its lane is quarantined, and a valid
-            // committed candidate followed by a reported failure.
             #[cfg(test)]
-            Self::Staged(bytes, epoch, start, end, _, fail) => {
-                let commit = *store
-                    .replace_with(&bytes, epoch, start, end, |step| state.io(deadline, step))?;
-                return if fail {
-                    Err(StoreError::Corrupt)
-                } else {
-                    Ok((commit, false))
-                };
-            }
-            #[cfg(test)]
-            Self::Phased(bytes, epoch, start, end, stage, entered, gate, fail) => {
-                let mut announced = false;
-                let commit = *store.replace_with(&bytes, epoch, start, end, |step| {
-                    phased_io(
-                        state,
-                        deadline,
-                        stage,
-                        step,
-                        &entered,
-                        &gate,
-                        &mut announced,
-                    )
-                })?;
-                return if fail {
-                    Err(StoreError::Corrupt)
-                } else {
-                    Ok((commit, false))
-                };
-            }
-            #[cfg(test)]
-            Self::AppendPhased(bytes, cap, end, stage, entered, gate) => {
-                let mut announced = false;
-                store.append_capped_with(&bytes, cap, end, |step| {
-                    phased_io(
-                        state,
-                        deadline,
-                        stage,
-                        step,
-                        &entered,
-                        &gate,
-                        &mut announced,
-                    )
-                })
-            }
-            #[cfg(test)]
-            Self::ClearPhased(observed, end, stage, entered, gate) => {
-                let selected = *store.selected();
-                if selected.index != observed || selected.length == 0 {
-                    return Ok((selected, selected.index != observed));
-                }
-                let epoch = selected.epoch.checked_add(1).ok_or(StoreError::Exhausted)?;
-                let mut announced = false;
-                store.replace_with(&[], epoch, end, end, |step| {
-                    phased_io(
-                        state,
-                        deadline,
-                        stage,
-                        step,
-                        &entered,
-                        &gate,
-                        &mut announced,
-                    )
-                })
-            }
-            #[cfg(test)]
-            Self::Recover(bytes, epoch, start, end, entered, gate) => {
-                store.replace_with(&bytes, epoch, start, end, |step| state.io(deadline, step))?;
-                let _ = entered.send(());
-                let _ = gate.recv();
-                return Err(StoreError::Corrupt);
-            }
-            #[cfg(test)]
-            Self::Hold(wait) => {
-                let _ = wait.recv();
-                return Ok((*store.selected(), false));
-            }
+            Self::Test(work) => return work.run(store, state, deadline),
         }
         .map(|commit| (*commit, false))
     }
@@ -532,25 +398,6 @@ impl Lane {
             Err(TryLockError::Poisoned(_)) => Frontier::Failed,
         }
     }
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn block_publication(&self, entered: Sender<()>, release: Receiver<()>) {
-        let published = Arc::clone(&self.published);
-        std::thread::spawn(move || {
-            let _guard = published.lock().expect("published lock");
-            let _ = entered.send(());
-            let _ = release.recv();
-        });
-    }
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn delay_publication(&self, entered: Sender<()>, release: Receiver<()>) {
-        *self
-            .state
-            .publication_gate
-            .lock()
-            .expect("publication gate") = Some((entered, release));
-    }
     pub(crate) fn writable(&self) -> bool {
         self.failure.is_none() && !self.state.closed()
     }
@@ -569,3 +416,9 @@ impl Lane {
         StoreError::Io(kind.into())
     }
 }
+
+#[cfg(test)]
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/unit/runtime_worker.rs"
+));
