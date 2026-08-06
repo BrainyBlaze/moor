@@ -3518,3 +3518,192 @@ fn v27_refuses_every_invalid_query_tuple_and_inexact_length() {
     assert!(decode_query(&good[..good.len() - 1]).is_err(), "short body");
     assert!(decode_query(&[]).is_err(), "empty payload");
 }
+
+// ------------------------------------------------------------ V23, V24 ----
+// §16 V23/V24 — the two remaining portable 92-byte MOORCMT1 initial commits.
+// V23 is the empty-log commit (kind 02); V24 is the canonical-running
+// lifecycle commit (kind 03) over an exact 286-byte body. Exact hex from the
+// schema; every body digest is recomputed through the crate's own hashing
+// entrypoint rather than trusted from this test.
+
+const V23_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 02 07 00 00 00
+     01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+     00 00 00 00 00 00 00 00 E3 B0 C4 42 98 FC 1C 14
+     9A FB F4 C8 99 6F B9 24 27 AE 41 E4 64 9B 93 4C
+     A4 95 99 1B 78 52 B8 55 CE 64 F3 A0";
+
+// §16 V24 — the exact 286-byte lifecycle body, final LF included, copied
+// verbatim from the ```jsonl block in the schema.
+const V24_BODY: &[u8] = b"{\"v\":1,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"AS9z\",\"generation\":7,\"wire_generation\":7,\"incarnation\":\"AgICAgICAgICAgICAgICAg==\",\"start_wall_ms\":\"1\",\"start_mono_ms\":\"2\",\"boot_id\":\"AwMDAwMDAwMDAwMDAwMDAw==\",\"path_encoding\":\"posix-bytes\",\"event_path\":null,\"instrument_path\":null}\n";
+
+const V24_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 03 07 00 00 00
+     01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+     1E 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+     00 00 00 00 00 00 00 00 D1 62 1C 31 51 33 6C AB
+     7C 33 05 FB 45 6C 7C A0 F8 8A 25 2C 43 D4 80 80
+     2A 7F 31 A1 92 26 BF 96 1A 7F 68 02";
+
+/// Hashes `body` through the crate's own digest entrypoint, so the frozen
+/// SHA-256 is confirmed against real hashing code and not restated here.
+fn v23_digest_of(body: &[u8], label: &str) -> [u8; 32] {
+    use std::io::Write as _;
+    let path = std::env::temp_dir().join(format!(
+        "moor-v16-{label}-{}-{}.body",
+        std::process::id(),
+        body.len()
+    ));
+    let mut file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(body).unwrap();
+    let digest = copy_digest(&mut file, None);
+    let _ = std::fs::remove_file(&path);
+    digest.unwrap()
+}
+
+#[test]
+fn v16_platform_v23_empty_log_commit_matches_the_ratified_record() {
+    let frozen = hex(V23_RECORD);
+    assert_eq!(frozen.len(), 92, "the ratified record is exactly 92 bytes");
+    // The empty-body SHA-256 the schema states, confirmed by hashing nothing
+    // through the real digest path.
+    let hash = v23_digest_of(b"", "platform-v23");
+    assert_eq!(
+        hash,
+        <[u8; 32]>::try_from(hex("E3 B0 C4 42 98 FC 1C 14 9A FB F4 C8 99 6F B9 24
+                 27 AE 41 E4 64 9B 93 4C A4 95 99 1B 78 52 B8 55"))
+        .unwrap(),
+        "the empty-body digest must be the value §16 V23 states"
+    );
+    // Kind log 02, generation 7, epoch 1, index 1, empty body, coordinates
+    // [0,0). The declared length is zero because the body is empty.
+    let produced = Commit {
+        slot: 0,
+        body: 0,
+        kind: Kind::Log,
+        generation: 7,
+        epoch: 1,
+        index: 1,
+        length: 0,
+        start: 0,
+        end: 0,
+        hash,
+    }
+    .encode();
+    assert_eq!(produced.as_slice(), frozen.as_slice());
+    assert_eq!(frozen[11], 0x02, "kind log is 02");
+    assert_eq!(
+        u64::from_le_bytes(frozen[32..40].try_into().unwrap()),
+        0,
+        "an empty body declares length zero"
+    );
+    assert_eq!(
+        u32::from_le_bytes(frozen[88..92].try_into().unwrap()),
+        crc32c(&frozen[..88]),
+        "the trailing CRC-32C must recompute over bytes 0..88"
+    );
+}
+
+#[test]
+fn v16_platform_v24_lifecycle_commit_matches_the_ratified_record() {
+    let frozen = hex(V24_RECORD);
+    assert_eq!(frozen.len(), 92, "the ratified record is exactly 92 bytes");
+    // The body is exactly 286 bytes including its final LF, and its SHA-256 is
+    // the value §16 V24 states — which is what proves this transcription of
+    // the jsonl block is the body the schema froze.
+    assert_eq!(
+        V24_BODY.len(),
+        286,
+        "the frozen lifecycle body is 286 bytes"
+    );
+    assert_eq!(*V24_BODY.last().unwrap(), b'\n', "the body ends with LF");
+    let hash = v23_digest_of(V24_BODY, "platform-v24");
+    assert_eq!(
+        hash,
+        <[u8; 32]>::try_from(hex("D1 62 1C 31 51 33 6C AB 7C 33 05 FB 45 6C 7C A0
+                 F8 8A 25 2C 43 D4 80 80 2A 7F 31 A1 92 26 BF 96"))
+        .unwrap(),
+        "the lifecycle body digest must be the value §16 V24 states"
+    );
+    // Kind exit 03, generation 7, epoch 1, index 1, coordinates [0,0).
+    let produced = Commit {
+        slot: 0,
+        body: 0,
+        kind: Kind::Exit,
+        generation: 7,
+        epoch: 1,
+        index: 1,
+        length: V24_BODY.len() as u64,
+        start: 0,
+        end: 0,
+        hash,
+    }
+    .encode();
+    assert_eq!(produced.as_slice(), frozen.as_slice());
+    assert_eq!(frozen[11], 0x03, "kind exit is 03");
+    // The declared prefix length really is the length of the frozen body, so a
+    // transcription error in either cannot pass unnoticed.
+    assert_eq!(
+        u64::from_le_bytes(frozen[32..40].try_into().unwrap()),
+        V24_BODY.len() as u64,
+    );
+    assert_eq!(
+        u32::from_le_bytes(frozen[88..92].try_into().unwrap()),
+        crc32c(&frozen[..88]),
+        "the trailing CRC-32C must recompute over bytes 0..88"
+    );
+}
+
+#[test]
+fn v16_platform_v23_v24_differ_only_where_the_schema_says_they_do() {
+    // V13, V23 and V24 are the same 92-byte layout at generation 7, index 1
+    // and coordinates [0,0). Asserting that they differ ONLY in kind, epoch,
+    // declared length, body hash and the resulting CRC is what makes the three
+    // records a layout check rather than three independent byte blobs.
+    let v13 = hex("4D 4F 4F 52 43 4D 54 31 01 00 00 01 07 00 00 00
+         00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
+         89 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 2C 71 E9 28 70 77 41 50
+         F5 DB EE C3 4F 19 05 2D 82 87 4F 6E B4 AC 4B C9
+         F8 D4 BF 7A D7 43 ED FB 28 95 8D 91");
+    let v23 = hex(V23_RECORD);
+    let v24 = hex(V24_RECORD);
+    let varying: Vec<usize> = (0..92)
+        .filter(|index| {
+            (11..12).contains(index)      // kind
+                || (16..24).contains(index) // epoch
+                || (32..40).contains(index) // declared body length
+                || (56..92).contains(index) // body hash and trailing CRC
+        })
+        .collect();
+    for index in 0..92 {
+        if varying.contains(&index) {
+            continue;
+        }
+        assert_eq!(
+            (v13[index], v23[index]),
+            (v13[index], v24[index]),
+            "byte {index} must be identical across all three records"
+        );
+        assert_eq!(
+            v23[index], v24[index],
+            "byte {index} must be identical across all three records"
+        );
+    }
+    // And the fields that do vary are exactly the stated values.
+    assert_eq!((v13[11], v23[11], v24[11]), (0x01, 0x02, 0x03), "kinds");
+    assert_eq!(
+        (
+            u64::from_le_bytes(v13[16..24].try_into().unwrap()),
+            u64::from_le_bytes(v23[16..24].try_into().unwrap()),
+            u64::from_le_bytes(v24[16..24].try_into().unwrap()),
+        ),
+        (0, 1, 1),
+        "epochs: V13 is epoch 0, V23 and V24 are epoch 1"
+    );
+}
