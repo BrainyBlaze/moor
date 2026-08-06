@@ -101,7 +101,10 @@ impl BootstrapRecord {
         let value = Self::decode_raw(bytes)
             .ok()
             .filter(|value| value.nonce == nonce)?;
-        (value.pid != 0 && value.process != 0 && value.thread != 0 && value.created != 0)
+        (value.pid != 0
+            && value.created != 0
+            && value.process.min(value.thread) != 0
+            && value.process != value.thread)
             .then_some(value)
     }
 }
@@ -179,7 +182,7 @@ mod native {
     };
     use windows_spawn::{
         AsPseudoConsole, Child, Command as SpawnCommand, CreationFlags, Job, SpawnOptions,
-        Stdio as SpawnStdio, SuspendedChild,
+        Stdio as SpawnStdio,
     };
     use windows_sys::Win32::{
         Foundation::*,
@@ -208,6 +211,7 @@ mod native {
     }
     macro_rules! transfer_handles {
         ($command:expr; $($name:expr => $handle:expr, $what:literal);+ $(;)?) => {$(
+            ($command).env_remove($name);
             if let Some(handle) = $handle {
                 win(($command).env_handle($name, handle), concat!("transfer ", $what))?;
             }
@@ -645,40 +649,6 @@ mod native {
         require(info.NumberOfLinks == 1, "hard-linked Windows store slot")?;
         unsafe { file_identity(file.raw()) }
     }
-    fn create_requested(
-        args: &[OsString],
-        instrument: Option<&Pipe>,
-        instrument_nonce: [u8; 16],
-        stderr: Option<&Handle>,
-    ) -> Result<SuspendedChild> {
-        let (program, args) = args.split_first().ok_or("empty Windows command")?;
-        let mut command = SpawnCommand::new(program);
-        command
-            .args(args)
-            .env_remove(INSTRUMENT_CHANNEL)
-            .env_remove(INSTRUMENT_NONCE);
-        transfer_handles!(command;
-            INSTRUMENT_CHANNEL => instrument, "instrumentation channel"
-        );
-        if instrument.is_some() {
-            command.env(
-                INSTRUMENT_NONCE,
-                format!("{:032x}", u128::from_be_bytes(instrument_nonce)),
-            );
-        }
-        if let Some(handle) = stderr {
-            command.stderr(win(
-                SpawnStdio::from_borrowed(handle),
-                "transfer requested child stderr",
-            )?);
-        }
-        win(
-            command.spawn_suspended_with(
-                SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
-            ),
-            "start requested child",
-        )
-    }
     fn selector_decimal(text: &str) -> Result<usize> {
         crate::canonical_u64(text)
             .filter(|value| *value != 0)
@@ -694,31 +664,22 @@ mod native {
             .ok_or_else(|| "invalid bootstrap nonce".into())
     }
 
-    unsafe fn inherited_handle(raw: usize, pipe: bool) -> Result<Handle> {
-        let handle = unsafe { Handle::owned(raw as HANDLE) };
+    fn inherited(name: &str, pipe: bool) -> Result<Option<Handle>> {
+        let Some(value) = std::env::var_os(name) else {
+            return Ok(None);
+        };
+        unsafe { std::env::remove_var(name) };
+        let text = value.to_str().ok_or("invalid bootstrap selector")?;
+        let handle = unsafe { Handle::owned(selector_decimal(text)? as HANDLE) };
         let mut inherit = 0;
-        win32!(
-            GetHandleInformation(handle.raw(), &mut inherit),
-            "inspect bootstrap handle"
-        )?;
-        require(
-            inherit & HANDLE_FLAG_INHERIT != 0,
-            "bootstrap handle was not inherited",
-        )?;
+        let inspected = unsafe { GetHandleInformation(handle.raw(), &mut inherit) };
+        check(inspected != 0, "inspect bootstrap handle")?;
+        let inherited = inherit & HANDLE_FLAG_INHERIT != 0;
+        require(inherited, "bootstrap handle was not inherited")?;
         if pipe {
             validate_pipe(handle.raw(), "bootstrap channel")?;
         }
-        Ok(handle)
-    }
-    fn inherited(name: &str, pipe: bool) -> Result<Option<Handle>> {
-        let value = std::env::var_os(name);
-        unsafe { std::env::remove_var(name) };
-        value
-            .map(|value| {
-                let text = value.to_str().ok_or("invalid bootstrap selector")?;
-                unsafe { inherited_handle(selector_decimal(text)?, pipe) }
-            })
-            .transpose()
+        Ok(Some(handle))
     }
     unsafe fn transfer_handle(source: HANDLE, target: HANDLE) -> Result<u64> {
         let mut copy = ptr::null_mut();
@@ -741,40 +702,54 @@ mod native {
         let text = selector.to_str().ok_or("invalid bootstrap selector")?;
         let (holder, nonces) = text.split_once(':').ok_or("invalid bootstrap selector")?;
         let (nonce, insertion) = nonces.split_once(':').ok_or("invalid bootstrap selector")?;
-        let nonce = parse_nonce(nonce)?;
-        let instrument_nonce = parse_nonce(insertion)?;
-        let holder_pid: u32 = selector_decimal(holder)?
-            .try_into()
-            .map_err(|_| "invalid holder pid")?;
-        require(holder_pid != 0, "invalid holder pid")?;
+        let (nonce, instrument_nonce) = (parse_nonce(nonce)?, parse_nonce(insertion)?);
+        let holder_pid =
+            u32::try_from(selector_decimal(holder)?).map_err(|_| "invalid holder pid")?;
         let command = std::env::args_os().skip(1).collect::<Vec<_>>();
         require(!command.is_empty(), "empty bootstrap command")?;
         unsafe {
             let required =
                 |name| inherited(name, true)?.ok_or_else(|| "missing bootstrap handle".to_string());
-            let control = required(BOOTSTRAP_CONTROL)?;
-            let result = required(BOOTSTRAP_RESULT)?;
+            let (control, result) = (required(BOOTSTRAP_CONTROL)?, required(BOOTSTRAP_RESULT)?);
             let stderr = inherited(BOOTSTRAP_STDERR, false)?;
             let instrument = inherited(BOOTSTRAP_INSTRUMENT, true)?;
             let raw = [
-                Some(control.raw()),
-                Some(result.raw()),
-                stderr.as_ref().map(Handle::raw),
-                instrument.as_ref().map(Pipe::raw),
+                control.raw(),
+                result.raw(),
+                stderr.as_ref().map_or(ptr::null_mut(), Handle::raw),
+                instrument.as_ref().map_or(ptr::null_mut(), Pipe::raw),
             ];
             require(
                 raw.iter()
                     .enumerate()
-                    .all(|(at, handle)| handle.is_none() || !raw[..at].contains(handle)),
+                    .all(|(at, handle)| handle.is_null() || !raw[..at].contains(handle)),
                 "aliased bootstrap handles",
             )?;
-            let mut child = Some(create_requested(
-                &command,
-                instrument.as_ref(),
-                instrument_nonce,
-                stderr.as_ref(),
+            let (program, args) = command.split_first().unwrap();
+            let mut requested = SpawnCommand::new(program);
+            requested.args(args).env_remove(INSTRUMENT_NONCE);
+            transfer_handles!(requested;
+                INSTRUMENT_CHANNEL => instrument.as_ref(), "instrumentation channel"
+            );
+            if instrument.is_some() {
+                requested.env(
+                    INSTRUMENT_NONCE,
+                    format!("{:032x}", u128::from_be_bytes(instrument_nonce)),
+                );
+            }
+            if let Some(handle) = &stderr {
+                requested.stderr(win(
+                    SpawnStdio::from_borrowed(handle),
+                    "transfer requested child stderr",
+                )?);
+            }
+            let mut child = Some(win(
+                requested.spawn_suspended_with(
+                    SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
+                ),
+                "start requested child",
             )?);
-            drop(instrument);
+            drop((requested, instrument));
             let holder = Handle::checked(
                 OpenProcess(PROCESS_DUP_HANDLE, 0, holder_pid),
                 "open holder for handle transfer",
@@ -782,19 +757,14 @@ mod native {
             let requested = child.as_ref().unwrap();
             let process_handle = requested.as_handle().as_raw_handle() as HANDLE;
             let thread_handle = requested.primary_thread_handle().as_raw_handle() as HANDLE;
-            let process = transfer_handle(process_handle, holder.raw())?;
-            let thread = transfer_handle(thread_handle, holder.raw())?;
-            let created = process_birth(process_handle, "read requested child birth")?;
-            let pid = requested.id();
             let record = BootstrapRecord {
                 nonce,
-                pid,
-                process,
-                thread,
-                created,
-            }
-            .encode();
-            result.write(&record, "report requested child")?;
+                process: transfer_handle(process_handle, holder.raw())?,
+                thread: transfer_handle(thread_handle, holder.raw())?,
+                created: process_birth(process_handle, "read requested child birth")?,
+                pid: requested.id(),
+            };
+            result.write(&record.encode(), "report requested child")?;
             let mut resumed = false;
             loop {
                 let mut command = [0; 17];
@@ -810,7 +780,7 @@ mod native {
                 let ok = if kind == 1 {
                     child.take().is_some_and(|child| child.resume().is_ok())
                 } else {
-                    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0
+                    GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, record.pid) != 0
                 };
                 result.write(&[u8::from(!ok)], "acknowledge bootstrap command")?;
             }
@@ -921,14 +891,15 @@ mod native {
     }
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
+    crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
     crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String,
         generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8,
-        conpty: Pseudo, job: Option<Job>, bootstrap: Option<Child>, process: Handle, pid: u32,
-        bootstrap_control: Pipe, bootstrap_result: Pipe, bootstrap_nonce: [u8; 16], early_exit: Option<u32>, birth: [u8; 16],
+        conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32,
+        early_exit: Option<u32>, birth: [u8; 16],
         input: Pipe, output: Pipe, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>,
         identity: [u8; 25], artifacts: Option<PreparedArtifacts>);
-    impl Native {
-        fn bootstrap_exchange(&self, kind: u8) -> Result<()> {
+    impl Bootstrap {
+        fn exchange(&self, kind: u8) -> Result<()> {
             let (write, read, rejected) = match kind {
                 1 => (
                     "command bootstrap to resume child",
@@ -941,13 +912,12 @@ mod native {
                     "bootstrap failed to break child",
                 ),
             };
-            self.bootstrap_control
-                .write(&bootstrap_command(kind, self.bootstrap_nonce), write)?;
-            require(
-                self.bootstrap_result.record::<1>(false, read)? == [0],
-                rejected,
-            )
+            self.control
+                .write(&bootstrap_command(kind, self.nonce), write)?;
+            require(self.result.record::<1>(false, read)? == [0], rejected)
         }
+    }
+    impl Native {
         fn prepare_storage(&mut self, marker_identity: [u8; 24]) -> Result<()> {
             self.identity = session_identity(marker_identity);
             let start = (now(), unsafe { GetTickCount64() }, boot_identity());
@@ -1004,7 +974,7 @@ mod native {
             if instrument.is_some() {
                 self.inject_and_ack(pid, nonce)?;
             }
-            self.bootstrap_exchange(1)?;
+            self.bootstrap.exchange(1)?;
             self.prepublication_alive()?;
             self.publish_marker(&marker_stage, marker_identity)?;
             Ok(listener)
@@ -1054,32 +1024,28 @@ mod native {
                     Pipe::pair("create bootstrap control channel")?;
                 let (bootstrap_result, result_write) =
                     Pipe::pair("create bootstrap result channel")?;
-                (self.bootstrap_control, self.bootstrap_result) =
-                    (bootstrap_control, bootstrap_result);
-                self.bootstrap_nonce = random_array()?;
+                self.bootstrap = Bootstrap {
+                    control: bootstrap_control,
+                    result: bootstrap_result,
+                    nonce: random_array()?,
+                    ..Bootstrap::default()
+                };
                 let executable = std::env::current_exe().map_err(string)?;
                 let mut bootstrap = SpawnCommand::new(executable);
                 bootstrap.args(command);
                 if let Some(directory) = &self.options.directory {
                     bootstrap.current_dir(directory);
                 }
-                for name in [
-                    BOOTSTRAP_SELECTOR,
-                    BOOTSTRAP_CONTROL,
-                    BOOTSTRAP_RESULT,
-                    BOOTSTRAP_STDERR,
-                    BOOTSTRAP_INSTRUMENT,
-                    INSTRUMENT_CHANNEL,
-                    INSTRUMENT_NONCE,
-                ] {
-                    bootstrap.env_remove(name);
-                }
+                bootstrap
+                    .env_remove(BOOTSTRAP_SELECTOR)
+                    .env_remove(INSTRUMENT_CHANNEL)
+                    .env_remove(INSTRUMENT_NONCE);
                 bootstrap.env(
                     BOOTSTRAP_SELECTOR,
                     format!(
                         "{}:{:032x}:{:032x}",
                         GetCurrentProcessId(),
-                        u128::from_be_bytes(self.bootstrap_nonce),
+                        u128::from_be_bytes(self.bootstrap.nonce),
                         u128::from_be_bytes(instrument_nonce)
                     ),
                 );
@@ -1099,17 +1065,14 @@ mod native {
                     "start Windows bootstrap",
                 )?;
                 drop(bootstrap);
-                self.bootstrap = Some(win(launched.resume(), "resume contained bootstrap")?);
+                self.bootstrap.child = Some(win(launched.resume(), "resume contained bootstrap")?);
                 if let Some(instrument) = &mut self.instrument {
                     drop(std::mem::take(&mut instrument.write));
                 }
-                let record = BootstrapRecord::decode(
-                    &self
-                        .bootstrap_result
-                        .record::<56>(false, "bootstrap identity")?,
-                    self.bootstrap_nonce,
-                )
-                .ok_or("bootstrap identity was invalid")?;
+                let endpoint = &self.bootstrap;
+                let identity = endpoint.result.record::<56>(false, "bootstrap identity")?;
+                let record = BootstrapRecord::decode(&identity, endpoint.nonce)
+                    .ok_or("bootstrap identity was invalid")?;
                 let process = Handle::owned(record.process as HANDLE);
                 let thread = Handle::owned(record.thread as HANDLE);
                 check(
@@ -1302,7 +1265,8 @@ mod native {
                 self.early_exit = Some(code);
                 return Err("requested child exited before publication".into());
             }
-            let bootstrap = self.bootstrap.as_mut().ok_or("bootstrap is unavailable")?;
+            let child = self.bootstrap.child.as_mut();
+            let bootstrap = child.ok_or("bootstrap is unavailable")?;
             require(
                 win(bootstrap.try_wait(), "inspect Windows bootstrap")?.is_none(),
                 "bootstrap exited before publication",
@@ -1321,7 +1285,7 @@ mod native {
             )
         }
         fn terminate(&mut self, force: bool) -> (u8, bool) {
-            if !force && self.bootstrap_exchange(2).is_ok() {
+            if !force && self.bootstrap.exchange(2).is_ok() {
                 return (0, false);
             }
             let terminated = self
