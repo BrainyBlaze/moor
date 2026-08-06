@@ -13,12 +13,18 @@ If the two artifacts disagree, the behavioural specification wins and the wire
 schema must be reported as defective. This README defines the handoff procedure
 only; it adds no behavioural requirements.
 
+`wire-schema-3` and `event-schema-2` received one in-place amendment before any
+conforming implementation existed. No mixed old/amended dialect is supported.
+Every later change to a frozen layout requires the corresponding version
+increment.
+
 ## Clean-room boundary
 
-Implement from the files in this directory only. Do not inspect an existing
-holder implementation, its tests, workaround inventories, research notes, or
-decision briefs. Their relevant conclusions have already been converted into
-behavioural requirements in the specification.
+Implement from this README and the two authoritative artifacts above only. Do
+not inspect an existing holder implementation, its tests, workaround
+inventories, research notes, or decision briefs. Their relevant conclusions
+have already been converted into behavioural requirements in the
+specification.
 
 When a requirement is ambiguous or incomplete, report the gap to the
 specification team in behavioural terms. Do not infer the answer from an
@@ -30,8 +36,8 @@ The reviewed handoff artifacts have these SHA-256 digests:
 
 | file | SHA-256 |
 |---|---|
-| `moor-spec.md` | `e102b1e49d59bfd0360a4b1d93a252446e8bdfcad302bd0536d895058e0626f0` |
-| `moor-wire-schema.md` | `ee7911a07f1b7213a7a04f5f9869a5c6c917419a1f8171c418d8ceb7ab0f8df2` |
+| `moor-spec.md` | `05f644d676beaa73d3bcd7a3aef6fb5c715ed53babf853333bb364bf37063433` |
+| `moor-wire-schema.md` | `8cc57dca672929ffab5d869e4c883d0e28d89070df9aa2fd619558a5f766869b` |
 
 Verify them from this directory with:
 
