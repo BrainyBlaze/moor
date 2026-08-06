@@ -10,18 +10,10 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 type Outcome = Result<(Commit, bool), StoreError>;
-type Completed = (Instant, Outcome);
 type Job = (Purpose, Instant, usize);
 type Submitted = (Work, Instant);
-struct Published {
-    frontier: Option<Commit>,
-    completed: VecDeque<Completed>,
-}
-pub(crate) enum Frontier {
-    Ready(Option<Commit>),
-    Busy,
-    Failed,
-}
+schema!(struct Published fields; frontier: Option<Commit>, completed: VecDeque<Outcome>);
+schema!(enum pub(crate) Frontier; Ready(Option<Commit>), Busy, Failed);
 const BODY: u8 = 1;
 const DIRTY: u8 = 2;
 const COMMIT: u8 = 3;
@@ -32,131 +24,72 @@ const PUBLISHING: u8 = 16;
 
 struct State {
     bits: AtomicU8,
+    published: Mutex<Published>,
     #[cfg(test)]
     publication_gate: Mutex<Option<TestGate>>,
 }
 
 impl State {
     fn deadline(&self, deadline: Instant) -> Result<(), StoreError> {
-        if Instant::now() < deadline {
-            Ok(())
-        } else {
-            self.close();
-            Err(StoreError::Io(ErrorKind::TimedOut.into()))
-        }
+        return_if!(Instant::now() < deadline, Ok(()));
+        self.close();
+        Err(failure(ErrorKind::TimedOut))
     }
 
     fn begin_body(&self, deadline: Instant) -> Result<(), StoreError> {
         loop {
             self.deadline(deadline)?;
-            let state = self.bits.load(Ordering::Acquire);
-            if state & CLOSED != 0 {
-                return Err(StoreError::Io(ErrorKind::WouldBlock.into()));
-            }
-            match state & PHASE {
-                0 => {
-                    if self
-                        .bits
-                        .compare_exchange(state, BODY, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        self.deadline(deadline)?;
-                        return Ok(());
-                    }
+            match self.change(0, BODY) {
+                Ok(_) => return self.deadline(deadline),
+                Err(HELD) => std::thread::yield_now(),
+                Err(state) if state & CLOSED != 0 => {
+                    return Err(failure(ErrorKind::WouldBlock));
                 }
-                HELD => std::thread::yield_now(),
-                _ => unreachable!("one worker owns each lane"),
+                Err(_) => unreachable!("one worker owns each lane"),
             }
         }
     }
 
     fn io(&self, deadline: Instant, step: StoreStep) -> Result<(), StoreError> {
         self.deadline(deadline)?;
-        match step {
-            StoreStep::Body => self.require(BODY),
-            StoreStep::Commit => {
-                let state = self.bits.load(Ordering::Acquire);
-                if state & CLOSED != 0 {
-                    return Err(StoreError::Io(ErrorKind::WouldBlock.into()));
-                }
-                match state & PHASE {
-                    BODY => self
-                        .bits
-                        .compare_exchange(state, DIRTY, Ordering::AcqRel, Ordering::Acquire)
-                        .map(|_| ())
-                        .map_err(|_| StoreError::Io(ErrorKind::WouldBlock.into())),
-                    DIRTY => Ok(()),
-                    _ => Err(StoreError::Io(ErrorKind::WouldBlock.into())),
-                }
-            }
-            StoreStep::Flush => self
-                .bits
-                .compare_exchange(DIRTY, COMMIT, Ordering::AcqRel, Ordering::Acquire)
-                .map(|_| ())
-                .map_err(|_| StoreError::Io(ErrorKind::WouldBlock.into())),
-        }
+        let state = self.bits.load(Ordering::Acquire);
+        let (from, to) = match (step, state) {
+            (StoreStep::Body, BODY) | (StoreStep::Commit, DIRTY) => return Ok(()),
+            (StoreStep::Commit, BODY) => (BODY, DIRTY),
+            (StoreStep::Flush, DIRTY) => (DIRTY, COMMIT),
+            _ => return Err(failure(ErrorKind::WouldBlock)),
+        };
+        self.change(from, to)
+            .map(|_| ())
+            .map_err(|_| failure(ErrorKind::WouldBlock))
     }
 
-    fn require(&self, phase: u8) -> Result<(), StoreError> {
-        let state = self.bits.load(Ordering::Acquire);
-        if state & CLOSED == 0 && state & PHASE == phase {
-            Ok(())
-        } else {
-            Err(StoreError::Io(ErrorKind::WouldBlock.into()))
-        }
+    fn change(&self, from: u8, to: u8) -> Result<u8, u8> {
+        self.bits
+            .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
+    }
+
+    fn set_unless(&self, blocked: u8, set: u8) -> bool {
+        self.bits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & blocked == 0).then_some(state | set)
+            })
+            .is_ok()
     }
 
     fn publish(&self) -> bool {
-        let mut state = self.bits.load(Ordering::Acquire);
-        loop {
-            if state & CLOSED != 0 {
-                return false;
-            }
-            match self.bits.compare_exchange(
-                state,
-                state | PUBLISHING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
+        self.set_unless(CLOSED, PUBLISHING)
     }
 
     fn expire(&self) -> bool {
-        let mut state = self.bits.load(Ordering::Acquire);
-        loop {
-            if state & PUBLISHING != 0 {
-                return false;
-            }
-            if state & CLOSED != 0 {
-                return true;
-            }
-            match self.bits.compare_exchange(
-                state,
-                state | CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => state = actual,
-            }
-        }
+        self.set_unless(PUBLISHING, CLOSED)
     }
 
     fn finish(&self, failed: bool) {
-        let mut state = self.bits.load(Ordering::Acquire);
-        loop {
-            let next = (state & CLOSED) | (u8::from(failed) * CLOSED);
-            match self
-                .bits
-                .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(actual) => state = actual,
-            }
+        if failed {
+            self.close();
         }
+        self.bits.fetch_and(CLOSED, Ordering::AcqRel);
     }
 
     fn close(&self) {
@@ -167,26 +100,22 @@ impl State {
         self.bits.load(Ordering::Acquire) & CLOSED != 0
     }
 
-    fn commit_issued(&self) -> bool {
-        self.bits.load(Ordering::Acquire) & PHASE == COMMIT
-    }
-
-    fn commit_dirty(&self) -> bool {
-        self.bits.load(Ordering::Acquire) & PHASE == DIRTY
+    fn phase(&self) -> u8 {
+        self.bits.load(Ordering::Acquire) & PHASE
     }
 
     fn hold(&self) -> bool {
         let state = self.bits.load(Ordering::Acquire);
-        state & PHASE == 0
-            && self
-                .bits
-                .compare_exchange(state, state | HELD, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        state & PHASE == 0 && self.change(state, state | HELD).is_ok()
     }
 
     fn release(&self) {
         self.bits.fetch_and(!PHASE, Ordering::Release);
     }
+}
+
+fn failure(kind: ErrorKind) -> StoreError {
+    StoreError::Io(kind.into())
 }
 schema!(enum pub(crate) Work; Append(Arc<[u8]>, u64, u64), Replace(Vec<u8>, u32, u64, u64), Clear(u64, u64), #[cfg(test)] Test(TestWork));
 
@@ -229,7 +158,7 @@ impl Work {
 }
 
 schema!(struct pub(crate) Lane fields; submit: Sender<Submitted>, limits: (usize, usize), pending: VecDeque<Job>,
-    bytes: usize, failure: Option<ErrorKind>, state: Arc<State>, published: Arc<Mutex<Published>>);
+    bytes: usize, failure: Option<ErrorKind>, state: Arc<State>);
 
 impl Lane {
     pub(crate) fn new(mut store: Store, jobs: usize, bytes: usize) -> Self {
@@ -238,14 +167,13 @@ impl Lane {
         // its completion still names the commit a reader would select (§5). The
         // alternative — re-opening the store by pathname — would reintroduce
         // §11.4's check/use substitution window on every STATUS.
-        let published = Arc::new(Mutex::new(Published {
-            frontier: Some(*store.selected()),
-            completed: VecDeque::new(),
-        }));
-        let worker_published = Arc::clone(&published);
         let (submit, work) = mpsc::channel::<Submitted>();
         let state = Arc::new(State {
             bits: AtomicU8::new(0),
+            published: Mutex::new(Published {
+                frontier: Some(*store.selected()),
+                completed: VecDeque::new(),
+            }),
             #[cfg(test)]
             publication_gate: Mutex::new(None),
         });
@@ -260,14 +188,14 @@ impl Lane {
                 // commit, so publishing it directly avoids a full read/hash of
                 // the store after every append. Only an ambiguous commit-phase
                 // error needs recovery through the already validated handles.
-                let selected = match &result {
-                    Ok((commit, _)) => Some(*commit),
+                let selected = match (&result, worker_state.phase()) {
+                    (Ok((commit, _)), _) => Some(*commit),
                     // None is published as an explicit unknown frontier; the
                     // holder then refuses STATUS/ATTACH instead of silently
                     // replaying stale coordinates.
-                    Err(_) if worker_state.commit_issued() => store.selected_result().ok(),
-                    Err(_) if worker_state.commit_dirty() => None,
-                    Err(_) => Some(*store.selected()),
+                    (Err(_), COMMIT) => store.selected_result().ok(),
+                    (Err(_), DIRTY) => None,
+                    (Err(_), _) => Some(*store.selected()),
                 };
                 let completed = Instant::now();
                 let publishing = completed < deadline && worker_state.publish();
@@ -276,7 +204,7 @@ impl Lane {
                     worker_state.pause_publication();
                 }
                 let result_failed = result.is_err();
-                let mut published = worker_published.lock().expect("published lock");
+                let mut published = worker_state.published.lock().expect("published lock");
                 match (&mut published.frontier, selected) {
                     (Some(current), Some(commit)) if commit.index > current.index => {
                         *current = commit
@@ -291,7 +219,7 @@ impl Lane {
                 // terminally closed on failure).
                 worker_state.finish(failed);
                 if publishing && !abandoned {
-                    published.completed.push_back((completed, result));
+                    published.completed.push_back(result);
                 }
                 drop(published);
                 if failed || worker_state.closed() {
@@ -306,7 +234,6 @@ impl Lane {
             bytes: 0,
             failure: None,
             state,
-            published,
         }
     }
 
@@ -343,31 +270,17 @@ impl Lane {
     pub(crate) fn try_complete(&mut self, now: Instant) -> Option<Done> {
         let deadline = self.pending.front()?.1;
         let result = if let Some(kind) = self.failure {
-            Err(StoreError::Io(kind.into()))
+            Err(failure(kind))
         } else {
-            let published = Arc::clone(&self.published);
-            let observed = match published.try_lock() {
+            let state = Arc::clone(&self.state);
+            match state.published.try_lock() {
                 Ok(mut published) => match published.completed.pop_front() {
-                    Some(completed) => Ok(Some(completed)),
-                    None if now >= deadline => {
-                        if self.state.expire() {
-                            Err(ErrorKind::TimedOut)
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    None => Ok(None),
+                    Some(result) => result,
+                    None if now < deadline || !self.state.expire() => return None,
+                    None => Err(self.fail(ErrorKind::TimedOut)),
                 },
                 Err(TryLockError::WouldBlock) => return None,
-                Err(TryLockError::Poisoned(_)) => Err(ErrorKind::BrokenPipe),
-            };
-            match observed {
-                Ok(Some((completed, _))) if completed >= deadline => {
-                    Err(self.fail(ErrorKind::TimedOut))
-                }
-                Ok(Some((_, result))) => result,
-                Ok(None) => return None,
-                Err(kind) => Err(self.fail(kind)),
+                Err(TryLockError::Poisoned(_)) => Err(self.fail(ErrorKind::BrokenPipe)),
             }
         };
         if result.is_err() && self.failure.is_none() {
@@ -389,7 +302,7 @@ impl Lane {
         self.state.release();
     }
     pub(crate) fn snapshot(&self) -> Frontier {
-        match self.published.try_lock() {
+        match self.state.published.try_lock() {
             Ok(published) => Frontier::Ready(published.frontier),
             Err(TryLockError::WouldBlock) => Frontier::Busy,
             Err(TryLockError::Poisoned(_)) => Frontier::Failed,
@@ -410,7 +323,7 @@ impl Lane {
     fn fail(&mut self, kind: ErrorKind) -> StoreError {
         self.failure.get_or_insert(kind);
         self.state.close();
-        StoreError::Io(kind.into())
+        failure(kind)
     }
 }
 

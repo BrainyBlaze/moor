@@ -18,28 +18,16 @@ schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, cr
 schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
     generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
 schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, events: Option<Events>);
-
-#[derive(Clone, Copy)]
-pub(crate) struct StatusSnapshot {
-    pub(crate) health: u8,
-    pub(crate) event: Option<Commit>,
-    pub(crate) log: Option<Commit>,
-}
-
-pub(crate) enum SnapshotState {
-    Ready(StatusSnapshot),
-    Busy,
-    Failed,
-}
+schema!(struct pub(crate) StatusSnapshot derive [Clone, Copy] pub(crate) fields; health: u8, event: Option<Commit>, log: Option<Commit>);
+schema!(enum pub(crate) SnapshotState; Ready(StatusSnapshot), Busy, Failed);
 
 impl Events {
     fn body(&self, cursor: Cursor, history: bool, records: &str) -> String {
+        let history = if history { &self.records } else { "" };
         let mut body =
             events::canonical_header(self.created, &self.session, self.generation, cursor);
-        body.reserve(records.len() + usize::from(history) * self.records.len());
-        if history {
-            body.push_str(&self.records);
-        }
+        body.reserve(history.len() + records.len());
+        body.push_str(history);
         body.push_str(records);
         body
     }
@@ -105,11 +93,8 @@ impl SessionStorage {
     }
 
     pub fn commit(&mut self, purpose: Purpose, events: &[Event]) -> Result<(), StorageError> {
-        if events.is_empty() {
-            Ok(())
-        } else {
-            self.record(purpose, events, None)
-        }
+        return_if!(events.is_empty(), Ok(()));
+        self.record(purpose, events, None)
     }
 
     fn record(
@@ -154,7 +139,7 @@ impl SessionStorage {
                     .semantic
                     .iter()
                     .filter(|(key, _)| !retained.contains_key(*key))
-                    .map(|(_, event)| event.0.clone()),
+                    .map(|(_, (event, _))| event.clone()),
             );
             next = events.stream;
             (records, cursor, exhausted) = next
@@ -229,16 +214,15 @@ impl SessionStorage {
     pub const EVENT_LANE: usize = 1;
 
     pub fn health(&self) -> u8 {
-        self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
-            bits | (u8::from(
-                lane.as_ref().is_some_and(Lane::writable)
-                    && (at != 1
-                        || self
-                            .events
-                            .as_ref()
-                            .is_some_and(|events| events.stream.writable())),
-            ) << at)
-        })
+        let lanes = self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
+            bits | (u8::from(lane.as_ref().is_some_and(Lane::writable)) << at)
+        });
+        let event = u8::from(
+            self.events
+                .as_ref()
+                .is_some_and(|events| events.stream.writable()),
+        ) << Self::EVENT_LANE;
+        lanes & (!2 | event)
     }
 
     /// Acquire a nonblocking memory-only status linearization point across all
@@ -286,9 +270,7 @@ impl SessionStorage {
 
     fn release_held(&self, held: u8) {
         for (at, lane) in self.lanes.iter().enumerate() {
-            if held & (1 << at) != 0
-                && let Some(lane) = lane
-            {
+            if let Some(lane) = lane.as_ref().filter(|_| held & (1 << at) != 0) {
                 lane.release();
             }
         }
@@ -299,11 +281,10 @@ impl SessionStorage {
     }
 
     pub(crate) fn abandon_clear(&mut self, tag: u64) {
-        let Some(lane) = self.lanes[0].as_mut() else {
-            return;
-        };
-        if lane.pending_matches(|purpose| matches!(purpose, Purpose::Clear(id, _) if id == tag)) {
-            lane.close();
+        if self.lanes[0].as_ref().is_some_and(|lane| {
+            lane.pending_matches(|purpose| matches!(purpose, Purpose::Clear(id, _) if id == tag))
+        }) {
+            self.quarantine_log();
         }
     }
 
