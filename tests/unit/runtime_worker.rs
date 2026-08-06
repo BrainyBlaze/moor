@@ -208,19 +208,20 @@ impl Work {
 
 impl Lane {
     #[allow(dead_code)]
+    pub(crate) fn phase(&self) -> u8 {
+        self.state.bits.load(Ordering::Acquire) & PHASE
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<Commit> {
-        self.state
-            .published
-            .lock()
-            .expect("published lock")
-            .frontier
+        *self.state.frontier.lock().expect("frontier lock")
     }
 
     #[allow(dead_code)]
     pub(crate) fn block_publication(&self, entered: Sender<()>, release: Receiver<()>) {
         let state = Arc::clone(&self.state);
         std::thread::spawn(move || {
-            let _guard = state.published.lock().expect("published lock");
+            let _guard = state.frontier.lock().expect("frontier lock");
             let _ = entered.send(());
             let _ = release.recv();
         });
