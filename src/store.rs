@@ -145,11 +145,7 @@ impl PreparedStore {
     ) -> Result<Store> {
         let (selected, hash) = initial_commit(kind, generation, initial, start..end)?;
         let slots = open_prepared(directory, &self.slots)?;
-        Ok(Store {
-            slots,
-            selected,
-            hash,
-        })
+        Ok(Store::from_parts(slots, selected, hash))
     }
 
     pub fn initialize_at(
@@ -240,11 +236,7 @@ impl Store {
             let slots = open_slots(path, true)?;
             durable(&slots[0], 0, initial)?;
             durable(&slots[2], 0, &selected.encode())?;
-            Ok(Self {
-                slots,
-                selected,
-                hash,
-            })
+            Ok(Self::from_parts(slots, selected, hash))
         }
     }
 
@@ -270,12 +262,8 @@ impl Store {
 
     pub fn open(path: &Path, kind: Kind, generation: impl Into<Option<u32>>) -> Result<Self> {
         let slots = open_slots(path, true)?;
-        let (selected, hash, _) = recover(&slots, kind, generation.into())?;
-        Ok(Self {
-            slots,
-            selected,
-            hash,
-        })
+        recover(&slots, kind, generation.into())
+            .map(|(selected, hash, _)| Self::from_parts(slots, selected, hash))
     }
 
     pub fn read_only(
@@ -292,12 +280,11 @@ impl Store {
     }
 
     pub fn duplicate(&self) -> Result<Self> {
-        let clone = |at: usize| self.slots[at].try_clone();
-        Ok(Self {
-            slots: [clone(0)?, clone(1)?, clone(2)?, clone(3)?],
-            selected: self.selected,
-            hash: self.hash.clone(),
-        })
+        Ok(Self::from_parts(
+            four(|at| self.slots[at].try_clone().map_err(Into::into))?,
+            self.selected,
+            self.hash.clone(),
+        ))
     }
 
     pub fn selected_result(&self) -> Result<Commit> {
@@ -418,6 +405,14 @@ impl Store {
         self.hash = hash;
         Ok(&self.selected)
     }
+
+    fn from_parts(slots: Slots, selected: Commit, hash: Sha256) -> Self {
+        Self {
+            slots,
+            selected,
+            hash,
+        }
+    }
 }
 
 fn initial_commit(
@@ -520,18 +515,10 @@ fn prepare_at(directory: &File) -> Result<Slots> {
     require(meta.is_dir() && protected(Path::new(""), &meta, 0o700))?;
     let mut slots = Vec::with_capacity(4);
     for at in 0..4 {
-        match slot_at(directory, at, true) {
-            Ok(slot) => slots.push(slot),
-            Err(error) => {
-                remove_at(directory, &slots);
-                return Err(error);
-            }
-        }
+        let slot = slot_at(directory, at, true).inspect_err(|_| remove_at(directory, &slots))?;
+        slots.push(slot);
     }
-    if let Err(error) = validate_at(directory, &slots) {
-        remove_at(directory, &slots);
-        return Err(error);
-    }
+    validate_at(directory, &slots).inspect_err(|_| remove_at(directory, &slots))?;
     Ok(slots.try_into().unwrap())
 }
 
@@ -566,9 +553,7 @@ fn slot_at(directory: &File, at: usize, create: bool) -> Result<File> {
             0o600,
         )
     };
-    if descriptor < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
+    return_if!(descriptor < 0, Err(io::Error::last_os_error().into()));
     let file = unsafe { File::from_raw_fd(descriptor) };
     if create && unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
         let error = io::Error::last_os_error();
@@ -657,9 +642,7 @@ fn read_commit(
     generation: Option<u32>,
 ) -> Result<Option<Candidate>> {
     let file = &slots[2 + slot as usize];
-    if file.metadata()?.len() != 92 {
-        return Ok(None);
-    }
+    return_if!(file.metadata()?.len() != 92, Ok(None));
     let record = read_range(file, 0, 92)?;
     let Some(commit) = Commit::decode(&record, slot, kind, generation) else {
         return Ok(None);

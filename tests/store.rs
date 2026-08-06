@@ -208,6 +208,10 @@ fn lifecycle_records_are_canonical_closed_and_identity_bound() {
             valid.replace("\"wire_generation\":7", "\"wire_generation\":8"),
         ),
         ("lifecycle-base64", valid.replace("AS9z", "AS9z=")),
+        (
+            "lifecycle-truncated",
+            valid.replace(",\"instrument_path\":null", ""),
+        ),
     ] {
         let path = temp(name);
         assert!(matches!(

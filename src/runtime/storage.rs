@@ -214,15 +214,14 @@ impl SessionStorage {
     pub const EVENT_LANE: usize = 1;
 
     pub fn health(&self) -> u8 {
-        let lanes = self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
-            bits | (u8::from(lane.as_ref().is_some_and(Lane::writable)) << at)
-        });
         let event = u8::from(
             self.events
                 .as_ref()
                 .is_some_and(|events| events.stream.writable()),
         ) << Self::EVENT_LANE;
-        lanes & (!2 | event)
+        self.lanes.iter().enumerate().fold(0, |bits, (at, lane)| {
+            bits | (u8::from(lane.as_ref().is_some_and(Lane::writable)) << at)
+        }) & (!2 | event)
     }
 
     /// Acquire a nonblocking memory-only status linearization point across all
