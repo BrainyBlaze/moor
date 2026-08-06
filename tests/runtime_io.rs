@@ -1,4 +1,4 @@
-use moor::cli::Options;
+use moor::cli::{Options, Redraw};
 use moor::runtime::client::Client;
 use moor::runtime::io::{self, Duplex, Event, SendError, ViewerSender};
 use moor::session::{LeaseResult, LeaseRole, ResultOutcome, ResultReason};
@@ -646,7 +646,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             6,
             &[&1_u64.to_le_bytes()[..], &0_u64.to_le_bytes(), b"x"].concat(),
         );
-        let mut saw = [false; 3];
+        let mut saw = [false; 4];
         while !saw.into_iter().all(|value| value) {
             let message = first.recv();
             match message.kind {
@@ -662,10 +662,11 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                     assert_eq!(&message.payload[13..], b"a");
                     saw[1] = true;
                 }
-                0x0b => {
-                    assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 100, 0, 30, 0]);
-                    saw[2] = true;
-                }
+                0x0b => match message.payload.as_ref() {
+                    [3, 0, 0, 0, 80, 0, 24, 0] => saw[2] = true,
+                    [3, 0, 0, 0, 100, 0, 30, 0] => saw[3] = true,
+                    payload => panic!("unexpected initial viewer resize {payload:?}"),
+                },
                 kind => panic!("unexpected initial viewer frame {kind}"),
             }
         }
@@ -708,6 +709,20 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             (attach.kind, attach.payload.as_ref()),
             (3, [100, 0, 30, 0, 0].as_slice())
         );
+        assert!(
+            second.queued.is_empty(),
+            "viewer queued a frame before resumed ATTACH was acknowledged"
+        );
+        second
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut premature = [0; 256];
+        assert!(
+            matches!(second.stream.read(&mut premature), Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "viewer sent a frame before resumed ATTACH was acknowledged"
+        );
+        second.stream.set_read_timeout(None).unwrap();
         second.send(7, 5, &[0, 0]);
         second.send(7, 4, &status(1, 2, 0, 2, 1));
         second.send(
@@ -722,7 +737,8 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
         );
         let mut acks = Vec::new();
         let mut replayed = false;
-        while acks.len() != 2 || !replayed {
+        let mut redrawn = false;
+        while acks.len() != 2 || !replayed || !redrawn {
             let message = second.recv();
             match message.kind {
                 7 => acks.push(u64::from_le_bytes(
@@ -738,6 +754,11 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                             .encode()
                             .unwrap(),
                     );
+                }
+                0x0b => {
+                    assert!(!redrawn, "resumed viewer redrew more than once");
+                    assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 100, 0, 30, 0]);
+                    redrawn = true;
                 }
                 kind => panic!("unexpected resumed viewer frame {kind}"),
             }
@@ -771,9 +792,13 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
     let mut sink = SignalWriter(output.clone(), gate.clone());
     let mut replacement = Some(second_client);
     let mut input = None;
+    let options = Options {
+        redraw: Redraw::Winch,
+        ..Options::default()
+    };
     let result = io::attach_viewer_to(
         &mut client,
-        &Options::default(),
+        &options,
         (24, 80),
         &mut sink,
         Duration::from_secs(15),
