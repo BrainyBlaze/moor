@@ -13,13 +13,18 @@ use interprocess::local_socket::{
     Stream as LocalStream,
 };
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
+use nix::dir::Dir;
+use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open, openat};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::stat::{FchmodatFlags, Mode, SFlag, fchmod, fchmodat, fstatat, mkdirat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use path_absolutize::Absolutize;
 use signal_hook::iterator::Signals;
 use std::cell::Cell;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
@@ -30,6 +35,11 @@ use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, String>;
 type StoreResult<T> = std::result::Result<T, StoreError>;
+const SAFE_OPEN_FLAGS: i32 = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+const DIRECTORY_FLAGS: OFlag =
+    OFlag::from_bits_retain(libc::O_RDONLY | libc::O_DIRECTORY | SAFE_OPEN_FLAGS);
+const INSTRUMENT_FLAGS: OFlag =
+    OFlag::from_bits_retain(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | SAFE_OPEN_FLAGS);
 
 trait Text<T> {
     fn text(self) -> Result<T>;
@@ -39,6 +49,22 @@ impl<T, E: std::fmt::Display> Text<T> for std::result::Result<T, E> {
     fn text(self) -> Result<T> {
         self.map_err(|error| error.to_string())
     }
+}
+
+fn os<T>(result: nix::Result<T>) -> io::Result<T> {
+    result.map_err(io::Error::from)
+}
+
+fn file(result: nix::Result<OwnedFd>) -> io::Result<File> {
+    os(result).map(File::from)
+}
+
+fn dir(descriptor: OwnedFd) -> io::Result<Dir> {
+    let raw = descriptor.as_raw_fd();
+    // nix 0.30 transfers ownership before fdopendir and otherwise leaks its error path.
+    Dir::from_fd(descriptor)
+        .inspect_err(|_| drop(unsafe { File::from_raw_fd(raw) }))
+        .map_err(Into::into)
 }
 
 fn owned(meta: &fs::Metadata) -> bool {
@@ -363,36 +389,25 @@ impl Drop for Stage {
 
 impl Stage {
     fn capture(&mut self) -> Result<()> {
-        let stat = stat_at(&self.0, &self.1).text()?;
-        crate::ensure!(
-            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK,
-            "staged rendezvous identity changed"
-        );
-        self.2 = Some(stat_identity(&stat));
-        Ok(())
+        self.2 = entry_identity(&self.0, &self.1, SFlag::S_IFSOCK, None).text()?;
+        crate::require(self.2.is_some(), "staged rendezvous identity changed")
     }
 
     fn matches(&self) -> bool {
         self.2.is_some_and(|identity| {
-            stat_at(&self.0, &self.1).ok().is_some_and(|stat| {
-                stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && stat_identity(&stat) == identity
-            })
+            entry_identity(&self.0, &self.1, SFlag::S_IFSOCK, None).ok() == Some(Some(identity))
         })
     }
 
     fn revalidate(&self) -> Result<()> {
-        crate::ensure!(self.matches(), "staged rendezvous identity changed");
-        Ok(())
+        crate::require(self.matches(), "staged rendezvous identity changed")
     }
 
     fn published_identity(&self, destination: &OsStr) -> Result<(u64, u64)> {
-        let stat = stat_at(&self.0, destination).text()?;
-        let identity = stat_identity(&stat);
-        crate::ensure!(
-            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && self.2 == Some(identity),
-            "published rendezvous identity changed"
-        );
-        Ok(identity)
+        entry_identity(&self.0, destination, SFlag::S_IFSOCK, None)
+            .text()?
+            .filter(|identity| self.2 == Some(*identity))
+            .ok_or_else(|| "published rendezvous identity changed".into())
     }
 
     fn rollback_published(&self, destination: &OsStr) {
@@ -1098,17 +1113,9 @@ fn open_event_target(
         .ok_or_else(|| reject("outside-root"))?
         .to_owned();
     for component in relative.parent().unwrap_or(Path::new("")).components() {
-        match open_directory_at(&directory, component.as_os_str()) {
-            Ok(opened) => directory = opened,
-            Err(error) => {
-                return Err(reject(component_cause(
-                    &directory,
-                    component.as_os_str(),
-                    false,
-                    &error,
-                )));
-            }
-        }
+        let name = component.as_os_str();
+        directory = open_directory_at(&directory, name)
+            .map_err(|error| reject(component_cause(&directory, name, false, &error)))?;
     }
     let opened = match open_directory_at(&directory, &leaf) {
         Ok(opened) => Some(opened),
@@ -1125,21 +1132,16 @@ fn validate_event_directory(directory: &File, operand: &Path) -> Result<()> {
     let meta = directory.metadata().map_err(|_| reject("io-error"))?;
     crate::ensure!(owned(&meta), reject("wrong-owner"));
     crate::ensure!(meta.mode() & 0o777 == 0o700, reject("wrong-mode"));
-    if let Some(entry) = first_directory_entry(directory).map_err(|_| reject("io-error"))? {
+    directory_entries::<_, io::Error>(directory, |entry| {
         let slots = ["body.0", "body.1", "commit.0", "commit.1"];
-        return Err(reject(if slots.iter().any(|name| entry == *name) {
+        Ok(Some(if slots.iter().any(|name| entry == name.as_bytes()) {
             "pre-existing-slot"
         } else {
             "extra-entry"
-        }));
-    }
-    Ok(())
-}
-
-fn first_directory_entry(directory: &File) -> io::Result<Option<OsString>> {
-    directory_entries(directory, |name| {
-        Ok(Some(OsString::from_vec(name.to_vec())))
+        }))
     })
+    .map_err(|_| reject("io-error"))?
+    .map_or(Ok(()), |cause| Err(reject(cause)))
 }
 
 pub(crate) fn directory_entries<T, E>(
@@ -1149,55 +1151,24 @@ pub(crate) fn directory_entries<T, E>(
 where
     E: From<io::Error>,
 {
-    use std::ffi::CStr;
-    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-    crate::return_if!(descriptor < 0, Err(io::Error::last_os_error().into()));
-    let duplicate = unsafe { File::from_raw_fd(descriptor) };
-    let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0
-        || flags & libc::O_NONBLOCK == 0
-            && unsafe {
-                libc::fcntl(
-                    duplicate.as_raw_fd(),
-                    libc::F_SETFL,
-                    flags | libc::O_NONBLOCK,
-                )
-            } < 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-    let descriptor = duplicate.into_raw_fd();
-    let stream = unsafe { libc::fdopendir(descriptor) };
-    if stream.is_null() {
-        drop(unsafe { File::from_raw_fd(descriptor) });
-        return Err(io::Error::last_os_error().into());
-    }
-    struct Stream(*mut libc::DIR);
-    impl Drop for Stream {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-    let _stream = Stream(stream);
-    unsafe { libc::rewinddir(stream) };
-    loop {
-        nix::errno::Errno::clear();
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            let errno = nix::errno::Errno::last_raw();
-            return if errno == 0 {
-                Ok(None)
-            } else {
-                Err(io::Error::from_raw_os_error(errno).into())
-            };
-        }
-        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+    let duplicate = directory.as_fd().try_clone_to_owned()?;
+    let flags = OFlag::from_bits_retain(os(fcntl(&duplicate, FcntlArg::F_GETFL))?);
+    os(fcntl(
+        &duplicate,
+        FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+    ))?;
+    let mut stream = dir(duplicate)?;
+    drop(stream.iter());
+    for entry in stream.iter() {
+        let entry = os(entry)?;
+        let name = entry.file_name().to_bytes();
         if !matches!(name, b"." | b"..")
             && let Some(value) = visit(name)?
         {
             return Ok(Some(value));
         }
     }
+    Ok(None)
 }
 
 fn event_store_error(operand: &Path, error: StoreError) -> String {
@@ -1209,19 +1180,19 @@ fn event_store_error(operand: &Path, error: StoreError) -> String {
     event_rejection(operand, cause)
 }
 
-crate::schema!(enum DirectoryFailure; Io(io::Error), Identity(Option<io::Error>));
+crate::schema!(enum DirectoryFailure; Io(io::Error), Identity(io::Error), Changed);
 
 impl DirectoryFailure {
     fn artifact(self) -> String {
         match self {
-            Self::Io(error) | Self::Identity(Some(error)) => error.to_string(),
-            Self::Identity(None) => "artifact identity changed".into(),
+            Self::Io(error) | Self::Identity(error) => error.to_string(),
+            Self::Changed => "artifact identity changed".into(),
         }
     }
 
     fn event(self, operand: &Path) -> String {
         let cause = match self {
-            Self::Identity(_) => "identity-changed",
+            Self::Identity(_) | Self::Changed => "identity-changed",
             Self::Io(_) => "io-error",
         };
         event_rejection(operand, cause)
@@ -1231,38 +1202,36 @@ impl DirectoryFailure {
 fn create_directory_at(
     parent: &File,
     leaf: &OsStr,
-    name: &std::ffi::CStr,
     require_owner: bool,
 ) -> std::result::Result<(File, (u64, u64)), DirectoryFailure> {
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-        let error = io::Error::last_os_error();
+    if let Err(error) = os(mkdirat(parent, leaf, Mode::from_bits_retain(0o700))) {
         return Err(if error.kind() == io::ErrorKind::AlreadyExists {
-            DirectoryFailure::Identity(Some(error))
+            DirectoryFailure::Identity(error)
         } else {
             DirectoryFailure::Io(error)
         });
     }
-    let inspect = |error| DirectoryFailure::Identity(Some(error));
-    let stat = stat_at(parent, leaf).map_err(inspect)?;
-    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        return Err(DirectoryFailure::Identity(None));
-    }
-    let identity = stat_identity(&stat);
+    let inspect = DirectoryFailure::Identity;
+    let identity = entry_identity(parent, leaf, SFlag::S_IFDIR, None)
+        .map_err(inspect)?
+        .ok_or(DirectoryFailure::Changed)?;
     let opened = (|| {
-        chmod_at(parent, leaf, 0o700).map_err(DirectoryFailure::Io)?;
-        let stat = stat_at(parent, leaf).map_err(inspect)?;
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-            || stat_identity(&stat) != identity
-            || stat.st_mode & 0o777 != 0o700
-        {
-            return Err(DirectoryFailure::Identity(None));
-        }
+        os(fchmodat(
+            parent,
+            leaf,
+            Mode::from_bits_retain(0o700),
+            FchmodatFlags::FollowSymlink,
+        ))
+        .map_err(DirectoryFailure::Io)?;
+        let valid = entry_identity(parent, leaf, SFlag::S_IFDIR, Some(0o700)).map_err(inspect)?
+            == Some(identity);
+        crate::return_if!(!valid, Err(DirectoryFailure::Changed));
         let directory = open_directory_at(parent, leaf).map_err(inspect)?;
         let meta = directory.metadata().map_err(DirectoryFailure::Io)?;
-        if !meta.is_dir() || file_id(&meta) != identity || require_owner && !protected(&meta, 0o700)
-        {
-            return Err(DirectoryFailure::Identity(None));
-        }
+        let valid = meta.is_dir()
+            && file_id(&meta) == identity
+            && (!require_owner || protected(&meta, 0o700));
+        crate::return_if!(!valid, Err(DirectoryFailure::Changed));
         Ok(directory)
     })();
     if opened.is_err() && directory_entry_matches(parent, leaf, identity) {
@@ -1278,9 +1247,8 @@ impl StoreTarget {
             .file_name()
             .ok_or("artifact path has no name")?
             .to_owned();
-        let name = native_name(&leaf)?;
         let (directory, identity) =
-            create_directory_at(&parent, &leaf, &name, true).map_err(DirectoryFailure::artifact)?;
+            create_directory_at(&parent, &leaf, true).map_err(DirectoryFailure::artifact)?;
         Self::from_directory(
             (parent, leaf, directory, identity),
             true,
@@ -1298,27 +1266,24 @@ impl StoreTarget {
         store_error: impl FnOnce(StoreError) -> String,
     ) -> Result<Self> {
         let (parent, leaf, directory, identity) = binding;
-        let prepared =
-            validate(&directory).and_then(|()| Store::prepare_at(&directory).map_err(store_error));
-        match prepared {
-            Ok(prepared) => Ok(Self {
-                parent,
-                leaf,
-                directory,
-                identity,
-                prepared,
-                validator: None,
-                exact_selection,
-                owned,
-                armed: true,
-            }),
-            Err(error) => {
+        let prepared = validate(&directory)
+            .and_then(|()| Store::prepare_at(&directory).map_err(store_error))
+            .inspect_err(|_| {
                 if owned && directory_entry_matches(&parent, &leaf, identity) {
                     let _ = remove_directory_at(&parent, &leaf);
                 }
-                Err(error)
-            }
-        }
+            })?;
+        Ok(Self {
+            parent,
+            leaf,
+            directory,
+            identity,
+            prepared,
+            validator: None,
+            exact_selection,
+            owned,
+            armed: true,
+        })
     }
 
     fn lease(&mut self, kind: Kind, generation: u32, initial: &[u8]) -> StoreResult<Store> {
@@ -1334,14 +1299,13 @@ impl StoreTarget {
         self.prepared
             .initialize_leased_at(&self.directory, store, initial)
             .map_err(|error| format!("store initialization failed: {error:?}"))?;
-        crate::ensure!(
+        crate::require(
             !self.exact_selection
                 || store
                     .selected_result()
                     .is_ok_and(|selected| selected == *store.selected()),
-            "store initialization failed: selected commit changed"
-        );
-        Ok(())
+            "store initialization failed: selected commit changed",
+        )
     }
 
     fn revalidate_store(&self) -> StoreResult<bool> {
@@ -1351,15 +1315,14 @@ impl StoreTarget {
     }
 
     fn revalidate(&self) -> Result<()> {
-        crate::ensure!(
+        crate::require(
             directory_entry_matches(&self.parent, &self.leaf, self.identity),
-            "artifact identity changed"
-        );
+            "artifact identity changed",
+        )?;
         let selected = self
             .revalidate_store()
             .map_err(|error| format!("store identity changed: {error:?}"))?;
-        crate::ensure!(selected, "store selected commit changed");
-        Ok(())
+        crate::require(selected, "store selected commit changed")
     }
 
     fn retain(&mut self) {
@@ -1395,8 +1358,7 @@ impl PendingEvent {
                 (directory, identity, false)
             }
             None => {
-                let name = native_name(&leaf).map_err(|_| event_rejection(&operand, "io-error"))?;
-                let (directory, identity) = create_directory_at(&parent, &leaf, &name, false)
+                let (directory, identity) = create_directory_at(&parent, &leaf, false)
                     .map_err(|error| error.event(&operand))?;
                 (directory, identity, true)
             }
@@ -1439,8 +1401,8 @@ impl EventTarget {
         );
         self.target
             .revalidate_store()
-            .map_err(|error| event_store_error(&self.operand, error))?;
-        Ok(())
+            .map_err(|error| event_store_error(&self.operand, error))
+            .map(|_| ())
     }
 }
 
@@ -1455,38 +1417,25 @@ impl PreparedInstrument {
             .ok_or("instrumentation stage has no name")?
             .to_owned();
         let parent = open_directory(root).text()?;
-        let name = native_name(&leaf)?;
-        let descriptor = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK,
-                0o500,
-            )
-        };
-        syscall!(descriptor >= 0);
-        let stage = unsafe { File::from_raw_fd(descriptor) };
-        let identity = (|| {
-            syscall!(unsafe { libc::fchmod(stage.as_raw_fd(), 0o500) } == 0);
+        let stage = file(openat(
+            &parent,
+            leaf.as_os_str(),
+            INSTRUMENT_FLAGS,
+            Mode::from_bits_retain(0o500),
+        ))
+        .text()?;
+        let identity = (|| -> Result<_> {
+            os(fchmod(&stage, Mode::from_bits_retain(0o500))).text()?;
             let meta = stage.metadata().text()?;
             crate::ensure!(
                 meta.is_file() && protected(&meta, 0o500),
                 "instrumentation stage identity changed"
             );
             Ok(file_id(&meta))
-        })();
-        let identity = match identity {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = unlink_at(&parent, &leaf);
-                return Err(error);
-            }
-        };
+        })()
+        .inspect_err(|_| {
+            let _ = unlink_at(&parent, &leaf);
+        })?;
         Ok(Self {
             source,
             stage,
@@ -1559,38 +1508,12 @@ impl Drop for PreparedInstrument {
     }
 }
 
-fn chmod_at(parent: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<()> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    (unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) } == 0)
-        .then_some(())
-        .ok_or_else(io::Error::last_os_error)
-}
-
 pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+    file(open(path, DIRECTORY_FLAGS, Mode::empty()))
 }
 
 fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    let descriptor = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY
-                | libc::O_DIRECTORY
-                | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK,
-        )
-    };
-    (descriptor >= 0)
-        .then(|| unsafe { File::from_raw_fd(descriptor) })
-        .ok_or_else(io::Error::last_os_error)
+    file(openat(parent, name, DIRECTORY_FLAGS, Mode::empty()))
 }
 
 fn component_cause(
@@ -1604,39 +1527,23 @@ fn component_cause(
     }
     let stat = match stat_at(parent, name) {
         Ok(stat) => stat,
-        Err(error) => {
-            return if error.kind() == io::ErrorKind::NotFound {
-                "missing"
-            } else {
-                "io-error"
-            };
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return "missing",
+        Err(_) => return "io-error",
     };
-    match stat.st_mode & libc::S_IFMT {
-        libc::S_IFLNK => "link",
-        libc::S_IFDIR => "identity-changed",
+    match SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT {
+        SFlag::S_IFLNK => "link",
+        SFlag::S_IFDIR => "identity-changed",
         _ if final_component => "wrong-type",
         _ => "not-directory",
     }
 }
 
 fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-    stat_cstr_at(parent, &name)
+    os(fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW))
 }
 
 pub(crate) fn stat_cstr_at(parent: &File, name: &std::ffi::CStr) -> io::Result<libc::stat> {
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    let valid = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            &mut stat,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } == 0;
-    valid.then_some(stat).ok_or_else(io::Error::last_os_error)
+    os(fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW))
 }
 
 pub(crate) fn stat_identity(stat: &libc::stat) -> (u64, u64) {
@@ -1647,10 +1554,20 @@ pub(crate) fn stat_identity(stat: &libc::stat) -> (u64, u64) {
     (device, stat.st_ino)
 }
 
+fn entry_identity(
+    parent: &File,
+    name: &OsStr,
+    kind: SFlag,
+    mode: Option<libc::mode_t>,
+) -> io::Result<Option<(u64, u64)>> {
+    let stat = stat_at(parent, name)?;
+    let matches = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == kind
+        && mode.is_none_or(|mode| stat.st_mode & 0o777 == mode);
+    Ok(matches.then(|| stat_identity(&stat)))
+}
+
 fn directory_entry_matches(parent: &File, name: &OsStr, identity: (u64, u64)) -> bool {
-    stat_at(parent, name).ok().is_some_and(|entry| {
-        entry.st_mode & libc::S_IFMT == libc::S_IFDIR && stat_identity(&entry) == identity
-    })
+    entry_identity(parent, name, SFlag::S_IFDIR, None).ok() == Some(Some(identity))
 }
 
 fn file_entry_matches(
@@ -1659,11 +1576,7 @@ fn file_entry_matches(
     identity: (u64, u64),
     mode: libc::mode_t,
 ) -> bool {
-    stat_at(parent, name).ok().is_some_and(|entry| {
-        entry.st_mode & libc::S_IFMT == libc::S_IFREG
-            && entry.st_mode & 0o777 == mode
-            && stat_identity(&entry) == identity
-    })
+    entry_identity(parent, name, SFlag::S_IFREG, Some(mode)).ok() == Some(Some(identity))
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -1700,15 +1613,11 @@ fn native_name(name: &OsStr) -> Result<CString> {
 }
 
 fn unlink_at(parent: &File, name: &OsStr) -> Result<()> {
-    let name = native_name(name)?;
-    syscall!(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0);
-    Ok(())
+    os(unlinkat(parent, name, UnlinkatFlags::NoRemoveDir)).text()
 }
 
 fn remove_directory_at(parent: &File, name: &OsStr) -> Result<()> {
-    let name = native_name(name)?;
-    syscall!(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0);
-    Ok(())
+    os(unlinkat(parent, name, UnlinkatFlags::RemoveDir)).text()
 }
 
 fn publish_exclusive(parent: &File, stage: &OsStr, destination: &OsStr) -> Result<()> {
@@ -2015,22 +1924,15 @@ fn cancel(stream: &LocalStream) {
 }
 
 fn readable(fd: i32, timeout: Duration) -> io::Result<bool> {
-    let mut descriptor = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
-    };
-    let result = unsafe {
-        libc::poll(
-            &mut descriptor,
-            1,
-            timeout.as_millis().min(i32::MAX as u128) as i32,
-        )
-    };
-    if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result > 0)
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut descriptor = [PollFd::new(fd, PollFlags::POLLIN | PollFlags::POLLHUP)];
+    match os(poll(
+        &mut descriptor,
+        PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX),
+    )) {
+        Ok(ready) => Ok(ready > 0),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
