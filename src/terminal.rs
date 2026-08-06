@@ -286,9 +286,8 @@ impl Scanner {
         Some(())
     }
     fn csi(&mut self, tail: &[u8]) {
-        if tail.starts_with(b"?") && matches!(tail.last(), Some(b'h' | b'l')) {
-            self.modes
-                .private(&tail[1..tail.len() - 1], tail.last() == Some(&b'h'));
+        if let [b'?', values @ .., set @ (b'h' | b'l')] = tail {
+            self.modes.private(values, *set == b'h');
             return;
         }
         let Some(values) = tail.strip_suffix(b"r") else {
@@ -324,20 +323,18 @@ fn decimal(bytes: &[u8], default: u32) -> u32 {
         .unwrap_or(u32::MAX)
 }
 fn possible_query(bytes: &[u8]) -> bool {
-    if recognize_query(bytes).is_some() {
-        return true;
-    }
     let Some((_, tail)) = csi(bytes) else {
         return false;
     };
-    match tail {
-        b"" | b"0" | b">" | b">0" | b"6" | b"?" => true,
-        [b'?', rest @ ..] => {
-            let digits = rest.strip_suffix(b"$").unwrap_or(rest);
-            parse_decimal(digits, u32::MAX as u64, true).is_some()
+    recognize_query(bytes).is_some()
+        || match tail {
+            b"" | b"0" | b">" | b">0" | b"6" | b"?" => true,
+            [b'?', rest @ ..] => {
+                let digits = rest.strip_suffix(b"$").unwrap_or(rest);
+                parse_decimal(digits, u32::MAX as u64, true).is_some()
+            }
+            _ => false,
         }
-        _ => false,
-    }
 }
 fn is_osc(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x1b]") || bytes.starts_with(&[0x9d])

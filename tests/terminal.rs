@@ -515,3 +515,67 @@ fn scroll_region_tracking_follows_the_session_row_count() {
     assert!(!exact, "an out-of-range region must clear exactness");
     assert!(preamble.is_none());
 }
+
+fn lossy_title(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|ch| if ch == '\0' { '\u{fffd}' } else { ch })
+        .collect()
+}
+
+fn title(bytes: &[u8], split: usize) -> (String, bool) {
+    let mut sequence = b"\x1b]2;".to_vec();
+    sequence.extend_from_slice(bytes);
+    sequence.push(7);
+    let mut scanner = Scanner::new(24);
+    let mut observations = scanner.feed(0, &sequence[..split]);
+    observations.extend(scanner.feed(1, &sequence[split..]));
+    let [Observation::State(_, title, truncated)] = observations.as_slice() else {
+        panic!("unexpected title observations for {bytes:?}: {observations:?}")
+    };
+    (title.clone(), *truncated)
+}
+
+#[test]
+fn title_utf8_replacement_matches_standard_lossy_grouping_exhaustively() {
+    let reserved = [7, 0x18, 0x1a, 0x1b, 0x9b, 0x9c, 0x9d];
+    for first in 0..=u8::MAX {
+        for second in 0..=u8::MAX {
+            if reserved.contains(&first) || reserved.contains(&second) {
+                continue;
+            }
+            let bytes = [first, second];
+            let (actual, truncated) = title(&bytes, 0);
+            assert!(!truncated, "{bytes:?}");
+            assert_eq!(actual, lossy_title(&bytes), "{bytes:?}");
+        }
+    }
+
+    for bytes in [
+        b"\xf0\x80\x80\x80".as_slice(),
+        b"\xed\xa0\x80",
+        b"\xe2\x82",
+        b"ok\xff\xfeend",
+        b"\xc2\0\xe2\x82\xac",
+    ] {
+        for split in 0..=bytes.len() + 5 {
+            let (actual, truncated) = title(bytes, split);
+            assert!(!truncated, "{bytes:?} at {split}");
+            assert_eq!(actual, lossy_title(bytes), "{bytes:?} at {split}");
+        }
+    }
+}
+
+#[test]
+fn title_truncation_counts_sanitized_utf8_bytes_at_the_exact_cap() {
+    let mut bytes = vec![b'x'; 252];
+    bytes.extend_from_slice(b"\xe2\x82\xac");
+    let (exact, truncated) = title(&bytes, 0);
+    assert_eq!(exact, format!("{}\u{20ac}", "x".repeat(252)));
+    assert!(!truncated);
+
+    bytes.insert(0, b'x');
+    let (bounded, truncated) = title(&bytes, 0);
+    assert_eq!(bounded, "x".repeat(253));
+    assert!(truncated);
+}

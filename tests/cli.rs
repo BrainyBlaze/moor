@@ -389,3 +389,80 @@ fn v32_cli_numeric_fixtures_are_parsed_exactly() {
         assert!(!parses(args), "{args:?} must be rejected");
     }
 }
+
+#[test]
+fn action_spellings_preserve_their_distinct_modes_and_payloads() {
+    use moor::cli::{Action, CreateMode};
+    use std::ffi::OsString;
+
+    let action = |args: &[&str]| {
+        let mut argv = vec![OsString::from("moor")];
+        argv.extend(args.iter().map(OsString::from));
+        moor::cli::parse(&argv).unwrap()
+    };
+    for (token, mode) in [
+        ("new", CreateMode::New),
+        ("n", CreateMode::New),
+        ("start", CreateMode::Start),
+        ("s", CreateMode::Start),
+        ("run", CreateMode::Run),
+        ("-A", CreateMode::LegacyA),
+        ("-c", CreateMode::LegacyC),
+        ("-n", CreateMode::LegacyStart),
+        ("-N", CreateMode::LegacyRun),
+    ] {
+        let Action::Create {
+            mode: actual,
+            session,
+            command,
+            ..
+        } = action(&[token, "session", "child", "-x"])
+        else {
+            panic!("{token} did not create")
+        };
+        assert_eq!(actual, mode, "{token}");
+        assert_eq!(session, "session", "{token}");
+        assert_eq!(command, ["child", "-x"], "{token}");
+    }
+
+    assert!(matches!(action(&["a", "session"]), Action::Attach { .. }));
+    assert_eq!(action(&["p", "session"]), Action::Push("session".into()));
+    assert_eq!(action(&["ls", "-a"]), Action::List { all: true });
+    assert_eq!(action(&["-i"]), Action::Current);
+    assert_eq!(
+        action(&["tail", "-f", "-n", "4294967295", "session"]),
+        Action::Tail {
+            session: "session".into(),
+            follow: true,
+            lines: u32::MAX,
+        }
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_name_rendering_and_final_component_rules_are_byte_exact() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+
+    let hostile = OsString::from_vec(b"dir/na\0me\xff".to_vec());
+    assert_eq!(moor::name::render(&hostile), "dir/na\\x00me\\xFF");
+    assert_eq!(moor::name::program(&hostile), "na\\x00me\\xFF");
+    assert_eq!(moor::name::program(OsStr::new("dir/")), "moor");
+
+    for valid in ["session", "dir/session", "session.LOG", "has:colon"] {
+        assert!(moor::name::valid_session(OsStr::new(valid)), "{valid}");
+    }
+    for invalid in [
+        "",
+        ".",
+        "..",
+        "dir/",
+        "session.log",
+        "dir/session.events",
+        "session.exit",
+        "session.instrument",
+    ] {
+        assert!(!moor::name::valid_session(OsStr::new(invalid)), "{invalid}");
+    }
+}

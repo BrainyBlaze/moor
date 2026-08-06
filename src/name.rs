@@ -1,5 +1,4 @@
-use std::borrow::Cow;
-use std::ffi::OsStr;
+use std::{borrow::Cow, ffi::OsStr, fmt::Write as _};
 #[cfg(not(any(unix, windows)))]
 compile_error!("Moor supports only Unix-family systems and Windows");
 
@@ -18,15 +17,12 @@ fn bytes(value: &OsStr) -> Cow<'_, [u8]> {
 }
 
 fn render_bytes(raw: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(raw.len().saturating_mul(4));
     for byte in raw.iter().copied() {
         if byte.is_ascii_alphanumeric() || b"._/-".contains(&byte) {
             out.push(byte as char);
         } else {
-            out.push_str("\\x");
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 15) as usize] as char);
+            write!(out, "\\x{byte:02X}").unwrap();
         }
     }
     out
@@ -50,13 +46,11 @@ fn separator(byte: u8) -> bool {
 pub(crate) fn artifact_suffix_len(raw: &[u8], insensitive: bool) -> Option<usize> {
     [b".log".as_slice(), b".events", b".exit", b".instrument"]
         .into_iter()
-        .find(|suffix| {
-            raw.get(raw.len().saturating_sub(suffix.len())..)
-                .is_some_and(|tail| {
-                    tail == *suffix || insensitive && tail.eq_ignore_ascii_case(suffix)
-                })
+        .find_map(|suffix| {
+            let tail = raw.get(raw.len().checked_sub(suffix.len())?..)?;
+            (tail == suffix || insensitive && tail.eq_ignore_ascii_case(suffix))
+                .then_some(suffix.len())
         })
-        .map(<[u8]>::len)
 }
 
 pub fn valid_session(value: &OsStr) -> bool {
