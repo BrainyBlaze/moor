@@ -260,6 +260,241 @@ fn event_store_accepts_a_protected_precreated_empty_directory() {
 
 #[cfg(unix)]
 #[test]
+fn descriptor_bound_creation_ignores_a_replacement_at_the_original_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("descriptor-create");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let moved = path.with_extension("bound");
+    fs::rename(&path, &moved).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let header = canonical_header(1, "AS9z", Some(7), Cursor(0, 0, 0, 1));
+    let store = Store::create_at(&directory, Kind::Event, 7, header.as_bytes(), 0, 0).unwrap();
+
+    assert_eq!(
+        Store::read_only(&moved, Kind::Event, 7).unwrap().1,
+        header.as_bytes()
+    );
+    assert!(fs::read_dir(&path).unwrap().next().is_none());
+    drop(store);
+    drop(directory);
+    fs::remove_dir_all(path).unwrap();
+    fs::remove_dir_all(moved).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_bound_creation_produces_the_exact_locked_slot_set() {
+    use fs2::FileExt as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("descriptor-slot-set");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let store = Store::create_at(&directory, Kind::Log, 7, b"", 0, 0).unwrap();
+    let mut entries = fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(entries, ["body.0", "body.1", "commit.0", "commit.1"]);
+    for name in entries {
+        assert_eq!(
+            fs::metadata(path.join(name)).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let competing_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join("commit.0"))
+        .unwrap();
+    assert!(competing_writer.try_lock_exclusive().is_err());
+    drop(store);
+    drop(directory);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_bound_creation_rejects_and_preserves_an_extra_entry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("descriptor-extra");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(path.join("extra"), b"").unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    assert!(matches!(
+        Store::create_at(&directory, Kind::Log, 7, b"", 0, 0),
+        Err(StoreError::Corrupt)
+    ));
+    assert_eq!(
+        fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        ["extra"]
+    );
+    drop(directory);
+    fs::remove_dir_all(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_bound_validation_uses_a_nonblocking_directory_description() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("descriptor-nonblocking-enumeration");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let before = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) };
+    assert!(before >= 0);
+    assert_eq!(before & libc::O_NONBLOCK, 0);
+
+    let prepared = Store::prepare_at(&directory).unwrap();
+
+    let after = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) };
+    assert!(after >= 0);
+    assert_ne!(after & libc::O_NONBLOCK, 0);
+    prepared.rollback_at(&directory);
+    drop(directory);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn descriptor_bound_revalidation_accepts_only_the_exact_slot_names() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("descriptor-exact-revalidation");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let prepared = Store::prepare_at(&directory).unwrap();
+    prepared.revalidate_at(&directory).unwrap();
+
+    fs::write(path.join("extra"), b"caller-owned").unwrap();
+    assert!(matches!(
+        prepared.revalidate_at(&directory),
+        Err(StoreError::Corrupt)
+    ));
+    assert_eq!(fs::read(path.join("extra")).unwrap(), b"caller-owned");
+
+    prepared.rollback_at(&directory);
+    fs::remove_file(path.join("extra")).unwrap();
+    drop(directory);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_store_defers_the_writer_lease_until_descriptor_bound_initialization() {
+    use fs2::FileExt as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("prepared-lock");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let prepared = Store::prepare_at(&directory).unwrap();
+    let competing_writer = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join("commit.0"))
+        .unwrap();
+    competing_writer.try_lock_exclusive().unwrap();
+    competing_writer.unlock().unwrap();
+
+    let store = prepared
+        .lease_at(&directory, Kind::Log, 7, b"abc", 0, 3)
+        .unwrap();
+    assert!(competing_writer.try_lock_exclusive().is_err());
+    assert!(matches!(
+        Store::read_only(&path, Kind::Log, 7),
+        Err(StoreError::Corrupt)
+    ));
+    prepared
+        .initialize_leased_at(&directory, &store, b"abc")
+        .unwrap();
+    assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"abc");
+
+    drop(store);
+    prepared.rollback_at(&directory);
+    drop(directory);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_store_rejects_a_substituted_slot_during_revalidation_and_initialization() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("prepared-substitution");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let prepared = Store::prepare_at(&directory).unwrap();
+    let displaced = path.join("displaced-body.1");
+    fs::rename(path.join("body.1"), &displaced).unwrap();
+    fs::write(path.join("body.1"), b"replacement").unwrap();
+    fs::set_permissions(path.join("body.1"), fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(matches!(
+        prepared.revalidate_at(&directory),
+        Err(StoreError::Corrupt)
+    ));
+    assert!(matches!(
+        prepared.initialize_at(&directory, Kind::Log, 7, b"", 0, 0),
+        Err(StoreError::Corrupt)
+    ));
+    assert_eq!(fs::read(path.join("body.1")).unwrap(), b"replacement");
+
+    prepared.rollback_at(&directory);
+    assert_eq!(fs::read(path.join("body.1")).unwrap(), b"replacement");
+    fs::remove_file(path.join("body.1")).unwrap();
+    fs::remove_file(displaced).unwrap();
+    drop(directory);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn prepared_store_rollback_removes_only_the_original_slot_identities() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = temp("prepared-rollback");
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = std::fs::File::open(&path).unwrap();
+    let prepared = Store::prepare_at(&directory).unwrap();
+    let displaced = path.join("displaced-commit.1");
+    fs::rename(path.join("commit.1"), &displaced).unwrap();
+    fs::write(path.join("commit.1"), b"replacement").unwrap();
+    fs::set_permissions(path.join("commit.1"), fs::Permissions::from_mode(0o600)).unwrap();
+
+    prepared.rollback_at(&directory);
+    for name in ["body.0", "body.1", "commit.0"] {
+        assert!(!path.join(name).exists());
+    }
+    assert_eq!(fs::read(path.join("commit.1")).unwrap(), b"replacement");
+    assert!(displaced.exists());
+
+    fs::remove_file(path.join("commit.1")).unwrap();
+    fs::remove_file(displaced).unwrap();
+    drop(directory);
+    fs::remove_dir(path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn created_slots_have_exact_mode_under_a_restrictive_umask() {
     const CHILD: &str = "MOOR_RESTRICTIVE_UMASK_CHILD";
     if std::env::var_os(CHILD).is_some() {

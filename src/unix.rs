@@ -1,10 +1,12 @@
 use crate::cli::{CreateMode, Options};
+use crate::events::Cursor;
 use crate::name;
 use crate::runtime::client::{Client as WireClient, CommandResult, missing, probe_session};
 use crate::runtime::holder::{Native, NativeExit, Runtime};
 use crate::runtime::io::{Duplex, InputConfig, InputState, attach_viewer_to, run_viewer_input};
 use crate::runtime::private as shared;
-use crate::store::{Kind, Store};
+use crate::store::{Kind, PreparedStore, Store, StoreError};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{
     GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
@@ -13,12 +15,13 @@ use interprocess::local_socket::{
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use path_absolutize::Absolutize;
 use signal_hook::iterator::Signals;
-use std::ffi::{OsStr, OsString};
+use std::cell::Cell;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -69,16 +72,104 @@ macro_rules! syscall {
     };
 }
 
-crate::schema!(struct Config<'a> fields; path: &'a Path, publish: PathBuf, _parent: File, stage: PathBuf, command: Vec<OsString>, options: &'a Options,
-    invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<File>);
+crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: ArtifactTarget, log: Option<ArtifactTarget>, stage: Stage,
+    command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
 crate::schema!(struct UnixNative fields; control: File, group: i32, child: Child);
 crate::schema!(struct ViewerTerminal derive [Clone, Copy] fields; fd: i32, saved: libc::termios);
-crate::schema!(struct Instrument fields; read: File, write: File, stage: File, path: PathBuf, identity: (u64, u64), hash: [u8; 32],
+crate::schema!(struct LaunchSeed fields; generation: u32, supervised: bool, incarnation: [u8; 16], semantic_token: [u8; 16], identity: Vec<u8>, start: (u64, u64, [u8; 16]));
+crate::schema!(struct Instrument fields; read: File, write: File, stage: File, parent: File, leaf: OsString, identity: (u64, u64), hash: [u8; 32],
     nonce: [u8; 16]);
+struct PreparedInstrument {
+    source: File,
+    stage: File,
+    parent: File,
+    leaf: OsString,
+    path: PathBuf,
+    identity: (u64, u64),
+    armed: bool,
+}
 
 struct RawTerminal(ViewerTerminal);
-struct Stage(PathBuf);
+struct ChildGuard(Option<Child>);
+struct EventTarget {
+    operand: PathBuf,
+    parent: File,
+    leaf: OsString,
+    directory: Option<File>,
+    created: Option<(u64, u64)>,
+    prepared: Option<PreparedStore>,
+    validator: Option<Store>,
+    armed: bool,
+}
+struct ArtifactTarget {
+    parent: File,
+    leaf: OsString,
+    directory: File,
+    identity: (u64, u64),
+    prepared: PreparedStore,
+    validator: Option<Store>,
+    armed: bool,
+}
+struct Stage(File, OsString, Option<(u64, u64)>, bool);
 struct SetupError(String, bool);
+
+impl ChildGuard {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().unwrap()
+    }
+
+    fn release(mut self) -> Child {
+        self.0.take().unwrap()
+    }
+}
+
+impl Config<'_> {
+    fn retain_stores(&mut self) {
+        if let Some(event) = self.event.as_mut() {
+            event.retain();
+        }
+        self.lifecycle.retain();
+        if let Some(log) = self.log.as_mut() {
+            log.retain();
+        }
+        if let Some(instrument) = self.instrument.as_mut() {
+            instrument.retain();
+        }
+    }
+
+    fn retain_artifacts(&mut self) {
+        self.retain_stores();
+        self.stage.retain();
+    }
+
+    fn rollback_artifacts(&mut self) {
+        if let Some(instrument) = self.instrument.as_mut() {
+            instrument.rollback();
+        }
+        if let Some(log) = self.log.as_mut() {
+            log.rollback();
+        }
+        self.lifecycle.rollback();
+        if let Some(event) = self.event.as_mut() {
+            event.rollback();
+        }
+        self.stage.rollback();
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.0.as_mut() else {
+            return;
+        };
+        let group = i32::try_from(child.id()).unwrap_or_default();
+        if group > 0 {
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 
 impl From<String> for SetupError {
     fn from(error: String) -> Self {
@@ -88,6 +179,33 @@ impl From<String> for SetupError {
 
 pub(crate) fn clock() -> Result<(u64, [u8; 16])> {
     Ok((monotonic()?, boot_id()?))
+}
+
+pub(crate) fn preflight_create(
+    options: &Options,
+    session: &OsStr,
+    invoked: &OsStr,
+) -> Result<PathBuf> {
+    if let Some(event) = options.events.as_deref() {
+        crate::ensure!(event.is_absolute(), event_rejection(event, "not-absolute"));
+    }
+    let marker = resolve(session, invoked)?;
+    if let Some(event) = options.events.as_deref() {
+        let resolved = absolute(event).map_err(|_| event_rejection(event, "io-error"))?;
+        let root = root(invoked)?;
+        crate::ensure!(
+            resolved != root && resolved.starts_with(&root),
+            event_rejection(event, "outside-root")
+        );
+        for other in [
+            marker.clone(),
+            shared::companion(&marker, ".log"),
+            shared::companion(&marker, ".exit"),
+        ] {
+            validate_event_alias(event, &other)?;
+        }
+    }
+    Ok(marker)
 }
 
 pub(crate) fn create(
@@ -102,12 +220,41 @@ pub(crate) fn create(
         CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
     );
     let terminal = terminal_config(interactive)?;
+    let root = root(invoked)?;
+    let mut event = validate_event_target(options.events.as_deref(), &root, path)?;
     let stderr = options.stderr.as_deref().map(open_stderr).transpose()?;
-    let instrument = options
+    let instrument_source = options
         .instrument
         .as_deref()
         .map(open_instrument)
         .transpose()?;
+    let (generation, supervised) = launch_generation(invoked)?;
+    let incarnation = shared::random_array::<16>()?;
+    let identity = identity(path)?;
+    let semantic_token = options
+        .events
+        .is_some()
+        .then(shared::random_array::<16>)
+        .transpose()?
+        .unwrap_or([0; 16]);
+    let start_wall = shared::now();
+    let (start_mono, boot) = clock()?;
+    let instrument_path = instrument_source
+        .as_ref()
+        .map(|_| shared::instrument_stage(&root, &identity, generation, incarnation))
+        .transpose()?;
+    if let (Some(event), Some(instrument)) = (options.events.as_deref(), instrument_path.as_deref())
+    {
+        validate_event_alias(event, instrument)?;
+    }
+    let launch = LaunchSeed {
+        generation,
+        supervised,
+        incarnation,
+        semantic_token,
+        identity,
+        start: (start_wall, start_mono, boot),
+    };
     let command = if command.is_empty() {
         vec![
             std::env::var_os("SHELL")
@@ -124,20 +271,45 @@ pub(crate) fn create(
     } else {
         command
     };
-    let stage = stage_path(invoked)?;
-    let (_stage_parent, listener) = socket_at(&stage, |name| {
-        ListenerOptions::new()
-            .name(name)
-            .mode(0o600)
-            .reclaim_name(false)
-            .nonblocking(ListenerNonblockingMode::Accept)
-            .create_sync()
-    })?;
     let (parent, publish) = socket_alias(path)?;
-    let config = Config {
+    let stage = Stage(
+        parent,
+        OsString::from(format!(".moor-{}.stage", hex(shared::random_array()?))),
+        None,
+        true,
+    );
+    let stage_alias = publish.with_file_name(&stage.1);
+    let stage_name = stage_alias
+        .as_os_str()
+        .to_fs_name::<GenericFilePath>()
+        .text()?;
+    let listener = ListenerOptions::new()
+        .name(stage_name)
+        .mode(0o600)
+        .reclaim_name(false)
+        .nonblocking(ListenerNonblockingMode::Accept)
+        .create_sync()
+        .text()?;
+    let mut stage = stage;
+    stage.capture()?;
+    if let Some(event) = &mut event {
+        event.prepare()?;
+    }
+    let log = (options.log_cap != 0)
+        .then(|| ArtifactTarget::prepare(&stage.0, &shared::companion(path, ".log")))
+        .transpose()?;
+    let lifecycle = ArtifactTarget::prepare(&stage.0, &shared::companion(path, ".exit"))?;
+    let instrument = instrument_source
+        .zip(instrument_path.as_deref())
+        .map(|(source, path)| PreparedInstrument::prepare(source, &root, path))
+        .transpose()?;
+    let mut config = Config {
         path,
-        publish,
-        _parent: parent,
+        root,
+        launch,
+        event,
+        lifecycle,
+        log,
         stage,
         command,
         options,
@@ -161,29 +333,113 @@ pub(crate) fn create(
     }
     drop(child);
     drop(listener);
-    let (result, _) = shared::await_launch_probe(parent, |generation| {
-        bounded(path, Duration::from_millis(250)).is_ok_and(|client| {
-            let published = client.generation == generation;
-            client.cancel();
-            published
-        })
-    })?;
+    parent
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .text()?;
+    config.retain_artifacts();
+    let adopted = Cell::new(false);
+    let launched = shared::await_launch_probe(
+        parent,
+        |generation| {
+            bounded(path, Duration::from_millis(250)).is_ok_and(|client| {
+                let published = client.generation == generation;
+                client.cancel();
+                published
+            })
+        },
+        |_| adopted.set(true),
+    );
+    let mut stopped = false;
+    if launched.is_err() {
+        stopped = holder_exited(pid, Duration::ZERO);
+        if !stopped {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+            stopped = holder_exited(pid, Duration::from_millis(250));
+        }
+    } else if !adopted.get() {
+        stopped = holder_exited(pid, Duration::from_millis(250));
+    }
+    if !adopted.get() && stopped {
+        config.rollback_artifacts();
+    }
+    let (result, _) = launched?;
     Ok(i32::from(result))
 }
 
-fn stage_path(invoked: &OsStr) -> Result<PathBuf> {
-    let directory = root(invoked)?.join(".moor-stage");
-    private_dir(&directory, || "invalid staging directory".into())?;
-    Ok(directory.join(hex(shared::random_array()?)))
+fn holder_exited(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut status = 0;
+        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+            observed if observed == pid => return true,
+            0 if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            -1 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => continue,
+            _ => return false,
+        }
+    }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-        let Some(parent) = self.0.parent() else {
-            return;
-        };
-        let _ = fs::remove_dir(parent);
+        if self.3 {
+            self.rollback();
+        }
+    }
+}
+
+impl Stage {
+    fn capture(&mut self) -> Result<()> {
+        let stat = stat_at(&self.0, &self.1).text()?;
+        crate::ensure!(
+            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK,
+            "staged rendezvous identity changed"
+        );
+        self.2 = Some(stat_identity(&stat));
+        Ok(())
+    }
+
+    fn matches(&self) -> bool {
+        self.2.is_some_and(|identity| {
+            stat_at(&self.0, &self.1).ok().is_some_and(|stat| {
+                stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && stat_identity(&stat) == identity
+            })
+        })
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        crate::ensure!(self.matches(), "staged rendezvous identity changed");
+        Ok(())
+    }
+
+    fn published_identity(&self, destination: &OsStr) -> Result<(u64, u64)> {
+        let stat = stat_at(&self.0, destination).text()?;
+        let identity = stat_identity(&stat);
+        crate::ensure!(
+            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK && self.2 == Some(identity),
+            "published rendezvous identity changed"
+        );
+        Ok(identity)
+    }
+
+    fn rollback_published(&self, destination: &OsStr) {
+        if self.published_identity(destination).is_ok() {
+            let _ = unlink_at(&self.0, destination);
+            let _ = self.0.sync_all();
+        }
+    }
+
+    fn retain(&mut self) {
+        self.3 = false;
+    }
+
+    fn rollback(&mut self) {
+        self.3 = false;
+        if self.matches() {
+            let _ = unlink_at(&self.0, &self.1);
+        }
     }
 }
 
@@ -240,11 +496,13 @@ fn holder(
         generation: 1,
     };
     let daemon = ready.output.is_some();
-    let stage = Stage(std::mem::take(&mut config.stage));
     let (path, invoked) = (config.path, config.invoked);
     let mut signals = Signals::new([libc::SIGINT, libc::SIGTERM, libc::SIGHUP]).text()?;
     let mut handled = 0;
-    let (mut state, running, early, generation) = match holder_setup(&mut config) {
+    let (mut state, running, early) = match holder_setup(&mut config, |generation| {
+        ready.generation = generation;
+        ready.notice(1, 0);
+    }) {
         Ok(setup) => setup,
         Err(SetupError(error, child)) => {
             let status = if child { 127 } else { 1 };
@@ -254,28 +512,87 @@ fn holder(
                 eprintln!("{}: {error}", name::program(invoked));
             }
             ready.notice(3, status);
-            let _ = cleanup(path);
             return if child { Ok(127) } else { Err(error) };
         }
     };
-    if let Some(observed) = early {
-        let status = state.drive(|| None, || None)?.unwrap_or(observed);
-        let (exit, _) = state.finish_exit(&running, status, None);
-        if ready.output.is_none() {
-            return Ok(exit);
+    let artifacts_valid = config
+        .lifecycle
+        .revalidate()
+        .and_then(|()| {
+            config
+                .event
+                .as_ref()
+                .map(|event| event.revalidate(&config.root))
+                .transpose()
+                .map(|_| ())
+        })
+        .and_then(|()| {
+            config
+                .log
+                .as_ref()
+                .map(ArtifactTarget::revalidate)
+                .transpose()
+                .map(|_| ())
+        });
+    if let Err(error) = artifacts_valid {
+        if let Some(observed) = wait_natural_exit(&mut state, Duration::from_millis(25))? {
+            return finalize_unpublished_exit(
+                &mut state,
+                &running,
+                observed,
+                &mut config,
+                &mut ready,
+                invoked,
+            );
         }
-        eprintln!(
-            "{}: child exited before session publication",
-            name::program(invoked)
-        );
-        ready.generation = generation;
+        let mut signal = Some(true);
+        let stopped = state.drive(|| None, || signal.take())?.is_some();
+        drop(state);
+        let _ = stopped;
+        if ready.output.is_some() {
+            eprintln!("{}: {error}", name::program(invoked));
+        }
         ready.notice(3, 1);
-        return Ok(1);
+        return Err(error);
     }
-    ready.generation = generation;
-    ready.notice(1, 0);
-    fs::rename(&stage.0, &config.publish).text()?;
-    let marker = file_id(&fs::symlink_metadata(&config.publish).text()?);
+    if let Some(observed) = early.or(state.observe_exit()?) {
+        return finalize_unpublished_exit(
+            &mut state,
+            &running,
+            observed,
+            &mut config,
+            &mut ready,
+            invoked,
+        );
+    }
+    let destination = path.file_name().ok_or("rendezvous has no name")?;
+    let publication = config.stage.revalidate().and_then(|()| {
+        publish_exclusive(&config.stage.0, &config.stage.1, destination)
+            .and_then(|()| config.stage.published_identity(destination))
+    });
+    let marker = match publication {
+        Ok(marker) => marker,
+        Err(error) => {
+            config.stage.rollback_published(destination);
+            if let Some(observed) = wait_natural_exit(&mut state, Duration::from_millis(25))? {
+                return finalize_unpublished_exit(
+                    &mut state,
+                    &running,
+                    observed,
+                    &mut config,
+                    &mut ready,
+                    invoked,
+                );
+            }
+            let mut signal = Some(true);
+            let stopped = state.drive(|| None, || signal.take())?.is_some();
+            drop(state);
+            let _ = stopped;
+            ready.notice(3, 1);
+            return Err(error);
+        }
+    };
+    config.retain_artifacts();
     ready.notice(2, 0);
     if daemon {
         let null = OpenOptions::new()
@@ -313,19 +630,170 @@ fn holder(
     Ok(exit)
 }
 
+fn finalize_unpublished_exit(
+    state: &mut Runtime<UnixNative>,
+    running: &str,
+    observed: NativeExit,
+    config: &mut Config<'_>,
+    ready: &mut shared::LaunchReporter<UnixStream>,
+    invoked: &OsStr,
+) -> Result<i32> {
+    let status = state.drive(|| None, || None)?.unwrap_or(observed);
+    let (exit, durable) = state.finish_exit(running, status, None);
+    if durable {
+        config.retain_stores();
+    }
+    if ready.output.is_none() {
+        return Ok(exit);
+    }
+    eprintln!(
+        "{}: child exited before session publication",
+        name::program(invoked)
+    );
+    ready.notice(3, 1);
+    Ok(1)
+}
+
+fn wait_natural_exit(
+    state: &mut Runtime<UnixNative>,
+    timeout: Duration,
+) -> Result<Option<NativeExit>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(observed) = state.observe_exit()? {
+            return Ok(Some(observed));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+enum InitialTarget<'a> {
+    Artifact(&'a ArtifactTarget),
+    Event(&'a EventTarget),
+}
+
+struct InitialStore<'a> {
+    target: InitialTarget<'a>,
+    store: &'a Store,
+    body: &'a [u8],
+}
+
+impl InitialStore<'_> {
+    fn initialize(&self) -> Result<()> {
+        match self.target {
+            InitialTarget::Artifact(target) => target.initialize(self.store, self.body),
+            InitialTarget::Event(target) => target.initialize(self.store, self.body),
+        }
+    }
+
+    fn descriptors(&self) -> Vec<i32> {
+        let (parent, directory, prepared) = match self.target {
+            InitialTarget::Artifact(target) => {
+                (&target.parent, &target.directory, &target.prepared)
+            }
+            InitialTarget::Event(target) => (
+                &target.parent,
+                target.directory.as_ref().expect("prepared event directory"),
+                target.prepared.as_ref().expect("prepared event slots"),
+            ),
+        };
+        let mut descriptors = Vec::from(prepared.raw_descriptors());
+        descriptors.extend(self.store.raw_descriptors());
+        descriptors.extend([parent.as_raw_fd(), directory.as_raw_fd()]);
+        descriptors.sort_unstable();
+        descriptors.dedup();
+        descriptors
+    }
+}
+
+fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (String, bool)> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let descriptors: Vec<_> = stores.iter().map(InitialStore::descriptors).collect();
+    let mut workers = Vec::with_capacity(stores.len());
+    let mut failed = None;
+    for (at, store) in stores.iter().enumerate() {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            failed = Some(at);
+            break;
+        }
+        if pid == 0 {
+            unsafe { close_fds::close_open_fds(3, &descriptors[at]) };
+            let status = u8::from(store.initialize().is_err());
+            unsafe { libc::_exit(i32::from(status)) }
+        }
+        workers.push((pid, at, None));
+    }
+    while workers.iter().any(|worker| worker.2.is_none()) && Instant::now() < deadline {
+        for (pid, at, status) in &mut workers {
+            if status.is_some() {
+                continue;
+            }
+            let mut observed = 0;
+            match unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } {
+                result if result == *pid => {
+                    let success = libc::WIFEXITED(observed) && libc::WEXITSTATUS(observed) == 0;
+                    *status = Some(success);
+                    if !success {
+                        failed.get_or_insert(*at);
+                    }
+                }
+                -1 if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => {
+                    *status = Some(false);
+                    failed.get_or_insert(*at);
+                }
+                _ => {}
+            }
+        }
+        if failed.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    if failed.is_none() && workers.iter().all(|worker| worker.2 == Some(true)) {
+        return Ok(());
+    }
+    for (pid, _, status) in &workers {
+        if status.is_none() {
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+    }
+    let reap_deadline = Instant::now() + Duration::from_millis(250);
+    while workers.iter().any(|worker| worker.2.is_none()) && Instant::now() < reap_deadline {
+        for (pid, _, status) in &mut workers {
+            if status.is_none() {
+                let mut observed = 0;
+                if unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } == *pid {
+                    *status = Some(false);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    let confirmed = workers.iter().all(|worker| worker.2.is_some());
+    Err((
+        if failed.is_some() {
+            "store initialization failed".into()
+        } else {
+            "store initialization timed out".into()
+        },
+        confirmed,
+    ))
+}
+
 fn holder_setup(
     config: &mut Config<'_>,
-) -> std::result::Result<(Runtime<UnixNative>, String, Option<NativeExit>, u32), SetupError> {
+    mut adopt: impl FnMut(u32),
+) -> std::result::Result<(Runtime<UnixNative>, String, Option<NativeExit>), SetupError> {
     let (path, options, invoked) = (config.path, config.options, config.invoked);
-    let (generation, supervised) = launch_generation(invoked)?;
-    let incarnation = shared::random_array::<16>()?;
-    let identity = identity(path)?;
-    let semantic_token = options
-        .events
-        .is_some()
-        .then(shared::random_array::<16>)
-        .transpose()?
-        .unwrap_or([0; 16]);
+    let generation = config.launch.generation;
+    let supervised = config.launch.supervised;
+    let incarnation = config.launch.incarnation;
+    let identity = config.launch.identity.clone();
+    let semantic_token = config.launch.semantic_token;
     let modes = config.terminal.0.map(nix::sys::termios::Termios::from);
     let pair = nix::pty::openpty(Some(&config.terminal.1), modes.as_ref()).text()?;
     let (master, slave): (File, File) = (pair.master.into(), pair.slave.into());
@@ -367,24 +835,88 @@ fn holder_setup(
     if semantic_token != [0; 16] {
         process.env("DESK_SESSION_SEMANTIC_TOKEN", hex(semantic_token));
     }
-    let start_wall = shared::now();
-    let (start_mono, boot) = clock()?;
+    let (start_wall, start_mono, boot) = config.launch.start;
     let event_path = options.events.as_deref();
-    let encode_path = |path: &Path| absolute(path).map(|path| path.into_os_string().into_vec());
-    let event_manifest = event_path.map(encode_path).transpose()?;
+    let event_manifest = event_path.map(|path| path.as_os_str().as_bytes().to_vec());
     let instrument_path = config
         .instrument
         .as_ref()
-        .map(|_| {
-            shared::instrument_stage(
-                path.parent().ok_or("session path has no parent")?,
-                &identity,
-                generation,
-                incarnation,
-            )
-        })
+        .map(|instrument| instrument.path.clone());
+    if let (Some(event), Some(instrument)) = (event_path, instrument_path.as_deref()) {
+        validate_event_alias(event, instrument)?;
+    }
+    let instrument_manifest = instrument_path
+        .as_deref()
+        .map(|path| path.as_os_str().as_bytes().to_vec());
+    let running = shared::lifecycle_running(
+        &identity,
+        (supervised.then_some(generation), generation),
+        incarnation,
+        (start_wall, start_mono, boot),
+        (
+            "posix-bytes",
+            event_manifest.as_deref(),
+            instrument_manifest.as_deref(),
+        ),
+    );
+    let event_initial = event_path.map(|_| {
+        crate::events::canonical_header(
+            start_wall,
+            &STANDARD.encode(&identity),
+            supervised.then_some(generation),
+            Cursor(0, 0, 0, 1),
+        )
+    });
+    let lifecycle_store = config
+        .lifecycle
+        .lease(Kind::Exit, generation, running.as_bytes())?;
+    let event_store = config
+        .event
+        .as_mut()
+        .zip(event_initial.as_deref())
+        .map(|(event, body)| event.lease(generation, body.as_bytes()))
         .transpose()?;
-    let instrument_manifest = instrument_path.as_deref().map(encode_path).transpose()?;
+    let log_store = config
+        .log
+        .as_mut()
+        .map(|log| log.lease(Kind::Log, generation, &[]))
+        .transpose()?;
+    adopt(generation);
+    let mut initial = vec![InitialStore {
+        target: InitialTarget::Artifact(&config.lifecycle),
+        store: &lifecycle_store,
+        body: running.as_bytes(),
+    }];
+    if let (Some(target), Some(store), Some(body)) = (
+        config.event.as_ref(),
+        event_store.as_ref(),
+        event_initial.as_deref(),
+    ) {
+        initial.push(InitialStore {
+            target: InitialTarget::Event(target),
+            store,
+            body: body.as_bytes(),
+        });
+    }
+    if let (Some(target), Some(store)) = (config.log.as_ref(), log_store.as_ref()) {
+        initial.push(InitialStore {
+            target: InitialTarget::Artifact(target),
+            store,
+            body: &[],
+        });
+    }
+    if let Err((error, rollback)) = initialize_stores(&initial) {
+        if !rollback {
+            config.lifecycle.retain();
+            if let Some(event) = config.event.as_mut() {
+                event.retain();
+            }
+            if let Some(log) = config.log.as_mut() {
+                log.retain();
+            }
+        }
+        return Err(error.into());
+    }
     let mut artifacts = shared::holder_artifacts(
         &identity,
         (supervised.then_some(generation), generation),
@@ -397,15 +929,20 @@ fn holder_setup(
             encoding: "posix-bytes",
             event_identity: event_manifest.as_deref(),
             instrument_identity: instrument_manifest.as_deref(),
+            event_store: None,
+            stores: Some(shared::ArtifactStores {
+                lifecycle: lifecycle_store,
+                event: event_store,
+                log: log_store,
+            }),
             event_layout: 2,
             log_cap: options.log_cap,
         },
     )?;
-    let instrument = instrument_setup(
-        config.instrument.take(),
-        instrument_path.as_deref(),
-        &mut process,
-    )?;
+    let instrument = instrument_setup(config.instrument.as_mut(), &mut process)?;
+    if let Some(event) = config.event.as_ref() {
+        event.revalidate(&config.root)?;
+    }
     let inherited = instrument
         .as_ref()
         .map_or(-1, |instrument| instrument.write.as_raw_fd());
@@ -413,20 +950,18 @@ fn holder_setup(
         use std::os::unix::process::CommandExt;
         process.pre_exec(move || child_process(inherited));
     }
-    let mut child = process.spawn().map_err(|error| {
+    let child = process.spawn().map_err(|error| {
         SetupError(
             format!("could not execute {}: {error}", name::render(&executable)),
             true,
         )
     })?;
-    instrument_ack(instrument, child.id(), generation).inspect_err(|_| {
-        let _ = child.kill();
-        let _ = child.wait();
-    })?;
+    let mut child = ChildGuard(Some(child));
+    instrument_ack(instrument, child.child().id(), generation)?;
     let reader = master.try_clone().text()?;
     let (pty, done_rx) = Duplex::tracked(reader, master.try_clone().text()?, 1 << 20);
     let cwd = absolute(options.directory.as_deref().unwrap_or(Path::new(".")))?;
-    let pid = child.id();
+    let pid = child.child().id();
     crate::wire::put_wide(&mut artifacts.status, cwd.as_os_str().as_bytes())
         .map_err(crate::protocol)?;
     artifacts.status.extend_from_slice(&pid.to_le_bytes());
@@ -434,7 +969,7 @@ fn holder_setup(
     artifacts
         .status
         .extend_from_slice(&shared::random_array::<16>()?);
-    let exited = child.try_wait().text()?.map(native_exit);
+    let exited = child.child().try_wait().text()?.map(native_exit);
     let running = artifacts.running.clone();
     let mut holder = artifacts.runtime(
         (pty, done_rx),
@@ -443,12 +978,12 @@ fn holder_setup(
             UnixNative {
                 control: master,
                 group: pid as i32,
-                child,
+                child: child.release(),
             },
         ),
     );
     holder.set_rows(config.terminal.1.ws_row);
-    Ok((holder, running, exited, generation))
+    Ok((holder, running, exited))
 }
 
 fn native_exit(status: ExitStatus) -> NativeExit {
@@ -621,6 +1156,672 @@ fn root(invoked: &OsStr) -> Result<PathBuf> {
     Ok(root)
 }
 
+fn event_rejection(path: &Path, cause: &str) -> String {
+    format!(
+        "event store rejected: {} ({cause})",
+        name::render(path.as_os_str())
+    )
+}
+
+fn validate_event_alias(event: &Path, other: &Path) -> Result<()> {
+    let resolved = absolute(event).map_err(|_| event_rejection(event, "io-error"))?;
+    crate::ensure!(
+        resolved != absolute(other).map_err(|_| event_rejection(event, "io-error"))?,
+        event_rejection(event, "identity-changed")
+    );
+    Ok(())
+}
+
+fn validate_event_target(
+    path: Option<&Path>,
+    root: &Path,
+    marker: &Path,
+) -> Result<Option<EventTarget>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let reject = |cause| event_rejection(path, cause);
+    let resolved = absolute(path).map_err(|_| reject("io-error"))?;
+    crate::ensure!(
+        resolved != root && resolved.starts_with(root),
+        reject("outside-root")
+    );
+    for other in [
+        marker.to_owned(),
+        shared::companion(marker, ".log"),
+        shared::companion(marker, ".exit"),
+    ] {
+        validate_event_alias(path, &other)?;
+    }
+    let (parent, leaf, opened) = open_event_target(root, &resolved, path)?;
+    if let Some(opened) = &opened {
+        validate_event_directory(opened, path)?;
+    }
+    Ok(Some(EventTarget {
+        operand: path.to_owned(),
+        parent,
+        leaf,
+        directory: opened,
+        created: None,
+        prepared: None,
+        validator: None,
+        armed: true,
+    }))
+}
+
+fn open_event_target(
+    root: &Path,
+    resolved: &Path,
+    operand: &Path,
+) -> Result<(File, OsString, Option<File>)> {
+    let reject = |cause| event_rejection(operand, cause);
+    let relative = resolved
+        .strip_prefix(root)
+        .map_err(|_| reject("outside-root"))?;
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root)
+        .map_err(|_| reject("io-error"))?;
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| reject("outside-root"))?
+        .to_owned();
+    for component in relative.parent().unwrap_or(Path::new("")).components() {
+        match open_directory_at(&directory, component.as_os_str()) {
+            Ok(opened) => directory = opened,
+            Err(error) => {
+                return Err(reject(component_cause(
+                    &directory,
+                    component.as_os_str(),
+                    false,
+                    &error,
+                )));
+            }
+        }
+    }
+    let opened = match open_directory_at(&directory, &leaf) {
+        Ok(opened) => Some(opened),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(reject(component_cause(&directory, &leaf, true, &error)));
+        }
+    };
+    Ok((directory, leaf, opened))
+}
+
+fn validate_event_directory(directory: &File, operand: &Path) -> Result<()> {
+    let reject = |cause| event_rejection(operand, cause);
+    let meta = directory.metadata().map_err(|_| reject("io-error"))?;
+    crate::ensure!(owned(&meta), reject("wrong-owner"));
+    crate::ensure!(meta.mode() & 0o777 == 0o700, reject("wrong-mode"));
+    if let Some(entry) = first_directory_entry(directory).map_err(|_| reject("io-error"))? {
+        let slots = ["body.0", "body.1", "commit.0", "commit.1"];
+        return Err(reject(if slots.iter().any(|name| entry == *name) {
+            "pre-existing-slot"
+        } else {
+            "extra-entry"
+        }));
+    }
+    Ok(())
+}
+
+fn first_directory_entry(directory: &File) -> io::Result<Option<OsString>> {
+    use std::ffi::CStr;
+
+    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        drop(unsafe { File::from_raw_fd(descriptor) });
+        return Err(io::Error::last_os_error());
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let _stream = Stream(stream);
+    unsafe { libc::rewinddir(stream) };
+    loop {
+        nix::errno::Errno::clear();
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let errno = nix::errno::Errno::last_raw();
+            return if errno == 0 {
+                Ok(None)
+            } else {
+                Err(io::Error::from_raw_os_error(errno))
+            };
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if !matches!(name, b"." | b"..") {
+            return Ok(Some(OsString::from_vec(name.to_vec())));
+        }
+    }
+}
+
+impl EventTarget {
+    fn store_error(&self, error: StoreError) -> String {
+        event_rejection(
+            &self.operand,
+            if matches!(error, StoreError::Corrupt) {
+                "identity-changed"
+            } else {
+                "io-error"
+            },
+        )
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        let operand = self.operand.clone();
+        let directory = self.provision()?;
+        self.prepared = Some(Store::prepare_at(directory).map_err(|error| {
+            event_rejection(
+                &operand,
+                if matches!(error, StoreError::Corrupt) {
+                    "identity-changed"
+                } else {
+                    "io-error"
+                },
+            )
+        })?);
+        Ok(())
+    }
+
+    fn lease(&mut self, generation: u32, initial: &[u8]) -> Result<Store> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        let store = prepared
+            .lease_at(directory, Kind::Event, generation, initial, 0, 0)
+            .map_err(|error| self.store_error(error))?;
+        self.validator = Some(store.duplicate().map_err(|error| self.store_error(error))?);
+        Ok(store)
+    }
+
+    fn initialize(&self, store: &Store, initial: &[u8]) -> Result<()> {
+        self.parent
+            .sync_all()
+            .map_err(|_| event_rejection(&self.operand, "io-error"))?;
+        self.prepared
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?
+            .initialize_leased_at(
+                self.directory
+                    .as_ref()
+                    .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?,
+                store,
+                initial,
+            )
+            .map_err(|error| self.store_error(error))
+    }
+
+    fn provision(&mut self) -> Result<&File> {
+        if self.directory.is_none() {
+            let name =
+                native_name(&self.leaf).map_err(|_| event_rejection(&self.operand, "io-error"))?;
+            let status = unsafe { libc::mkdirat(self.parent.as_raw_fd(), name.as_ptr(), 0o700) };
+            if status != 0 {
+                let error = io::Error::last_os_error();
+                return Err(event_rejection(
+                    &self.operand,
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        "identity-changed"
+                    } else {
+                        "io-error"
+                    },
+                ));
+            }
+            let created = stat_at(&self.parent, &self.leaf)
+                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
+            crate::ensure!(
+                created.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                event_rejection(&self.operand, "identity-changed")
+            );
+            self.created = Some(stat_identity(&created));
+            chmod_at(&self.parent, &self.leaf, 0o700)
+                .map_err(|_| event_rejection(&self.operand, "io-error"))?;
+            let protected = stat_at(&self.parent, &self.leaf)
+                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
+            crate::ensure!(
+                protected.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    && stat_identity(&protected) == self.created.unwrap()
+                    && protected.st_mode & 0o777 == 0o700,
+                event_rejection(&self.operand, "identity-changed")
+            );
+            let opened = open_directory_at(&self.parent, &self.leaf)
+                .map_err(|_| event_rejection(&self.operand, "identity-changed"))?;
+            crate::ensure!(
+                file_id(
+                    &opened
+                        .metadata()
+                        .map_err(|_| event_rejection(&self.operand, "io-error"))?
+                ) == self.created.unwrap(),
+                event_rejection(&self.operand, "identity-changed")
+            );
+            self.directory = Some(opened);
+            let opened = self.directory.as_ref().unwrap();
+            validate_event_directory(opened, &self.operand)?;
+        }
+        let directory = self.directory.as_ref().unwrap();
+        validate_event_directory(directory, &self.operand)?;
+        Ok(directory)
+    }
+
+    fn revalidate(&self, root: &Path) -> Result<()> {
+        let resolved =
+            absolute(&self.operand).map_err(|_| event_rejection(&self.operand, "io-error"))?;
+        let (_, _, current) = open_event_target(root, &resolved, &self.operand)?;
+        let current = current.ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        let expected = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        crate::ensure!(
+            file_id(
+                &current
+                    .metadata()
+                    .map_err(|_| event_rejection(&self.operand, "io-error"))?
+            ) == file_id(
+                &expected
+                    .metadata()
+                    .map_err(|_| event_rejection(&self.operand, "io-error"))?
+            ),
+            event_rejection(&self.operand, "identity-changed")
+        );
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?;
+        prepared
+            .revalidate_at(expected)
+            .map_err(|error| self.store_error(error))?;
+        self.validator
+            .as_ref()
+            .ok_or_else(|| event_rejection(&self.operand, "identity-changed"))?
+            .selected_result()
+            .map_err(|error| self.store_error(error))?;
+        Ok(())
+    }
+
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(&mut self) {
+        self.armed = false;
+        if let (Some(directory), Some(prepared)) = (&self.directory, &self.prepared) {
+            prepared.rollback_at(directory);
+        }
+        if self
+            .created
+            .is_some_and(|identity| directory_entry_matches(&self.parent, &self.leaf, identity))
+        {
+            let _ = remove_directory_at(&self.parent, &self.leaf);
+        }
+    }
+}
+
+impl ArtifactTarget {
+    fn prepare(parent: &File, path: &Path) -> Result<Self> {
+        let parent = parent.try_clone().text()?;
+        let leaf = path
+            .file_name()
+            .ok_or("artifact path has no name")?
+            .to_owned();
+        let name = native_name(&leaf)?;
+        syscall!(unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0);
+        let identity = match stat_at(&parent, &leaf) {
+            Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFDIR => stat_identity(&stat),
+            result => {
+                let _ = remove_directory_at(&parent, &leaf);
+                return Err(result
+                    .err()
+                    .map_or("artifact identity changed".into(), |error| {
+                        error.to_string()
+                    }));
+            }
+        };
+        let prepared = (|| {
+            chmod_at(&parent, &leaf, 0o700).text()?;
+            let directory = open_directory_at(&parent, &leaf).text()?;
+            let meta = directory.metadata().text()?;
+            crate::ensure!(
+                meta.is_dir() && protected(&meta, 0o700) && file_id(&meta) == identity,
+                "artifact identity changed"
+            );
+            let prepared = Store::prepare_at(&directory)
+                .map_err(|error| format!("store preparation failed: {error:?}"))?;
+            Ok((directory, prepared))
+        })();
+        let (directory, prepared) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if directory_entry_matches(&parent, &leaf, identity) {
+                    let _ = remove_directory_at(&parent, &leaf);
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            parent,
+            leaf,
+            directory,
+            identity,
+            prepared,
+            validator: None,
+            armed: true,
+        })
+    }
+
+    fn lease(&mut self, kind: Kind, generation: u32, initial: &[u8]) -> Result<Store> {
+        let store = self
+            .prepared
+            .lease_at(&self.directory, kind, generation, initial, 0, 0)
+            .map_err(|error| format!("store lease failed: {error:?}"))?;
+        self.validator = Some(
+            store
+                .duplicate()
+                .map_err(|error| format!("store lease failed: {error:?}"))?,
+        );
+        Ok(store)
+    }
+
+    fn initialize(&self, store: &Store, initial: &[u8]) -> Result<()> {
+        self.parent.sync_all().text()?;
+        self.prepared
+            .initialize_leased_at(&self.directory, store, initial)
+            .map_err(|error| format!("store initialization failed: {error:?}"))?;
+        crate::ensure!(
+            store
+                .selected_result()
+                .is_ok_and(|selected| selected == *store.selected()),
+            "store initialization failed: selected commit changed"
+        );
+        Ok(())
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        crate::ensure!(
+            directory_entry_matches(&self.parent, &self.leaf, self.identity),
+            "artifact identity changed"
+        );
+        self.prepared
+            .revalidate_at(&self.directory)
+            .map_err(|error| format!("store identity changed: {error:?}"))?;
+        crate::ensure!(
+            self.validator.as_ref().is_some_and(|store| {
+                store
+                    .selected_result()
+                    .is_ok_and(|selected| selected == *store.selected())
+            }),
+            "store selected commit changed"
+        );
+        Ok(())
+    }
+
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(&mut self) {
+        self.armed = false;
+        self.prepared.rollback_at(&self.directory);
+        if directory_entry_matches(&self.parent, &self.leaf, self.identity) {
+            let _ = remove_directory_at(&self.parent, &self.leaf);
+        }
+    }
+}
+
+impl Drop for ArtifactTarget {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rollback();
+        }
+    }
+}
+
+impl PreparedInstrument {
+    fn prepare(source: File, root: &Path, path: &Path) -> Result<Self> {
+        crate::ensure!(
+            path.parent() == Some(root),
+            "instrumentation stage escaped root"
+        );
+        let leaf = path
+            .file_name()
+            .ok_or("instrumentation stage has no name")?
+            .to_owned();
+        let parent = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(root)
+            .text()?;
+        let name = native_name(&leaf)?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK,
+                0o500,
+            )
+        };
+        syscall!(descriptor >= 0);
+        let stage = unsafe { File::from_raw_fd(descriptor) };
+        if unsafe { libc::fchmod(stage.as_raw_fd(), 0o500) } != 0 {
+            let error = io::Error::last_os_error();
+            let _ = unlink_at(&parent, &leaf);
+            return Err(error.to_string());
+        }
+        let meta = match stage.metadata() {
+            Ok(meta) => meta,
+            Err(error) => {
+                let _ = unlink_at(&parent, &leaf);
+                return Err(error.to_string());
+            }
+        };
+        let identity = file_id(&meta);
+        if !meta.is_file() || !protected(&meta, 0o500) {
+            let _ = unlink_at(&parent, &leaf);
+            return Err("instrumentation stage identity changed".into());
+        }
+        Ok(Self {
+            source,
+            stage,
+            parent,
+            leaf,
+            path: path.to_owned(),
+            identity,
+            armed: true,
+        })
+    }
+
+    fn configure(&mut self, process: &mut Command) -> Result<Instrument> {
+        let hash = shared::copy_digest(&mut self.source, Some(&mut self.stage))?;
+        self.stage.sync_all().text()?;
+        crate::ensure!(
+            file_entry_matches(&self.parent, &self.leaf, self.identity, 0o500),
+            "instrumentation stage identity changed"
+        );
+        let mut staged = self.stage.try_clone().text()?;
+        crate::ensure!(
+            shared::copy_digest(&mut staged, None)? == hash,
+            "instrumentation stage identity changed"
+        );
+        let (read, write) = nix::unistd::pipe().text()?;
+        let nonce = shared::random_array::<16>()?;
+        process.env(
+            "DESK_MOOR_INSTRUMENT_CHANNEL",
+            write.as_raw_fd().to_string(),
+        );
+        process.env("DESK_MOOR_INSTRUMENT_NONCE", hex(nonce));
+        #[cfg(target_os = "macos")]
+        let (loader, separator) = ("DYLD_INSERT_LIBRARIES", ":");
+        #[cfg(not(target_os = "macos"))]
+        let (loader, separator) = ("LD_PRELOAD", " ");
+        let mut preload = self.path.as_os_str().to_owned();
+        if let Some(prior) = std::env::var_os(loader).filter(|value| !value.is_empty()) {
+            preload.push(separator);
+            preload.push(prior);
+        }
+        process.env(loader, preload);
+        Ok(Instrument {
+            read: read.into(),
+            write: write.into(),
+            stage: staged,
+            parent: self.parent.try_clone().text()?,
+            leaf: self.leaf.clone(),
+            identity: self.identity,
+            hash,
+            nonce,
+        })
+    }
+
+    fn retain(&mut self) {
+        self.armed = false;
+    }
+
+    fn rollback(&mut self) {
+        self.armed = false;
+        if file_entry_matches(&self.parent, &self.leaf, self.identity, 0o500) {
+            let _ = unlink_at(&self.parent, &self.leaf);
+        }
+    }
+}
+
+impl Drop for PreparedInstrument {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rollback();
+        }
+    }
+}
+
+impl Drop for EventTarget {
+    fn drop(&mut self) {
+        if self.armed {
+            self.rollback();
+        }
+    }
+}
+
+fn chmod_at(parent: &File, name: &OsStr, mode: libc::mode_t) -> io::Result<()> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    if unsafe { libc::fchmodat(parent.as_raw_fd(), name.as_ptr(), mode, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> io::Result<File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+fn component_cause(
+    parent: &File,
+    name: &OsStr,
+    final_component: bool,
+    error: &io::Error,
+) -> &'static str {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return "not-searchable";
+    }
+    let stat = match stat_at(parent, name) {
+        Ok(stat) => stat,
+        Err(error) => {
+            return if error.kind() == io::ErrorKind::NotFound {
+                "missing"
+            } else {
+                "io-error"
+            };
+        }
+    };
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => "link",
+        libc::S_IFDIR => "identity-changed",
+        _ if final_component => "wrong-type",
+        _ => "not-directory",
+    }
+}
+
+fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        Ok(stat)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn stat_identity(stat: &libc::stat) -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev).unwrap_or(u64::MAX);
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    (device, stat.st_ino)
+}
+
+fn directory_entry_matches(parent: &File, name: &OsStr, identity: (u64, u64)) -> bool {
+    stat_at(parent, name).ok().is_some_and(|entry| {
+        entry.st_mode & libc::S_IFMT == libc::S_IFDIR && stat_identity(&entry) == identity
+    })
+}
+
+fn file_entry_matches(
+    parent: &File,
+    name: &OsStr,
+    identity: (u64, u64),
+    mode: libc::mode_t,
+) -> bool {
+    stat_at(parent, name).ok().is_some_and(|entry| {
+        entry.st_mode & libc::S_IFMT == libc::S_IFREG
+            && entry.st_mode & 0o777 == mode
+            && stat_identity(&entry) == identity
+    })
+}
+
 fn absolute(path: &Path) -> Result<PathBuf> {
     path.absolutize().map(|path| path.into_owned()).text()
 }
@@ -638,14 +1839,58 @@ fn socket_alias(path: &Path) -> Result<(File, PathBuf)> {
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(parent)
         .text()?;
+    let alias = descriptor_path(&file).join(path.file_name().ok_or("rendezvous has no name")?);
+    Ok((file, alias))
+}
+
+fn descriptor_path(file: &File) -> PathBuf {
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let base = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let root = "/proc/self/fd";
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    let base = format!("/dev/fd/{}", file.as_raw_fd());
-    Ok((
-        file,
-        PathBuf::from(base).join(path.file_name().ok_or("rendezvous has no name")?),
-    ))
+    let root = "/dev/fd";
+    Path::new(root).join(file.as_raw_fd().to_string())
+}
+
+fn native_name(name: &OsStr) -> Result<CString> {
+    CString::new(name.as_bytes()).map_err(|_| "native path contains NUL".into())
+}
+
+fn unlink_at(parent: &File, name: &OsStr) -> Result<()> {
+    let name = native_name(name)?;
+    syscall!(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } == 0);
+    Ok(())
+}
+
+fn remove_directory_at(parent: &File, name: &OsStr) -> Result<()> {
+    let name = native_name(name)?;
+    syscall!(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == 0);
+    Ok(())
+}
+
+fn publish_exclusive(parent: &File, stage: &OsStr, destination: &OsStr) -> Result<()> {
+    let (stage, destination) = (native_name(stage)?, native_name(destination)?);
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            stage.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            stage.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    syscall!(status == 0);
+    parent.sync_all().text()
 }
 
 fn socket_at<T, E: std::fmt::Display>(
@@ -666,6 +1911,10 @@ fn peer_owned(stream: &LocalStream) -> bool {
 }
 
 pub(crate) fn cleanup(path: &Path) -> Result<()> {
+    cleanup_excluding(path, None)
+}
+
+fn cleanup_excluding(path: &Path, event: Option<&Path>) -> Result<()> {
     let observed = match fs::symlink_metadata(path) {
         Ok(meta) => Some(file_id(&meta)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -681,9 +1930,6 @@ pub(crate) fn cleanup(path: &Path) -> Result<()> {
         "rendezvous changed before cleanup"
     );
     let expected_identity = identity(path)?;
-    let (external, expected) = shared::cleanup_artifacts(path, Some(&expected_identity), |bytes| {
-        Some(PathBuf::from(OsString::from_vec(bytes)))
-    });
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             crate::ensure!(
@@ -694,6 +1940,17 @@ pub(crate) fn cleanup(path: &Path) -> Result<()> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound && observed.is_none() => {}
         Err(error) => return Err(error.to_string()),
+    }
+    rollback_companions(path, &expected_identity, event)
+}
+
+fn rollback_companions(path: &Path, expected_identity: &[u8], event: Option<&Path>) -> Result<()> {
+    let (mut external, expected) =
+        shared::cleanup_artifacts(path, Some(expected_identity), |bytes| {
+            Some(PathBuf::from(OsString::from_vec(bytes)))
+        });
+    if event.is_some() {
+        external[0] = None;
     }
     shared::cleanup_companions(path, external, true, |target| {
         Store::read_only(target, Kind::Event, None).is_ok()
@@ -709,8 +1966,7 @@ pub(crate) fn cleanup(path: &Path) -> Result<()> {
                     && meta.file_type().is_file()
                     && protected(&meta, 0o500)
             })
-    })?;
-    Ok(())
+    })
 }
 
 fn launch_generation(invoked: &OsStr) -> Result<(u32, bool)> {
@@ -831,66 +2087,10 @@ fn open_instrument(path: &Path) -> Result<File> {
 }
 
 fn instrument_setup(
-    source: Option<File>,
-    stage: Option<&Path>,
+    source: Option<&mut PreparedInstrument>,
     process: &mut Command,
 ) -> Result<Option<Instrument>> {
-    let Some(mut source) = source else {
-        return Ok(None);
-    };
-    let stage = stage.ok_or("instrumentation stage is unavailable")?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o500)
-        .open(stage)
-        .text()?;
-    let hash = shared::copy_digest(&mut source, Some(&mut output))?;
-    output
-        .set_permissions(fs::Permissions::from_mode(0o500))
-        .text()?;
-    output.sync_all().text()?;
-    let identity = file_id(&output.metadata().text()?);
-    drop(output);
-    let mut staged = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(stage)
-        .text()?;
-    let reopened = staged.metadata().text()?;
-    crate::ensure!(
-        reopened.file_type().is_file()
-            && protected(&reopened, 0o500)
-            && file_id(&reopened) == identity
-            && shared::copy_digest(&mut staged, None)? == hash,
-        "instrumentation stage identity changed"
-    );
-    let (read, write) = nix::unistd::pipe().text()?;
-    let nonce = shared::random_array::<16>()?;
-    process.env(
-        "DESK_MOOR_INSTRUMENT_CHANNEL",
-        write.as_raw_fd().to_string(),
-    );
-    process.env("DESK_MOOR_INSTRUMENT_NONCE", hex(nonce));
-    #[cfg(target_os = "macos")]
-    let (loader, separator) = ("DYLD_INSERT_LIBRARIES", ":");
-    #[cfg(not(target_os = "macos"))]
-    let (loader, separator) = ("LD_PRELOAD", " ");
-    let mut preload = stage.as_os_str().to_owned();
-    if let Some(prior) = std::env::var_os(loader).filter(|value| !value.is_empty()) {
-        preload.push(separator);
-        preload.push(prior);
-    }
-    process.env(loader, preload);
-    Ok(Some(Instrument {
-        read: read.into(),
-        write: write.into(),
-        stage: staged,
-        path: stage.into(),
-        identity,
-        hash,
-        nonce,
-    }))
+    source.map(|source| source.configure(process)).transpose()
 }
 
 fn instrument_ack(instrument: Option<Instrument>, pid: u32, generation: u32) -> Result<()> {
@@ -905,11 +2105,13 @@ fn instrument_ack(instrument: Option<Instrument>, pid: u32, generation: u32) -> 
         pid,
         instrument.nonce,
     )?;
-    let meta = fs::symlink_metadata(instrument.path).text()?;
     crate::ensure!(
-        meta.file_type().is_file()
-            && file_id(&meta) == instrument.identity
-            && shared::copy_digest(&mut instrument.stage, None)? == instrument.hash,
+        file_entry_matches(
+            &instrument.parent,
+            &instrument.leaf,
+            instrument.identity,
+            0o500
+        ) && shared::copy_digest(&mut instrument.stage, None)? == instrument.hash,
         "instrumentation stage identity changed"
     );
     Ok(())

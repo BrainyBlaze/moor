@@ -428,7 +428,6 @@ pub fn attach_viewer_to(
                 lease.resume(stream.client, &mut reconnect)?;
                 request[4] &= !1;
                 stream.client.send(3, &request)?;
-                (stream.wire.terminal, stream.wire.replay) = (false, None);
                 if let Some((rows, columns)) = stream.size {
                     lease.send(stream.client, LeaseCommand::Resize(rows, columns))?;
                 }

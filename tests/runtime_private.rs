@@ -1,13 +1,51 @@
 use moor::runtime::private::{
-    ArtifactConfig, SessionState, age, await_launch, clear_store, companion, decode_launch_record,
-    decode_launch_result, discover_sessions, environment_key, holder_artifacts, instrument_ack,
-    instrument_stage, launch_result, lifecycle_running, monotonic, now, parse_boot_uuid,
-    random_array, supervised_generation, validate_instrument_ack,
+    ArtifactConfig, SessionState, age, await_launch, await_launch_probe, clear_store, companion,
+    decode_launch_record, decode_launch_result, discover_sessions, environment_key,
+    holder_artifacts, instrument_ack, instrument_stage, launch_result, lifecycle_running,
+    monotonic, now, parse_boot_uuid, random_array, supervised_generation, validate_instrument_ack,
 };
+use moor::runtime::storage::SessionStorage;
 use moor::store::{Kind, Store};
 use moor::wire::{get_wide, put_wide};
+use std::cell::Cell;
 use std::fs;
+use std::io::{Cursor, Read};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+struct AdoptionObservedInput {
+    input: Cursor<Vec<u8>>,
+    adopted: Rc<Cell<Option<u32>>>,
+}
+
+impl Read for AdoptionObservedInput {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if self.input.position() >= 12 {
+            assert_eq!(
+                self.adopted.get(),
+                Some(42),
+                "the state-1 callback must run before reading the next record"
+            );
+        }
+        self.input.read(output)
+    }
+}
+
+fn adoption_probe(bytes: Vec<u8>, published: bool) -> (Result<(u16, u32), String>, Option<u32>) {
+    let adopted = Rc::new(Cell::new(None));
+    let input = AdoptionObservedInput {
+        input: Cursor::new(bytes),
+        adopted: adopted.clone(),
+    };
+    let result = await_launch_probe(
+        input,
+        |_| published,
+        |generation| {
+            assert_eq!(adopted.replace(Some(generation)), None);
+        },
+    );
+    (result, adopted.get())
+}
 
 #[test]
 fn private_records_are_exact_and_generation_fenced() {
@@ -52,6 +90,44 @@ fn background_result_and_instrument_stage_are_identity_bound() {
     .concat();
     assert_eq!(await_launch(std::io::Cursor::new(complete)), Ok((0, 42)));
     assert_eq!(await_launch(std::io::Cursor::new(ready)), Ok((127, 42)));
+}
+
+#[test]
+fn launch_adoption_is_reported_before_every_state_one_continuation() {
+    let adopted = launch_result(1, 0, 42).unwrap();
+
+    let ready = [adopted, launch_result(2, 0, 42).unwrap()].concat();
+    assert_eq!(adoption_probe(ready, false), (Ok((0, 42)), Some(42)));
+
+    let failed = [adopted, launch_result(3, 127, 42).unwrap()].concat();
+    assert_eq!(adoption_probe(failed, false), (Ok((127, 42)), Some(42)));
+
+    assert_eq!(
+        adoption_probe(adopted.to_vec(), false),
+        (Err("holder failed before launch".into()), Some(42))
+    );
+    assert_eq!(
+        adoption_probe(adopted.to_vec(), true),
+        (Ok((0, 42)), Some(42))
+    );
+
+    let malformed = [adopted, [0; 12]].concat();
+    assert_eq!(
+        adoption_probe(malformed, false),
+        (
+            Err("holder returned an invalid launch result".into()),
+            Some(42)
+        )
+    );
+}
+
+#[test]
+fn state_three_without_adoption_does_not_invoke_the_callback() {
+    let failed = launch_result(3, 127, 42).unwrap();
+    assert_eq!(
+        adoption_probe(failed.to_vec(), false),
+        (Ok((127, 42)), None)
+    );
 }
 
 #[test]
@@ -245,13 +321,22 @@ fn portable_event_status_advertises_the_selected_commit_frontier() {
             encoding: "posix-bytes",
             event_identity: Some(event.as_os_str().as_encoded_bytes()),
             instrument_identity: None,
+            event_store: None,
+            stores: None,
             event_layout: 2,
             log_cap: 0,
         },
     )
     .unwrap();
     let commit_at = artifacts.commit_at;
-    let (mut storage, status) = (artifacts.storage, artifacts.status);
+    let mut storage = SessionStorage::new(
+        artifacts.storage.log,
+        artifacts.storage.events,
+        artifacts.storage.lifecycle,
+        64,
+        4 << 20,
+    );
+    let status = artifacts.status;
     let (commit, _) = Store::read_only(&event, Kind::Event, 1).unwrap();
     let mut at = 4 + identity.len() + 4 + 16;
     assert_eq!(status[at], 2);

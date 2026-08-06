@@ -108,6 +108,68 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
 }
 
 #[test]
+fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
+    let expected = (b"\x01/tmp/session".as_slice(), 1, [1; 16]);
+    let mut stream = ViewerStream {
+        next: Some((4, 3)),
+        ..ViewerStream::default()
+    };
+    let terminal = Message {
+        scope: 1,
+        kind: 5,
+        payload: [0, 0].as_slice().into(),
+    };
+    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
+
+    let mut payload = status_prefix();
+    payload.extend(
+        StatusTail {
+            replay: ReplayDescriptor {
+                first: 1,
+                last: 3,
+                start: 0,
+                end: 3,
+                complete: true,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: true,
+            running: true,
+            event_writable: true,
+            lease_epoch: 0,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    let status = Message {
+        scope: 1,
+        kind: 4,
+        payload: payload.as_slice().into(),
+    };
+    assert_eq!(decode_viewer(&mut stream, &status, expected), Ok(None));
+
+    let live_payload = [&4_u64.to_le_bytes()[..], &3_u64.to_le_bytes(), b"x"].concat();
+    let live = Message {
+        scope: 1,
+        kind: 6,
+        payload: live_payload.as_slice().into(),
+    };
+    assert_eq!(
+        decode_viewer(&mut stream, &live, expected),
+        Err(WireError::Malformed)
+    );
+}
+
+#[test]
 fn input_receipts_round_trip_exact_identity_and_outcome() {
     let written = InputReceipt {
         epoch: 2,

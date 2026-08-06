@@ -1293,6 +1293,8 @@ fn status_drains_a_completed_event_commit_before_copying_its_frontier() {
             encoding: "posix-bytes",
             event_identity: Some(event.as_os_str().as_encoded_bytes()),
             instrument_identity: None,
+            event_store: None,
+            stores: None,
             event_layout: 2,
             log_cap: 0,
         },
@@ -1405,6 +1407,89 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
     assert!(preamble.windows(3).any(|part| part == b"\x1b[r"));
     assert!(!preamble.windows(7).any(|part| part == b"\x1b[1;24r"));
 
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ordinary_same_size_resize_never_uses_the_attach_redraw_exception() {
+    use std::sync::{Arc, Mutex};
+
+    struct CountResize(Arc<Mutex<(usize, usize)>>);
+    impl Native for CountResize {
+        fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
+            self.0.lock().unwrap().0 += 1;
+            Ok(())
+        }
+        fn redraw(&mut self, _: u16, _: u16) -> Result<(), String> {
+            self.0.lock().unwrap().1 += 1;
+            Ok(())
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-ordinary-resize-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let lifecycle = Store::create(
+        &root,
+        Kind::Exit,
+        7,
+        lifecycle_running(
+            b"\x01/session",
+            (Some(7), 7),
+            [1; 16],
+            (1, 1, [2; 16]),
+            ("posix-bytes", None, None),
+        )
+        .as_bytes(),
+        0,
+        0,
+    )
+    .unwrap();
+    let (_, writes) = mpsc::channel();
+    let calls = Arc::new(Mutex::new((0, 0)));
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        writes,
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: CountResize(Arc::clone(&calls)),
+    });
+    let mut owner = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut owner, &mut runtime);
+    owner.send(7, 3, &[80, 0, 50, 0, 1]);
+    owner.recv_kind(&mut runtime, 5);
+    owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 0x16);
+    owner.send(7, 0x0b, &[1, 0, 0, 0, 80, 0, 50, 0]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while {
+        runtime.poll();
+        let calls = *calls.lock().unwrap();
+        calls.0 + calls.1 < 2 && Instant::now() < deadline
+    } {}
+
+    assert_eq!(*calls.lock().unwrap(), (2, 0));
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }

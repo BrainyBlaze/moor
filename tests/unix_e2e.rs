@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use moor::events::{Cursor, canonical_header};
-use moor::runtime::private::{companion, lifecycle_running, now};
+use moor::runtime::private::{companion, environment_key, lifecycle_running, now};
 use moor::store::{Kind, Store};
 use std::fs::{self, DirBuilder, File};
 use std::io::{Read, Write};
@@ -186,13 +186,32 @@ fn instrumentation(dir: &Path, exit: Option<u8>) -> PathBuf {
         &source,
         r#"#include <stdlib.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <stdio.h>
+#ifdef __linux__
+#include <sys/inotify.h>
+#endif
+#include <sys/stat.h>
 #include <unistd.h>
 __attribute__((constructor)) static void ack(void) {
   char *f=getenv("DESK_MOOR_INSTRUMENT_CHANNEL"), *n=getenv("DESK_MOOR_INSTRUMENT_NONCE");
   if(!f || !n) return; unsigned char b[36]={'M','O','O','R','I','N','S','3',1};
+  int watch=-1;
+#ifdef __linux__
+  char *observe=getenv("MOOR_EXIT_ON_EVENT_OPEN"); if(observe) {
+    watch=inotify_init1(IN_CLOEXEC); if(watch<0 || inotify_add_watch(watch,observe,IN_OPEN)<0) _exit(123); }
+#endif
+  char *occupy=getenv("MOOR_OCCUPY_RENDEZVOUS"); if(occupy && symlink("missing",occupy)) _exit(124);
+  char *s=getenv("MOOR_SUBSTITUTE_EVENT"); if(s) { char from[4096], moved[4096];
+    snprintf(from,sizeof(from),"%s/body.1",s); snprintf(moved,sizeof(moved),"%s/displaced",s);
+    if(rename(from,moved)) _exit(121); int out=open(from,O_WRONLY|O_CREAT|O_EXCL,0600);
+    if(out<0) _exit(122); write(out,"replacement",11); fchmod(out,0600); close(out); }
   b[12]=1; uint32_t p=(uint32_t)getpid(); for(int i=0;i<4;i++) b[16+i]=(p>>(8*i))&255;
   for(int i=0;i<16;i++) { char x[3]={n[i*2],n[i*2+1],0}; b[20+i]=(unsigned char)strtoul(x,0,16); }
   int fd=atoi(f); unsetenv("DESK_MOOR_INSTRUMENT_CHANNEL"); unsetenv("DESK_MOOR_INSTRUMENT_NONCE"); write(fd,b,36);
+#ifdef __linux__
+  if(watch>=0) { close(fd); char event[4096]; read(watch,event,sizeof(event)); _exit(23); }
+#endif
 #ifdef EXIT_STATUS
   _exit(EXIT_STATUS);
 #else
@@ -218,6 +237,101 @@ __attribute__((constructor)) static void ack(void) {
             .set_len(16 << 20)
             .unwrap();
     }
+    fs::set_permissions(&library, fs::Permissions::from_mode(0o500)).unwrap();
+    library
+}
+
+#[cfg(target_os = "linux")]
+fn storage_delay_shim(dir: &Path) -> PathBuf {
+    let source = dir.join("storage-delay.c");
+    let library = dir.join("storage-delay.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <limits.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+static void delay(int fd,const char *variable,const char *needle) {
+  char link[64], path[PATH_MAX]; snprintf(link,sizeof(link),"/proc/self/fd/%d",fd);
+  ssize_t n=readlink(link,path,sizeof(path)-1); if(n<0) return; path[n]=0;
+  char *value=getenv(variable); if(value && strstr(path,needle)) {
+    char *entered=getenv("MOOR_TEST_FLOCK_ENTERED");
+    if(entered && strstr(variable,"FLOCK")) { int out=open(entered,O_WRONLY|O_CREAT|O_EXCL,0600); if(out>=0) close(out); }
+    usleep(strtoul(value,0,10)*1000);
+  }
+}
+static void trace_lock(int fd) {
+  char *trace=getenv("MOOR_TEST_FLOCK_TRACE"); if(!trace) return;
+  char link[64], path[PATH_MAX]; snprintf(link,sizeof(link),"/proc/self/fd/%d",fd);
+  ssize_t n=readlink(link,path,sizeof(path)-1); if(n<0) return; path[n]=0;
+  int out=open(trace,O_WRONLY|O_CREAT|O_APPEND,0600); if(out<0) return;
+  write(out,path,n); write(out,"\n",1); close(out);
+}
+int fsync(int fd) { delay(fd,"MOOR_TEST_FSYNC_DELAY_MS","/body.0"); return syscall(SYS_fsync,fd); }
+int flock(int fd,int operation) { trace_lock(fd); delay(fd,"MOOR_TEST_FLOCK_DELAY_MS",".exit/commit.0"); return syscall(SYS_flock,fd,operation); }
+"#,
+    )
+    .unwrap();
+    let built = Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&library)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(built.success());
+    library
+}
+
+#[cfg(target_os = "linux")]
+fn resource_exhausting_instrumentation(dir: &Path) -> PathBuf {
+    let source = dir.join("exhaust-holder.c");
+    let library = dir.join("exhaust-holder.so");
+    fs::write(
+        &source,
+        r#"#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <unistd.h>
+__attribute__((constructor)) static void ack(void) {
+  char *p=getenv("MOOR_GUARD_PID_FILE"), *f=getenv("DESK_MOOR_INSTRUMENT_CHANNEL"), *n=getenv("DESK_MOOR_INSTRUMENT_NONCE");
+  signal(SIGHUP,SIG_IGN); signal(SIGTERM,SIG_IGN);
+  if(!p || !f || !n) return; int fd=atoi(f), ready[2]; pipe(ready); pid_t survivor=fork();
+  if(survivor==0) { close(fd); close(ready[0]); int out=open(p,O_WRONLY|O_CREAT|O_TRUNC,0600); char text[32];
+    int size=snprintf(text,sizeof(text),"%d\n",getpid()); write(out,text,size); close(out); write(ready[1],"x",1); close(ready[1]); for(;;) pause(); }
+  close(ready[1]); char confirmed; read(ready[0],&confirmed,1); close(ready[0]);
+  unsigned char b[36]={'M','O','O','R','I','N','S','3',1}; b[12]=1; uint32_t pid=(uint32_t)getpid();
+  for(int i=0;i<4;i++) b[16+i]=(pid>>(8*i))&255;
+  for(int i=0;i<16;i++) { char x[3]={n[i*2],n[i*2+1],0}; b[20+i]=(unsigned char)strtoul(x,0,16); }
+  unsetenv("DESK_MOOR_INSTRUMENT_CHANNEL"); unsetenv("DESK_MOOR_INSTRUMENT_NONCE"); write(fd,b,36); close(fd);
+  struct rlimit limit; prlimit(getppid(),RLIMIT_NOFILE,0,&limit); limit.rlim_cur=0; prlimit(getppid(),RLIMIT_NOFILE,&limit,0);
+  for(;;) pause();
+}"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    File::options()
+        .write(true)
+        .open(&library)
+        .unwrap()
+        .set_len(16 << 20)
+        .unwrap();
     fs::set_permissions(&library, fs::Permissions::from_mode(0o500)).unwrap();
     library
 }
@@ -434,6 +548,521 @@ fn cleanup_refuses_a_dangling_rendezvous_symlink() {
 }
 
 #[test]
+fn creation_never_replaces_a_dangling_rendezvous_symlink() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let path = root.join("dangling-create");
+    symlink(root.join("missing"), &path).unwrap();
+
+    let created = invoked(alias, &["start", "dangling-create", "/bin/true"]);
+    let preserved = fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if created.status.success() {
+        let _ = invoked(alias, &["kill", "-f", "dangling-create"]);
+    }
+    assert_eq!(created.status.code(), Some(1), "{created:?}");
+    assert!(preserved, "publication replaced the dangling symlink");
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn publication_failure_confirms_child_death_and_rolls_back_owned_companions() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let path = root.join("rollback");
+    let pidfile = marker.join("pid");
+    symlink(root.join("missing"), &path).unwrap();
+    let script = format!(
+        "trap '' HUP TERM; echo $$ > '{}'; sleep 30",
+        pidfile.display()
+    );
+
+    let created = invoked(alias, &["start", "rollback", "/bin/sh", "-c", &script]);
+    let until = Instant::now() + Duration::from_secs(2);
+    while !pidfile.exists() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pid = fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok());
+    thread::sleep(Duration::from_millis(100));
+    let alive = pid.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+    if let Some(pid) = pid.filter(|_| alive) {
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+
+    assert_eq!(created.status.code(), Some(1), "{created:?}");
+    assert!(
+        !alive,
+        "unpublished child {pid:?} survived publication failure"
+    );
+    assert!(!companion(&path, ".log").exists());
+    assert!(!companion(&path, ".exit").exists());
+    assert!(fs::symlink_metadata(path).unwrap().file_type().is_symlink());
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn event_substitution_failure_preserves_the_replacement_during_rollback() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let event = companion(&root.join("substituted"), ".events");
+    let library = instrumentation(&marker, None);
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "substituted",
+            "-T",
+            event.to_str().unwrap(),
+            "-S",
+            library.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .env("MOOR_SUBSTITUTE_EVENT", &event)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read(event.join("body.1")).unwrap(), b"replacement");
+    assert!(event.join("displaced").exists());
+    for name in ["body.0", "commit.0", "commit.1"] {
+        assert!(!event.join(name).exists(), "unexpected survivor {name}");
+    }
+    let session = root.join("substituted");
+    assert!(!companion(&session, ".log").exists());
+    assert!(!companion(&session, ".exit").exists());
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn natural_exit_during_publication_failure_is_finalized_and_retained() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let session = root.join("exit-race");
+    let event = root.join("exit-race-events");
+    let library = instrumentation(&marker, None);
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "exit-race",
+            "-T",
+            event.to_str().unwrap(),
+            "-S",
+            library.to_str().unwrap(),
+            "/bin/true",
+        ])
+        .env("MOOR_EXIT_ON_EVENT_OPEN", &event)
+        .env("MOOR_OCCUPY_RENDEZVOUS", &session)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        format!("{alias}: child exited before session publication\n").as_bytes()
+    );
+    assert!(
+        fs::symlink_metadata(&session).is_ok_and(|meta| meta.file_type().is_symlink()),
+        "{output:?}"
+    );
+    let (_, lifecycle) = Store::read_only(&companion(&session, ".exit"), Kind::Exit, 1).unwrap();
+    assert!(
+        String::from_utf8(lifecycle)
+            .unwrap()
+            .contains("\"phase\":\"exited\"")
+    );
+    let (_, events) = Store::read_only(&event, Kind::Event, 1).unwrap();
+    assert!(
+        String::from_utf8(events)
+            .unwrap()
+            .contains("\"type\":\"exit\"")
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn literal_dot_moor_stage_remains_a_legal_bare_session() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let _ = fs::remove_dir_all(&root);
+
+    let started = invoked(
+        alias,
+        &["start", ".moor-stage", "/bin/sh", "-c", "sleep 30"],
+    );
+    if started.status.success() {
+        let _ = invoked(alias, &["kill", "-f", ".moor-stage"]);
+        let _ = invoked(alias, &["rm", ".moor-stage"]);
+    }
+    assert!(started.status.success(), "{started:?}");
+
+    let _ = fs::remove_dir_all(root);
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn path_form_publication_is_staged_on_the_destination_filesystem() {
+    use std::os::unix::fs::MetadataExt;
+
+    let shared = Path::new("/dev/shm");
+    if !shared.is_dir()
+        || fs::metadata(shared).unwrap().dev() == fs::metadata(std::env::temp_dir()).unwrap().dev()
+    {
+        return;
+    }
+    let dir = shared.join(format!("moor-e2e-{}-cross-device", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let socket = dir.join("session");
+    let name = socket.to_str().unwrap();
+
+    let started = moor(&["start", name, "/bin/sh", "-c", "sleep 30"]);
+    if started.status.success() {
+        let _ = moor(&["kill", "-f", name]);
+        let _ = moor(&["rm", name]);
+    }
+    assert!(started.status.success(), "{started:?}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn failure_before_holder_entry_unlinks_the_staged_rendezvous() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let mut command = invoked_command(alias);
+    command.args(["start", "no-stage-leak", "/bin/sh", "-c", "sleep 30"]);
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 6,
+                rlim_max: 6,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let residue = fs::read_dir(&root)
+        .map(|entries| entries.filter_map(Result::ok).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(residue.is_empty(), "{residue:?}");
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preadoption_holder_death_rolls_back_the_prepared_event_store() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let shim = storage_delay_shim(&marker);
+    for precreated in [false, true] {
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .or_else(|error| {
+                (error.kind() == std::io::ErrorKind::AlreadyExists)
+                    .then_some(())
+                    .ok_or(error)
+            })
+            .unwrap();
+        let session = format!("holder-death-{precreated}");
+        let event = root.join(format!("events-{precreated}"));
+        if precreated {
+            DirBuilder::new().mode(0o700).create(&event).unwrap();
+        }
+        let entered = marker.join(format!("lease-entered-{precreated}"));
+        let creator = invoked_command(alias)
+            .args([
+                "start",
+                &session,
+                "-T",
+                event.to_str().unwrap(),
+                "/bin/true",
+            ])
+            .env("LD_PRELOAD", &shim)
+            .env("MOOR_TEST_FLOCK_DELAY_MS", "10000")
+            .env("MOOR_TEST_FLOCK_ENTERED", &entered)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let creator_pid = creator.id();
+        let children = format!("/proc/{creator_pid}/task/{creator_pid}/children");
+        let until = Instant::now() + Duration::from_secs(2);
+        let holder = loop {
+            let found = fs::read_to_string(&children)
+                .ok()
+                .and_then(|pids| pids.split_whitespace().next()?.parse::<i32>().ok());
+            if (found.is_some() && entered.exists()) || Instant::now() >= until {
+                break found;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        .expect("background holder was not forked");
+        assert!(event.exists(), "event preparation did not precede fork");
+        assert_eq!(unsafe { libc::kill(holder, libc::SIGKILL) }, 0);
+        let output = creator.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        if precreated {
+            assert!(event.is_dir());
+            assert!(fs::read_dir(&event).unwrap().next().is_none());
+            fs::remove_dir(&event).unwrap();
+        } else {
+            assert!(!event.exists());
+        }
+        assert!(!companion(&root.join(&session), ".exit").exists());
+    }
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn preadoption_rollback_preserves_substituted_companions_and_instrument() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let session = root.join("identity-ledger");
+    let event = root.join("identity-events");
+    let instrument = instrumentation(&dir, None);
+    let shim = storage_delay_shim(&dir);
+    let entered = dir.join("lease-entered");
+    let creator = invoked_command(alias)
+        .args([
+            "start",
+            "identity-ledger",
+            "-T",
+            event.to_str().unwrap(),
+            "-S",
+            instrument.to_str().unwrap(),
+            "/bin/true",
+        ])
+        .env("LD_PRELOAD", &shim)
+        .env("MOOR_TEST_FLOCK_DELAY_MS", "10000")
+        .env("MOOR_TEST_FLOCK_ENTERED", &entered)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let creator_pid = creator.id();
+    let children = format!("/proc/{creator_pid}/task/{creator_pid}/children");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let (holder, staged) = loop {
+        let holder = fs::read_to_string(&children)
+            .ok()
+            .and_then(|pids| pids.split_whitespace().next()?.parse::<i32>().ok());
+        let staged = fs::read_dir(&root).ok().and_then(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .find(|path| path.extension() == Some(std::ffi::OsStr::new("instrument")))
+        });
+        if let (Some(holder), Some(staged)) = (holder, staged)
+            && entered.exists()
+        {
+            break (holder, staged);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "artifacts were not prepared before fork"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let log = companion(&session, ".log");
+    let lifecycle = companion(&session, ".exit");
+    let original_log = root.join("original-log");
+    let original_lifecycle = root.join("original-lifecycle");
+    let original_instrument = root.join("original-instrument");
+    fs::rename(&log, &original_log).unwrap();
+    fs::rename(&lifecycle, &original_lifecycle).unwrap();
+    fs::rename(&staged, &original_instrument).unwrap();
+    DirBuilder::new().mode(0o700).create(&log).unwrap();
+    DirBuilder::new().mode(0o700).create(&lifecycle).unwrap();
+    fs::write(&staged, b"replacement").unwrap();
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o500)).unwrap();
+
+    assert_eq!(unsafe { libc::kill(holder, libc::SIGKILL) }, 0);
+    let output = creator.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fs::read_dir(&log).unwrap().next().is_none());
+    assert!(fs::read_dir(&lifecycle).unwrap().next().is_none());
+    assert_eq!(fs::read(&staged).unwrap(), b"replacement");
+    assert!(fs::read_dir(&original_log).unwrap().next().is_none());
+    assert!(fs::read_dir(&original_lifecycle).unwrap().next().is_none());
+    assert!(original_instrument.is_file());
+    assert!(!event.exists());
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stalled_initial_fsync_is_cancelled_with_exact_rollback() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let event = root.join("stalled-events");
+    let shim = storage_delay_shim(&dir);
+    let started = Instant::now();
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "stalled",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/true",
+        ])
+        .env("LD_PRELOAD", &shim)
+        .env("MOOR_TEST_FSYNC_DELAY_MS", "5000")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
+    assert!(!root.exists() || fs::read_dir(&root).unwrap().next().is_none());
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn three_initial_store_flushes_run_in_parallel_under_one_deadline() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let event = root.join("parallel-events");
+    let shim = storage_delay_shim(&dir);
+    let started = Instant::now();
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "parallel",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .env("LD_PRELOAD", &shim)
+        .env("MOOR_TEST_FSYNC_DELAY_MS", "800")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(started.elapsed() < Duration::from_secs(2), "{output:?}");
+    assert!(invoked(alias, &["kill", "-f", "parallel"]).status.success());
+    assert!(invoked(alias, &["rm", "parallel"]).status.success());
+    assert!(!root.exists() || fs::read_dir(&root).unwrap().next().is_none());
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writer_leases_are_taken_in_lifecycle_event_log_order() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let session = root.join("lease-order");
+    let event = root.join("lease-order-events");
+    let shim = storage_delay_shim(&dir);
+    let trace = dir.join("locks");
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "lease-order",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .env("LD_PRELOAD", &shim)
+        .env("MOOR_TEST_FLOCK_TRACE", &trace)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let locks = fs::read_to_string(&trace).unwrap();
+    let locks = locks.lines().take(3).collect::<Vec<_>>();
+    assert_eq!(locks.len(), 3, "{locks:?}");
+    assert!(locks[0].ends_with("lease-order.exit/commit.0"), "{locks:?}");
+    assert!(
+        locks[1].ends_with("lease-order-events/commit.0"),
+        "{locks:?}"
+    );
+    assert!(locks[2].ends_with("lease-order.log/commit.0"), "{locks:?}");
+    assert!(
+        invoked(alias, &["kill", "-f", "lease-order"])
+            .status
+            .success()
+    );
+    assert!(invoked(alias, &["rm", "lease-order"]).status.success());
+    assert!(!session.exists());
+    assert!(!root.exists() || fs::read_dir(&root).unwrap().next().is_none());
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn post_spawn_setup_failure_reaps_the_requested_process_group() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let pid_file = dir.join("requested.pid");
+    let library = resource_exhausting_instrumentation(&dir);
+    let output = invoked_command(alias)
+        .args([
+            "run",
+            "guarded",
+            "-S",
+            library.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ])
+        .env("MOOR_GUARD_PID_FILE", &pid_file)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let pid = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        let group = unsafe { libc::getpgid(pid) };
+        unsafe {
+            libc::kill(if group > 0 { -group } else { pid }, libc::SIGKILL);
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+    fs::remove_dir_all(dir).unwrap();
+    assert!(
+        !alive,
+        "requested process {pid} survived holder setup failure"
+    );
+}
+
+#[test]
 fn restrictive_umask_still_creates_an_exact_owner_only_root() {
     let dir = temp();
     let alias = dir.file_name().unwrap().to_str().unwrap();
@@ -454,6 +1083,224 @@ fn restrictive_umask_still_creates_an_exact_owner_only_root() {
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
     fs::remove_dir(&root).unwrap();
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn restrictive_umask_still_creates_an_exact_event_store() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let event = root.join("events");
+    let mut command = invoked_command(alias);
+    command.args([
+        "start",
+        "restrictive-event",
+        "-T",
+        event.to_str().unwrap(),
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o777);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    let event_mode = fs::symlink_metadata(&event)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777);
+    let slot_modes = ["body.0", "body.1", "commit.0", "commit.1"].map(|name| {
+        fs::symlink_metadata(event.join(name))
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o777)
+    });
+    if output.status.success() {
+        let _ = invoked(alias, &["kill", "-f", "restrictive-event"]);
+        let _ = invoked(alias, &["rm", "restrictive-event"]);
+    }
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(event_mode, Some(0o700));
+    assert_eq!(slot_modes, [Some(0o600); 4]);
+    let _ = fs::remove_dir_all(root);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn event_target_requires_an_absolute_path_inside_the_invoked_root() {
+    use std::os::unix::fs::MetadataExt;
+
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let outside = marker.join("outside-events");
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let stale = root.join("relative");
+    stale_socket(&stale);
+    let stale_id = fs::symlink_metadata(&stale).unwrap().ino();
+
+    let relative = invoked(alias, &["start", "relative", "-T", "events", "/bin/true"]);
+    assert_eq!(relative.status.code(), Some(1), "{relative:?}");
+    assert_eq!(
+        relative.stderr,
+        format!("{alias}: event store rejected: events (not-absolute)\n").as_bytes()
+    );
+    assert_eq!(fs::symlink_metadata(&stale).unwrap().ino(), stale_id);
+
+    let outside_text = outside.to_str().unwrap();
+    let escaped = moor::name::render(outside.as_os_str());
+    let rejected = invoked(
+        alias,
+        &["start", "outside", "-T", outside_text, "/bin/true"],
+    );
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert_eq!(
+        rejected.stderr,
+        format!("{alias}: event store rejected: {escaped} (outside-root)\n").as_bytes()
+    );
+    assert!(!outside.exists());
+    assert!(!root.join("outside").exists());
+
+    fs::remove_file(stale).unwrap();
+    let _ = fs::remove_dir_all(root);
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn event_target_cannot_escape_the_root_through_a_linked_ancestor() {
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let outside = marker.join("outside");
+    fs::create_dir(&outside).unwrap();
+    symlink(&outside, root.join("linked-parent")).unwrap();
+    let event = root.join("linked-parent/events");
+    let output = invoked(
+        alias,
+        &[
+            "start",
+            "escaped",
+            "-T",
+            event.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    if output.status.success() {
+        let _ = invoked(alias, &["kill", "-f", "escaped"]);
+        let _ = invoked(alias, &["rm", "escaped"]);
+    }
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        output.stderr,
+        format!(
+            "{alias}: event store rejected: {} (link)\n",
+            moor::name::render(event.as_os_str())
+        )
+        .as_bytes()
+    );
+    assert!(!outside.join("events").exists());
+    assert!(!root.join("escaped").exists());
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn event_target_cannot_alias_the_rendezvous_or_derived_companions() {
+    use std::os::unix::fs::MetadataExt;
+
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    for (session, suffix) in [
+        ("same-rendezvous", ""),
+        ("same-log", ".log"),
+        ("same-exit", ".exit"),
+    ] {
+        let rendezvous = root.join(session);
+        let event = PathBuf::from(format!("{}{suffix}", rendezvous.display()));
+        stale_socket(&rendezvous);
+        let stale = fs::symlink_metadata(&rendezvous).unwrap().ino();
+        let output = invoked(
+            alias,
+            &[
+                "start",
+                session,
+                "-T",
+                event.to_str().unwrap(),
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+            ],
+        );
+        if output.status.success() {
+            let _ = invoked(alias, &["kill", "-f", session]);
+            let _ = invoked(alias, &["rm", session]);
+        }
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(
+            output.stderr,
+            format!(
+                "{alias}: event store rejected: {} (identity-changed)\n",
+                moor::name::render(event.as_os_str())
+            )
+            .as_bytes()
+        );
+        assert_eq!(fs::symlink_metadata(&rendezvous).unwrap().ino(), stale);
+        assert!(!companion(&rendezvous, ".log").exists());
+        assert!(!companion(&rendezvous, ".exit").exists());
+        fs::remove_file(&rendezvous).unwrap();
+    }
+    let _ = fs::remove_dir(&root);
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn event_manifest_retains_the_exact_absolute_operand_spelling() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    DirBuilder::new().mode(0o700).create(&root).unwrap();
+    fs::create_dir(root.join("parent")).unwrap();
+    let event = root.join("parent").join("..").join("events");
+    let event_text = event.to_str().unwrap();
+    let started = invoked(
+        alias,
+        &[
+            "start",
+            "exact-event",
+            "-T",
+            event_text,
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
+    assert!(started.status.success(), "{started:?}");
+
+    let session = root.join("exact-event");
+    let (_, lifecycle) = Store::read_only(&companion(&session, ".exit"), Kind::Exit, 1).unwrap();
+    let expected = STANDARD.encode(event.as_os_str().as_bytes());
+    assert!(
+        String::from_utf8(lifecycle)
+            .unwrap()
+            .contains(&format!("\"event_path\":\"{expected}\""))
+    );
+    assert!(
+        invoked(alias, &["kill", "-f", "exact-event"])
+            .status
+            .success()
+    );
+    assert!(invoked(alias, &["rm", "exact-event"]).status.success());
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(marker).unwrap();
 }
 
 #[test]
@@ -798,65 +1645,6 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
 }
 
 #[test]
-fn same_size_winch_redraw_notifies_the_child_exactly_once() {
-    let dir = temp();
-    let socket = dir.join("same-size-winch");
-    let name = socket.to_str().unwrap();
-    let start = moor(&[
-        "start",
-        name,
-        "/bin/sh",
-        "-c",
-        "trap 'printf \"WINCH\\n\"' WINCH; printf 'READY\\n'; while :; do read line || :; done",
-    ]);
-    assert!(start.status.success(), "{start:?}");
-    wait_for(&socket, b"READY\r\n");
-
-    let (mut master, slave) = terminal_pair(24, 80);
-    let mut attach = terminal_command(&slave)
-        .args(["attach", "-r", "winch", name])
-        .spawn()
-        .unwrap();
-    let _ = terminal_output(&mut master, b"READY\r\n", Duration::from_secs(1));
-    let until = Instant::now() + Duration::from_secs(3);
-    loop {
-        let logged = tail(&socket);
-        if logged
-            .stdout
-            .windows(b"WINCH\r\n".len())
-            .any(|part| part == b"WINCH\r\n")
-            || Instant::now() >= until
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(100));
-    let _ = master.write_all(&[0x1c]);
-    let until = Instant::now() + Duration::from_secs(2);
-    while attach.try_wait().unwrap().is_none() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(20));
-    }
-    if attach.try_wait().unwrap().is_none() {
-        attach.kill().unwrap();
-    }
-    let _ = attach.wait();
-    let logged = tail(&socket);
-    let _ = moor(&["kill", "-f", "-q", name]);
-    fs::remove_dir_all(dir).unwrap();
-
-    assert_eq!(
-        logged
-            .stdout
-            .windows(b"WINCH\r\n".len())
-            .filter(|part| *part == b"WINCH\r\n")
-            .count(),
-        1,
-        "{logged:?}"
-    );
-}
-
-#[test]
 fn foreground_run_returns_the_child_status() {
     let dir = temp();
     let socket = dir.join("foreground");
@@ -1139,21 +1927,28 @@ fn legal_stage_like_session_names_remain_visible_and_untouched() {
 #[test]
 fn supervised_launch_validates_private_record_and_propagates_generation() {
     let dir = temp();
-    let socket = dir.join("supervised");
-    let events = dir.join("events");
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let socket = root.join("supervised");
+    let events = root.join("events");
+    let generation_key = environment_key(std::ffi::OsStr::new(alias), "_GENERATION");
+    let script = format!(
+        "printf '<%s><%s>\\n' \"${}\" \"$DESK_SESSION_GENERATION\"; sleep 30",
+        generation_key.to_str().unwrap()
+    );
     let descriptor = launch_channel(42);
-    let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+    let output = invoked_command(alias)
         .args([
             "start",
-            socket.to_str().unwrap(),
+            "supervised",
             "-T",
             events.to_str().unwrap(),
             "/bin/sh",
             "-c",
-            "printf '<%s><%s>\\n' \"$MOOR_GENERATION\" \"$DESK_SESSION_GENERATION\"; sleep 30",
+            &script,
         ])
         .env("DESK_MOOR_LAUNCH_CHANNEL", descriptor.to_string())
-        .env("MOOR_GENERATION", "42")
+        .env(&generation_key, "42")
         .env("DESK_SESSION_GENERATION", "42")
         .output()
         .unwrap();
@@ -1167,10 +1962,12 @@ fn supervised_launch_validates_private_record_and_propagates_generation() {
             .contains("\"generation\":42")
     );
     assert!(
-        moor(&["kill", "-f", socket.to_str().unwrap()])
+        invoked(alias, &["kill", "-f", "supervised"])
             .status
             .success()
     );
+    assert!(invoked(alias, &["rm", "supervised"]).status.success());
+    fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1203,19 +2000,24 @@ fn inherited_generation_without_launch_channel_is_stripped() {
 #[test]
 fn instrumentation_must_ack_from_inside_the_requested_child() {
     let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
     let library = instrumentation(&dir, None);
     let socket = dir.join("instrumented");
-    let output = moor(&[
-        "start",
-        socket.to_str().unwrap(),
-        "-S",
-        library.to_str().unwrap(),
-        "/bin/sh",
-        "-c",
-        "sleep 30",
-    ]);
+    let output = invoked(
+        alias,
+        &[
+            "start",
+            socket.to_str().unwrap(),
+            "-S",
+            library.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "sleep 30",
+        ],
+    );
     assert!(output.status.success(), "{output:?}");
-    let stages = fs::read_dir(&dir)
+    let stages = fs::read_dir(&root)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension() == Some(std::ffi::OsStr::new("instrument")))
@@ -1224,14 +2026,19 @@ fn instrumentation_must_ack_from_inside_the_requested_child() {
     assert_eq!(stages[0].file_stem().unwrap().as_encoded_bytes().len(), 64);
     assert_ne!(stages[0], companion(&socket, ".instrument"));
     assert!(
-        moor(&["kill", "-f", socket.to_str().unwrap()])
+        invoked(alias, &["kill", "-f", socket.to_str().unwrap()])
             .status
             .success()
     );
     assert!(stages[0].exists());
-    assert!(moor(&["rm", socket.to_str().unwrap()]).status.success());
+    assert!(
+        invoked(alias, &["rm", socket.to_str().unwrap()])
+            .status
+            .success()
+    );
     assert!(!stages[0].exists());
     assert!(library.exists());
+    fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1244,7 +2051,7 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
     for (mode, expected) in [("start", 1), ("run", 23)] {
         let session = format!("early-{mode}");
         let socket = root.join(&session);
-        let events = dir.join(format!("{mode}-events"));
+        let events = root.join(format!("{mode}-events"));
         let output = invoked(
             alias,
             &[
@@ -1337,20 +2144,23 @@ fn current_uses_canonical_v2_ancestry_and_rejects_bad_carriers() {
 #[test]
 fn observed_exit_is_durable_listed_and_emitted_to_events() {
     let dir = temp();
-    let session = dir.file_name().unwrap().to_str().unwrap();
-    let socket = std::env::temp_dir()
-        .join(format!(".moor-{}", unsafe { libc::geteuid() }))
-        .join(session);
-    let events = dir.join("event-store");
-    let output = moor(&[
-        "start",
-        session,
-        "-T",
-        events.to_str().unwrap(),
-        "/bin/sh",
-        "-c",
-        "printf '\x1b[>0q'; sleep .2; exit 7",
-    ]);
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let session = "observed-exit";
+    let socket = root.join(session);
+    let events = root.join("event-store");
+    let output = invoked(
+        alias,
+        &[
+            "start",
+            session,
+            "-T",
+            events.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "printf '\x1b[>0q'; sleep .2; exit 7",
+        ],
+    );
     assert!(output.status.success(), "{output:?}");
     let until = Instant::now() + Duration::from_secs(5);
     while socket.exists() && Instant::now() < until {
@@ -1368,7 +2178,7 @@ fn observed_exit_is_durable_listed_and_emitted_to_events() {
     let body = String::from_utf8(body).unwrap();
     assert!(body.contains("\"type\":\"ready\""), "{body}");
     assert!(body.contains("\"type\":\"exit\""), "{body}");
-    let listed = moor(&["list", "-a"]);
+    let listed = invoked(alias, &["list", "-a"]);
     assert!(
         listed
             .stdout
@@ -1383,8 +2193,9 @@ fn observed_exit_is_durable_listed_and_emitted_to_events() {
             .any(|w| w == b"[exited]"),
         "{listed:?}"
     );
-    assert!(moor(&["rm", session]).status.success());
+    assert!(invoked(alias, &["rm", session]).status.success());
     assert!(!events.exists());
+    fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(dir).unwrap();
 }
 

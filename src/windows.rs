@@ -981,6 +981,8 @@ mod native {
                     encoding: "windows-wtf8",
                     event_identity: event_identity.as_deref(),
                     instrument_identity: instrument_identity.as_deref(),
+                    event_store: None,
+                    stores: None,
                     event_layout: 2,
                     log_cap: self.options.log_cap,
                 },
@@ -1722,6 +1724,21 @@ mod native {
         host.ready.notice(2, 0);
         Ok(holder(host, listener)?)
     }
+    pub(crate) fn preflight_create(
+        options: &Options,
+        session: &OsStr,
+        invoked: &OsStr,
+    ) -> Result<PathBuf> {
+        if let Some(event) = options.events.as_deref() {
+            if !event.is_absolute() {
+                return Err(format!(
+                    "event store rejected: {} (not-absolute)",
+                    name::render(event.as_os_str())
+                ));
+            }
+        }
+        resolve(session, invoked)
+    }
     pub(crate) fn clock() -> Result<(u64, [u8; 16])> {
         Ok((unsafe { GetTickCount64() }, boot_identity()))
     }
@@ -1732,5 +1749,5 @@ pub use native::bootstrap;
 #[cfg(windows)]
 pub(crate) use native::{
     attach, classify, cleanup, clock, connect, create, create_store_path, current_paths,
-    protected_store_path, resolve, sessions, valid_store_slots,
+    preflight_create, protected_store_path, resolve, sessions, valid_store_slots,
 };

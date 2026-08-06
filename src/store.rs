@@ -8,6 +8,8 @@ use std::path::Path;
 
 const LIMITS: [u64; 4] = [0, 320 << 10, u64::MAX, 4 << 20];
 const NAMES: [&str; 4] = ["body.0", "body.1", "commit.0", "commit.1"];
+#[cfg(unix)]
+const NATIVE_NAMES: [&std::ffi::CStr; 4] = [c"body.0", c"body.1", c"commit.0", c"commit.1"];
 const EVENT_CAP: u64 = 256 << 10;
 const EVENT_END: u64 = 1 << 53;
 const SNAPSHOT: u8 = 1;
@@ -106,7 +108,81 @@ fn make_commit(
 
 schema!(struct pub Store fields; slots: [File; 4], selected: Commit, hash: Sha256);
 
+#[cfg(unix)]
+pub struct PreparedStore {
+    slots: [File; 4],
+}
+
+#[cfg(unix)]
+impl PreparedStore {
+    pub fn raw_descriptors(&self) -> [std::os::fd::RawFd; 4] {
+        use std::os::fd::AsRawFd;
+        self.slots.each_ref().map(|slot| slot.as_raw_fd())
+    }
+
+    pub fn lease_at(
+        &self,
+        directory: &File,
+        kind: Kind,
+        generation: u32,
+        initial: &[u8],
+        start: u64,
+        end: u64,
+    ) -> Result<Store, StoreError> {
+        let epoch = if kind == Kind::Event { 0 } else { 1 };
+        let (selected, hash) =
+            make_commit(kind, generation, (0, 0, epoch, 1, start, end), initial)?;
+        let slots = open_prepared_slots_at(directory, &self.slots)?;
+        Ok(Store {
+            slots,
+            selected,
+            hash,
+        })
+    }
+
+    pub fn initialize_at(
+        &self,
+        directory: &File,
+        kind: Kind,
+        generation: u32,
+        initial: &[u8],
+        start: u64,
+        end: u64,
+    ) -> Result<Store, StoreError> {
+        let store = self.lease_at(directory, kind, generation, initial, start, end)?;
+        self.initialize_leased_at(directory, &store, initial)?;
+        Ok(store)
+    }
+
+    pub fn initialize_leased_at(
+        &self,
+        directory: &File,
+        store: &Store,
+        initial: &[u8],
+    ) -> Result<(), StoreError> {
+        self.revalidate_at(directory)?;
+        directory.sync_all()?;
+        update(&store.slots[0], 0, initial)?;
+        update(&store.slots[2], 0, &store.selected.encode())?;
+        Ok(())
+    }
+
+    pub fn revalidate_at(&self, directory: &File) -> Result<(), StoreError> {
+        validate_slots_at(directory, &self.slots)
+    }
+
+    pub fn rollback_at(&self, directory: &File) {
+        remove_slots_at(directory, &self.slots);
+    }
+}
+
 impl Store {
+    #[cfg(unix)]
+    pub fn raw_descriptors(&self) -> [std::os::fd::RawFd; 4] {
+        use std::os::fd::AsRawFd;
+        self.slots.each_ref().map(|slot| slot.as_raw_fd())
+    }
+
     pub fn remove(path: &Path) -> Result<(), StoreError> {
         for name in NAMES {
             let _ = fs::remove_file(path.join(name));
@@ -145,6 +221,28 @@ impl Store {
             selected: commit,
             hash,
         })
+    }
+    #[cfg(unix)]
+    pub fn prepare_at(directory: &File) -> Result<PreparedStore, StoreError> {
+        prepare_slots_at(directory).map(|slots| PreparedStore { slots })
+    }
+    #[cfg(unix)]
+    pub fn create_at(
+        directory: &File,
+        kind: Kind,
+        generation: u32,
+        initial: &[u8],
+        start: u64,
+        end: u64,
+    ) -> Result<Self, StoreError> {
+        let prepared = Self::prepare_at(directory)?;
+        match prepared.initialize_at(directory, kind, generation, initial, start, end) {
+            Ok(store) => Ok(store),
+            Err(error) => {
+                prepared.rollback_at(directory);
+                Err(error)
+            }
+        }
     }
     pub fn open(
         path: &Path,
@@ -573,6 +671,204 @@ fn open_slots(path: &Path, write: bool) -> Result<[File; 4], StoreError> {
         slots[2].try_lock_exclusive()?;
     }
     Ok(slots)
+}
+
+#[cfg(unix)]
+fn prepare_slots_at(directory: &File) -> Result<[File; 4], StoreError> {
+    let meta = directory.metadata()?;
+    corrupt_if(!meta.is_dir() || !protected(Path::new(""), &meta, 0o700))?;
+    let mut slots = Vec::with_capacity(4);
+    for at in 0..4 {
+        match slot_at(directory, at, true) {
+            Ok(slot) => slots.push(slot),
+            Err(error) => {
+                remove_slots_at(directory, &slots);
+                return Err(error);
+            }
+        }
+    }
+    let validated = validate_slots_at(directory, &slots);
+    if let Err(error) = validated {
+        remove_slots_at(directory, &slots);
+        return Err(error);
+    }
+    Ok(slots.try_into().unwrap())
+}
+
+#[cfg(unix)]
+fn open_prepared_slots_at(directory: &File, prepared: &[File; 4]) -> Result<[File; 4], StoreError> {
+    let slots = [
+        slot_at(directory, 0, false)?,
+        slot_at(directory, 1, false)?,
+        slot_at(directory, 2, false)?,
+        slot_at(directory, 3, false)?,
+    ];
+    validate_slots_at(directory, prepared)?;
+    for at in 0..4 {
+        corrupt_if(!same_file(
+            &prepared[at].metadata()?,
+            &slots[at].metadata()?,
+        ))?;
+    }
+    slots[2].try_lock_exclusive()?;
+    Ok(slots)
+}
+
+#[cfg(unix)]
+fn slot_at(directory: &File, at: usize, create: bool) -> Result<File, StoreError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            NATIVE_NAMES[at].as_ptr(),
+            libc::O_RDWR
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK
+                | if create {
+                    libc::O_CREAT | libc::O_EXCL
+                } else {
+                    0
+                },
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !create {
+        return Ok(file);
+    }
+    let initialized = (unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error);
+    if let Err(error) = initialized {
+        remove_slot_at(directory, at, &file);
+        return Err(error.into());
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn stat_at(directory: &File, at: usize) -> io::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+    let mut stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            NATIVE_NAMES[at].as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        Ok(stat)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn validate_slots_at(directory: &File, slots: &[File]) -> Result<(), StoreError> {
+    use std::ffi::CStr;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::fs::MetadataExt;
+
+    let descriptor = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let duplicate = unsafe { File::from_raw_fd(descriptor) };
+    let flags = unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || flags & libc::O_NONBLOCK == 0
+            && unsafe {
+                libc::fcntl(
+                    duplicate.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags | libc::O_NONBLOCK,
+                )
+            } < 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let descriptor = duplicate.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        drop(unsafe { File::from_raw_fd(descriptor) });
+        return Err(io::Error::last_os_error().into());
+    }
+    let _stream = DirectoryStream(stream);
+    unsafe { libc::rewinddir(stream) };
+    let mut seen = 0u8;
+    loop {
+        nix::errno::Errno::clear();
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let errno = nix::errno::Errno::last_raw();
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno).into());
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        let Some(at) = NAMES
+            .iter()
+            .position(|candidate| candidate.as_bytes() == name)
+        else {
+            return Err(StoreError::Corrupt);
+        };
+        corrupt_if(seen & (1 << at) != 0)?;
+        let stat = stat_at(directory, at).map_err(|_| StoreError::Corrupt)?;
+        let handle = slots[at].metadata()?;
+        corrupt_if(
+            stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || stat.st_mode & 0o777 != 0o600
+                || !handle.is_file()
+                || !protected(Path::new(""), &handle, 0o600)
+                || stat.st_dev as u64 != handle.dev()
+                || stat.st_ino as u64 != handle.ino(),
+        )?;
+        seen |= 1 << at;
+    }
+    corrupt_if(seen != 0b1111)
+}
+
+#[cfg(unix)]
+struct DirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // macOS and Linux expose different libc::stat widths.
+fn remove_slot_at(directory: &File, at: usize, slot: &File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    if let (Ok(opened), Ok(entry)) = (slot.metadata(), stat_at(directory, at))
+        && entry.st_mode & libc::S_IFMT == libc::S_IFREG
+        && entry.st_dev as u64 == opened.dev()
+        && entry.st_ino as u64 == opened.ino()
+    {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), NATIVE_NAMES[at].as_ptr(), 0) };
+    }
+}
+
+#[cfg(unix)]
+fn remove_slots_at(directory: &File, slots: &[File]) {
+    for (at, slot) in slots.iter().enumerate().rev() {
+        remove_slot_at(directory, at, slot);
+    }
 }
 
 fn recover(
