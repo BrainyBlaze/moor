@@ -66,7 +66,9 @@ impl<N: Native> Runtime<N> {
                         continue;
                     }
                     if let Some((rows, columns)) = resize {
-                        self.resize(rows, columns);
+                        self.resize(rows, columns, false);
+                        // ATTACH has no redraw bit; winch is its matching RESIZE.
+                        self.redraw = Some((id, rows, columns));
                     }
                     if self.send_status(id, true, snapshot, deadline, clock) {
                         if let Some(peer) = self.peers.get_mut(&id) {
@@ -77,7 +79,10 @@ impl<N: Native> Runtime<N> {
                         }
                     }
                 }
-                PolicyEffect::Resize(rows, columns) => self.resize(rows, columns),
+                PolicyEffect::Resize(id, rows, columns) => {
+                    let redraw = self.redraw.take() == Some((id, rows, columns));
+                    self.resize(rows, columns, redraw);
+                }
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
                 PolicyEffect::CommitSources(ticket, changes, mandatory) => {
                     let purpose = Purpose::Sources(ticket.get(), mandatory);
@@ -178,8 +183,12 @@ impl<N: Native> Runtime<N> {
     /// so it may only adopt a geometry the platform actually applied: adopting a
     /// failed resize makes the next preamble claim a default region that is not
     /// the child's (§6 of the schema, §5.2).
-    fn resize(&mut self, rows: u16, columns: u16) {
+    fn resize(&mut self, rows: u16, columns: u16, redraw: bool) {
+        if !redraw && self.geometry == (rows, columns) {
+            return;
+        }
         if self.native.resize(rows, columns).is_ok() {
+            self.geometry = (rows, columns);
             self.scanner.set_rows(rows);
         }
     }
@@ -312,7 +321,7 @@ impl Peer {
 
 schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
     writes: Receiver<(u64, Option<u16>)>, pending_writes: VecDeque<Ticket>, peers: HashMap<u64, Peer>, recipients: Vec<u64>,
-    frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
+    frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
     heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<PendingDescriptor>, status_snapshot: Option<(StatusSnapshot, u64)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
@@ -327,7 +336,8 @@ impl<N: Native> Runtime<N> {
     /// The tracked-mode scanner resolves a scroll region's omitted bottom
     /// against the current row count (schema §6), so it has to start from the
     /// creation geometry rather than a fixed 24.
-    pub fn set_rows(&mut self, rows: u16) {
+    pub fn set_geometry(&mut self, rows: u16, columns: u16) {
+        self.geometry = (rows, columns);
         self.scanner.set_rows(rows);
     }
     #[cfg(unix)]
@@ -371,6 +381,8 @@ impl<N: Native> Runtime<N> {
             buffered: 0,
             next_peer: 1,
             scanner: Scanner::new(24),
+            geometry: (24, 80),
+            redraw: None,
             storage: config.storage,
             status: config.status,
             commit_at: config.commit_at,
@@ -659,7 +671,12 @@ impl<N: Native> Runtime<N> {
         let token = matches!(message.kind, 3 | 0x15)
             .then(|| random_array().ok())
             .flatten();
-        match wire::decode_controller(message.kind, &message.payload, token)? {
+        let request = wire::decode_controller(message.kind, &message.payload, token)?;
+        // Any other request closes the immediate attach-redraw window.
+        if message.kind != 0x0b && self.redraw.is_some_and(|redraw| redraw.0 == id) {
+            self.redraw = None;
+        }
+        match request {
             ControllerRequest::Hello(identity) => {
                 let refusal = if message.scope != 0 && message.scope != self.config.generation {
                     Some((9, 5, &b"generation did not match"[..]))

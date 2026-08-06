@@ -1412,14 +1412,18 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
 }
 
 #[test]
-fn attach_and_ordinary_same_size_resize_use_the_platform_resize_path() {
+fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     use std::sync::{Arc, Mutex};
 
-    struct CountResize(Arc<Mutex<usize>>);
+    struct CountResize(Arc<Mutex<Vec<(u16, u16)>>>);
     impl Native for CountResize {
-        fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
-            *self.0.lock().unwrap() += 1;
-            Ok(())
+        fn resize(&mut self, rows: u16, columns: u16) -> Result<(), String> {
+            self.0.lock().unwrap().push((rows, columns));
+            if (rows, columns) == (40, 120) {
+                Err("injected resize failure".into())
+            } else {
+                Ok(())
+            }
         }
         fn terminate(&mut self, _: bool) -> (u8, bool) {
             (0, false)
@@ -1453,8 +1457,8 @@ fn attach_and_ordinary_same_size_resize_use_the_platform_resize_path() {
         0,
     )
     .unwrap();
-    let (_, writes) = mpsc::channel();
-    let calls = Arc::new(Mutex::new(0));
+    let (pty, writes) = Duplex::tracked(Cursor::new(Vec::new()), std::io::sink(), 1024);
+    let calls = Arc::new(Mutex::new(Vec::new()));
     let mut runtime = Runtime::new(HolderConfig {
         core: CoreConfig {
             generation: 7,
@@ -1463,7 +1467,7 @@ fn attach_and_ordinary_same_size_resize_use_the_platform_resize_path() {
             semantic_token: [0; 16],
             replay_limit: 1024,
         },
-        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        pty,
         writes,
         storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
         status: Vec::new(),
@@ -1473,18 +1477,70 @@ fn attach_and_ordinary_same_size_resize_use_the_platform_resize_path() {
     });
     let mut owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut owner, &mut runtime);
-    owner.send(7, 3, &[80, 0, 50, 0, 1]);
+    owner.send(7, 3, &[80, 0, 24, 0, 1]);
     owner.recv_kind(&mut runtime, 5);
     owner.recv_kind(&mut runtime, 4);
-    owner.recv_kind(&mut runtime, 0x16);
-    owner.send(7, 0x0b, &[1, 0, 0, 0, 80, 0, 50, 0]);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while {
-        runtime.poll();
-        *calls.lock().unwrap() < 2 && Instant::now() < deadline
-    } {}
+    let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert!(calls.lock().unwrap().is_empty(), "redraw none resized");
 
-    assert_eq!(*calls.lock().unwrap(), 2);
+    let input = [
+        lease.epoch.to_le_bytes().as_slice(),
+        1u64.to_le_bytes().as_slice(),
+        &[0, 0x0c],
+    ]
+    .concat();
+    owner.send(7, 9, &input);
+    owner.send(7, 13, &[]);
+    owner.recv_kind(&mut runtime, 14);
+    assert!(calls.lock().unwrap().is_empty(), "ctrl_l resized");
+
+    let resize = [
+        lease.epoch.to_le_bytes().as_slice(),
+        80u16.to_le_bytes().as_slice(),
+        24u16.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    owner.send(7, 0x0b, &resize);
+    owner.send(7, 13, &[]);
+    owner.recv_kind(&mut runtime, 14);
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "an unchanged resize after ctrl_l used the winch exception"
+    );
+
+    let release = [lease.epoch.to_le_bytes().as_slice(), lease.token.as_slice()].concat();
+    owner.send(7, 0x17, &release);
+    owner.recv_kind(&mut runtime, 0x16);
+    let mut redraw_owner = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut redraw_owner, &mut runtime);
+    redraw_owner.send(7, 3, &[80, 0, 24, 0, 1]);
+    redraw_owner.recv_kind(&mut runtime, 5);
+    redraw_owner.recv_kind(&mut runtime, 4);
+    let lease =
+        LeaseResult::decode_wire(&redraw_owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    let resize = [
+        lease.epoch.to_le_bytes().as_slice(),
+        80u16.to_le_bytes().as_slice(),
+        24u16.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    redraw_owner.send(7, 0x0b, &resize);
+    redraw_owner.send(7, 0x0b, &resize);
+    for (rows, columns) in [(30u16, 100u16), (30, 100), (40, 120), (40, 120), (30, 100)] {
+        let resize = [
+            lease.epoch.to_le_bytes().as_slice(),
+            columns.to_le_bytes().as_slice(),
+            rows.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        redraw_owner.send(7, 0x0b, &resize);
+    }
+    redraw_owner.send(7, 13, &[]);
+    redraw_owner.recv_kind(&mut runtime, 14);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [(24, 80), (30, 100), (40, 120), (40, 120)]
+    );
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }

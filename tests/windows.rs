@@ -275,9 +275,9 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
         synthetic: 3,
         native: Fake(sizes.clone()),
     });
-    let owner = add(&mut runtime, b"session", (24, 80));
+    let owner = add(&mut runtime, b"session", (25, 80));
     let observer = add(&mut runtime, b"session", (40, 100));
-    assert_eq!(*sizes.lock().unwrap(), [(24, 80)]);
+    assert_eq!(*sizes.lock().unwrap(), [(25, 80)]);
     drop((owner, observer, child, runtime));
     std::fs::remove_dir_all(root).unwrap();
 }
