@@ -28,15 +28,15 @@ pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
         format_description!("[year][month][day][hour][minute][second].[subsecond digits:6]"),
     )
     .ok()?;
-    let minutes = value[21..].parse::<i32>().ok()?;
-    let utc = local.assume_offset(UtcOffset::from_whole_seconds(minutes.checked_mul(60)?).ok()?);
-    let ticks = u64::try_from(
+    let offset = value[21..].parse::<i32>().ok()?.checked_mul(60)?;
+    let utc = local.assume_offset(UtcOffset::from_whole_seconds(offset).ok()?);
+    u64::try_from(
         utc.unix_timestamp_nanos()
             .div_euclid(100)
             .checked_add(116_444_736_000_000_000)?,
     )
-    .ok()?;
-    Some(u128::from(ticks).to_le_bytes())
+    .ok()
+    .map(|ticks| u128::from(ticks).to_le_bytes())
 }
 
 schema!(struct pub Marker derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46]);
@@ -47,9 +47,10 @@ binary_record!(RawMarker => Marker[80] error () = ();
 impl Marker {
     pub fn new(generation: u32, incarnation: [u8; 16], random: [u8; 16]) -> Result<Self> {
         require(generation != 0, "zero marker generation")?;
-        let mut pipe = [0; 46];
-        pipe[..14].copy_from_slice(br"\\.\pipe\moor-");
-        pipe[14..].copy_from_slice(format!("{:032x}", u128::from_be_bytes(random)).as_bytes());
+        let pipe = format!(r"\\.\pipe\moor-{:032x}", u128::from_be_bytes(random))
+            .into_bytes()
+            .try_into()
+            .map_err(|_| "invalid pipe name")?;
         Ok(Self {
             generation,
             incarnation,
@@ -147,7 +148,7 @@ mod native {
     };
     use interprocess::local_socket::prelude::*;
     use interprocess::local_socket::{
-        GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions,
+        GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
         Stream as LocalStream,
     };
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
@@ -235,21 +236,17 @@ mod native {
             !handle.is_null() && handle != INVALID_HANDLE_VALUE,
             "child process is unavailable",
         )?;
-        match unsafe { WaitForSingleObject(handle, 0) } {
-            WAIT_TIMEOUT => Ok(None),
-            WAIT_OBJECT_0 => {
-                let mut code = 127;
-                win32!(
-                    GetExitCodeProcess(handle, &mut code),
-                    "read child exit code"
-                )?;
-                Ok(Some(code))
-            }
-            _ => Err(format!(
-                "wait for child process: {}",
-                io::Error::last_os_error()
-            )),
+        let status = unsafe { WaitForSingleObject(handle, 0) };
+        if status == WAIT_TIMEOUT {
+            return Ok(None);
         }
+        check(status == WAIT_OBJECT_0, "wait for child process")?;
+        let mut code = 127;
+        win32!(
+            GetExitCodeProcess(handle, &mut code),
+            "read child exit code"
+        )?;
+        Ok(Some(code))
     }
     const BOOTSTRAP_SELECTOR: &str = "DESK_MOOR_BOOTSTRAP";
     const BOOTSTRAP_CONTROL: &str = "DESK_MOOR_BOOTSTRAP_CONTROL";
@@ -281,8 +278,7 @@ mod native {
     impl Handle {
         fn checked(raw: HANDLE, what: &str) -> Result<Self> {
             let value = unsafe { Self::owned(raw) };
-            check(!value.is_null(), what)?;
-            Ok(value)
+            check(!value.is_null(), what).map(|()| value)
         }
         unsafe fn owned(raw: HANDLE) -> Self {
             Self(
@@ -300,12 +296,13 @@ mod native {
         }
         fn pair(what: &str) -> Result<(Self, Self)> {
             let (read, write) = io::pipe().map_err(|error| format!("{what}: {error}"))?;
-            let read: OwnedHandle = read.into();
-            let write: OwnedHandle = write.into();
-            Ok((Self(Some(read.into())), Self(Some(write.into()))))
+            Ok((
+                Self(Some(OwnedHandle::from(read).into())),
+                Self(Some(OwnedHandle::from(write).into())),
+            ))
         }
-        fn into_file(mut self) -> File {
-            self.0.take().unwrap()
+        fn into_file(self) -> File {
+            self.0.unwrap()
         }
         fn write(&self, bytes: &[u8], what: &str) -> Result<()> {
             let mut file = self.0.as_ref().unwrap();
@@ -350,11 +347,11 @@ mod native {
             )
         } != 0
         {
-            Ok(Some(available as usize))
-        } else if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
-            Ok(None)
-        } else {
-            Err(io::Error::last_os_error())
+            return Ok(Some(available as usize));
+        }
+        match unsafe { GetLastError() } {
+            ERROR_BROKEN_PIPE => Ok(None),
+            _ => Err(io::Error::last_os_error()),
         }
     }
     impl AsHandle for Pipe {
@@ -398,19 +395,20 @@ mod native {
         let (security, creation) = security.map_or((ptr::null(), OPEN_EXISTING), |value| {
             (value as *const SECURITY_ATTRIBUTES, CREATE_NEW)
         });
-        let file = unsafe {
-            Handle::owned(CreateFileW(
-                wide(path.as_os_str()).as_ptr(),
-                policy.0,
-                policy.1,
-                security,
-                creation,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                ptr::null_mut(),
-            ))
-        };
-        check(!file.is_null(), what)?;
-        Ok(file)
+        unsafe {
+            Handle::checked(
+                CreateFileW(
+                    wide(path.as_os_str()).as_ptr(),
+                    policy.0,
+                    policy.1,
+                    security,
+                    creation,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    ptr::null_mut(),
+                ),
+                what,
+            )
+        }
     }
     fn read_reparse(path: &Path, share: u32) -> Result<File> {
         OpenOptions::new()
@@ -459,16 +457,14 @@ mod native {
                 let text = selector
                     .to_str()
                     .ok_or("invalid supervised-launch handle")?;
-                require(
-                    !text.is_empty()
-                        && text.len() <= 16
-                        && !text.starts_with('0')
-                        && lowercase_hex(text.as_bytes()),
-                    "invalid supervised-launch handle",
-                )?;
                 let raw = usize::from_str_radix(text, 16)
                     .ok()
-                    .filter(|raw| *raw != 0)
+                    .filter(|raw| {
+                        *raw != 0
+                            && text.len() <= 16
+                            && !text.starts_with('0')
+                            && lowercase_hex(text.as_bytes())
+                    })
                     .ok_or("invalid supervised-launch handle")?;
                 let channel = unsafe { Handle::owned(raw as HANDLE) };
                 validate_pipe(channel.raw(), "supervised-launch channel")?;
@@ -661,11 +657,10 @@ mod native {
             .args(args)
             .env_remove(INSTRUMENT_CHANNEL)
             .env_remove(INSTRUMENT_NONCE);
-        if let Some(handle) = instrument {
-            win(
-                command.env_handle(INSTRUMENT_CHANNEL, handle),
-                "transfer instrumentation channel",
-            )?;
+        transfer_handles!(command;
+            INSTRUMENT_CHANNEL => instrument, "instrumentation channel"
+        );
+        if instrument.is_some() {
             command.env(
                 INSTRUMENT_NONCE,
                 format!("{:032x}", u128::from_be_bytes(instrument_nonce)),
@@ -888,6 +883,13 @@ mod native {
         pipe.inner().as_handle().as_raw_handle()
     }
 
+    fn local_name(pipe: &[u8; 46]) -> Result<Name<'_>> {
+        let name = std::str::from_utf8(pipe).map_err(|_| "invalid pipe name")?;
+        OsStr::new(name)
+            .to_fs_name::<GenericFilePath>()
+            .map_err(string)
+    }
+
     fn same_user(stream: &LocalStream, user: &str) -> bool {
         unsafe {
             if ImpersonateNamedPipeClient(stream_handle(stream)) == 0 {
@@ -948,15 +950,8 @@ mod native {
         }
         fn prepare_storage(&mut self, marker_identity: [u8; 24]) -> Result<()> {
             self.identity = session_identity(marker_identity);
-            let wall = now();
-            let mono = unsafe { GetTickCount64() };
-            let boot = boot_identity();
-            let event_path = self
-                .options
-                .events
-                .as_ref()
-                .map(|path| absolute(path))
-                .transpose()?;
+            let start = (now(), unsafe { GetTickCount64() }, boot_identity());
+            let event_path = self.options.events.as_deref().map(absolute).transpose()?;
             let event_identity = event_path.as_deref().map(|path| os_bytes(path.as_os_str()));
             let instrument_identity = self
                 .instrument
@@ -970,7 +965,7 @@ mod native {
                 ),
                 self.incarnation,
                 self.semantic_token,
-                (wall, mono, boot),
+                start,
                 ArtifactConfig {
                     marker: &self.marker,
                     event_path: event_path.as_deref(),
@@ -984,18 +979,15 @@ mod native {
                 },
             )?;
             let cwd = absolute(self.options.directory.as_deref().unwrap_or(Path::new(".")))?;
-            let (pid, birth) = (self.pid, self.birth);
             let containment = u32::from_le_bytes(random_array::<4>()?).max(1);
             put_wide(&mut artifacts.status, &os_bytes(cwd.as_os_str())).map_err(crate::protocol)?;
-            for bytes in [pid.to_le_bytes(), containment.to_le_bytes()] {
+            for bytes in [self.pid.to_le_bytes(), containment.to_le_bytes()] {
                 artifacts.status.extend_from_slice(&bytes);
             }
-            artifacts.status.extend_from_slice(&birth);
+            artifacts.status.extend_from_slice(&self.birth);
             self.artifacts = Some(artifacts);
             Ok(())
         }
-    }
-    impl Native {
         fn launch(
             &mut self,
             marker: &Marker,
@@ -1005,9 +997,8 @@ mod native {
             let instrument = self.options.instrument.take();
             let listener = self.first_protected_pipe(&marker.pipe)?;
             let (marker_stage, marker_identity) = self.stage_marker(&marker.encode())?;
-            let identity = session_identity(marker_identity);
             if let Some(path) = &instrument {
-                self.stage_instrument(path, &identity)?;
+                self.stage_instrument(path, &session_identity(marker_identity))?;
             }
             let pid = self.conpty_job_bootstrap(command, nonce)?;
             if instrument.is_some() {
@@ -1020,13 +1011,8 @@ mod native {
         }
 
         fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<LocalListener> {
-            let name = std::str::from_utf8(pipe).map_err(|_| "invalid pipe name")?;
             ListenerOptions::new()
-                .name(
-                    OsStr::new(name)
-                        .to_fs_name::<GenericFilePath>()
-                        .map_err(string)?,
-                )
+                .name(local_name(pipe)?)
                 .security_descriptor(pipe_descriptor(&self.sid)?)
                 .nonblocking(ListenerNonblockingMode::Accept)
                 .create_sync()
@@ -1354,6 +1340,9 @@ mod native {
             GetFullPathNameW(wide(path.as_os_str()).as_ptr(), size, out, ptr::null_mut())
         })
     }
+    fn os_string(bytes: &[u8]) -> Result<OsString> {
+        wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
+    }
     fn wmi_boot_identity() -> Option<[u8; 16]> {
         #[derive(serde::Deserialize)]
         struct OperatingSystem {
@@ -1394,27 +1383,17 @@ mod native {
     }
     pub(crate) fn resolve(session: &OsStr, invoked: &OsStr) -> Result<PathBuf> {
         let path = PathBuf::from(session);
-        if session
-            .encode_wide()
-            .any(|unit| unit == b'/' as u16 || unit == b'\\' as u16)
-        {
+        if session.encode_wide().any(|unit| [47, 92].contains(&unit)) {
             absolute(&path)
         } else {
             Ok(root(invoked)?.join(path))
         }
     }
     pub(crate) fn current_paths(invoked: &OsStr) -> Result<Vec<PathBuf>> {
-        ancestry_paths(invoked, |bytes| {
-            wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
-        })
+        ancestry_paths(invoked, os_string)
     }
     fn child_environment(invoked: &OsStr, path: &Path) -> Result<()> {
-        extend_ancestry(
-            invoked,
-            absolute(path)?,
-            |bytes| wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide)),
-            os_bytes,
-        )
+        extend_ancestry(invoked, absolute(path)?, os_string, os_bytes)
     }
     fn read_marker(path: &Path) -> Result<(Marker, [u8; 25])> {
         validate(path, sid()?, "FR", false)?;
@@ -1434,7 +1413,6 @@ mod native {
     fn controller(path: &Path, timeout: u32) -> Result<WireClient> {
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
         let (marker, identity) = read_marker(path)?;
-        let name = std::str::from_utf8(&marker.pipe).map_err(|_| "invalid pipe name")?;
         let pipe = pipe_name(&marker);
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -1445,12 +1423,7 @@ mod native {
             WaitNamedPipeW(pipe.as_ptr(), remaining),
             "wait for holder pipe"
         )?;
-        let stream = LocalStream::connect(
-            OsStr::new(name)
-                .to_fs_name::<GenericFilePath>()
-                .map_err(string)?,
-        )
-        .map_err(string)?;
+        let stream = LocalStream::connect(local_name(&marker.pipe)?).map_err(string)?;
         require(
             read_marker(path)?.1 == identity,
             "marker identity changed during connection",
@@ -1490,15 +1463,13 @@ mod native {
     }
     pub(crate) fn cleanup(path: &Path) -> Result<()> {
         let (external, expected) = cleanup_artifacts(path, None, |bytes| {
-            wtf8_decode(&bytes)
-                .ok()
-                .map(|wide| PathBuf::from(OsString::from_wide(&wide)))
+            os_string(&bytes).ok().map(PathBuf::from)
         });
         let instrument = external[1].clone();
         let user = sid()?;
         if path.exists() {
             read_marker(path)?;
-            fs::remove_file(path).map_err(|e| e.to_string())?;
+            fs::remove_file(path).map_err(string)?;
         }
         cleanup_companions(path, external, false, |target| {
             let directory = target.is_dir();
@@ -1651,8 +1622,7 @@ mod native {
         child_environment(invoked, path)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
-        if let Some(event) = &options.events {
-            let event = absolute(event)?;
+        if let Some(event) = options.events.as_deref().map(absolute).transpose()? {
             let namespace = path
                 .parent()
                 .ok_or_else(|| "session has no parent".to_string())?;
@@ -1692,16 +1662,17 @@ mod native {
             Err(error) => {
                 if let Some(code) = host.early_exit {
                     if child {
+                        host.ready.notice(
+                            if code == 0 { 1 } else { 3 },
+                            code.min(u16::MAX as u32) as u16,
+                        );
                         if code == 0 {
-                            host.ready.notice(1, 0);
                             host.ready.notice(2, 0);
-                        } else {
-                            host.ready.notice(3, code.min(u16::MAX as u32) as u16);
                         }
                     }
                     return Ok(code as i32);
                 }
-                let result: u16 = if error.starts_with("could not execute ") {
+                let result = if error.starts_with("could not execute ") {
                     127
                 } else {
                     1
@@ -1723,13 +1694,15 @@ mod native {
         session: &OsStr,
         invoked: &OsStr,
     ) -> Result<PathBuf> {
-        if let Some(event) = options.events.as_deref() {
-            if !event.is_absolute() {
-                return Err(format!(
-                    "event store rejected: {} (not-absolute)",
-                    name::render(event.as_os_str())
-                ));
-            }
+        if let Some(event) = options
+            .events
+            .as_deref()
+            .filter(|event| !event.is_absolute())
+        {
+            return Err(format!(
+                "event store rejected: {} (not-absolute)",
+                name::render(event.as_os_str())
+            ));
         }
         resolve(session, invoked)
     }
