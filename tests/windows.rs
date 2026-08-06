@@ -124,6 +124,9 @@ fn bootstrap_identity_and_commands_are_nonce_bound_and_ordered() {
         assert_eq!(BootstrapRecord::decode(&bad, nonce), None);
     }
     assert_eq!(BootstrapRecord::decode(&bytes[..55], nonce), None);
+    let mut aliased = record;
+    aliased.thread = aliased.process;
+    assert_eq!(BootstrapRecord::decode(&aliased.encode(), nonce), None);
     let mut resumed = false;
     assert_eq!(
         accept_bootstrap_command(&bootstrap_command(2, nonce), nonce, &mut resumed),
