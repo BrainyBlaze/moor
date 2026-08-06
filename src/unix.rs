@@ -920,7 +920,7 @@ fn holder_setup(
             },
         ),
     );
-    holder.set_rows(config.terminal.1.ws_row);
+    holder.set_geometry(config.terminal.1.ws_row, config.terminal.1.ws_col);
     Ok((holder, running, exited))
 }
 

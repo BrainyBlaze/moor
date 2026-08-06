@@ -350,7 +350,7 @@ schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(
     NoticeCancel(ApplicationReceipt), SemanticAck(SemanticAck), SemanticRefused(Option<SemanticEvent>, SemanticRefusal),
     SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]),
     Termination(u8, u8, u8, &'static [u8]));
-schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(u16, u16),
+schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16),
     Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool),
     CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>),
     QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64),
@@ -1429,7 +1429,7 @@ impl Machine {
                 self.expire_lease(now);
                 require_policy(self.touch_lease(conn, epoch, None, now))?;
                 if columns != 0 {
-                    self.effects.push(Effect::Resize(rows, columns));
+                    self.effects.push(Effect::Resize(conn, rows, columns));
                 }
             }
             Request::Input(input, application) => self.input(conn, now, input, application),

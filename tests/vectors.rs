@@ -1991,7 +1991,7 @@ fn v16_framing_v4_resize_applies_80x24_under_lease_epoch_3() {
     assert!(
         effects
             .iter()
-            .any(|effect| matches!(effect, Effect::Resize(24, 80))),
+            .any(|effect| matches!(effect, Effect::Resize(_, 24, 80))),
         "the child must be resized to 80 columns x 24 rows"
     );
 }

@@ -103,7 +103,7 @@ mod descriptor_deadline_tests {
             PendingDescriptor {
                 peer: 1,
                 deadline: now + 50,
-                request: Descriptor::Attach(80, 24, true, false, Some([3; 16])),
+                request: Descriptor::Attach(81, 24, true, false, Some([3; 16])),
             },
             PendingDescriptor {
                 peer: 2,
