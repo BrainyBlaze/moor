@@ -2721,3 +2721,144 @@ fn v16_status_v30_every_result_row_round_trips_byte_for_byte() {
         );
     }
 }
+
+// ---------------------------------------------------------------- V31 ----
+// §16 V31 — every private background-result state, each exactly 12 bytes,
+// generation 7. Store-adopted and ready use result zero and are the
+// two-record success sequence; failed carries the frozen sample code 0x1234
+// and never follows ready. Exact hex from the schema.
+
+const V31_ADOPTED: &str = "4D 4F 52 52 01 01 00 00 07 00 00 00";
+const V31_READY: &str = "4D 4F 52 52 01 02 00 00 07 00 00 00";
+const V31_FAILED: &str = "4D 4F 52 52 01 03 34 12 07 00 00 00";
+
+#[test]
+fn v31_every_state_encodes_and_decodes_the_frozen_record() {
+    for (state, result, bytes, label) in [
+        (1u8, 0u16, V31_ADOPTED, "store-adopted"),
+        (2, 0, V31_READY, "ready"),
+        (3, 0x1234, V31_FAILED, "failed"),
+    ] {
+        let expected = hex(bytes);
+        let produced = moor::runtime::private::launch_result(state, result, 7)
+            .unwrap_or_else(|| panic!("{label}: refused a valid record"));
+        assert_eq!(produced.len(), 12, "{label} is not exactly 12 bytes");
+        assert_eq!(produced.as_slice(), expected.as_slice(), "{label} encode");
+        assert_eq!(
+            moor::runtime::private::decode_launch_result(&expected),
+            Some((state, result, 7)),
+            "{label} decode"
+        );
+    }
+}
+
+#[test]
+fn v31_refuses_every_malformed_background_result() {
+    let good = hex(V31_FAILED);
+    // Wrong magic, then wrong format byte: the discriminator is the whole
+    // five-byte prefix, so neither may be treated as advisory.
+    for index in 0..5 {
+        let mut bytes = good.clone();
+        bytes[index] ^= 0xFF;
+        assert_eq!(
+            moor::runtime::private::decode_launch_result(&bytes),
+            None,
+            "prefix byte {index} was accepted when corrupted"
+        );
+    }
+    // Short and long records. A 12-byte record is exact, not a minimum, so a
+    // trailing byte must be refused rather than ignored.
+    assert_eq!(
+        moor::runtime::private::decode_launch_result(&good[..11]),
+        None,
+        "a short record was accepted"
+    );
+    let mut long = good.clone();
+    long.push(0);
+    assert_eq!(
+        moor::runtime::private::decode_launch_result(&long),
+        None,
+        "a long record was accepted"
+    );
+    assert_eq!(moor::runtime::private::decode_launch_result(&[]), None);
+    // Wrong state, nonzero success result, zero result on failed, and zero
+    // generation — each refused by the encoder and by the decoder alike.
+    for (state, result, generation, label) in [
+        (0u8, 0u16, 7u32, "state zero"),
+        (4, 0, 7, "state above the frozen set"),
+        (1, 5, 7, "store-adopted with a nonzero result"),
+        (2, 5, 7, "ready with a nonzero result"),
+        (3, 0, 7, "failed with a zero result"),
+        (1, 0, 0, "zero generation"),
+        (3, 0x1234, 0, "zero generation on failed"),
+    ] {
+        assert_eq!(
+            moor::runtime::private::launch_result(state, result, generation),
+            None,
+            "{label} was encoded"
+        );
+        let mut bytes = good.clone();
+        bytes[5] = state;
+        bytes[6..8].copy_from_slice(&result.to_le_bytes());
+        bytes[8..].copy_from_slice(&generation.to_le_bytes());
+        assert_eq!(
+            moor::runtime::private::decode_launch_result(&bytes),
+            None,
+            "{label} was decoded"
+        );
+    }
+}
+
+#[test]
+fn v31_reporter_emits_the_success_sequence_and_never_fails_after_ready() {
+    // The two-record success sequence, driven through the real reporter.
+    let mut sink = Vec::new();
+    {
+        let mut reporter = moor::runtime::private::LaunchReporter {
+            output: Some(&mut sink),
+            generation: 7,
+        };
+        reporter.notice(1, 0);
+        reporter.notice(2, 0);
+        // Drop runs here: it reports loss, which must NOT follow ready.
+    }
+    let mut expected = hex(V31_ADOPTED);
+    expected.extend_from_slice(&hex(V31_READY));
+    assert_eq!(
+        sink, expected,
+        "ready was not the final record; a failure followed it"
+    );
+}
+
+#[test]
+fn v31_reporter_reports_loss_before_and_after_adoption() {
+    // Loss before adoption: the channel closes having reported nothing, so the
+    // reporter must still name the failure rather than leave a requester
+    // waiting on a record that never arrives.
+    let mut before = Vec::new();
+    drop(moor::runtime::private::LaunchReporter {
+        output: Some(&mut before),
+        generation: 7,
+    });
+    let loss = moor::runtime::private::launch_result(3, 1, 7).expect("loss record");
+    assert_eq!(before, loss, "loss before adoption was not reported");
+
+    // Loss after adoption: the adopted record stands and the loss follows it,
+    // because adoption is not readiness.
+    let mut after = Vec::new();
+    {
+        let mut reporter = moor::runtime::private::LaunchReporter {
+            output: Some(&mut after),
+            generation: 7,
+        };
+        reporter.notice(1, 0);
+    }
+    let mut expected = hex(V31_ADOPTED);
+    expected.extend_from_slice(&loss);
+    assert_eq!(after, expected, "loss after adoption was not reported");
+    assert_eq!(
+        moor::runtime::private::decode_launch_result(&after[12..]),
+        Some((3, 1, 7)),
+        "the reported loss is not a decodable failed record"
+    );
+}
