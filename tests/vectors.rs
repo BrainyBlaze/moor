@@ -24,7 +24,7 @@ use moor::wire::crc32c;
 
 fn hex(s: &str) -> Vec<u8> {
     let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    assert!(digits.len() % 2 == 0, "odd hex digit count");
+    assert!(digits.len().is_multiple_of(2), "odd hex digit count");
     digits
         .chunks(2)
         .map(|pair| {
@@ -1852,17 +1852,19 @@ fn v16_framing_v2_output_coordinates_apply_through_viewer_decoder() {
     let message = v16_framing_feed_one(9, &frame);
     // A viewer whose ATTACH_ACK advertised exactly V2's record: §6.1 freezes
     // that V2's two bytes occupy offsets 4096 and 4097 with exclusive end 4098.
-    let mut stream = ViewerStream::default();
-    stream.terminal = true;
-    stream.replay = Some(ReplayDescriptor {
-        first: 42,
-        last: 42,
-        start: 4096,
-        end: 4098,
-        complete: false,
-        modes_exact: false,
-    });
-    stream.next = Some((42, 4096));
+    let mut stream = ViewerStream {
+        terminal: true,
+        replay: Some(ReplayDescriptor {
+            first: 42,
+            last: 42,
+            start: 4096,
+            end: 4098,
+            complete: false,
+            modes_exact: false,
+        }),
+        next: Some((42, 4096)),
+        ..ViewerStream::default()
+    };
     assert_eq!(
         decode_viewer(&mut stream, &message, (b"".as_slice(), 7, [9; 16])),
         Ok(Some(ViewerEvent::Output(42, true, b"hi")))

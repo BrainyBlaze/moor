@@ -662,10 +662,7 @@ fn a_valid_candidate_followed_by_a_reported_error_still_advances_the_frontier() 
     )
     .unwrap();
     let done = next(&mut lane);
-    assert!(
-        matches!(done.result, Err(_)),
-        "the operation must report failure"
-    );
+    assert!(done.result.is_err(), "the operation must report failure");
     assert!(
         frontier(&lane).index > base,
         "frontier stayed at {base} despite a valid committed candidate"

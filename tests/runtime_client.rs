@@ -372,11 +372,11 @@ fn push_accepts_only_the_exact_success_receipt() {
     for changed in [
         wire::InputReceipt {
             request: 8,
-            ..expected.clone()
+            ..expected
         },
         wire::InputReceipt {
             incarnation: [5; 16],
-            ..expected.clone()
+            ..expected
         },
         wire::InputReceipt {
             written: 4,

@@ -730,7 +730,8 @@ fn reply_state(bytes: &[u8]) -> i8 {
         [0x1b] => 0,
         [0x1b, b'P', ..] | [0x90, ..] if bytes.ends_with(b"\x1b\\") => 1,
         [0x1b, b'P', ..] | [0x90, ..] if bytes.ends_with(&[0x9c]) => 1,
-        [0x1b, b'P', ..] | [0x90, ..] => (bytes.len() <= 256).then_some(0).unwrap_or(-1),
+        [0x1b, b'P', ..] | [0x90, ..] if bytes.len() <= 256 => 0,
+        [0x1b, b'P', ..] | [0x90, ..] => -1,
         [0x1b, b'[', body @ ..] | [0x9b, body @ ..] => match body.last() {
             Some(0x40..=0x7e) => 1,
             Some(0x20..=0x3f) | None if bytes.len() <= 256 => 0,

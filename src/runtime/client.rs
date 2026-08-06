@@ -478,9 +478,13 @@ pub fn probe_session(
         return SessionState::Indeterminate;
     }
     match connect() {
-        Ok(mut client) => (status && client.attached())
-            .then_some(SessionState::Attached)
-            .unwrap_or(SessionState::Live),
+        Ok(mut client) => {
+            if status && client.attached() {
+                SessionState::Attached
+            } else {
+                SessionState::Live
+            }
+        }
         Err(true) => SessionState::Stale,
         Err(false) => SessionState::Indeterminate,
     }
