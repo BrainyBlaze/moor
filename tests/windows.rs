@@ -233,6 +233,8 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
         runtime.accept(
             Duplex::closing(server.try_clone().unwrap(), server, 1 << 20, || {}),
             true,
+            None,
+            false,
         );
         let mut codec = Codec::new(Profile::Controller);
         let mut hello = b"MOOR\x03\0\0".to_vec();
@@ -382,6 +384,8 @@ fn holder_reports_exact_log_clear_barriers_and_keeps_validated_handles() {
             || {},
         ),
         true,
+        None,
+        false,
     );
     let stop = Arc::new(AtomicBool::new(false));
     let holder_stop = stop.clone();

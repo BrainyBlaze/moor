@@ -13,6 +13,10 @@ use std::fs;
 use std::io::{Cursor, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn duplex<R: Read + Send + 'static, W: Write + Send + 'static>(
@@ -34,6 +38,29 @@ impl Native for FakeNative {
     }
     fn exited(&mut self) -> Result<Option<NativeExit>, String> {
         Ok(Some(NativeExit::Code(9)))
+    }
+}
+
+struct AncestryNative {
+    ancestor: u32,
+    checks: Arc<AtomicUsize>,
+    resizes: Arc<AtomicUsize>,
+}
+
+impl Native for AncestryNative {
+    fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
+        self.resizes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    fn terminate(&mut self, force: bool) -> (u8, bool) {
+        (if force { 2 } else { 1 }, false)
+    }
+    fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+        Ok(None)
+    }
+    fn holder_ancestor(&self, pid: u32) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        pid == self.ancestor
     }
 }
 
@@ -123,6 +150,10 @@ impl Peer {
 }
 
 fn fixture() -> (Runtime<FakeNative>, PathBuf) {
+    fixture_with_native(FakeNative)
+}
+
+fn fixture_with_native<N: Native>(native: N) -> (Runtime<N>, PathBuf) {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -151,7 +182,7 @@ fn fixture() -> (Runtime<FakeNative>, PathBuf) {
         status: Vec::new(),
         commit_at: 0,
         synthetic: 0,
-        native: FakeNative,
+        native,
     });
     (runtime, root)
 }
@@ -214,6 +245,25 @@ fn connect(runtime: &mut Runtime<FakeNative>) -> Peer {
 }
 
 fn connect_as<N: Native>(runtime: &mut Runtime<N>, profile: Profile) -> Peer {
+    connect_as_with(runtime, profile, true, None)
+}
+
+fn connect_as_with<N: Native>(
+    runtime: &mut Runtime<N>,
+    profile: Profile,
+    same_user: bool,
+    pid: Option<u32>,
+) -> Peer {
+    connect_as_reserved(runtime, profile, same_user, pid, false)
+}
+
+fn connect_as_reserved<N: Native>(
+    runtime: &mut Runtime<N>,
+    profile: Profile,
+    same_user: bool,
+    pid: Option<u32>,
+    exhausted: bool,
+) -> Peer {
     let (client, server) = UnixStream::pair().unwrap();
     client.set_nonblocking(true).unwrap();
     let write = server.try_clone().unwrap();
@@ -222,13 +272,192 @@ fn connect_as<N: Native>(runtime: &mut Runtime<N>, profile: Profile) -> Peer {
         Duplex::closing(server, write, 1 << 20, move || {
             let _ = close.shutdown(std::net::Shutdown::Both);
         }),
-        true,
+        same_user,
+        pid,
+        exhausted,
     );
     Peer {
         stream: client,
         codec: Codec::new(profile),
         queued: VecDeque::new(),
     }
+}
+
+#[test]
+fn wrong_user_gets_a_profile_specific_refusal_after_only_the_preface() {
+    for (profile, preface, kind, code) in [
+        (Profile::Controller, b"MOOR".as_slice(), 0x13, 11),
+        (Profile::Semantic, b"MOOS".as_slice(), 9, 4),
+    ] {
+        let (mut runtime, root) = fixture();
+        let mut peer = connect_as_with(&mut runtime, profile, false, None);
+        peer.raw(&preface[..2]);
+        assert!(peer.try_recv(&mut runtime).is_none());
+        let mut tail = preface[2..].to_vec();
+        tail.extend_from_slice(&[0xa5; 64]);
+        peer.raw(&tail);
+        let error = peer.recv_kind(&mut runtime, kind);
+        assert_eq!(
+            u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+            code
+        );
+        assert_eq!(
+            wire::get_compact(&error.payload, 2, true),
+            Some(b"unauthorised peer".as_slice())
+        );
+        assert!(peer.closed(&mut runtime));
+
+        let mut trusted = connect(&mut runtime);
+        hello(&mut trusted, &mut runtime);
+        drop(runtime);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn concurrent_wrong_users_each_receive_their_profile_specific_refusal() {
+    let (mut runtime, root) = fixture();
+    let mut controller = connect_as_with(&mut runtime, Profile::Controller, false, None);
+    let mut semantic = connect_as_with(&mut runtime, Profile::Semantic, false, None);
+    controller.raw(b"MOOR");
+    semantic.raw(b"MOOS");
+    for (peer, kind, code) in [(&mut controller, 0x13, 11), (&mut semantic, 9, 4)] {
+        let error = peer.recv_kind(&mut runtime, kind);
+        assert_eq!(
+            u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+            code
+        );
+        assert!(peer.closed(&mut runtime));
+    }
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_holder_ancestry_refuses_attach_before_any_attach_state_change() {
+    let checks = Arc::new(AtomicUsize::new(0));
+    let resizes = Arc::new(AtomicUsize::new(0));
+    let (mut runtime, root) = fixture_with_native(AncestryNative {
+        ancestor: 41,
+        checks: checks.clone(),
+        resizes: resizes.clone(),
+    });
+    runtime.output(b"retained history".to_vec());
+
+    let mut malformed = connect_as_with(&mut runtime, Profile::Controller, true, Some(41));
+    hello(&mut malformed, &mut runtime);
+    malformed.send(7, 3, &[0, 0, 0, 0, 4]);
+    assert_eq!(malformed.recv_kind(&mut runtime, 0x13).kind, 0x13);
+    assert_eq!(checks.load(Ordering::Relaxed), 0);
+
+    let mut ancestral = connect_as_with(&mut runtime, Profile::Controller, true, Some(41));
+    hello(&mut ancestral, &mut runtime);
+    ancestral.send(7, 3, &[80, 0, 24, 0, 1]);
+    let error = ancestral.recv_kind(&mut runtime, 0x13);
+    assert_eq!(
+        u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+        11
+    );
+    assert_eq!(
+        wire::get_compact(&error.payload, 2, true),
+        Some(b"holder is an ancestor of attaching process".as_slice())
+    );
+    assert!(ancestral.closed(&mut runtime));
+    assert_eq!(checks.load(Ordering::Relaxed), 1);
+    assert_eq!(resizes.load(Ordering::Relaxed), 0);
+
+    let mut unrelated = connect_as_with(&mut runtime, Profile::Controller, true, Some(42));
+    hello(&mut unrelated, &mut runtime);
+    unrelated.send(7, 3, &[80, 0, 24, 0, 1]);
+    assert_eq!(unrelated.recv(&mut runtime).kind, 5);
+    assert_eq!(unrelated.recv(&mut runtime).kind, 4);
+    let lease = LeaseResult::decode_wire(&unrelated.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(lease.outcome, ResultOutcome::Granted);
+    assert_eq!(unrelated.recv(&mut runtime).kind, 6);
+    let resize = [
+        lease.epoch.to_le_bytes().as_slice(),
+        80u16.to_le_bytes().as_slice(),
+        24u16.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    unrelated.send(7, 0x0b, &resize);
+    unrelated.send(7, 13, &[]);
+    unrelated.recv_kind(&mut runtime, 14);
+    assert_eq!(checks.load(Ordering::Relaxed), 2);
+    assert_eq!(resizes.load(Ordering::Relaxed), 1);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn seventeenth_preface_gets_resource_exhausted_without_disturbing_existing_peers() {
+    let (mut runtime, root) = fixture();
+    let mut pending = (0..16).map(|_| connect(&mut runtime)).collect::<Vec<_>>();
+    for (index, (profile, preface, kind, code)) in [
+        (Profile::Controller, b"MOOR".as_slice(), 0x13, 13),
+        (Profile::Semantic, b"MOOS".as_slice(), 9, 12),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut excess = connect_as(&mut runtime, profile);
+        if index == 0 {
+            let mut beyond_overflow = connect(&mut runtime);
+            assert!(beyond_overflow.closed(&mut runtime));
+        }
+        excess.raw(preface);
+        let error = excess.recv_kind(&mut runtime, kind);
+        assert_eq!(
+            u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+            code
+        );
+        assert_eq!(
+            wire::get_compact(&error.payload, 2, true),
+            Some(b"connection limit exhausted".as_slice())
+        );
+        assert!(excess.closed(&mut runtime));
+    }
+    hello(&mut pending[0], &mut runtime);
+    drop((pending, runtime));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reserved_overflow_remains_exhausted_when_authentication_finishes_late() {
+    let (mut runtime, root) = fixture();
+    let mut excess = connect_as_reserved(&mut runtime, Profile::Controller, true, Some(41), true);
+    excess.raw(b"MOOR");
+    let error = excess.recv_kind(&mut runtime, 0x13);
+    assert_eq!(
+        u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+        13
+    );
+    assert!(excess.closed(&mut runtime));
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sixty_four_authenticated_controllers_are_admitted_and_peer_sixty_five_is_refused() {
+    let (mut runtime, root) = fixture();
+    let mut peers = Vec::new();
+    for _ in 0..64 {
+        let mut peer = connect(&mut runtime);
+        hello(&mut peer, &mut runtime);
+        peers.push(peer);
+    }
+    let mut excess = connect(&mut runtime);
+    excess.raw(b"MOOR");
+    let error = excess.recv_kind(&mut runtime, 0x13);
+    assert_eq!(
+        u16::from_le_bytes(error.payload[..2].try_into().unwrap()),
+        13
+    );
+    assert!(excess.closed(&mut runtime));
+    peers[0].send(7, 13, &[]);
+    assert_eq!(peers[0].recv(&mut runtime).kind, 14);
+    drop((peers, runtime));
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn hello<N: Native>(peer: &mut Peer, runtime: &mut Runtime<N>) {
@@ -850,6 +1079,24 @@ fn silent_handshakes_expire_before_the_admission_limit_is_checked() {
 }
 
 #[test]
+fn expired_dialect_only_peers_immediately_free_the_normal_admission_slots() {
+    let (mut runtime, root) = fixture();
+    let mut stalled = (0..16).map(|_| connect(&mut runtime)).collect::<Vec<_>>();
+    for peer in &mut stalled {
+        peer.raw(b"MOOR");
+    }
+    for _ in 0..20 {
+        runtime.poll();
+    }
+    runtime.tick(monotonic().saturating_add(5_001));
+
+    let mut replacement = connect(&mut runtime);
+    hello(&mut replacement, &mut runtime);
+    drop((stalled, runtime));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn hello_cannot_restart_the_whole_status_exchange_deadline() {
     let (mut runtime, root) = fixture();
     let mut peer = connect(&mut runtime);
@@ -934,6 +1181,16 @@ fn dialect_only_peers_still_consume_the_sixteen_initial_hello_slots() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let mut excess = connect(&mut runtime);
+    excess.raw(b"MOOR");
+    let refusal = excess.recv_kind(&mut runtime, 0x13);
+    assert_eq!(
+        u16::from_le_bytes(refusal.payload[..2].try_into().unwrap()),
+        13
+    );
+    assert_eq!(
+        wire::get_compact(&refusal.payload, 2, true),
+        Some(b"connection limit exhausted".as_slice())
+    );
     assert!(excess.closed(&mut runtime));
     drop((stalled, runtime));
     fs::remove_dir_all(root).unwrap();
@@ -1083,7 +1340,7 @@ fn termination_deadline_abandons_drive_before_observing_a_late_exit() {
     let (mut runtime, root) = fixture();
     runtime.shutdown_requested(0, false);
     runtime.tick(10_001);
-    let result = runtime.drive(|| None, || None).unwrap();
+    let result = runtime.drive(|_, _| None, || None).unwrap();
     assert_eq!(result, None);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
@@ -1162,7 +1419,7 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
     peer.recv_kind(&mut runtime, 4);
     while peer.try_recv(&mut runtime).is_some() {}
     assert_eq!(
-        runtime.drive(|| None, || None).unwrap(),
+        runtime.drive(|_, _| None, || None).unwrap(),
         Some(NativeExit::Code(9))
     );
     assert_eq!(runtime.output_end(), 11);
@@ -1227,6 +1484,8 @@ fn retirement_waits_for_the_termination_result_to_flush() {
             },
         ),
         true,
+        None,
+        false,
     );
     let mut peer = Peer {
         stream: client,
