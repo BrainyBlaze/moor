@@ -431,11 +431,6 @@ impl Machine {
         self.replay_limit = limit.try_into().unwrap_or(u64::MAX);
     }
 
-    pub fn allocated(mut self, allocated: u32) -> Self {
-        self.allocated = allocated;
-        self
-    }
-
     pub fn register_controller(&mut self, conn: ConnId) {
         self.peers.insert(conn, Peer::Controller(false, false));
     }

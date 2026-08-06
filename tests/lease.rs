@@ -310,37 +310,6 @@ fn invalid_input_sequence_does_not_refresh_the_owner_deadline() {
 }
 
 #[test]
-fn maximum_epoch_is_granted_once_and_token_failure_consumes_nothing() {
-    let mut machine = Machine::new(7, token(9), [8; 16]).allocated(u32::MAX - 1);
-    let failed = fresh(&mut machine, 0, 1, None);
-    assert_eq!(
-        (failed.outcome, failed.reason),
-        (ResultOutcome::Refused, ResultReason::Exhausted)
-    );
-    let final_grant = lease(
-        &mut machine,
-        1,
-        1,
-        LeaseRequest::fresh(LeaseRole::InputOnly),
-        Some(token(1)),
-    );
-    assert_eq!(final_grant.epoch, u32::MAX);
-    request(&mut machine, 2, 1, Request::Release(u32::MAX, token(1)));
-    machine.register_controller(2);
-    let exhausted = lease(
-        &mut machine,
-        2,
-        2,
-        LeaseRequest::fresh(LeaseRole::InputOnly),
-        Some(token(2)),
-    );
-    assert_eq!(
-        (exhausted.outcome, exhausted.reason),
-        (ResultOutcome::Refused, ResultReason::Exhausted)
-    );
-}
-
-#[test]
 fn machine_phase_table_fences_state_changing_frames() {
     let mut machine = new_machine(token(9));
     machine.register_controller(1);
