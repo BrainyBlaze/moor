@@ -954,9 +954,23 @@ fn a_live_writer_excludes_another_writer() {
 #[test]
 fn a_reader_recovers_while_the_writer_holds_its_lease() {
     let path = temp("reader");
-    let _writer = Store::create(&path, Kind::Log, 7, b"abc", 0, 3).unwrap();
-    let (commit, body) = Store::read_only(&path, Kind::Log, 7).unwrap();
-    assert_eq!((commit.index, body.as_slice()), (1, b"abc".as_slice()));
+    let mut writer = Store::create(&path, Kind::Log, 7, b"abc", 0, 3).unwrap();
+    let read = || {
+        let (commit, body) = Store::read_only(&path, Kind::Log, 7).unwrap();
+        (commit.index, body)
+    };
+
+    assert_eq!(read(), (1, b"abc".to_vec()));
+    assert!(matches!(
+        Store::open(&path, Kind::Log, 7),
+        Err(StoreError::Io(_))
+    ));
+    writer.replace(b"def", 2, 3, 6).unwrap();
+    assert_eq!(read(), (2, b"def".to_vec()));
+    writer.replace(b"ghi", 3, 6, 9).unwrap();
+    assert_eq!(read(), (3, b"ghi".to_vec()));
+
+    drop(writer);
     fs::remove_dir_all(path).unwrap();
 }
 

@@ -663,6 +663,8 @@ fn a_ready_completion_does_not_reacquire_the_frontier_lock() {
 #[test]
 fn ambiguous_recovery_failure_publishes_an_unknown_frontier_without_panicking() {
     let (mut lane, path) = staged_lane("unknown-frontier");
+    let mut equal = frontier(&lane);
+    equal.slot = 1;
     let (announce, entered) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     lane.submit(
@@ -671,8 +673,9 @@ fn ambiguous_recovery_failure_publishes_an_unknown_frontier_without_panicking() 
     )
     .unwrap();
     entered.recv_timeout(Duration::from_secs(2)).unwrap();
-    fs::write(path.join("commit.0"), b"torn").unwrap();
-    fs::write(path.join("commit.1"), b"torn").unwrap();
+    // Leave two independently valid candidates with the same index. Recovery
+    // must reject that ambiguity without mutating the leased commit.0 slot.
+    fs::write(path.join("commit.1"), equal.encode()).unwrap();
     drop(release);
     assert!(next(&mut lane).result.is_err());
     assert_eq!(lane.selected(), None);

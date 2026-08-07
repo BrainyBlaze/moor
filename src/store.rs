@@ -1,10 +1,11 @@
 use crate::{events::Stored, wire::crc32c};
-use fs2::FileExt as _;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+#[cfg(unix)]
+use fs2::FileExt as _;
 #[cfg(unix)]
 use nix::fcntl::OFlag;
 #[cfg(unix)]
@@ -387,6 +388,41 @@ fn four(mut open: impl FnMut(usize) -> Result<File>) -> Result<Slots> {
     Ok([open(0)?, open(1)?, open(2)?, open(3)?])
 }
 
+#[cfg(unix)]
+fn try_lease(file: &File) -> io::Result<()> {
+    file.try_lock_exclusive()
+}
+
+#[cfg(windows)]
+fn try_lease(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
+        System::IO::OVERLAPPED,
+    };
+
+    // Lock a sentinel beyond the fixed commit record. Windows byte ranges are
+    // mandatory even between handles in one process, so locking the record
+    // itself would prevent live readers from recovering the selected commit.
+    let mut range = OVERLAPPED::default();
+    let locked = unsafe {
+        range.Anonymous.Anonymous.Offset = 92;
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut range,
+        )
+    };
+    if locked == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn open_slots(path: &Path, write: bool) -> Result<Slots> {
     let slots = four(|at| {
         open_slot(&path.join(NAMES[at]), write, write && at == 2).map_err(|_| StoreError::Corrupt)
@@ -412,7 +448,7 @@ fn open_slots(path: &Path, write: bool) -> Result<Slots> {
     #[cfg(windows)]
     require(crate::windows::valid_store_slots(path, &slots))?;
     if write {
-        slots[2].try_lock_exclusive()?;
+        try_lease(&slots[2])?;
     }
     Ok(slots)
 }
@@ -461,7 +497,7 @@ fn open_prepared(directory: &File, prepared: &Slots) -> Result<Slots> {
     for at in 0..4 {
         require(same_file(&prepared[at].metadata()?, &slots[at].metadata()?))?;
     }
-    slots[2].try_lock_exclusive()?;
+    try_lease(&slots[2])?;
     Ok(slots)
 }
 

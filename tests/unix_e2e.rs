@@ -11,7 +11,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -118,11 +118,11 @@ fn terminal_pair(rows: u16, columns: u16) -> (File, File) {
     (master, slave)
 }
 
-fn terminal_command(slave: &File) -> Command {
+fn terminal_command(slave: File) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
     command.stdin(Stdio::from(slave.try_clone().unwrap()));
     command.stdout(Stdio::from(slave.try_clone().unwrap()));
-    command.stderr(Stdio::from(slave.try_clone().unwrap()));
+    command.stderr(Stdio::from(slave));
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
@@ -132,6 +132,46 @@ fn terminal_command(slave: &File) -> Command {
         });
     }
     command
+}
+
+fn wait_child(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let until = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_terminal_child(
+    child: &mut Child,
+    master: &mut File,
+    timeout: Duration,
+) -> Option<ExitStatus> {
+    let until = Instant::now() + timeout;
+    let mut bytes = [0; 4096];
+    loop {
+        loop {
+            match master.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn terminal_output(master: &mut File, needle: &[u8], timeout: Duration) -> Vec<u8> {
@@ -1789,7 +1829,7 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
     // attach requires a controlling terminal (§13.1), so the viewer runs under
     // a real pseudo-terminal and the detach byte is typed into its master.
     let (mut master, slave) = terminal_pair(24, 80);
-    let mut attach = terminal_command(&slave)
+    let mut attach = terminal_command(slave)
         .args(["attach", name])
         .env("MOOR_SESSION", name)
         .env("MOOR_SESSION_V2", format!("v2:{}", STANDARD.encode(name)))
@@ -1797,14 +1837,8 @@ fn attach_replays_and_detaches_without_stopping_the_session() {
         .unwrap();
     terminal_output(&mut master, b"attached", Duration::from_secs(5));
     master.write_all(&[0x1c]).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = attach.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < until, "attach did not detach");
-        thread::sleep(Duration::from_millis(20));
-    };
+    let status = wait_terminal_child(&mut attach, &mut master, Duration::from_secs(5))
+        .expect("attach did not detach");
     assert!(status.success(), "attach: {status:?}");
     assert!(socket.exists());
     assert!(moor(&["kill", "-f", name]).status.success());
@@ -1875,7 +1909,7 @@ fn same_size_winch_redraw_notifies_the_child_exactly_once() {
     wait_for(&socket, b"READY\r\n");
 
     let (mut master, slave) = terminal_pair(24, 80);
-    let mut attach = terminal_command(&slave)
+    let mut attach = terminal_command(slave)
         .args(["attach", "-r", "winch", name])
         .spawn()
         .unwrap();
@@ -1895,18 +1929,24 @@ fn same_size_winch_redraw_notifies_the_child_exactly_once() {
     }
     thread::sleep(Duration::from_millis(100));
     let _ = master.write_all(&[0x1c]);
-    let until = Instant::now() + Duration::from_secs(2);
-    while attach.try_wait().unwrap().is_none() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(20));
-    }
-    if attach.try_wait().unwrap().is_none() {
+    let mut status = wait_terminal_child(&mut attach, &mut master, Duration::from_secs(2));
+    let detached = status.is_some();
+    if status.is_none() {
+        // A session leader can remain in Darwin terminal teardown while an
+        // external slave is open. The command builder consumes that slave;
+        // close the remaining master as well before bounded forced cleanup.
+        drop(master);
         attach.kill().unwrap();
+        status = wait_child(&mut attach, Duration::from_secs(2));
     }
-    let _ = attach.wait();
     let logged = tail(&socket);
     let _ = moor(&["kill", "-f", "-q", name]);
     fs::remove_dir_all(dir).unwrap();
 
+    assert!(
+        detached && status.is_some_and(|status| status.success()),
+        "attach did not detach cleanly: {status:?}"
+    );
     assert_eq!(
         logged
             .stdout
@@ -1968,29 +2008,26 @@ fn creating_viewer_copies_terminal_geometry_and_restores_local_modes() {
         unsafe { libc::tcgetattr(master.as_raw_fd(), &mut before) },
         0
     );
-    let mut create = terminal_command(&slave)
+    let mut create = terminal_command(slave)
         .args(["new", name, "/bin/sh", "-c", "stty size; sleep 30"])
         .spawn()
         .unwrap();
     let output = terminal_output(&mut master, b"33 101\r\n", Duration::from_secs(3));
     master.write_all(&[0x1c]).unwrap();
-    let until = Instant::now() + Duration::from_secs(2);
-    while create.try_wait().unwrap().is_none() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(20));
+    let mut status = wait_terminal_child(&mut create, &mut master, Duration::from_secs(2));
+    if status.is_none() {
+        create.kill().unwrap();
+        status = wait_terminal_child(&mut create, &mut master, Duration::from_secs(2));
     }
-    let status = match create.try_wait().unwrap() {
-        Some(status) => status,
-        None => {
-            create.kill().unwrap();
-            create.wait().unwrap()
-        }
-    };
     let mut after: libc::termios = unsafe { std::mem::zeroed() };
     let restored = unsafe { libc::tcgetattr(master.as_raw_fd(), &mut after) };
     let _ = moor(&["kill", "-f", "-q", name]);
     fs::remove_dir_all(dir).unwrap();
     assert_eq!(restored, 0);
-    assert!(status.success(), "viewer exited with {status:?}");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "viewer exited with {status:?}"
+    );
     assert!(
         output
             .windows(b"33 101\r\n".len())
@@ -2105,6 +2142,7 @@ fn list_status_probe_is_bounded_and_marks_fully_attached_viewers() {
         .stderr(Stdio::from(slave.try_clone().unwrap()))
         .spawn()
         .unwrap();
+    drop(slave);
     let until = Instant::now() + Duration::from_secs(3);
     let mut last = invoked(alias, &["list"]);
     let attached = loop {
@@ -2120,14 +2158,11 @@ fn list_status_probe_is_bounded_and_marks_fully_attached_viewers() {
     };
     input.write_all(&[0x1c]).unwrap();
     drop(input);
-    let until = Instant::now() + Duration::from_secs(2);
-    while attach.try_wait().unwrap().is_none() && Instant::now() < until {
-        thread::sleep(Duration::from_millis(20));
-    }
-    if attach.try_wait().unwrap().is_none() {
+    let mut attach_status = wait_child(&mut attach, Duration::from_secs(2));
+    if attach_status.is_none() {
         attach.kill().unwrap();
+        attach_status = wait_child(&mut attach, Duration::from_secs(2));
     }
-    let _ = attach.wait();
     assert!(
         invoked(alias, &["kill", "-f", "-q", "live"])
             .status
@@ -2135,6 +2170,10 @@ fn list_status_probe_is_bounded_and_marks_fully_attached_viewers() {
     );
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(marker).unwrap();
+    assert!(
+        attach_status.is_some_and(|status| status.success()),
+        "attach did not detach cleanly: {attach_status:?}"
+    );
     assert!(attached, "last list result: {last:?}");
 
     let marker = temp();
