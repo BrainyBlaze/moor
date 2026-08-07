@@ -1586,6 +1586,129 @@ fn status_drains_a_completed_event_commit_before_copying_its_frontier() {
 }
 
 #[test]
+fn v25_status_emitter_patches_exact_selected_commit_region() {
+    const HEADER: &[u8] = b"{\"v\":2,\"type\":\"header\",\"ts\":0,\"session\":\"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==\",\"generation\":7,\"epoch\":0,\"next_seq\":0,\"first_retained\":0}\n";
+    const COMMIT: [u8; 49] = [
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x85, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x2B, 0xBE, 0xEF, 0xB6, 0x37, 0x54, 0x66, 0x12, 0xD6, 0xA3, 0xA6, 0xBD, 0x7C,
+        0xBD, 0xB7, 0xBE, 0x29, 0x42, 0xD6, 0xDA, 0xDD, 0xC7, 0x33, 0x39, 0x54, 0x45, 0xF9, 0xED,
+        0xD7, 0x88, 0xB6, 0x4B,
+    ];
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("moor-v25-status-{}-{nonce}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    let marker = root.join("build");
+    let event = root.join("events");
+    let identity = b"\x01/tmp/.moor-1000/build";
+    let incarnation = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+    // V25 covers both time fields but contradicts itself: its event header
+    // freezes ts=0, while its descriptor and V24 lifecycle freeze wall=1.
+    // Start wall 0 selects the frozen header/commit. The assertions below
+    // expose that emitted 0 rather than treating it as unspecified; only its
+    // comparison with V25's frozen wall=1 awaits the consumer-team ruling.
+    let mut artifacts = holder_artifacts(
+        identity,
+        (Some(7), 7),
+        incarnation,
+        [0; 16],
+        (0, 2, [3; 16]),
+        ArtifactConfig {
+            marker: &marker,
+            event_path: Some(&event),
+            encoding: "posix-bytes",
+            event_identity: Some(b"/tmp/events"),
+            instrument_identity: None,
+            event_store: None,
+            stores: None,
+            event_layout: 2,
+            log_cap: 0,
+        },
+    )
+    .unwrap();
+
+    let commit_at = artifacts.commit_at;
+    let (selected, body) = Store::read_only(&event, Kind::Event, 7).unwrap();
+    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&body).into();
+    assert_eq!(commit_at, 62, "V25 selected-commit offset");
+    assert_eq!(body, HEADER, "holder persisted the frozen V25 header");
+    assert_eq!(body.len(), 133);
+    assert_eq!(
+        (selected.body, selected.index, selected.length),
+        (0, 1, 133)
+    );
+    assert_eq!(selected.hash, digest);
+    assert_eq!(&digest, &COMMIT[17..], "frozen V25 header SHA-256");
+    assert_eq!(
+        &artifacts.status[commit_at..commit_at + COMMIT.len()],
+        &COMMIT,
+        "prebuilt descriptor frontier"
+    );
+    let wall_at = commit_at + COMMIT.len();
+    assert_eq!(
+        u64::from_le_bytes(artifacts.status[wall_at..wall_at + 8].try_into().unwrap()),
+        0,
+        "wall 0 is required by the frozen header"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            artifacts.status[wall_at + 8..wall_at + 16]
+                .try_into()
+                .unwrap()
+        ),
+        2,
+        "non-contradictory frozen monotonic time"
+    );
+    assert_eq!(
+        &artifacts.status[wall_at + 16..wall_at + 32],
+        &[3; 16],
+        "non-contradictory frozen boot identity"
+    );
+
+    // Complete the POSIX descriptor exactly as the launcher does. The fixed
+    // sizes make the emitted payload the same 244-byte shape frozen by V25.
+    wire::put_wide(&mut artifacts.status, b"/tmp").unwrap();
+    artifacts.status.extend_from_slice(&0x1234u32.to_le_bytes());
+    artifacts.status.extend_from_slice(&0x5678u32.to_le_bytes());
+    artifacts.status.extend(0x10u8..=0x1F);
+    assert_eq!(artifacts.status.len(), 175);
+
+    // A construction-only assertion can pass even if live STATUS patching is
+    // removed. Poison every cached byte so the reply must use the lane's
+    // published selected-commit frontier.
+    artifacts.status[commit_at..commit_at + COMMIT.len()].fill(0xA5);
+    assert_ne!(
+        &artifacts.status[commit_at..commit_at + COMMIT.len()],
+        &COMMIT
+    );
+    let mut runtime = artifacts.runtime(
+        duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        (0, FakeNative),
+    );
+    let mut peer = connect(&mut runtime);
+    peer.send(0, 1, &wire::controller_hello(identity).unwrap());
+    assert_eq!(peer.recv(&mut runtime).kind, 2);
+    peer.send(7, 13, &[]);
+    let status = peer.recv_kind(&mut runtime, 14);
+
+    assert_eq!(status.payload.len(), 244, "frozen V25 payload shape");
+    assert_eq!(
+        &status.payload[commit_at..commit_at + COMMIT.len()],
+        &COMMIT,
+        "live STATUS copied the real selected event commit"
+    );
+    wire::StatusTail::decode_for(&status.payload, identity, 7, incarnation)
+        .expect("live V25-shaped STATUS descriptor decodes");
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn failed_native_resize_does_not_change_the_scanner_row_model() {
     struct FailResize;
     impl Native for FailResize {
