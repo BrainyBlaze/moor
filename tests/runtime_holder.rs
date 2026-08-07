@@ -149,17 +149,25 @@ impl Peer {
     }
 }
 
+fn temp(name: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "moor-holder-{name}-{}-{time}-{sequence}",
+        std::process::id()
+    ))
+}
+
 fn fixture() -> (Runtime<FakeNative>, PathBuf) {
     fixture_with_native(FakeNative)
 }
 
 fn fixture_with_native<N: Native>(native: N) -> (Runtime<N>, PathBuf) {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root =
-        std::env::temp_dir().join(format!("moor-holder-wire-{}-{nonce}", std::process::id()));
+    let root = temp("wire");
     let running = lifecycle_running(
         b"\x01/session",
         (Some(7), 7),
@@ -192,12 +200,7 @@ fn event_fixture() -> (Runtime<FakeNative>, [PathBuf; 2]) {
 }
 
 fn event_fixture_with(jobs: usize, bytes: usize) -> (Runtime<FakeNative>, [PathBuf; 2]) {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let base =
-        std::env::temp_dir().join(format!("moor-holder-event-{}-{nonce}", std::process::id()));
+    let base = temp("event");
     let event_path = base.with_extension("events");
     let exit_path = base.with_extension("exit");
     let header = canonical_header(1, "AS9zZXNzaW9u", Some(7), EventCursor(0, 0, 0, 1));
