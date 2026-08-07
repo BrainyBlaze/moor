@@ -48,6 +48,13 @@ fn isolated_root(alias: &str) -> PathBuf {
     std::env::temp_dir().join(format!(".{alias}-{}", unsafe { libc::geteuid() }))
 }
 
+fn true_program() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "/usr/bin/true";
+    #[cfg(not(target_os = "macos"))]
+    "/bin/true"
+}
+
 fn stale_socket(path: &Path) {
     drop(UnixListener::bind(path).unwrap());
 }
@@ -507,7 +514,7 @@ fn stderr_sink_is_opened_once_without_following_or_blocking() {
         socket.to_str().unwrap(),
         "-2",
         link.to_str().unwrap(),
-        "/bin/true",
+        true_program(),
     ]);
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");
     assert!(!socket.exists());
@@ -530,7 +537,7 @@ fn stderr_sink_is_opened_once_without_following_or_blocking() {
         socket.to_str().unwrap(),
         "-2",
         fifo.to_str().unwrap(),
-        "/bin/true",
+        true_program(),
     ]);
     assert_eq!(refused.status.code(), Some(1), "{refused:?}");
     assert!(
@@ -572,7 +579,7 @@ fn creation_never_replaces_a_dangling_rendezvous_symlink() {
     let path = root.join("dangling-create");
     symlink(root.join("missing"), &path).unwrap();
 
-    let created = invoked(alias, &["start", "dangling-create", "/bin/true"]);
+    let created = invoked(alias, &["start", "dangling-create", true_program()]);
     let preserved = fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink());
     if created.status.success() {
         let _ = invoked(alias, &["kill", "-f", "dangling-create"]);
@@ -677,7 +684,7 @@ fn natural_exit_during_publication_failure_is_finalized_and_retained() {
             event.to_str().unwrap(),
             "-S",
             library.to_str().unwrap(),
-            "/bin/true",
+            true_program(),
         ])
         .env("MOOR_EXIT_ON_EVENT_OPEN", &event)
         .env("MOOR_OCCUPY_RENDEZVOUS", &session)
@@ -812,7 +819,7 @@ fn preadoption_holder_death_rolls_back_the_prepared_event_store() {
                 &session,
                 "-T",
                 event.to_str().unwrap(),
-                "/bin/true",
+                true_program(),
             ])
             .env("LD_PRELOAD", &shim)
             .env("MOOR_TEST_FLOCK_DELAY_MS", "10000")
@@ -870,7 +877,7 @@ fn preadoption_rollback_preserves_substituted_companions_and_instrument() {
             event.to_str().unwrap(),
             "-S",
             instrument.to_str().unwrap(),
-            "/bin/true",
+            true_program(),
         ])
         .env("LD_PRELOAD", &shim)
         .env("MOOR_TEST_FLOCK_DELAY_MS", "10000")
@@ -945,7 +952,7 @@ fn stalled_initial_fsync_is_cancelled_with_exact_rollback() {
             "stalled",
             "-T",
             event.to_str().unwrap(),
-            "/bin/true",
+            true_program(),
         ])
         .env("LD_PRELOAD", &shim)
         .env("MOOR_TEST_FSYNC_DELAY_MS", "5000")
@@ -1228,7 +1235,7 @@ fn directory_mode_setting_never_follows_a_substituted_symlink() {
             "mode-race",
             "-T",
             event.to_str().unwrap(),
-            "/bin/true",
+            true_program(),
         ])
         .env("LD_PRELOAD", shim)
         .env("MOOR_TEST_DIRECTORY_SWAP_NAME", event.file_name().unwrap())
@@ -1266,7 +1273,10 @@ fn event_target_requires_an_absolute_path_inside_the_invoked_root() {
     stale_socket(&stale);
     let stale_id = fs::symlink_metadata(&stale).unwrap().ino();
 
-    let relative = invoked(alias, &["start", "relative", "-T", "events", "/bin/true"]);
+    let relative = invoked(
+        alias,
+        &["start", "relative", "-T", "events", true_program()],
+    );
     assert_eq!(relative.status.code(), Some(1), "{relative:?}");
     assert_eq!(
         relative.stderr,
@@ -1278,7 +1288,7 @@ fn event_target_requires_an_absolute_path_inside_the_invoked_root() {
     let escaped = moor::name::render(outside.as_os_str());
     let rejected = invoked(
         alias,
-        &["start", "outside", "-T", outside_text, "/bin/true"],
+        &["start", "outside", "-T", outside_text, true_program()],
     );
     assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
     assert_eq!(
@@ -1494,7 +1504,7 @@ fn operational_errors_use_stdout_and_launch_validation_uses_stderr() {
         missing.to_str().unwrap(),
         "-2",
         sink.to_str().unwrap(),
-        "/bin/true",
+        true_program(),
     ]);
     assert_eq!(launched.status.code(), Some(1));
     assert!(launched.stdout.is_empty());
@@ -2299,7 +2309,7 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
                 events.to_str().unwrap(),
                 "-S",
                 library.to_str().unwrap(),
-                "/bin/true",
+                true_program(),
             ],
         );
         assert_eq!(output.status.code(), Some(expected), "{output:?}");

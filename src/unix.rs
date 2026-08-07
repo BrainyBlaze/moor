@@ -442,6 +442,14 @@ fn holder_exited(pid: libc::pid_t, timeout: Duration) -> bool {
     }
 }
 
+fn accept_blocking(listener: &LocalListener) -> Option<LocalStream> {
+    let stream = listener.accept().ok()?;
+    // Darwin propagates O_NONBLOCK from an accepting listener to the new
+    // socket. Runtime I/O owns its own threads and requires blocking streams.
+    stream.set_nonblocking(false).ok()?;
+    Some(stream)
+}
+
 impl Drop for Stage {
     fn drop(&mut self) {
         if self.3 {
@@ -591,7 +599,7 @@ fn holder(
     }
     let Some(status) = state.drive(
         |_, _| {
-            let stream = listener.accept().ok()?;
+            let stream = accept_blocking(&listener)?;
             let (trusted, pid) = peer_identity(&stream);
             stream
                 .set_send_timeout(Some(Duration::from_millis(250)))
@@ -2137,6 +2145,38 @@ mod tests {
         observer.join().unwrap();
         assert_eq!(during, before);
         assert_eq!(std::env::current_dir().unwrap(), before);
+        fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn accepted_socket_is_blocking_before_runtime_io_starts() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "moor-blocking-accept-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        let parent = open_directory(&path).unwrap();
+        let leaf = OsStr::new("probe");
+        let listener = socket_name(&parent, leaf, |name| {
+            ListenerOptions::new()
+                .name(name)
+                .reclaim_name(false)
+                .nonblocking(ListenerNonblockingMode::Accept)
+                .create_sync()
+        })
+        .unwrap();
+        let client = socket_name(&parent, leaf, LocalStream::connect).unwrap();
+        let accepted = accept_blocking(&listener).expect("pending local connection");
+        let LocalStream::UdSocket(accepted) = accepted;
+        let flags = fcntl(accepted.as_fd(), FcntlArg::F_GETFL).unwrap();
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        drop(client);
+        drop(listener);
+        fs::remove_file(path.join(leaf)).unwrap();
         fs::remove_dir(path).unwrap();
     }
 }
