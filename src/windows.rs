@@ -513,7 +513,7 @@ mod native {
         access: &str,
     ) -> Result<(LocalBox<SecurityDescriptor>, SECURITY_ATTRIBUTES)> {
         let descriptor: LocalBox<SecurityDescriptor> =
-            format!("D:P(A;;{access};;;SY)(A;;{access};;;{sid})")
+            format!("O:{sid}D:P(A;;{access};;;SY)(A;;{access};;;{sid})")
                 .parse()
                 .map_err(|error: io::Error| format!("build protected DACL: {error}"))?;
         let attributes = SECURITY_ATTRIBUTES {
