@@ -1620,7 +1620,10 @@ fn publish_exclusive(parent: &File, stage: &OsStr, destination: &OsStr) -> Resul
     };
     #[cfg(not(target_os = "macos"))]
     let status = unsafe {
-        libc::renameat2(
+        // musl does not export the renameat2 wrapper; the Linux kernel ABI is
+        // the same operation and preserves atomic RENAME_NOREPLACE semantics.
+        libc::syscall(
+            libc::SYS_renameat2,
             parent.as_raw_fd(),
             stage.as_ptr(),
             parent.as_raw_fd(),

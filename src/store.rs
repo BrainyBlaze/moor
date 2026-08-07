@@ -724,7 +724,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         OpenOptions::new()
-            .read(true)
+            .write(true)
             .custom_flags(0x02000000)
             .open(path)?
             .sync_all()?;

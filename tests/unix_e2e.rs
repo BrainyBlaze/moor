@@ -241,7 +241,7 @@ __attribute__((constructor)) static void ack(void) {
     library
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn storage_delay_shim(dir: &Path) -> PathBuf {
     let source = dir.join("storage-delay.c");
     let library = dir.join("storage-delay.so");
@@ -783,7 +783,7 @@ fn failure_before_holder_entry_unlinks_the_staged_rendezvous() {
     fs::remove_dir_all(marker).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn preadoption_holder_death_rolls_back_the_prepared_event_store() {
     let marker = temp();
@@ -851,7 +851,7 @@ fn preadoption_holder_death_rolls_back_the_prepared_event_store() {
     fs::remove_dir_all(marker).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn preadoption_rollback_preserves_substituted_companions_and_instrument() {
     let dir = temp();
@@ -930,7 +930,7 @@ fn preadoption_rollback_preserves_substituted_companions_and_instrument() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn stalled_initial_fsync_is_cancelled_with_exact_rollback() {
     let dir = temp();
@@ -958,7 +958,7 @@ fn stalled_initial_fsync_is_cancelled_with_exact_rollback() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn three_initial_store_flushes_run_in_parallel_under_one_deadline() {
     let dir = temp();
@@ -990,7 +990,7 @@ fn three_initial_store_flushes_run_in_parallel_under_one_deadline() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn writer_leases_are_taken_in_lifecycle_event_log_order() {
     let dir = temp();
@@ -1156,7 +1156,7 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
     fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn directory_mode_setting_never_follows_a_substituted_symlink() {
     let dir = temp();
@@ -1484,6 +1484,7 @@ fn graceful_kill_escalates_and_reports_the_requested_outcome() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[test]
 fn graceful_escalation_ignores_a_realtime_step_after_sigterm() {
     use std::os::unix::fs::PermissionsExt;
