@@ -79,6 +79,7 @@ fn empty_log_commit_matches_the_approved_92_byte_vector() {
             0x78, 0x52, 0xb8, 0x55, 0xce, 0x64, 0xf3, 0xa0,
         ]
     );
+    drop(store);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -120,6 +121,7 @@ fn append_replace_recovery_and_uncommitted_tail_preserve_frontier() {
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"abc");
     recovered.replace(b"", 2, 3, 3).unwrap();
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"");
+    drop(recovered);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -142,6 +144,7 @@ fn capped_append_keeps_only_the_newest_suffix_and_validates_the_frontier() {
         Err(StoreError::Corrupt)
     ));
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"ijkl");
+    drop(store);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -227,6 +230,7 @@ fn log_and_lifecycle_start_at_epoch_one_and_lifecycle_exits_once() {
         store.replace(exited.as_bytes(), 1, 9, 9),
         Err(StoreError::Exhausted)
     ));
+    drop(store);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -1062,6 +1066,7 @@ fn selected_now_reports_no_frontier_rather_than_a_wrong_one() {
     // The already-open writer handle still reports its own last valid commit,
     // which is exactly the last-known-valid policy the frontier relies on.
     assert_eq!(store.selected().index, 2);
+    drop(store);
     fs::remove_dir_all(path).unwrap();
 }
 
@@ -1110,5 +1115,6 @@ fn contended_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
     let (commit, body) = Store::read_only(&path, Kind::Log, 7).unwrap();
     assert_eq!(commit.end, end);
     assert_eq!(body.len() as u64, commit.end - commit.start);
+    drop(store);
     fs::remove_dir_all(path).unwrap();
 }
