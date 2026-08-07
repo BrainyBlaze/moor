@@ -1063,6 +1063,10 @@ fn post_spawn_setup_failure_reaps_the_requested_process_group() {
         .trim()
         .parse::<i32>()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     let alive = unsafe { libc::kill(pid, 0) } == 0;
     if alive {
         let group = unsafe { libc::getpgid(pid) };
@@ -1102,6 +1106,49 @@ fn restrictive_umask_still_creates_an_exact_owner_only_root() {
 }
 
 #[test]
+fn concurrent_restrictive_umask_root_creation_is_atomic() {
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let executable = dir.join(alias);
+    let gate = dir.join("go");
+    let _ = fs::remove_dir_all(&root);
+    symlink(env!("CARGO_BIN_EXE_moor"), &executable).unwrap();
+    let children = (0..32)
+        .map(|_| {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "while [ ! -e \"$1\" ]; do :; done; exec \"$2\" list",
+                    "sh",
+                ])
+                .arg(&gate)
+                .arg(&executable)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o777);
+                    Ok(())
+                });
+            }
+            command.spawn().unwrap()
+        })
+        .collect::<Vec<_>>();
+    File::create(gate).unwrap();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let meta = fs::symlink_metadata(&root).unwrap();
+    assert!(meta.file_type().is_dir());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    fs::remove_dir(&root).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn restrictive_umask_still_creates_an_exact_event_store() {
     let dir = temp();
     let alias = dir.file_name().unwrap().to_str().unwrap();
@@ -1127,6 +1174,9 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
         });
     }
     let output = command.output().unwrap();
+    let rendezvous_mode = fs::symlink_metadata(root.join("restrictive-event"))
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o777);
     let event_mode = fs::symlink_metadata(&event)
         .ok()
         .map(|meta| meta.permissions().mode() & 0o777);
@@ -1149,6 +1199,7 @@ fn restrictive_umask_still_creates_an_exact_event_store() {
         let _ = invoked(alias, &["rm", "restrictive-event"]);
     }
     assert!(output.status.success(), "{output:?}");
+    assert_eq!(rendezvous_mode, Some(0o600));
     assert_eq!(event_mode, Some(0o700));
     assert_eq!(slot_modes, [Some(0o600); 4]);
     assert_eq!(inherited.as_deref().map(str::trim), Some("0777"));

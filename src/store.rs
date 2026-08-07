@@ -680,7 +680,11 @@ pub(crate) fn private_directory(path: &Path, create: bool) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
             let result = create_directory(path);
             #[cfg(unix)]
-            result?;
+            if let Err(error) = result
+                && error.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(error);
+            }
             #[cfg(windows)]
             if let Err(error) = result
                 && fs::symlink_metadata(path).is_err()
@@ -702,9 +706,8 @@ pub(crate) fn private_directory(path: &Path, create: bool) -> io::Result<bool> {
 fn create_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new().mode(0o700).create(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        crate::unix::with_umask(0o077, || fs::DirBuilder::new().mode(0o700).create(path))?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

@@ -12,6 +12,7 @@ use interprocess::local_socket::{
     GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
     Stream as LocalStream,
 };
+#[cfg(not(target_os = "macos"))]
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, FcntlArg, OFlag, fcntl, open, openat};
@@ -40,6 +41,69 @@ const DIRECTORY_FLAGS: OFlag =
     OFlag::from_bits_retain(libc::O_RDONLY | libc::O_DIRECTORY | SAFE_OPEN_FLAGS);
 const INSTRUMENT_FLAGS: OFlag =
     OFlag::from_bits_retain(libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | SAFE_OPEN_FLAGS);
+static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct Umask(libc::mode_t);
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
+pub(crate) fn with_umask<T>(mask: libc::mode_t, operation: impl FnOnce() -> T) -> T {
+    let _lock = UMASK_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _restore = Umask(unsafe { libc::umask(mask) });
+    operation()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+struct ThreadDirectory(bool);
+
+#[cfg(target_os = "macos")]
+impl ThreadDirectory {
+    fn enter(fd: libc::c_int) -> io::Result<Self> {
+        pthread_directory(unsafe { pthread_fchdir_np(fd) })?;
+        Ok(Self(true))
+    }
+
+    fn restore(mut self) -> io::Result<()> {
+        pthread_directory(unsafe { pthread_fchdir_np(-1) })?;
+        self.0 = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ThreadDirectory {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                pthread_fchdir_np(-1);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pthread_directory(status: libc::c_int) -> io::Result<()> {
+    if status == 0 {
+        Ok(())
+    } else if status == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::from_raw_os_error(status))
+    }
+}
 
 trait Text<T> {
     fn text(self) -> Result<T>;
@@ -270,21 +334,23 @@ pub(crate) fn create(
                 .unwrap_or_else(|| "/bin/sh".into()),
         );
     }
-    let (parent, publish) = socket_alias(path)?;
+    let parent = socket_parent(path)?;
     let leaf = OsString::from(format!(".moor-{}.stage", hex(shared::random_array()?)));
-    let stage_alias = publish.with_file_name(&leaf);
-    let stage_name = stage_alias
-        .as_os_str()
-        .to_fs_name::<GenericFilePath>()
-        .text()?;
-    let listener = ListenerOptions::new()
-        .name(stage_name)
-        .mode(0o600)
-        .reclaim_name(false)
-        .nonblocking(ListenerNonblockingMode::Accept)
-        .create_sync()
-        .text()?;
-    let identity = entry_identity(&parent, &leaf, SFlag::S_IFSOCK, None)
+    // A restrictive temporary umask gives the unpredictable staged name its
+    // exact mode at bind time, even when the caller supplied a stricter mask.
+    let listener = with_umask(0o177, || {
+        socket_name(&parent, &leaf, |stage_name| {
+            let options = ListenerOptions::new()
+                .name(stage_name)
+                .reclaim_name(false)
+                .nonblocking(ListenerNonblockingMode::Accept);
+            #[cfg(not(target_os = "macos"))]
+            let options = options.mode(0o600);
+            options.create_sync()
+        })
+    });
+    let listener = listener?;
+    let identity = entry_identity(&parent, &leaf, SFlag::S_IFSOCK, Some(0o600))
         .text()?
         .ok_or_else(|| "staged rendezvous identity changed".to_string())?;
     let stage = Stage(parent, leaf, identity, true);
@@ -914,14 +980,18 @@ impl Drop for RawTerminal {
     }
 }
 
-fn bounded(path: &Path, timeout: Duration) -> Result<WireClient> {
-    let (_parent, stream) = socket_at(path, LocalStream::connect)?;
+fn connected(path: &Path, timeout: Duration, stream: LocalStream) -> Result<WireClient> {
     crate::ensure!(peer_owned(&stream), "holder peer identity mismatch");
     let deadline = Instant::now() + timeout;
     stream
         .set_send_timeout(Some(Duration::from_millis(250)))
         .text()?;
     WireClient::from_stream(stream, identity(path)?, deadline, cancel)
+}
+
+fn bounded(path: &Path, timeout: Duration) -> Result<WireClient> {
+    let (_parent, stream) = socket_stream(path).map_err(|(error, _)| error)?;
+    connected(path, timeout, stream)
 }
 
 pub(crate) fn connect(path: &Path) -> Result<WireClient> {
@@ -983,7 +1053,10 @@ fn inspect(path: &Path, status: bool, timeout: Duration) -> shared::SessionState
             fs::symlink_metadata(path)
                 .is_ok_and(|meta| meta.file_type().is_socket() && owned(&meta))
         },
-        || bounded(path, timeout).map_err(|error| error.contains("Connection refused")),
+        || {
+            let (_parent, stream) = socket_stream(path).map_err(|(_, refused)| refused)?;
+            connected(path, timeout, stream).map_err(|_| false)
+        },
     )
 }
 
@@ -1575,17 +1648,38 @@ fn identity(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn socket_alias(path: &Path) -> Result<(File, PathBuf)> {
+fn socket_parent(path: &Path) -> Result<File> {
     let parent = path.parent().ok_or("rendezvous has no parent")?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(parent)
-        .text()?;
-    let alias = descriptor_path(&file).join(path.file_name().ok_or("rendezvous has no name")?);
-    Ok((file, alias))
+    open_directory(parent).text()
 }
 
+fn socket_name<T, E: std::fmt::Display>(
+    parent: &File,
+    leaf: &OsStr,
+    open: impl FnOnce(Name<'_>) -> std::result::Result<T, E>,
+) -> Result<T> {
+    #[cfg(target_os = "macos")]
+    {
+        // /dev/fd entries are not traversable directories on macOS. Resolve
+        // the short leaf using Darwin's per-thread working directory, never
+        // mutating the process-wide directory forbidden by schema section 2.2.
+        let directory = ThreadDirectory::enter(parent.as_raw_fd()).text()?;
+        let result = Path::new(leaf)
+            .to_fs_name::<GenericFilePath>()
+            .text()
+            .and_then(|name| open(name).text());
+        directory.restore().text()?;
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let alias = descriptor_path(parent).join(leaf);
+        let name = alias.as_os_str().to_fs_name::<GenericFilePath>().text()?;
+        open(name).text()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn descriptor_path(file: &File) -> PathBuf {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let root = "/proc/self/fd";
@@ -1635,13 +1729,19 @@ fn publish_exclusive(parent: &File, stage: &OsStr, destination: &OsStr) -> Resul
     parent.sync_all().text()
 }
 
-fn socket_at<T, E: std::fmt::Display>(
-    path: &Path,
-    open: impl FnOnce(Name<'_>) -> std::result::Result<T, E>,
-) -> Result<(File, T)> {
-    let (parent, alias) = socket_alias(path)?;
-    let name = alias.as_os_str().to_fs_name::<GenericFilePath>().text()?;
-    Ok((parent, open(name).text()?))
+fn socket_stream(path: &Path) -> std::result::Result<(File, LocalStream), (String, bool)> {
+    let parent = socket_parent(path).map_err(|error| (error, false))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| ("rendezvous has no name".into(), false))?;
+    let mut refused = false;
+    let stream = socket_name(&parent, leaf, |name| {
+        LocalStream::connect(name).inspect_err(|error| {
+            refused = error.kind() == io::ErrorKind::ConnectionRefused;
+        })
+    })
+    .map_err(|error| (error, refused))?;
+    Ok((parent, stream))
 }
 
 fn peer_identity(stream: &LocalStream) -> (bool, Option<u32>) {
@@ -2005,4 +2105,38 @@ fn readable(fd: i32, timeout: Duration) -> io::Result<bool> {
 
 fn uid() -> u32 {
     unsafe { libc::geteuid() }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn descriptor_relative_socket_name_never_changes_process_cwd() {
+        let before = std::env::current_dir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("moor-thread-cwd-{}-{nonce}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let parent = open_directory(&path).unwrap();
+        let (entered, wait) = sync_channel(0);
+        let (observed, receive) = sync_channel(0);
+        let observer = thread::spawn(move || {
+            wait.recv().unwrap();
+            observed.send(std::env::current_dir().unwrap()).unwrap();
+        });
+        let during = socket_name(&parent, OsStr::new("probe"), move |_| {
+            entered.send(()).unwrap();
+            Ok::<_, io::Error>(receive.recv().unwrap())
+        })
+        .unwrap();
+        observer.join().unwrap();
+        assert_eq!(during, before);
+        assert_eq!(std::env::current_dir().unwrap(), before);
+        fs::remove_dir(path).unwrap();
+    }
 }
