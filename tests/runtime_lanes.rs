@@ -35,7 +35,8 @@ mod worker;
 use moor::runtime::private::lifecycle_running;
 use moor::store::{Commit, Kind, Store, StoreError};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -73,6 +74,15 @@ fn next(lane: &mut Lane) -> Done {
 
 fn frontier(lane: &Lane) -> Commit {
     lane.selected().expect("validated frontier")
+}
+
+fn commit_bytes(path: &Path) -> [u8; 92] {
+    let mut bytes = [0; 92];
+    fs::File::open(path)
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    bytes
 }
 
 fn selected(done: Done) -> (u64, u64, u32, u64, u64, u64) {
@@ -448,7 +458,7 @@ fn quarantined_clear_cannot_replace_the_selected_log() {
     let (mut lane, path) = staged_lane("clear-before-commit");
     capped(&mut lane, Purpose::Test(0), b"old".to_vec(), 64, 3).unwrap();
     let base = selected(next(&mut lane)).1;
-    let prior_commit = fs::read(path.join("commit.0")).unwrap();
+    let prior_commit = commit_bytes(&path.join("commit.0"));
     let (announce, entered) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     let (sentinel, held) = mpsc::sync_channel(0);
@@ -467,7 +477,7 @@ fn quarantined_clear_cannot_replace_the_selected_log() {
     );
     drop(release);
     wait_until_receiver_is_dropped(&sentinel);
-    assert_eq!(fs::read(path.join("commit.0")).unwrap(), prior_commit);
+    assert_eq!(commit_bytes(&path.join("commit.0")), prior_commit);
     assert_eq!(frontier(&lane).index, base);
     assert_eq!(Store::read_only(&path, Kind::Log, 7).unwrap().1, b"old");
     let _ = fs::remove_dir_all(path);
