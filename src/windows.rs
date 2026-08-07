@@ -127,12 +127,69 @@ pub fn accept_bootstrap_command(bytes: &[u8], nonce: [u8; 16], resumed: &mut boo
     Some(kind)
 }
 
+#[cfg(any(windows, test))]
+fn exact_descriptor_semantics(
+    owner_matches: bool,
+    dacl_protected: bool,
+    actual_entries: usize,
+    expected_entries: usize,
+    mut same_entry: impl FnMut(usize, usize) -> bool,
+) -> bool {
+    if !owner_matches || !dacl_protected || actual_entries != expected_entries {
+        return false;
+    }
+    let mut matched = vec![false; expected_entries];
+    for actual in 0..actual_entries {
+        let Some(expected) = (0..expected_entries)
+            .find(|expected| !matched[*expected] && same_entry(actual, *expected))
+        else {
+            return false;
+        };
+        matched[expected] = true;
+    }
+    true
+}
+
+#[cfg(test)]
+mod descriptor_semantics_tests {
+    use super::exact_descriptor_semantics;
+
+    #[test]
+    fn exact_dacl_semantics_ignore_order_and_reject_every_difference() {
+        let expected = [(0u8, 0u8, 0x1f01ffu32, 18u32), (0, 0, 0x1f01ff, 42)];
+        let reversed = [expected[1], expected[0]];
+        let matches = |actual: &[_], owner, protected| {
+            exact_descriptor_semantics(
+                owner,
+                protected,
+                actual.len(),
+                expected.len(),
+                |left, right| actual[left] == expected[right],
+            )
+        };
+
+        assert!(matches(&reversed, true, true));
+        assert!(!matches(&expected, false, true));
+        assert!(!matches(&expected, true, false));
+        assert!(!matches(&expected[..1], true, true));
+        assert!(!matches(
+            &[expected[0], expected[1], (0, 0, 0x1f01ff, 1)],
+            true,
+            true
+        ));
+        assert!(!matches(&[expected[0], expected[0]], true, true));
+        assert!(!matches(&[expected[0], (0, 0, 0x120089, 42)], true, true));
+        assert!(!matches(&[expected[0], (0, 2, 0x1f01ff, 42)], true, true));
+        assert!(!matches(&[expected[0], (1, 0, 0x1f01ff, 42)], true, true));
+    }
+}
+
 #[cfg(windows)]
 #[allow(unused_unsafe)]
 mod native {
     use super::{
         BootstrapRecord, Marker, Result, accept_bootstrap_command, bootstrap_command,
-        cim_boot_identity, wtf8_decode, wtf8_encode,
+        cim_boot_identity, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
     };
     use crate::{
         cli::{CreateMode, Options},
@@ -175,8 +232,10 @@ mod native {
         time::{Duration, Instant},
     };
     use windows_permissions::{
-        LocalBox, SecurityDescriptor, WindowsSecure, constants::SecurityInformation,
-        utilities::buf_from_os as wide, wrappers,
+        LocalBox, SecurityDescriptor,
+        constants::{SeObjectType, SecurityInformation},
+        utilities::buf_from_os as wide,
+        wrappers,
     };
     use windows_spawn::{
         AsPseudoConsole, Child, Command as SpawnCommand, CreationFlags, Job, SpawnOptions,
@@ -525,6 +584,140 @@ mod native {
         };
         Ok((descriptor, attributes))
     }
+    fn descriptor_control(descriptor: &SecurityDescriptor) -> Result<u16> {
+        let (mut control, mut revision) = (0, 0);
+        win32!(
+            GetSecurityDescriptorControl(
+                (descriptor as *const SecurityDescriptor).cast_mut().cast(),
+                &mut control,
+                &mut revision,
+            ),
+            "inspect Windows security descriptor control"
+        )?;
+        Ok(control)
+    }
+    fn acl_entries(acl: &windows_permissions::Acl) -> Option<usize> {
+        let acl = (acl as *const windows_permissions::Acl).cast::<ACL>();
+        (unsafe { IsValidAcl(acl) } != 0).then(|| unsafe { (*acl).AceCount as usize })
+    }
+    fn ace_bytes(acl: &windows_permissions::Acl, index: usize) -> Option<&[u8]> {
+        let raw_acl = (acl as *const windows_permissions::Acl).cast::<ACL>();
+        if unsafe { IsValidAcl(raw_acl) } == 0 {
+            return None;
+        }
+        let mut ace: *mut c_void = ptr::null_mut();
+        if unsafe { GetAce(raw_acl, index.try_into().ok()?, &mut ace) } == 0 || ace.is_null() {
+            return None;
+        }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let size = usize::from(header.AceSize);
+        let start = (ace as usize).checked_sub(raw_acl as usize)?;
+        let end = start.checked_add(size)?;
+        let acl_size = usize::from(unsafe { (*raw_acl).AclSize });
+        if size < size_of::<ACE_HEADER>() || start < size_of::<ACL>() || end > acl_size {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ace.cast::<u8>(), size) })
+    }
+    fn descriptor_matches(
+        actual: &SecurityDescriptor,
+        expected: &SecurityDescriptor,
+    ) -> Result<bool> {
+        if unsafe {
+            IsValidSecurityDescriptor((actual as *const SecurityDescriptor).cast_mut().cast()) == 0
+                || IsValidSecurityDescriptor(
+                    (expected as *const SecurityDescriptor).cast_mut().cast(),
+                ) == 0
+        } {
+            return Ok(false);
+        }
+        let protected = descriptor_control(actual)? & SE_DACL_PROTECTED != 0;
+        let (Some(actual_owner), Some(expected_owner)) = (actual.owner(), expected.owner()) else {
+            return Ok(false);
+        };
+        let (Some(actual_dacl), Some(expected_dacl)) = (actual.dacl(), expected.dacl()) else {
+            return Ok(false);
+        };
+        let (Some(actual_entries), Some(expected_entries)) =
+            (acl_entries(actual_dacl), acl_entries(expected_dacl))
+        else {
+            return Ok(false);
+        };
+        Ok(exact_descriptor_semantics(
+            actual_owner == expected_owner,
+            protected,
+            actual_entries,
+            expected_entries,
+            |left, right| match (
+                ace_bytes(actual_dacl, left),
+                ace_bytes(expected_dacl, right),
+            ) {
+                (Some(actual), Some(expected)) => actual == expected,
+                _ => false,
+            },
+        ))
+    }
+    #[cfg(test)]
+    mod security_descriptor_tests {
+        use super::*;
+
+        const USER: &str = "S-1-5-21-1-2-3-42";
+
+        fn parsed(value: impl AsRef<str>) -> LocalBox<SecurityDescriptor> {
+            value.as_ref().parse().unwrap()
+        }
+
+        fn first_ace(descriptor: &SecurityDescriptor) -> *mut ACE_HEADER {
+            let acl = descriptor.dacl().unwrap() as *const windows_permissions::Acl;
+            let mut ace = ptr::null_mut();
+            assert_ne!(unsafe { GetAce(acl.cast(), 0, &mut ace) }, 0);
+            ace.cast()
+        }
+
+        #[test]
+        fn structural_validation_accepts_only_the_exact_protected_owner_and_aces() {
+            let (expected, _) = descriptor(USER, "FA").unwrap();
+            let reordered = parsed(format!("O:{USER}D:PAI(A;;FA;;;{USER})(A;;FA;;;SY)"));
+            assert!(descriptor_matches(&expected, &expected).unwrap());
+            assert!(descriptor_matches(&reordered, &expected).unwrap());
+
+            for invalid in [
+                format!("O:S-1-5-21-1-2-3-43D:P(A;;FA;;;SY)(A;;FA;;;{USER})"),
+                format!("O:{USER}D:AI(A;;FA;;;SY)(A;;FA;;;{USER})"),
+                format!("O:{USER}D:P(A;;FA;;;{USER})"),
+                format!("O:{USER}D:P(A;;FA;;;{USER})(A;;FA;;;{USER})"),
+                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;FA;;;WD)"),
+                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FR;;;{USER})"),
+                format!("O:{USER}D:P(D;;FA;;;SY)(A;;FA;;;{USER})"),
+                format!("O:{USER}D:P(A;CI;FA;;;SY)(A;;FA;;;{USER})"),
+            ] {
+                assert!(
+                    !descriptor_matches(&parsed(&invalid), &expected).unwrap(),
+                    "accepted {invalid}"
+                );
+            }
+
+            let invalid_flags = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
+            unsafe { (*first_ace(&invalid_flags)).AceFlags = 0x20 };
+            assert!(!descriptor_matches(&invalid_flags, &expected).unwrap());
+
+            let invalid_type = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
+            unsafe { (*first_ace(&invalid_type)).AceType = u8::MAX };
+            assert!(!descriptor_matches(&invalid_type, &expected).unwrap());
+        }
+
+        #[test]
+        fn file_descriptor_query_validates_a_created_store_directory() {
+            let path = std::env::temp_dir().join(format!(
+                "moor-windows-descriptor-{}-{}",
+                std::process::id(),
+                now()
+            ));
+            create_store_path(&path, true).unwrap();
+            validate(&path, sid().unwrap(), "FA", true).unwrap();
+            fs::remove_dir(path).unwrap();
+        }
+    }
     fn pipe_descriptor(
         sid: &str,
     ) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
@@ -559,18 +752,15 @@ mod native {
             "reject Windows reparse point",
         )?;
         let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
-        let actual = path
-            .as_os_str()
-            .security_descriptor(selector)
-            .and_then(|descriptor| {
-                wrappers::ConvertSecurityDescriptorToStringSecurityDescriptor(&descriptor, selector)
-            })
-            .map_err(|error| format!("read protected DACL: {error}"))?;
+        let actual = wrappers::GetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            selector,
+        )
+        .map_err(|error| format!("read protected DACL: {error}"))?;
+        let (expected, _) = descriptor(user, access)?;
         require(
-            actual
-                == OsStr::new(&format!(
-                    "O:{user}D:P(A;;{access};;;SY)(A;;{access};;;{user})"
-                )),
+            descriptor_matches(&actual, &expected)?,
             "unexpected Windows owner/DACL",
         )
     }

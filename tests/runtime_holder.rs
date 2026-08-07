@@ -1923,7 +1923,10 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
 
 #[test]
 fn rejectable_source_queue_overflow_does_not_close_unrelated_semantic_peers() {
-    let (mut runtime, paths) = event_fixture_with(1, 1 << 20);
+    // A zero-job lane is a deterministic saturated queue. Using a one-job
+    // lane plus a background commit races its worker completion against the
+    // candidate peer reader under the parallel test harness.
+    let (mut runtime, paths) = event_fixture_with(0, 1 << 20);
     let semantic_hello = |producer: u8, mode: u8, source: &[u8]| {
         let mut payload = [
             [5; 16].as_slice(),
@@ -1941,9 +1944,6 @@ fn rejectable_source_queue_overflow_does_not_close_unrelated_semantic_peers() {
     existing.send(0, 1, &semantic_hello(6, 0, b"edge"));
     assert_eq!(existing.recv(&mut runtime).kind, 2);
 
-    // Occupy the one-job event queue. Even if the worker has finished, the
-    // holder has not polled its completion, so admission is deterministically full.
-    runtime.output(b"\x1b]2;queued\x07".to_vec());
     let mut candidate = connect_as(&mut runtime, Profile::Semantic);
     candidate.send(0, 1, &semantic_hello(7, 1, b"stateful"));
     let refusal = candidate.recv_kind(&mut runtime, 9);
