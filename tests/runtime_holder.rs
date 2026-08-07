@@ -444,6 +444,8 @@ fn sixty_four_authenticated_controllers_are_admitted_and_peer_sixty_five_is_refu
     for _ in 0..64 {
         let mut peer = connect(&mut runtime);
         hello(&mut peer, &mut runtime);
+        peer.send(7, 13, &[]);
+        assert_eq!(peer.recv(&mut runtime).kind, 14);
         peers.push(peer);
     }
     let mut excess = connect(&mut runtime);

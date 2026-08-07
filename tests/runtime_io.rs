@@ -172,12 +172,16 @@ impl Peer {
         }
     }
 
-    fn send(&mut self, scope: u32, kind: u8, payload: &[u8]) {
+    fn try_send(&mut self, scope: u32, kind: u8, payload: &[u8]) -> std::io::Result<()> {
         let mut bytes = Vec::new();
         self.outbound
             .encode(scope, kind, payload, &mut bytes)
             .unwrap();
-        self.stream.write_all(&bytes).unwrap();
+        self.stream.write_all(&bytes)
+    }
+
+    fn send(&mut self, scope: u32, kind: u8, payload: &[u8]) {
+        self.try_send(scope, kind, payload).unwrap();
     }
 }
 
@@ -1026,9 +1030,13 @@ fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
             .encode_wire()
             .unwrap(),
         );
-        for _ in 0..3 {
+        for _ in 0..20 {
             std::thread::sleep(Duration::from_millis(5));
-            peer.send(7, 0x11, &[]);
+            match peer.try_send(7, 0x11, &[]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(error) => panic!("send viewer wakeup: {error}"),
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
     });
