@@ -10,7 +10,7 @@ use std::io::{Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -297,8 +297,10 @@ fn controller_error_is_reported_without_waiting_for_an_unrelated_reply() {
 }
 
 fn clear_result(outcome: u8, reason: u8, prior_delta: u64) -> Result<(), String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "moor-client-clear-{}-{}-{outcome}-{reason}",
+        "moor-client-clear-{}-{}-{outcome}-{reason}-{sequence}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
