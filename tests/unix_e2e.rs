@@ -236,6 +236,7 @@ __attribute__((constructor)) static void ack(void) {
         compiler.arg(format!("-DEXIT_STATUS={status}"));
     }
     assert!(compiler.status().unwrap().success());
+    #[cfg(not(target_os = "macos"))]
     if exit.is_some() {
         File::options()
             .write(true)
@@ -246,6 +247,31 @@ __attribute__((constructor)) static void ack(void) {
     }
     fs::set_permissions(&library, fs::Permissions::from_mode(0o500)).unwrap();
     library
+}
+
+fn instrumentable_program(dir: &Path) -> PathBuf {
+    let source = dir.join("instrument-child.c");
+    let program = dir.join("instrument-child");
+    fs::write(
+        &source,
+        r#"#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if(argc > 1) sleep((unsigned int)strtoul(argv[1], 0, 10));
+  return 0;
+}"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-o"])
+            .arg(&program)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    program
 }
 
 #[cfg(all(target_os = "linux", not(target_env = "musl")))]
@@ -639,6 +665,7 @@ fn event_substitution_failure_preserves_the_replacement_during_rollback() {
     let root = isolated_root(alias);
     let event = companion(&root.join("substituted"), ".events");
     let library = instrumentation(&marker, None);
+    let program = instrumentable_program(&marker);
     let output = invoked_command(alias)
         .args([
             "start",
@@ -647,9 +674,8 @@ fn event_substitution_failure_preserves_the_replacement_during_rollback() {
             event.to_str().unwrap(),
             "-S",
             library.to_str().unwrap(),
-            "/bin/sh",
-            "-c",
-            "sleep 30",
+            program.to_str().unwrap(),
+            "30",
         ])
         .env("MOOR_SUBSTITUTE_EVENT", &event)
         .output()
@@ -1939,7 +1965,7 @@ fn creating_viewer_copies_terminal_geometry_and_restores_local_modes() {
     let (mut master, slave) = terminal_pair(33, 101);
     let mut before: libc::termios = unsafe { std::mem::zeroed() };
     assert_eq!(
-        unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut before) },
+        unsafe { libc::tcgetattr(master.as_raw_fd(), &mut before) },
         0
     );
     let mut create = terminal_command(&slave)
@@ -1952,14 +1978,19 @@ fn creating_viewer_copies_terminal_geometry_and_restores_local_modes() {
     while create.try_wait().unwrap().is_none() && Instant::now() < until {
         thread::sleep(Duration::from_millis(20));
     }
-    if create.try_wait().unwrap().is_none() {
-        create.kill().unwrap();
-    }
-    let _ = create.wait();
+    let status = match create.try_wait().unwrap() {
+        Some(status) => status,
+        None => {
+            create.kill().unwrap();
+            create.wait().unwrap()
+        }
+    };
     let mut after: libc::termios = unsafe { std::mem::zeroed() };
-    assert_eq!(unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut after) }, 0);
+    let restored = unsafe { libc::tcgetattr(master.as_raw_fd(), &mut after) };
     let _ = moor(&["kill", "-f", "-q", name]);
     fs::remove_dir_all(dir).unwrap();
+    assert_eq!(restored, 0);
+    assert!(status.success(), "viewer exited with {status:?}");
     assert!(
         output
             .windows(b"33 101\r\n".len())
@@ -2251,6 +2282,7 @@ fn instrumentation_must_ack_from_inside_the_requested_child() {
     let alias = dir.file_name().unwrap().to_str().unwrap();
     let root = isolated_root(alias);
     let library = instrumentation(&dir, None);
+    let program = instrumentable_program(&dir);
     let socket = dir.join("instrumented");
     let output = invoked(
         alias,
@@ -2259,9 +2291,8 @@ fn instrumentation_must_ack_from_inside_the_requested_child() {
             socket.to_str().unwrap(),
             "-S",
             library.to_str().unwrap(),
-            "/bin/sh",
-            "-c",
-            "sleep 30",
+            program.to_str().unwrap(),
+            "30",
         ],
     );
     assert!(output.status.success(), "{output:?}");
@@ -2296,6 +2327,7 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
     let alias = dir.file_name().unwrap().to_str().unwrap();
     let root = isolated_root(alias);
     let library = instrumentation(&dir, Some(23));
+    let program = instrumentable_program(&dir);
     for (mode, expected) in [("start", 1), ("run", 23)] {
         let session = format!("early-{mode}");
         let socket = root.join(&session);
@@ -2309,7 +2341,7 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
                 events.to_str().unwrap(),
                 "-S",
                 library.to_str().unwrap(),
-                true_program(),
+                program.to_str().unwrap(),
             ],
         );
         assert_eq!(output.status.code(), Some(expected), "{output:?}");

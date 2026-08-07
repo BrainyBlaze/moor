@@ -1,5 +1,13 @@
 use std::process::{Command, Output};
 
+fn program() -> String {
+    std::path::Path::new(env!("CARGO_BIN_EXE_moor"))
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("Cargo test binary has an ASCII basename")
+        .to_owned()
+}
+
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_moor"))
         .args(args)
@@ -17,7 +25,12 @@ const HELP: &str = "Usage:\n  moor <session> [options] [command [argument...]]\n
 
 #[test]
 fn help_and_no_args_are_identical_success() {
-    let expected = format!("moor {}\n{HELP}", env!("CARGO_PKG_VERSION"));
+    let program = program();
+    let expected = format!(
+        "{program} {}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        HELP.replace("moor", &program)
+    );
     for args in [&[][..], &["--help"][..], &["-h"][..], &["?"][..]] {
         let out = run(args);
         assert!(out.status.success());
@@ -32,7 +45,7 @@ fn version_is_one_lf_line() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        format!("moor {}\n", env!("CARGO_PKG_VERSION"))
+        format!("{} {}\n", program(), env!("CARGO_PKG_VERSION"))
     );
     assert!(out.stderr.is_empty());
 }
@@ -43,7 +56,11 @@ fn invalid_mode_uses_frozen_two_line_stdout() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "moor: Invalid mode '--typo'\nTry 'moor --help' for more information.\n"
+        format!(
+            "{}: Invalid mode '--typo'\nTry '{} --help' for more information.\n",
+            program(),
+            program()
+        )
     );
     assert!(out.stderr.is_empty());
 }
@@ -113,7 +130,11 @@ fn numerics_are_canonical_and_attach_reports_option_ownership() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "moor: Option '-C' is not valid for 'attach'\nTry 'moor --help' for more information.\n"
+        format!(
+            "{}: Option '-C' is not valid for 'attach'\nTry '{} --help' for more information.\n",
+            program(),
+            program()
+        )
     );
     assert!(out.stderr.is_empty());
 }
@@ -147,7 +168,11 @@ fn option_terminator_is_permanent_and_legacy_k_has_frozen_error() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "moor: Invalid number of arguments\nTry 'moor --help' for more information.\n"
+        format!(
+            "{}: Invalid number of arguments\nTry '{} --help' for more information.\n",
+            program(),
+            program()
+        )
     );
 }
 
@@ -158,7 +183,11 @@ fn repeated_flags_and_known_option_ownership_are_exact() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        "moor: Option '-q' is not valid for 'tail'\nTry 'moor --help' for more information.\n"
+        format!(
+            "{}: Option '-q' is not valid for 'tail'\nTry '{} --help' for more information.\n",
+            program(),
+            program()
+        )
     );
 }
 
