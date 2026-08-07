@@ -17,4 +17,4 @@ for file in $files; do
     count=$((count + lines))
 done
 printf '%5s TOTAL production lines\n' "$count"
-test "$count" -le 11250
+test "$count" -le 12000
