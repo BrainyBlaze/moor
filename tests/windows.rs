@@ -1036,11 +1036,14 @@ mod launch_paths {
             ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
             FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
             GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD,
-            KEY_EVENT, ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+            INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED,
+            ReadConsoleInputW, ResizePseudoConsole, SHIFT_PRESSED, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode,
+            WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
 
         struct Console {
             value: HPCON,
@@ -1228,6 +1231,18 @@ mod launch_paths {
             console.spawn(command)
         }
 
+        fn send_console_records(console: &Console) -> io::Result<Child> {
+            let mut command = SpawnCommand::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_input_sender",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_INPUT_SENDER", "1");
+            console.spawn(command)
+        }
+
         fn modes(bytes: &[u8], label: &str) -> (u32, u32) {
             let text = String::from_utf8_lossy(bytes);
             let prefix = format!("MOOR-MODE-{label}:");
@@ -1325,6 +1340,83 @@ mod launch_paths {
         }
 
         #[test]
+        fn console_byte_probe() {
+            if std::env::var_os("MOOR_CONSOLE_BYTE_PROBE").is_none() {
+                return;
+            }
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let mut mode = 0;
+            assert!(unsafe { GetConsoleMode(input, &mut mode) } != 0);
+            let raw = ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_PROCESSED_INPUT
+                | ENABLE_QUICK_EDIT_MODE
+                | ENABLE_WINDOW_INPUT;
+            assert!(
+                unsafe {
+                    SetConsoleMode(
+                        input,
+                        (mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) & !raw,
+                    )
+                } != 0
+            );
+            assert!(unsafe { SetConsoleCP(CP_UTF8) } != 0);
+            println!("MOOR-BYTE-READY");
+            io::stdout().flush().unwrap();
+
+            let expected = b"A\xf0\x9f\x99\x82\xc3\xa9\0Z";
+            let mut received = Vec::new();
+            while !received.ends_with(b"Z") {
+                let mut bytes = [0; 64];
+                let count = io::stdin().read(&mut bytes).unwrap();
+                assert_ne!(count, 0, "console input closed before the sentinel");
+                received.extend_from_slice(&bytes[..count]);
+                assert!(received.len() <= 64, "console input exceeded its bound");
+            }
+            assert_eq!(received, expected);
+            println!("MOOR-BYTES:41F09F9982C3A9005A");
+        }
+
+        #[test]
+        fn console_input_sender() {
+            if std::env::var_os("MOOR_CONSOLE_INPUT_SENDER").is_none() {
+                return;
+            }
+            let zero = unsafe { VkKeyScanW(0) } as u16;
+            let mut records =
+                [u16::from(b'A'), 0xd83d, 0xde42, 0x00e9, 0, u16::from(b'Z')].map(|unit| {
+                    let mut key = KEY_EVENT_RECORD {
+                        bKeyDown: 1,
+                        wRepeatCount: 1,
+                        ..KEY_EVENT_RECORD::default()
+                    };
+                    key.uChar.UnicodeChar = unit;
+                    if unit == 0 {
+                        key.wVirtualKeyCode = zero & 0xff;
+                        key.dwControlKeyState = (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
+                            | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
+                            | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED);
+                    }
+                    INPUT_RECORD {
+                        EventType: KEY_EVENT as u16,
+                        Event: INPUT_RECORD_0 { KeyEvent: key },
+                    }
+                });
+            let mut written = 0;
+            assert!(
+                unsafe {
+                    WriteConsoleInputW(
+                        GetStdHandle(STD_INPUT_HANDLE),
+                        records.as_mut_ptr(),
+                        records.len() as u32,
+                        &mut written,
+                    )
+                } != 0
+            );
+            assert_eq!(written as usize, records.len());
+        }
+
+        #[test]
         fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
             let mut console = Console::new(37, 93).unwrap();
             let mut before = probe(&console, "before").unwrap();
@@ -1414,17 +1506,9 @@ mod launch_paths {
 
             console.resize(37, 93).unwrap();
             thread::sleep(Duration::from_millis(500));
-            console.write("A🙂é".as_bytes()).unwrap();
+            console.write(b"A").unwrap();
             console
                 .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
-                .unwrap();
-            for unit in [b"D83D", b"DE42", b"00E9"] {
-                let marker = [b"MOOR-UNIT:".as_slice(), unit.as_slice(), b":0"].concat();
-                console.wait_for(&marker, Duration::from_secs(5)).unwrap();
-            }
-            console.write(&[0]).unwrap();
-            console
-                .wait_for(b"MOOR-UNIT:0000:0", Duration::from_secs(5))
                 .unwrap();
             console.resize(41, 101).unwrap();
             console
@@ -1436,15 +1520,7 @@ mod launch_paths {
                 .unwrap();
             let trace = String::from_utf8_lossy(&console.received);
             let mut after = 0;
-            for marker in [
-                "MOOR-KEY:A:0",
-                "MOOR-UNIT:D83D:0",
-                "MOOR-UNIT:DE42:0",
-                "MOOR-UNIT:00E9:0",
-                "MOOR-UNIT:0000:0",
-                "MOOR-RESIZE:1:41:101",
-                "MOOR-KEY:B:1",
-            ] {
+            for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
             console.write(&[0x1c]).unwrap();
@@ -1461,6 +1537,45 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
+
+            let byte_session = format!("console-byte-e2e-{}", std::process::id());
+            let _byte_cleanup = Cleanup(byte_session.clone());
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .args([
+                    "new".as_ref(),
+                    byte_session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_byte_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env("MOOR_CONSOLE_BYTE_PROBE", "1");
+            let mut byte_viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"MOOR-BYTE-READY", Duration::from_secs(10))
+                .unwrap();
+            let mut sender = send_console_records(&console).unwrap();
+            assert!(
+                wait_spawn(&mut sender, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            console
+                .wait_for(b"MOOR-BYTES:41F09F9982C3A9005A", Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                wait_spawn(&mut byte_viewer, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let mut after_bytes = probe(&console, "after-bytes").unwrap();
+            assert!(
+                wait_spawn(&mut after_bytes, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(wait_modes(&mut console, "after-bytes"), before_modes);
         }
 
         static CONTROL_BREAKS: AtomicU8 = AtomicU8::new(0);
