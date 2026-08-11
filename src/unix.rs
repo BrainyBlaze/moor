@@ -1129,7 +1129,6 @@ pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
                         detach,
                         pass_suspend,
                         last_size: terminal.and_then(|terminal| terminal.size()),
-                        vt_resize: false,
                     },
                     || match readable(libc::STDIN_FILENO, Duration::from_millis(50)) {
                         Ok(true) => InputState::Ready,

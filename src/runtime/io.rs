@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
-schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Closed);
+schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Resize(u16, u16), Closed);
 
-schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>, vt_resize: bool);
+schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
 type Charge = (usize, usize);
 pub type SendResult = Result<(), SendError>;
@@ -450,14 +450,10 @@ pub fn run_viewer_input(
         detach,
         pass_suspend,
         mut last_size,
-        vt_resize,
     } = config;
     let mut armed = None;
     let mut bytes = vec![0; 65536];
     let mut output = Vec::with_capacity(bytes.len());
-    let mut plain = Vec::with_capacity(bytes.len());
-    let mut filter = crate::wire::ResizeInput::default();
-    let mut resizes = Vec::new();
     let mut renewed = now();
     let graceful = 'input: loop {
         let current = now();
@@ -467,45 +463,36 @@ pub fn run_viewer_input(
             }
             renewed = current;
         }
-        let next_size = if vt_resize { last_size } else { size() };
-        if next_size != last_size {
-            if let Some((rows, columns)) = next_size {
-                let _ = sender.0.send(Command::Resize(rows, columns));
-            }
-            last_size = next_size;
+        if let Some((rows, columns)) = size().filter(|size| Some(*size) != last_size) {
+            let _ = sender.0.send(Command::Resize(rows, columns));
+            last_size = Some((rows, columns));
         }
         if armed
             .is_some_and(|at| current.saturating_duration_since(at) >= Duration::from_millis(250))
         {
             break true;
         }
-        let closing = match ready() {
-            InputState::Pending if !filter.probe.is_empty() => filter.flush(&mut plain, false),
+        match ready() {
             InputState::Pending => continue,
-            InputState::Closed => filter.flush(&mut plain, true),
-            InputState::Ready => match input.read(&mut bytes) {
-                Ok(0) => filter.flush(&mut plain, true),
-                Ok(count) => {
-                    filter.input(&bytes[..count], vt_resize, detach, &mut plain, &mut resizes);
-                    false
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => break false,
-            },
-        };
-        let mut changes = resizes.drain(..).peekable();
-        for at in 0..=plain.len() {
-            while let Some((_, rows, columns)) = changes.next_if(|change| change.0 == at) {
+            InputState::Resize(rows, columns) => {
                 let next = Some((rows, columns));
-                if next != last_size
-                    && (!sender.flush(&mut output)
-                        || sender.0.send(Command::Resize(rows, columns)).is_err())
-                {
-                    break 'input false;
+                if next != last_size && sender.0.send(Command::Resize(rows, columns)).is_err() {
+                    break false;
                 }
                 last_size = next;
+                continue;
             }
-            let Some(&byte) = plain.get(at) else { break };
+            InputState::Closed => break true,
+            InputState::Ready => {}
+        }
+        let count = match input.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break false,
+        };
+        output.clear();
+        for byte in bytes[..count].iter().copied() {
             if armed.take().is_some() {
                 output.push(byte);
                 if Some(byte) != detach {
@@ -525,13 +512,12 @@ pub fn run_viewer_input(
                 output.push(byte);
             }
         }
-        plain.clear();
-        let sent = sender.flush(&mut output);
-        if !sent || closing {
-            break sent;
+        if !sender.flush(&mut output) {
+            break false;
         }
     };
-    if !(graceful && sender.release()) {
+    let released = graceful && sender.release();
+    if !released {
         let _ = sender.0.send(Command::Abort);
     }
 }

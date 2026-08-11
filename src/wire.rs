@@ -413,7 +413,6 @@ wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], 
 pub use crc32c::crc32c;
 
 schema!(struct pub Query derive [Clone, Debug, Eq, PartialEq] pub fields; correlation: u64, epoch: u32, class: u8, bytes: Vec<u8>);
-schema!(struct pub(crate) ResizeInput derive [Default] pub(crate) fields; probe: Vec<u8>);
 
 impl Query {
     wire_rules!(method fn valid(this: &Self) -> bool = valid_query(this.correlation, this.epoch, this.class, &this.bytes));
@@ -489,7 +488,7 @@ impl ViewerStream {
     wire_rules!(method pub fn disconnected(this: &mut Self) -> () = { this.queries.clear(); this.terminal = false; this.replay = None; this.received = None; });
 }
 
-wire_rules!(pure pub(crate) fn reply_state(bytes: &[u8]) -> i8 = match bytes { [0x1b] => 0, [0x1b, b'P', ..] | [0x90, ..] if bytes.ends_with(b"\x1b\\") || bytes.ends_with(&[0x9c]) => 1, [0x1b, b'P', ..] | [0x90, ..] if bytes.len() <= 256 => 0, [0x1b, b'P', ..] | [0x90, ..] => -1, [0x1b, b'[', body @ ..] | [0x9b, body @ ..] => match body.last() { Some(0x40..=0x7e) => 1, Some(0x20..=0x3f) | None if bytes.len() <= 256 => 0, _ => -1 }, _ => -1 });
+wire_rules!(pure fn reply_state(bytes: &[u8]) -> i8 = match bytes { [0x1b] => 0, [0x1b, b'P', ..] | [0x90, ..] if bytes.ends_with(b"\x1b\\") || bytes.ends_with(&[0x9c]) => 1, [0x1b, b'P', ..] | [0x90, ..] if bytes.len() <= 256 => 0, [0x1b, b'P', ..] | [0x90, ..] => -1, [0x1b, b'[', body @ ..] | [0x9b, body @ ..] => match body.last() { Some(0x40..=0x7e) => 1, Some(0x20..=0x3f) | None if bytes.len() <= 256 => 0, _ => -1 }, _ => -1 });
 
 schema!(enum pub ControllerRequest<'a>; Hello(&'a [u8]), Policy(PolicyRequest<'a>), Status, LogClear([u8; 16], u64));
 
@@ -601,12 +600,8 @@ impl Heartbeat {
 schema!(struct pub QueryShape derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; class: u8, csi8: bool, mode: Option<u32>);
 
 wire_rules!(pure pub(crate) fn csi(bytes: &[u8]) -> Option<(bool, &[u8])> = bytes.strip_prefix(b"\x1b[").map(|tail| (false, tail)).or_else(|| bytes.strip_prefix(&[0x9b]).map(|tail| (true, tail))));
-wire_rules!(pure fn resize_input(bytes: &[u8]) -> Option<(u16, u16)> = { let body = csi_body(bytes, b"8;", b"t")?; let split = body.iter().position(|byte| *byte == b';')?; let size = (decimal(&body[..split], i16::MAX as u64, false)? as u16, decimal(&body[split + 1..], i16::MAX as u64, false)? as u16); valid_size(size).then_some(size) });
+#[cfg(windows)]
 wire_rules!(pure pub(crate) fn valid_size(size: (u16, u16)) -> bool = size.0 != 0 && size.1 != 0 && size.0 <= i16::MAX as u16 && size.1 <= i16::MAX as u16 && u32::from(size.0) * u32::from(size.1) <= 2_000_000);
-impl ResizeInput {
-    wire_rules!(method pub(crate) fn input(this: &mut Self, bytes: &[u8], enabled: bool, detach: Option<u8>, plain: &mut Vec<u8>, resizes: &mut Vec<(usize, u16, u16)>) -> () = for byte in bytes.iter().copied() { let candidate = enabled && (!this.probe.is_empty() || byte == 0x1b && Some(byte) != detach); if !candidate { plain.push(byte); continue; } this.probe.push(byte); match reply_state(&this.probe) { 0 => {}, 1 => if let Some((rows, columns)) = resize_input(&this.probe) { resizes.push((plain.len(), rows, columns)); this.probe.clear(); } else { plain.append(&mut this.probe); }, _ if byte == 0x1b && this.probe.len() > 1 => { this.probe.pop(); plain.append(&mut this.probe); this.probe.push(byte); }, _ => plain.append(&mut this.probe) } });
-    wire_rules!(method pub(crate) fn flush(this: &mut Self, plain: &mut Vec<u8>, closing: bool) -> bool = { plain.append(&mut this.probe); closing });
-}
 fn csi_body<'a>(bytes: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
     csi(bytes)?.1.strip_prefix(prefix)?.strip_suffix(suffix)
 }

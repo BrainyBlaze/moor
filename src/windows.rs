@@ -2023,12 +2023,11 @@ mod native {
         })
     }
     fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
-        let raw = ENABLE_LINE_INPUT
-            | ENABLE_ECHO_INPUT
-            | ENABLE_PROCESSED_INPUT
-            | ENABLE_QUICK_EDIT_MODE
-            | ENABLE_WINDOW_INPUT;
-        let input = (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) & !raw;
+        let raw =
+            ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
+        let input =
+            (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+                & !raw;
         let output = output
             | ENABLE_PROCESSED_OUTPUT
             | ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -2070,6 +2069,30 @@ mod native {
             self.set(self.1).ok();
         }
     }
+    fn viewer_input_state(input: HANDLE) -> InputState {
+        let wait = unsafe { WaitForSingleObject(input, 50) };
+        crate::return_if!(wait == WAIT_TIMEOUT, InputState::Pending);
+        crate::return_if!(wait != WAIT_OBJECT_0, InputState::Closed);
+        let (mut event, mut count) = (INPUT_RECORD::default(), 0);
+        let window = WINDOW_BUFFER_SIZE_EVENT as u16;
+        let peeked = unsafe { PeekConsoleInputW(input, &mut event, 1, &mut count) };
+        crate::return_if!(peeked == 0, InputState::Closed);
+        crate::return_if!(count == 0, InputState::Pending);
+        crate::return_if!(event.EventType != window, InputState::Ready);
+        let read = unsafe { ReadConsoleInputW(input, &mut event, 1, &mut count) };
+        crate::return_if!(
+            read == 0 || count != 1 || event.EventType != window,
+            InputState::Closed
+        );
+        let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
+        u16::try_from(size.Y)
+            .ok()
+            .zip(u16::try_from(size.X).ok())
+            .filter(|size| crate::wire::valid_size(*size))
+            .map_or(InputState::Pending, |size| {
+                InputState::Resize(size.0, size.1)
+            })
+    }
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
@@ -2097,13 +2120,8 @@ mod native {
                     detach,
                     pass_suspend: true,
                     last_size: crate::wire::valid_size(geometry).then_some(geometry),
-                    vt_resize: true,
                 },
-                move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
-                    WAIT_OBJECT_0 => InputState::Ready,
-                    WAIT_TIMEOUT => InputState::Pending,
-                    _ => InputState::Closed,
-                },
+                move || viewer_input_state(input as HANDLE),
                 || None,
                 || {},
                 Instant::now,
