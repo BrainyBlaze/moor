@@ -416,6 +416,9 @@ mod native {
     }
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
     crate::schema!(tuple RelativePolicy [Clone, Copy]; fields; u32, u32, u32, u32);
+    type StoreFile = (File, [u8; 24]);
+    type StoreFileFailure = (io::Error, Option<StoreFile>);
+    type StoreFileResult = std::result::Result<StoreFile, StoreFileFailure>;
     const SHARE_RW: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
     const SHARE_ALL: u32 = SHARE_RW | FILE_SHARE_DELETE;
     const NO_FOLLOW: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
@@ -792,32 +795,28 @@ mod native {
         .map(|directory| (directory, true))
         .map_err(io::Error::other)
     }
-    pub(crate) fn create_store_file(directory: &File, name: &str) -> io::Result<(File, [u8; 24])> {
+    pub(crate) fn create_store_file(directory: &File, name: &str) -> StoreFileResult {
+        let failure = |error| (io::Error::other(error), None);
         let created = relative_file(
             directory,
             OsStr::new(name),
-            sid().map_err(io::Error::other)?,
+            sid().map_err(failure)?,
             CREATE_SLOT,
         )
-        .map_err(io::Error::other)?;
+        .map_err(failure)?;
         let rollback = || {
             delete_file(&created);
         };
         let identity = unsafe { unique_file_identity(created.as_raw_handle()) }
             .inspect_err(|_| rollback())
-            .map_err(io::Error::other)?;
+            .map_err(failure)?;
         let guard = reopen(&created, OPEN_SLOT)
             .inspect_err(|_| rollback())
-            .map_err(io::Error::other)?;
+            .map_err(failure)?;
         drop(created);
-        let file = reopen(&guard, OPEN_STORE)
-            .inspect_err(|_| {
-                if let Ok(file) = reopen(&guard, OpenPolicy(OPEN_SLOT.0 | DELETE, OPEN_SLOT.1)) {
-                    delete_file(&file);
-                }
-            })
-            .map_err(io::Error::other)?;
-        Ok((file, identity))
+        reopen(&guard, OPEN_STORE)
+            .map(|file| (file, identity))
+            .map_err(|error| (io::Error::other(error), Some((guard, identity))))
     }
     pub(crate) fn valid_store_directory(path: &Path, directory: &File) -> bool {
         store_directory(path, false)
@@ -826,13 +825,14 @@ mod native {
             })
             .is_ok_and(|current| unsafe { file_identity(directory.as_raw_handle()) } == Ok(current))
     }
-    pub(crate) fn rollback_store(directory: File, identities: &[[u8; 24]], owned: bool) {
+    pub(crate) fn rollback_store(directory: File, ids: &[[u8; 24]], state: (Option<File>, bool)) {
+        let (guard, owned) = state;
         let Ok(user) = sid() else {
             return;
         };
         for (name, expected) in ["body.0", "body.1", "commit.0", "commit.1"]
             .into_iter()
-            .zip(identities)
+            .zip(ids)
         {
             let Ok(file) = relative_file(&directory, OsStr::new(name), user, OPEN_ROLLBACK_SLOT)
             else {
@@ -842,6 +842,7 @@ mod native {
                 delete_file(&file);
             }
         }
+        drop(guard);
         if owned {
             delete_file(&directory);
         }

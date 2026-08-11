@@ -208,15 +208,17 @@ impl Store {
                 validate_event_directory(path)?;
             }
             let mut created = Vec::with_capacity(4);
-            if let Err(error) = NAMES.into_iter().try_for_each(|name| {
+            if let Err((error, failed)) = NAMES.into_iter().try_for_each(|name| {
                 crate::windows::create_store_file(&directory, name).map(|file| created.push(file))
             }) {
                 let identities = created
                     .iter()
                     .map(|(_, identity)| *identity)
+                    .chain(failed.as_ref().map(|(_, identity)| *identity))
                     .collect::<Vec<_>>();
                 drop(created);
-                crate::windows::rollback_store(directory, &identities, owned);
+                let guard = failed.map(|(guard, _)| guard);
+                crate::windows::rollback_store(directory, &identities, (guard, owned));
                 return Err(error.into());
             }
             let (slots, identities): (Vec<_>, Vec<_>) = created.into_iter().unzip();
@@ -382,7 +384,7 @@ impl Store {
         } = self;
         drop(slots);
         if let Some((directory, identities, owned)) = _rollback {
-            crate::windows::rollback_store(directory, &identities, owned);
+            crate::windows::rollback_store(directory, &identities, (None, owned));
         }
     }
 }
