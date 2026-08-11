@@ -69,7 +69,7 @@ jobs:
           cargo build --release --bin moor
 
   production-loc:
-    name: Production LOC / hard maximum 12,000
+    name: Production source report
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:

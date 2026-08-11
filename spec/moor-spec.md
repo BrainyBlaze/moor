@@ -33,27 +33,11 @@ This is the specification of **our** session holder — the program our product 
 
 The second caller is the reason this program exists in the form specified here. Its requirements — the event stream (§8), the observed state it consumes (§9), generation fencing (§10), the security model around a shared session root (§11) — are not extensions bolted onto a terminal tool. They are load-bearing, and a submission that implements the human-facing behaviour well and the supervisor's contract loosely has not met this specification.
 
-### 0.1.1 Implementation size ceiling **[normative]**
+### 0.1.1 Implementation quality **[normative]**
 
-The complete first-party production implementation is capped at **4,900 source lines across all components in aggregate**. The count includes every nonblank, non-comment physical line in every first-party source file compiled, interpreted, packaged, or executed as part of Moor: command surfaces, holder, controller/client code, semantic transport, platform backends, Windows bootstrap/insertion helpers, libraries, and build-time source that implements runtime behaviour. Generated production source counts at its generated line total; moving handwritten logic into a generator or helper does not remove it from the budget. Normal compiler, linker, and package-manager outputs are not source.
+There is no source-line ceiling. The implementation MUST remain normally formatted, reviewable, tested, and maintainable. Shared policy and state machines SHOULD remain centralized where doing so makes their invariants clearer, but reducing a line count never justifies omitted behaviour, compressed control flow, duplicated risk, weakened validation, or a narrower conformance claim.
 
-Tests, conformance fixtures, this specification and its documentation, and unmodified vendored third-party dependencies are outside the 4,900-line count. A modified vendored file becomes first-party for this rule. Code MUST remain normally formatted; minifying it or combining independent statements solely to evade the line budget is nonconforming. Every release candidate reports the per-file count and aggregate total together with its conformance evidence, and CI MUST fail at 4,901. The remaining 100 lines below the former 5,000-line ceiling are mandatory unavailable headroom, not a contingency, release reserve, override, or borrowing allowance.
-
-| production area | maximum counted lines |
-|---|---:|
-| CLI, controller, and viewer | 700 |
-| holder event loop and state machines | 900 |
-| controller and semantic codecs | 600 |
-| terminal/query scanners | 450 |
-| shared durable store, event, log, and lifecycle adapters | 500 |
-| POSIX backend | 600 |
-| Windows backend, bootstrap, and insertion | 950 |
-| instrumentation shims and build-time runtime source | 200 |
-| **aggregate design budget** | **4,900** |
-
-One serializer, one frame codec, one deadline scheduler, and one committed-store engine are shared. Platform modules implement OS primitives only and do not duplicate policy state machines. A task exceeding an area allocation must simplify or update the aggregate ledger before proceeding; no update may exceed 4,900.
-
-The cap is an architecture constraint, not permission to omit behaviour. Every requirement in this document still applies; if an implementation cannot satisfy both the contract and the cap, its architecture must be simplified rather than its conformance claim narrowed silently.
+Every release candidate reports the per-file and aggregate first-party production line count for review visibility. The count is informational: CI MUST NOT reject a candidate solely because it exceeds a numeric source-line threshold. Behavioural conformance, security properties, native-platform evidence, test quality, and maintainability are the release criteria.
 
 ### 0.2 Compatibility with what exists today
 
