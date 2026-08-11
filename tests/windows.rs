@@ -504,6 +504,25 @@ mod working_directory {
             "{out:?}"
         );
 
+        // Detached creation owns the same one-line diagnostic; the launch
+        // result pipe must not race it away or make the common layer print it
+        // a second time.
+        let out = moor(&[
+            "start",
+            session.to_str().unwrap(),
+            "-d",
+            gone.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("{program}: could not enter {} (missing)\n", rendered(&gone)),
+            "{out:?}"
+        );
+
         let file = dir.join("plain");
         std::fs::write(&file, b"x").unwrap();
         let out = moor(&[
@@ -541,13 +560,32 @@ mod working_directory {
             "directory validation must precede executable resolution: {out:?}"
         );
 
-        // Denied traverse is exactly not-searchable: deny the execute right
-        // to the current user, probe, then restore so cleanup succeeds.
+        // A real successful launch proves the child inherits the requested
+        // directory, rather than a validator that rejects every operand.
+        let proof = dir.join("cwd-proof");
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-d",
+            dir.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "type nul > cwd-proof",
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(
+            proof.is_file(),
+            "child did not enter the requested directory"
+        );
+
+        // Denied entry is exactly not-searchable. A full deny is deliberate:
+        // hosted service accounts may hold traverse-bypass privilege, which
+        // can make a narrow (X) denial ineffective.
         let sealed = dir.join("no-traverse");
         std::fs::create_dir(&sealed).unwrap();
         let user = std::env::var("USERNAME").unwrap();
         let denied = Command::new("icacls")
-            .args([sealed.to_str().unwrap(), "/deny", &format!("{user}:(X)")])
+            .args([sealed.to_str().unwrap(), "/deny", &format!("{user}:(F)")])
             .output()
             .unwrap();
         // Fixture setup is mandatory: a silent skip would turn the required

@@ -107,6 +107,56 @@ impl BootstrapRecord {
     }
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryCause {
+    Missing = 1,
+    NotDirectory = 2,
+    NotSearchable = 3,
+    Io = 4,
+}
+
+#[cfg(any(windows, test))]
+impl DirectoryCause {
+    #[cfg(windows)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::NotDirectory => "not-directory",
+            Self::NotSearchable => "not-searchable",
+            Self::Io => "io-error",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn directory_failure_record(nonce: [u8; 16], cause: DirectoryCause) -> [u8; 56] {
+    let mut record = [0; 56];
+    record[..12].copy_from_slice(b"MOORCWD1\x01\0\0\0");
+    record[12..28].copy_from_slice(&nonce);
+    record[28] = cause as u8;
+    record
+}
+
+#[cfg(any(windows, test))]
+fn directory_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<DirectoryCause> {
+    crate::return_if!(
+        bytes.len() != 56 || bytes[..12] != *b"MOORCWD1\x01\0\0\0",
+        None
+    );
+    crate::return_if!(
+        bytes[12..28] != nonce || bytes[29..].iter().any(|byte| *byte != 0),
+        None
+    );
+    match bytes[28] {
+        1 => Some(DirectoryCause::Missing),
+        2 => Some(DirectoryCause::NotDirectory),
+        3 => Some(DirectoryCause::NotSearchable),
+        4 => Some(DirectoryCause::Io),
+        _ => None,
+    }
+}
+
 #[doc(hidden)]
 pub fn bootstrap_command(kind: u8, nonce: [u8; 16]) -> [u8; 17] {
     let mut out = [0; 17];
@@ -152,7 +202,9 @@ fn exact_descriptor_semantics(
 
 #[cfg(test)]
 mod descriptor_semantics_tests {
-    use super::exact_descriptor_semantics;
+    use super::{
+        DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
+    };
 
     #[test]
     fn exact_dacl_semantics_ignore_order_and_reject_every_difference() {
@@ -182,14 +234,36 @@ mod descriptor_semantics_tests {
         assert!(!matches(&[expected[0], (0, 2, 0x1f01ff, 42)], true, true));
         assert!(!matches(&[expected[0], (1, 0, 0x1f01ff, 42)], true, true));
     }
+
+    #[test]
+    fn bootstrap_directory_failure_is_nonce_bound_and_closed() {
+        let nonce = [7; 16];
+        for cause in [
+            DirectoryCause::Missing,
+            DirectoryCause::NotDirectory,
+            DirectoryCause::NotSearchable,
+            DirectoryCause::Io,
+        ] {
+            let record = directory_failure_record(nonce, cause);
+            assert_eq!(directory_failure(&record, nonce), Some(cause));
+            assert_eq!(directory_failure(&record, [8; 16]), None);
+        }
+        let mut record = directory_failure_record(nonce, DirectoryCause::Missing);
+        for at in [0, 28, 55] {
+            record[at] ^= 0xff;
+            assert_eq!(directory_failure(&record, nonce), None, "byte {at}");
+            record[at] ^= 0xff;
+        }
+    }
 }
 
 #[cfg(windows)]
 #[allow(unused_unsafe)]
 mod native {
     use super::{
-        BootstrapRecord, Marker, Result, accept_bootstrap_command, bootstrap_command,
-        cim_boot_identity, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
+        BootstrapRecord, DirectoryCause, Marker, Result, accept_bootstrap_command,
+        bootstrap_command, cim_boot_identity, directory_failure, directory_failure_record,
+        exact_descriptor_semantics, wtf8_decode, wtf8_encode,
     };
     use crate::{
         cli::{CreateMode, Options},
@@ -314,6 +388,7 @@ mod native {
     const BOOTSTRAP_RESULT: &str = "DESK_MOOR_BOOTSTRAP_RESULT";
     const BOOTSTRAP_STDERR: &str = "DESK_MOOR_BOOTSTRAP_STDERR";
     const BOOTSTRAP_INSTRUMENT: &str = "DESK_MOOR_BOOTSTRAP_INSTRUMENT";
+    const BOOTSTRAP_DIRECTORY: &str = "DESK_MOOR_BOOTSTRAP_DIRECTORY";
     const INSTRUMENT_CHANNEL: &str = "DESK_MOOR_INSTRUMENT_CHANNEL";
     const INSTRUMENT_NONCE: &str = "DESK_MOOR_INSTRUMENT_NONCE";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
@@ -471,60 +546,15 @@ mod native {
             )
         }
     }
-    // §3.5/OB-32: validate a working directory by its opened handle, not by a
-    // pathname re-lookup. FILE_TRAVERSE is the directory-only search right —
-    // distinct from FILE_LIST_DIRECTORY, which a traverse-only grant lacks —
-    // and the directory type is read from that same handle. Returns the
-    // canonical identity-bound spelling so a later reparse-point substitution
-    // of the caller's name cannot redirect entry. FILE_FLAG_BACKUP_SEMANTICS
-    // is required to open a directory handle; OPEN_REPARSE_POINT is absent so
-    // junctions/symlinks resolve the way SetCurrentDirectory does.
-    fn enter_directory(directory: &Path) -> std::result::Result<OsString, &'static str> {
-        let handle = unsafe {
-            CreateFileW(
-                wide(directory.as_os_str()).as_ptr(),
-                FILE_TRAVERSE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                ptr::null_mut(),
-            )
-        };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(match unsafe { GetLastError() } {
-                ERROR_ACCESS_DENIED => "not-searchable",
-                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME => "missing",
-                ERROR_DIRECTORY => "not-directory",
-                _ => "io-error",
-            });
+    fn directory_cause(error: &io::Error) -> DirectoryCause {
+        match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME) => {
+                DirectoryCause::Missing
+            }
+            Some(ERROR_DIRECTORY) => DirectoryCause::NotDirectory,
+            Some(ERROR_ACCESS_DENIED) => DirectoryCause::NotSearchable,
+            _ => DirectoryCause::Io,
         }
-        let guard = unsafe { Handle::owned(handle) };
-        let raw = guard
-            .0
-            .as_ref()
-            .expect("checked non-null handle")
-            .as_raw_handle() as HANDLE;
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(raw, &mut info) } == 0 {
-            return Err("io-error");
-        }
-        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-            return Err("not-directory");
-        }
-        let mut buffer = [0u16; 1024];
-        let length = unsafe {
-            GetFinalPathNameByHandleW(
-                raw,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        };
-        if length == 0 || length as usize >= buffer.len() {
-            return Err("io-error");
-        }
-        Ok(OsString::from_wide(&buffer[..length as usize]))
     }
     fn read_reparse(path: &Path, share: u32) -> Result<File> {
         OpenOptions::new()
@@ -968,6 +998,16 @@ mod native {
                     .all(|(at, handle)| handle.is_null() || !raw[..at].contains(handle)),
                 "aliased bootstrap handles",
             )?;
+            if let Some(directory) = std::env::var_os(BOOTSTRAP_DIRECTORY) {
+                std::env::remove_var(BOOTSTRAP_DIRECTORY);
+                if let Err(error) = std::env::set_current_dir(directory) {
+                    result.write(
+                        &directory_failure_record(nonce, directory_cause(&error)),
+                        "report rejected working directory",
+                    )?;
+                    return Ok(1);
+                }
+            }
             let (program, args) = command.split_first().unwrap();
             let mut requested = SpawnCommand::new(program);
             requested.args(args).env_remove(INSTRUMENT_NONCE);
@@ -1338,19 +1378,14 @@ mod native {
                 let executable = std::env::current_exe().map_err(string)?;
                 let mut bootstrap = SpawnCommand::new(executable);
                 bootstrap.args(command);
+                bootstrap.env_remove(BOOTSTRAP_DIRECTORY);
                 if let Some(directory) = &self.options.directory {
-                    // §3.5/OB-32: a rejected working directory names the
-                    // directory with status 1, never the executable with 127.
-                    let resolved = enter_directory(directory).map_err(|cause| {
-                        format!(
-                            "could not enter {} ({cause})",
-                            name::render(directory.as_os_str())
-                        )
-                    })?;
-                    // Enter the canonical identity-bound spelling resolved from
-                    // the opened directory, so a later reparse-point
-                    // substitution of the caller's name cannot redirect entry.
-                    bootstrap.current_dir(&resolved);
+                    // The bootstrap is single-threaded and performs the one
+                    // authoritative directory change in its own process before
+                    // resolving the requested executable. The parent never
+                    // mutates its process-wide cwd, and no check/use pathname
+                    // gap exists between acceptance and child inheritance.
+                    bootstrap.env(BOOTSTRAP_DIRECTORY, directory);
                 }
                 bootstrap
                     .env_remove(BOOTSTRAP_SELECTOR)
@@ -1387,6 +1422,18 @@ mod native {
                 }
                 let endpoint = &self.bootstrap;
                 let identity = endpoint.result.record::<56>(false, "bootstrap identity")?;
+                if let Some(cause) = directory_failure(&identity, endpoint.nonce) {
+                    let directory = self
+                        .options
+                        .directory
+                        .as_deref()
+                        .expect("directory failure");
+                    return Err(format!(
+                        "could not enter {} ({})",
+                        name::render(directory.as_os_str()),
+                        cause.label()
+                    ));
+                }
                 let record = BootstrapRecord::decode(&identity, endpoint.nonce)
                     .ok_or("bootstrap identity was invalid")?;
                 let process = Handle::owned(record.process as HANDLE);
