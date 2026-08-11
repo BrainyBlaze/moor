@@ -56,33 +56,30 @@ jobs:
             uname -a
           } > "$out/identity.txt"
 
-      - name: Build both release command names
+      - name: Build the release command
         env:
           LANE: ${{ matrix.lane }}
         run: |
           set -o pipefail
-          cargo build --release --bin moor --bin atch 2>&1 | tee "ci-output/$LANE/build.log"
+          cargo build --release --bin moor 2>&1 | tee "ci-output/$LANE/build.log"
 
-      - name: Package, hash, and smoke both command names
+      - name: Package, hash, and smoke the release command
         env:
           LANE: ${{ matrix.lane }}
         run: |
           out="ci-output/$LANE"
           cp target/release/moor "$out/moor"
-          cp target/release/atch "$out/atch"
           (
             cd "$out"
             if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum moor atch
+              sha256sum moor
             else
-              shasum -a 256 moor atch
+              shasum -a 256 moor
             fi > SHA256SUMS
           )
           {
             "$out/moor" --version
             "$out/moor" --help
-            "$out/atch" --version
-            "$out/atch" --help
           } >> "$out/smoke.log" 2>&1
           cat "$out/SHA256SUMS" "$out/smoke.log"
 
@@ -139,20 +136,19 @@ jobs:
             "platform=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
           ) | Set-Content -Encoding utf8NoBOM "$out/identity.txt"
 
-      - name: Build both release command names
+      - name: Build the release command
         shell: pwsh
         run: |
           $out = "ci-output/${{ matrix.lane }}"
-          cargo build --release --bin moor --bin atch *>&1 | Tee-Object -FilePath "$out/build.log"
+          cargo build --release --bin moor *>&1 | Tee-Object -FilePath "$out/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Package, hash, and smoke both command names
+      - name: Package, hash, and smoke the release command
         shell: pwsh
         run: |
           $out = "ci-output/${{ matrix.lane }}"
           Copy-Item target/release/moor.exe "$out/moor.exe"
-          Copy-Item target/release/atch.exe "$out/atch.exe"
-          $hashes = foreach ($file in @("$out/moor.exe", "$out/atch.exe")) {
+          $hashes = foreach ($file in @("$out/moor.exe")) {
             $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))"
           }
@@ -160,10 +156,6 @@ jobs:
           & "$out/moor.exe" --version *>> "$out/smoke.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$out/moor.exe" --help *>> "$out/smoke.log"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$out/atch.exe" --version *>> "$out/smoke.log"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$out/atch.exe" --help *>> "$out/smoke.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-Content "$out/SHA256SUMS"
           Get-Content "$out/smoke.log"
@@ -226,15 +218,12 @@ jobs:
                 printf "arch=%s\n" "$(uname -m)"
                 uname -a
               } > "$out/identity.txt"
-              cargo build --release --bin moor --bin atch 2>&1 | tee "$out/build.log"
+              cargo build --release --bin moor 2>&1 | tee "$out/build.log"
               cp target/release/moor "$out/moor"
-              cp target/release/atch "$out/atch"
-              (cd "$out" && sha256sum moor atch > SHA256SUMS)
+              (cd "$out" && sha256sum moor > SHA256SUMS)
               {
                 "$out/moor" --version
                 "$out/moor" --help
-                "$out/atch" --version
-                "$out/atch" --help
               } >> "$out/smoke.log" 2>&1
               cat "$out/SHA256SUMS" "$out/smoke.log"
               cargo test --release --all-targets 2>&1 | tee "$out/test.log"
