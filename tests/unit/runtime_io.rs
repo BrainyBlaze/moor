@@ -43,13 +43,21 @@ impl Read for InputChunks {
 }
 
 fn observe_input(chunks: Vec<Vec<u8>>, last_size: Option<(u16, u16)>) -> Vec<ObservedInput> {
+    observe_input_with_detach(chunks, last_size, None)
+}
+
+fn observe_input_with_detach(
+    chunks: Vec<Vec<u8>>,
+    last_size: Option<(u16, u16)>,
+    detach: Option<u8>,
+) -> Vec<ObservedInput> {
     let (send, receive) = unbounded();
     let worker = std::thread::spawn(move || {
         run_viewer_input(
             InputChunks(chunks.into()),
             ViewerSender(send),
             InputConfig {
-                detach: None,
+                detach,
                 pass_suspend: true,
                 last_size,
                 vt_resize: true,
@@ -79,6 +87,25 @@ fn observe_input(chunks: Vec<Vec<u8>>, last_size: Option<(u16, u16)>) -> Vec<Obs
     }
     worker.join().unwrap();
     observed
+}
+
+#[test]
+fn viewer_resize_sequence_takes_priority_over_an_interior_detach_byte() {
+    for detach in [b'8', b';', b'1', b't'] {
+        assert_eq!(
+            observe_input_with_detach(
+                vec![b"a\x1b[8;41;101tb".to_vec()],
+                Some((37, 93)),
+                Some(detach),
+            ),
+            vec![
+                ObservedInput::Bytes(b"a".to_vec()),
+                ObservedInput::Resize(41, 101),
+                ObservedInput::Bytes(b"b".to_vec()),
+            ],
+            "detach byte {detach:?}",
+        );
+    }
 }
 
 #[test]
