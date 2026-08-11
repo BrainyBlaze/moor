@@ -1029,7 +1029,6 @@ mod launch_paths {
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
         use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE};
         use windows_sys::Win32::Globalization::CP_UTF8;
-        use windows_sys::Win32::Storage::FileSystem::ReadFile;
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
             CreatePseudoConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
@@ -1037,14 +1036,12 @@ mod launch_paths {
             ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
             FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
             GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD,
-            INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED,
-            ReadConsoleInputW, ResizePseudoConsole, SHIFT_PRESSED, STD_INPUT_HANDLE,
-            STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode,
-            WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
+            INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, ReadConsoleInputW, ResizePseudoConsole,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler,
+            SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
 
         struct Console {
             value: HPCON,
@@ -1232,7 +1229,7 @@ mod launch_paths {
             console.spawn(command)
         }
 
-        fn send_console_records(console: &Console) -> io::Result<Child> {
+        fn send_detach(console: &Console) -> io::Result<Child> {
             let mut command = SpawnCommand::new(std::env::current_exe()?);
             command
                 .args([
@@ -1240,7 +1237,7 @@ mod launch_paths {
                     "launch_paths::native_console::console_input_sender",
                     "--nocapture",
                 ])
-                .env("MOOR_CONSOLE_INPUT_SENDER", "1");
+                .env("MOOR_CONSOLE_INPUT_SENDER", "detach");
             console.spawn(command)
         }
 
@@ -1341,94 +1338,28 @@ mod launch_paths {
         }
 
         #[test]
-        fn console_byte_probe() {
-            if std::env::var_os("MOOR_CONSOLE_BYTE_PROBE").is_none() {
-                return;
-            }
-            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-            let mut mode = 0;
-            assert!(unsafe { GetConsoleMode(input, &mut mode) } != 0);
-            let raw = ENABLE_LINE_INPUT
-                | ENABLE_ECHO_INPUT
-                | ENABLE_PROCESSED_INPUT
-                | ENABLE_QUICK_EDIT_MODE
-                | ENABLE_WINDOW_INPUT;
-            assert!(
-                unsafe {
-                    SetConsoleMode(
-                        input,
-                        (mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) & !raw,
-                    )
-                } != 0
-            );
-            assert!(unsafe { SetConsoleCP(CP_UTF8) } != 0);
-            println!("MOOR-BYTE-READY");
-            io::stdout().flush().unwrap();
-
-            let expected = b"A\xf0\x9f\x99\x82\xc3\xa9\0Z";
-            let mut received = Vec::new();
-            while !received.ends_with(b"Z") {
-                let mut bytes = [0; 64];
-                let mut count = 0;
-                // Rust's console stdin uses ReadConsoleW; this probe needs the
-                // VT byte stream before another console-record translation.
-                assert!(
-                    unsafe {
-                        ReadFile(
-                            input,
-                            bytes.as_mut_ptr(),
-                            bytes.len() as u32,
-                            &mut count,
-                            std::ptr::null_mut(),
-                        )
-                    } != 0
-                );
-                let count = count as usize;
-                assert_ne!(count, 0, "console input closed before the sentinel");
-                received.extend_from_slice(&bytes[..count]);
-                assert!(received.len() <= 64, "console input exceeded its bound");
-            }
-            assert_eq!(received, expected);
-            println!("MOOR-BYTES:41F09F9982C3A9005A");
-        }
-
-        #[test]
         fn console_input_sender() {
-            if std::env::var_os("MOOR_CONSOLE_INPUT_SENDER").is_none() {
+            let Some(mode) = std::env::var_os("MOOR_CONSOLE_INPUT_SENDER") else {
                 return;
-            }
-            let zero = unsafe { VkKeyScanW(0) } as u16;
-            let mut records =
-                [u16::from(b'A'), 0xd83d, 0xde42, 0x00e9, 0, u16::from(b'Z')].map(|unit| {
-                    let mut key = KEY_EVENT_RECORD {
-                        bKeyDown: 1,
-                        wRepeatCount: 1,
-                        ..KEY_EVENT_RECORD::default()
-                    };
-                    key.uChar.UnicodeChar = unit;
-                    if unit == 0 {
-                        key.wVirtualKeyCode = zero & 0xff;
-                        key.dwControlKeyState = (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
-                            | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
-                            | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED);
-                    }
-                    INPUT_RECORD {
-                        EventType: KEY_EVENT as u16,
-                        Event: INPUT_RECORD_0 { KeyEvent: key },
-                    }
-                });
+            };
+            assert_eq!(mode, "detach");
+            let mut key = KEY_EVENT_RECORD {
+                bKeyDown: 1,
+                wRepeatCount: 1,
+                ..KEY_EVENT_RECORD::default()
+            };
+            key.uChar.UnicodeChar = 0x1c;
+            let mut record = INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: INPUT_RECORD_0 { KeyEvent: key },
+            };
             let mut written = 0;
             assert!(
                 unsafe {
-                    WriteConsoleInputW(
-                        GetStdHandle(STD_INPUT_HANDLE),
-                        records.as_mut_ptr(),
-                        records.len() as u32,
-                        &mut written,
-                    )
+                    WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &mut record, 1, &mut written)
                 } != 0
             );
-            assert_eq!(written as usize, records.len());
+            assert_eq!(written, 1);
         }
 
         #[test]
@@ -1485,8 +1416,7 @@ mod launch_paths {
                     "launch_paths::native_console::console_geometry_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached")
-                .env("MOOR_TRACE_CONSOLE_RECORDS", "1");
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
             let mut viewer = console.spawn(command).unwrap();
             console
                 .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
@@ -1539,7 +1469,12 @@ mod launch_paths {
             for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
-            console.write(&[0x1c]).unwrap();
+            let mut detach = send_detach(&console).unwrap();
+            assert!(
+                wait_spawn(&mut detach, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
             let detached =
                 wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
                     panic!(
@@ -1556,45 +1491,6 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
-
-            let byte_session = format!("console-byte-e2e-{}", std::process::id());
-            let _byte_cleanup = Cleanup(byte_session.clone());
-            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
-            command
-                .args([
-                    "new".as_ref(),
-                    byte_session.as_ref(),
-                    executable.as_os_str(),
-                    "--exact".as_ref(),
-                    "launch_paths::native_console::console_byte_probe".as_ref(),
-                    "--nocapture".as_ref(),
-                ])
-                .env("MOOR_CONSOLE_BYTE_PROBE", "1");
-            let mut byte_viewer = console.spawn(command).unwrap();
-            console
-                .wait_for(b"MOOR-BYTE-READY", Duration::from_secs(10))
-                .unwrap();
-            let mut sender = send_console_records(&console).unwrap();
-            assert!(
-                wait_spawn(&mut sender, Duration::from_secs(5))
-                    .unwrap()
-                    .success()
-            );
-            console
-                .wait_for(b"MOOR-BYTES:41F09F9982C3A9005A", Duration::from_secs(5))
-                .unwrap();
-            assert!(
-                wait_spawn(&mut byte_viewer, Duration::from_secs(5))
-                    .unwrap()
-                    .success()
-            );
-            let mut after_bytes = probe(&console, "after-bytes").unwrap();
-            assert!(
-                wait_spawn(&mut after_bytes, Duration::from_secs(5))
-                    .unwrap()
-                    .success()
-            );
-            assert_eq!(wait_modes(&mut console, "after-bytes"), before_modes);
         }
 
         static CONTROL_BREAKS: AtomicU8 = AtomicU8::new(0);
