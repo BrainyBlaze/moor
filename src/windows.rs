@@ -1237,12 +1237,13 @@ mod native {
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
+    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, guards: Vec<File>);
     crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String,
         generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8,
         conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32,
         early_exit: Option<u32>, birth: [u8; 16],
         input: Pipe, output: Pipe, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>,
-        identity: [u8; 25], artifacts: Option<PreparedArtifacts>);
+        identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
             let (write, read, rejected) = match kind {
@@ -1266,8 +1267,8 @@ mod native {
         fn prepare_storage(&mut self, marker_identity: [u8; 24]) -> Result<()> {
             self.identity = session_identity(marker_identity);
             let start = (now(), unsafe { GetTickCount64() }, boot_identity());
-            let event_path = self.options.events.as_deref().map(absolute).transpose()?;
-            let event_identity = event_path.as_deref().map(|path| os_bytes(path.as_os_str()));
+            let event_path = self.event.as_ref().map(|target| target.path.as_path());
+            let event_identity = event_path.map(|path| os_bytes(path.as_os_str()));
             let instrument_identity = self
                 .instrument
                 .as_ref()
@@ -1283,7 +1284,7 @@ mod native {
                 start,
                 ArtifactConfig {
                     marker: &self.marker,
-                    event_path: event_path.as_deref(),
+                    event_path,
                     encoding: "windows-wtf8",
                     event_identity: event_identity.as_deref(),
                     instrument_identity: instrument_identity.as_deref(),
@@ -1301,6 +1302,9 @@ mod native {
             }
             artifacts.status.extend_from_slice(&self.birth);
             self.artifacts = Some(artifacts);
+            // Slot handles now carry storage identity; only now release the
+            // no-delete component handles that fenced path-based provisioning.
+            self.event = None;
             Ok(())
         }
         fn launch(
@@ -1678,15 +1682,10 @@ mod native {
     }
     fn event_component(path: &Path) -> io::Result<File> {
         OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
-    }
-    fn event_handle_path(handle: &File) -> Result<PathBuf> {
-        path_buffer("resolve event path handle", |out, size| unsafe {
-            GetFinalPathNameByHandleW(handle.as_raw_handle(), out, size, 0)
-        })
     }
     fn event_component_cause(error: &io::Error) -> &'static str {
         match error.raw_os_error().map(|code| code as u32) {
@@ -1696,20 +1695,51 @@ mod native {
             _ => "io-error",
         }
     }
-    fn event_target(operand: &Path, root: &Path) -> Result<(PathBuf, bool)> {
+    fn event_attributes(handle: &File) -> Result<u32> {
+        let info: FILE_ATTRIBUTE_TAG_INFO = unsafe {
+            file_info(
+                handle.as_raw_handle(),
+                FileAttributeTagInfo,
+                "inspect event path component",
+            )?
+        };
+        Ok(info.FileAttributes)
+    }
+    fn event_target(operand: &Path, root: &Path) -> Result<EventTarget> {
         let reject = |cause| event_rejection(operand, cause);
         let event = absolute(operand).map_err(|_| reject("io-error"))?;
-        let relative = event
-            .strip_prefix(root)
-            .ok()
-            .filter(|path| !path.as_os_str().is_empty())
-            .ok_or_else(|| reject("outside-root"))?;
         let root_handle =
             event_component(root).map_err(|error| reject(event_component_cause(&error)))?;
-        let canonical_root = event_handle_path(&root_handle).map_err(|_| reject("io-error"))?;
-        let mut components = relative.components().peekable();
-        let mut current = root.to_owned();
-        let mut handles = vec![root_handle];
+        let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
+            .map_err(|_| reject("io-error"))?;
+        let mut all = event.components();
+        let base: PathBuf = all.by_ref().take(root.components().count()).collect();
+        let mut components = all.peekable();
+        crate::ensure!(components.peek().is_some(), reject("outside-root"));
+        let mut prefix = PathBuf::new();
+        let mut guards = vec![root_handle];
+        for component in base.components() {
+            prefix.push(component.as_os_str());
+            if !prefix.is_absolute() {
+                continue;
+            }
+            let handle = event_component(&prefix).map_err(|_| reject("outside-root"))?;
+            let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
+            crate::ensure!(
+                attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                reject("reparse-point")
+            );
+            crate::ensure!(
+                attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                reject("outside-root")
+            );
+            guards.push(handle);
+        }
+        let base_handle = guards.last().ok_or_else(|| reject("outside-root"))?;
+        let base_identity = unsafe { file_identity(base_handle.as_raw_handle()) }
+            .map_err(|_| reject("io-error"))?;
+        crate::ensure!(root_identity == base_identity, reject("outside-root"));
+        let mut current = base;
         let mut present = true;
         while let Some(component) = components.next() {
             let std::path::Component::Normal(name) = component else {
@@ -1726,30 +1756,46 @@ mod native {
                 }
                 Err(error) => return Err(reject(event_component_cause(&error))),
             };
-            let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
-                file_info(
-                    handle.as_raw_handle(),
-                    FileAttributeTagInfo,
-                    "inspect event path component",
-                )
-                .map_err(|_| reject("io-error"))?
-            };
+            let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
             crate::ensure!(
-                attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
                 reject("reparse-point")
             );
             crate::ensure!(
-                attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
                 reject("not-directory")
             );
-            let canonical = event_handle_path(&handle).map_err(|_| reject("io-error"))?;
-            crate::ensure!(
-                canonical != canonical_root && canonical.starts_with(&canonical_root),
-                reject("outside-root")
-            );
-            handles.push(handle);
+            guards.push(handle);
         }
-        Ok((event, present))
+        Ok(EventTarget {
+            path: operand.to_owned(),
+            present,
+            guards,
+        })
+    }
+    fn validate_event(target: &EventTarget, user: &str) -> Result<()> {
+        crate::return_if!(!target.present, Ok(()));
+        let reject = |cause| event_rejection(&target.path, cause);
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(
+            target.guards.last().unwrap(),
+            SeObjectType::SE_FILE_OBJECT,
+            selector,
+        )
+        .map_err(|_| reject("io-error"))?;
+        let (expected, _) = descriptor(user, "FA").map_err(|_| reject("io-error"))?;
+        crate::ensure!(
+            actual
+                .owner()
+                .zip(expected.owner())
+                .is_some_and(|(a, b)| a == b),
+            reject("wrong-owner")
+        );
+        crate::ensure!(
+            descriptor_matches(&actual, &expected).map_err(|_| reject("io-error"))?,
+            reject("broad-dacl")
+        );
+        Ok(())
     }
     fn os_string(bytes: &[u8]) -> Result<OsString> {
         wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
@@ -2048,12 +2094,15 @@ mod native {
         child_environment(invoked, path)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
-        if let Some(operand) = options.events.as_deref() {
-            let (event, present) = event_target(operand, &stage_root)?;
-            if present {
-                validate(&event, user, "FA", true)?;
-            }
-        }
+        let event = options
+            .events
+            .as_deref()
+            .map(|operand| -> Result<EventTarget> {
+                let target = event_target(operand, &stage_root)?;
+                validate_event(&target, user)?;
+                Ok(target)
+            })
+            .transpose()?;
         let random = random_array::<64>()?;
         let generation = launch_generation(invoked)?;
         ready.generation = generation;
@@ -2077,6 +2126,7 @@ mod native {
             semantic_token: semantic,
             synthetic,
             ready,
+            event,
             ..Native::default()
         };
         let listener = match host.launch(&marker, &command, random[32..48].try_into().unwrap()) {
