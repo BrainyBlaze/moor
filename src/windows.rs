@@ -202,59 +202,10 @@ fn exact_descriptor_semantics(
 
 #[cfg(test)]
 mod descriptor_semantics_tests {
-    use super::{
-        DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
-    };
-
-    #[test]
-    fn exact_dacl_semantics_ignore_order_and_reject_every_difference() {
-        let expected = [(0u8, 0u8, 0x1f01ffu32, 18u32), (0, 0, 0x1f01ff, 42)];
-        let reversed = [expected[1], expected[0]];
-        let matches = |actual: &[_], owner, protected| {
-            exact_descriptor_semantics(
-                owner,
-                protected,
-                actual.len(),
-                expected.len(),
-                |left, right| actual[left] == expected[right],
-            )
-        };
-
-        assert!(matches(&reversed, true, true));
-        assert!(!matches(&expected, false, true));
-        assert!(!matches(&expected, true, false));
-        assert!(!matches(&expected[..1], true, true));
-        assert!(!matches(
-            &[expected[0], expected[1], (0, 0, 0x1f01ff, 1)],
-            true,
-            true
-        ));
-        assert!(!matches(&[expected[0], expected[0]], true, true));
-        assert!(!matches(&[expected[0], (0, 0, 0x120089, 42)], true, true));
-        assert!(!matches(&[expected[0], (0, 2, 0x1f01ff, 42)], true, true));
-        assert!(!matches(&[expected[0], (1, 0, 0x1f01ff, 42)], true, true));
-    }
-
-    #[test]
-    fn bootstrap_directory_failure_is_nonce_bound_and_closed() {
-        let nonce = [7; 16];
-        for cause in [
-            DirectoryCause::Missing,
-            DirectoryCause::NotDirectory,
-            DirectoryCause::NotSearchable,
-            DirectoryCause::Io,
-        ] {
-            let record = directory_failure_record(nonce, cause);
-            assert_eq!(directory_failure(&record, nonce), Some(cause));
-            assert_eq!(directory_failure(&record, [8; 16]), None);
-        }
-        let mut record = directory_failure_record(nonce, DirectoryCause::Missing);
-        for at in [0, 28, 55] {
-            record[at] ^= 0xff;
-            assert_eq!(directory_failure(&record, nonce), None, "byte {at}");
-            record[at] ^= 0xff;
-        }
-    }
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/unit/windows_descriptor.rs"
+    ));
 }
 
 #[cfg(windows)]
@@ -753,67 +704,9 @@ mod native {
     #[cfg(test)]
     mod security_descriptor_tests {
         use super::*;
-
-        const USER: &str = "S-1-5-21-1-2-3-42";
-
-        fn parsed(value: impl AsRef<str>) -> LocalBox<SecurityDescriptor> {
-            value.as_ref().parse().unwrap()
-        }
-
-        fn first_ace(descriptor: &SecurityDescriptor) -> *mut ACE_HEADER {
-            let acl = descriptor.dacl().unwrap() as *const windows_permissions::Acl;
-            let mut ace = ptr::null_mut();
-            assert_ne!(unsafe { GetAce(acl.cast(), 0, &mut ace) }, 0);
-            ace.cast()
-        }
-
-        #[test]
-        fn structural_validation_accepts_only_the_exact_protected_owner_and_aces() {
-            let (expected, _) = descriptor(USER, "FA").unwrap();
-            let reordered = parsed(format!("O:{USER}D:PAI(A;;FA;;;{USER})(A;;FA;;;SY)"));
-            assert!(descriptor_matches(&expected, &expected).unwrap());
-            assert!(descriptor_matches(&reordered, &expected).unwrap());
-
-            for invalid in [
-                format!("O:S-1-5-21-1-2-3-43D:P(A;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:AI(A;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;{USER})(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;FA;;;WD)"),
-                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FR;;;{USER})"),
-                format!("O:{USER}D:P(D;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;CI;FA;;;SY)(A;;FA;;;{USER})"),
-            ] {
-                assert!(
-                    !descriptor_matches(&parsed(&invalid), &expected).unwrap(),
-                    "accepted {invalid}"
-                );
-            }
-
-            let invalid_flags = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
-            unsafe { (*first_ace(&invalid_flags)).AceFlags = 0x20 };
-            assert!(!descriptor_matches(&invalid_flags, &expected).unwrap());
-
-            let invalid_type = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
-            unsafe { (*first_ace(&invalid_type)).AceType = u8::MAX };
-            assert!(!descriptor_matches(&invalid_type, &expected).unwrap());
-        }
-
-        #[test]
-        fn file_descriptor_query_validates_a_created_store_directory() {
-            let path = std::env::temp_dir().join(format!(
-                "moor-windows-descriptor-{}-{}",
-                std::process::id(),
-                now()
-            ));
-            create_store_path(&path, true).unwrap();
-            validate(&path, sid().unwrap(), "FA", true).unwrap();
-            fs::remove_dir(path).unwrap();
-        }
-
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/unit/windows_event.rs"
+            "/tests/unit/windows_security.rs"
         ));
     }
     fn pipe_descriptor(
