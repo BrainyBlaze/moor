@@ -499,6 +499,58 @@ mod launch_paths {
     }
 
     #[test]
+    fn child_start_failure_is_127_crlf_and_rolls_back_unpublished_artifacts() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let missing = root.join(format!("missing-child-{}", std::process::id()));
+        let system = Command::new(&missing).spawn().unwrap_err().to_string();
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+
+        for mode in ["run", "start"] {
+            let session = format!("exec-failure-{mode}-{}", std::process::id());
+            let marker = root.join(&session);
+            let event = root.join(format!("{session}-events"));
+            let out = moor(&[
+                mode,
+                &session,
+                "-T",
+                event.to_str().unwrap(),
+                missing.to_str().unwrap(),
+            ]);
+            assert_eq!(out.status.code(), Some(127), "{out:?}");
+            assert!(out.stdout.is_empty(), "{out:?}");
+            assert_eq!(
+                out.stderr,
+                format!(
+                    "{program}: could not execute {}: {system}\r\n",
+                    moor::name::render(missing.as_os_str())
+                )
+                .as_bytes(),
+                "{out:?}"
+            );
+            for path in [
+                marker.clone(),
+                companion(&marker, ".log"),
+                companion(&marker, ".exit"),
+                event.clone(),
+            ] {
+                assert!(std::fs::symlink_metadata(&path).is_err(), "leaked {path:?}");
+            }
+            let stage = format!("{session}.stage-");
+            assert!(
+                std::fs::read_dir(&root).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&stage)
+                }),
+                "leaked marker stage for {session}"
+            );
+        }
+    }
+
+    #[test]
     fn rejected_working_directory_names_the_directory_not_the_executable() {
         // Closure §6.2 / OB-32 on Windows: `could not enter <path> (<cause>)`,
         // stderr, status 1 — never 127, never the executable's name.
