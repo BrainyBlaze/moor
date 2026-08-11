@@ -11,10 +11,8 @@ pub fn wtf8_encode(wide: &[u16]) -> Vec<u8> {
 pub fn wtf8_decode(bytes: &[u8]) -> Result<Vec<u16>> {
     let value = Wtf8::from_bytes(bytes).ok_or("malformed WTF-8")?;
     let wide = value.encode_wide().collect::<Vec<_>>();
-    require(
-        Wtf8Buf::from_wide(&wide).as_bytes() == bytes,
-        "noncanonical WTF-8",
-    )?;
+    let canonical = Wtf8Buf::from_wide(&wide).as_bytes() == bytes;
+    crate::ensure!(canonical, "noncanonical WTF-8");
     Ok(wide)
 }
 
@@ -205,18 +203,13 @@ mod native {
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
     use interprocess::os::windows::security_descriptor::*;
     use smallvec::SmallVec;
-    use std::ffi::*;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::windows::{ffi::*, fs::*, io::*};
-    use std::path::*;
     use std::sync::{OnceLock, atomic::*, mpsc};
-    use std::thread;
-    use std::time::*;
-    use std::{mem::*, ptr};
-    use windows_permissions::{
-        LocalBox, SecurityDescriptor, constants::*, utilities::buf_from_os as wide, wrappers,
-    };
+    use std::{ffi::*, mem::*, path::*, ptr, thread, time::*};
+    use windows_permissions::utilities::buf_from_os as wide;
+    use windows_permissions::{LocalBox, SecurityDescriptor, constants::*, wrappers};
     use windows_spawn::{Command as SpawnCommand, Stdio as SpawnStdio, *};
     use windows_sys::Wdk::{Foundation::*, Storage::FileSystem::*};
     use windows_sys::Win32::{
@@ -266,8 +259,7 @@ mod native {
         error.to_string()
     }
     fn os_bytes(value: &OsStr) -> Vec<u8> {
-        let wide: SmallVec<[u16; 256]> = value.encode_wide().collect();
-        wtf8_encode(&wide)
+        wtf8_encode(&value.encode_wide().collect::<SmallVec<[u16; 256]>>())
     }
     fn process_birth(handle: HANDLE, what: &str) -> Result<u64> {
         let (mut created, mut exit, mut kernel, mut user) = Default::default();
@@ -424,35 +416,33 @@ mod native {
     }
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
     crate::schema!(tuple RelativePolicy [Clone, Copy]; fields; u32, u32, u32, u32);
-    const OPEN_SLOT: OpenPolicy = OpenPolicy(
-        FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    );
+    const SHARE_RW: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    const SHARE_ALL: u32 = SHARE_RW | FILE_SHARE_DELETE;
+    const NO_FOLLOW: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
+    const OPEN_SLOT: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES, SHARE_ALL);
     const OPEN_STDERR: OpenPolicy = OpenPolicy(FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ);
     const CREATE_STAGE: OpenPolicy = OpenPolicy(
         GENERIC_READ | GENERIC_WRITE | DELETE,
         FILE_SHARE_READ | FILE_SHARE_DELETE,
     );
-    const OPEN_STAGE: OpenPolicy = OpenPolicy(
-        GENERIC_READ | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    );
+    const OPEN_STAGE: OpenPolicy = OpenPolicy(GENERIC_READ | DELETE, SHARE_ALL);
     const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+    const OPEN_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, SHARE_RW);
     const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+        SHARE_RW,
         FILE_CREATE,
         FILE_DIRECTORY_FILE,
     );
     const CREATE_SLOT: RelativePolicy = RelativePolicy(
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        GENERIC_READ | GENERIC_WRITE | DELETE,
+        SHARE_ALL,
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE,
     );
     const OPEN_ROLLBACK_SLOT: RelativePolicy = RelativePolicy(
         FILE_READ_ATTRIBUTES | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        SHARE_ALL,
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
@@ -479,6 +469,10 @@ mod native {
                 what,
             )
         }
+    }
+    fn reopen(file: &File, policy: OpenPolicy) -> Result<File> {
+        let raw = unsafe { ReOpenFile(file.as_raw_handle(), policy.0, policy.1, NO_FOLLOW) };
+        Handle::checked(raw, "reopen exact Windows object").map(Handle::into_file)
     }
     fn directory_cause(error: &io::Error) -> DirectoryCause {
         match error.raw_os_error().map(|code| code as u32) {
@@ -515,45 +509,6 @@ mod native {
             what
         )?;
         Ok(info)
-    }
-    fn launch_reporter() -> LaunchReporter<File> {
-        let selected =
-            std::env::var_os("DESK_MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
-        unsafe { std::env::remove_var("DESK_MOOR_DETACHED_HOLDER") };
-        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let output =
-            (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
-                .then(|| unsafe { File::from_raw_handle(handle) });
-        LaunchReporter {
-            output,
-            generation: 1,
-        }
-    }
-    fn launch_generation(invoked: &OsStr) -> Result<u32> {
-        supervised_generation(
-            invoked,
-            false,
-            "supervised-launch acknowledgement was invalid",
-            |selector| {
-                let text = selector
-                    .to_str()
-                    .ok_or("invalid supervised-launch handle")?;
-                let raw = usize::from_str_radix(text, 16)
-                    .ok()
-                    .filter(|raw| {
-                        *raw != 0
-                            && text.len() <= 16
-                            && !text.starts_with('0')
-                            && lowercase_hex(text.as_bytes())
-                    })
-                    .ok_or("invalid supervised-launch handle")?;
-                let channel = unsafe { Handle::owned(raw as HANDLE) };
-                validate_pipe(channel.raw(), "supervised-launch channel")?;
-                decode_launch_record(&channel.record::<32>(true, "supervised-launch record")?)
-                    .ok_or_else(|| "supervised-launch acknowledgement was invalid".into())
-            },
-        )
-        .map(|result| result.0)
     }
     unsafe fn token_user(token: Handle) -> Result<String> {
         let mut size = 0;
@@ -681,16 +636,6 @@ mod native {
     mod security_descriptor_tests {
         use super::*;
         include!("../tests/unit/windows_security.rs");
-    }
-    fn pipe_descriptor(
-        sid: &str,
-    ) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-        let (descriptor, _) = descriptor(sid, "0x12019f")?;
-        unsafe {
-            BorrowedSecurityDescriptor::from_ptr((&*descriptor as *const SecurityDescriptor).cast())
-        }
-        .to_owned_sd()
-        .map_err(string)
     }
     fn protect(path: &Path, sid: &str, access: &str) -> Result<()> {
         let (descriptor, _) = descriptor(sid, access)?;
@@ -848,14 +793,30 @@ mod native {
         .map_err(io::Error::other)
     }
     pub(crate) fn create_store_file(directory: &File, name: &str) -> io::Result<(File, [u8; 24])> {
-        let file = relative_file(
+        let created = relative_file(
             directory,
             OsStr::new(name),
             sid().map_err(io::Error::other)?,
             CREATE_SLOT,
         )
         .map_err(io::Error::other)?;
-        let identity = unsafe { file_identity(file.as_raw_handle()) }.map_err(io::Error::other)?;
+        let rollback = || {
+            delete_file(&created);
+        };
+        let identity = unsafe { unique_file_identity(created.as_raw_handle()) }
+            .inspect_err(|_| rollback())
+            .map_err(io::Error::other)?;
+        let guard = reopen(&created, OPEN_SLOT)
+            .inspect_err(|_| rollback())
+            .map_err(io::Error::other)?;
+        drop(created);
+        let file = reopen(&guard, OPEN_STORE)
+            .inspect_err(|_| {
+                if let Ok(file) = reopen(&guard, OpenPolicy(OPEN_SLOT.0 | DELETE, OPEN_SLOT.1)) {
+                    delete_file(&file);
+                }
+            })
+            .map_err(io::Error::other)?;
         Ok((file, identity))
     }
     pub(crate) fn valid_store_directory(path: &Path, directory: &File) -> bool {
@@ -1400,9 +1361,17 @@ mod native {
         }
 
         fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<Listener> {
+            let (descriptor, _) = descriptor(&self.sid, "0x12019b")?;
+            let pipe_descriptor = unsafe {
+                BorrowedSecurityDescriptor::from_ptr(
+                    (&*descriptor as *const SecurityDescriptor).cast(),
+                )
+            }
+            .to_owned_sd()
+            .map_err(string)?;
             ListenerOptions::new()
                 .name(local_name(pipe)?)
-                .security_descriptor(pipe_descriptor(&self.sid)?)
+                .security_descriptor(pipe_descriptor)
                 .nonblocking(ListenerNonblockingMode::Accept)
                 .create_sync()
                 .map_err(string)
@@ -1546,10 +1515,7 @@ mod native {
         }
         fn stage_instrument(&mut self, source: &Path, identity: &[u8]) -> Result<()> {
             require(source.is_absolute(), "instrumentation path is not absolute")?;
-            let mut input = read_reparse(
-                source,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            )?;
+            let mut input = read_reparse(source, SHARE_ALL)?;
             let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
                 file_info(
                     input.as_raw_handle(),
@@ -1965,9 +1931,6 @@ mod native {
     pub(crate) fn current_paths(invoked: &OsStr) -> Result<Vec<PathBuf>> {
         ancestry_paths(invoked, os_string)
     }
-    fn child_environment(invoked: &OsStr, path: &Path) -> Result<()> {
-        extend_ancestry(invoked, absolute(path)?, os_string, os_bytes)
-    }
     fn read_marker(path: &Path) -> Result<(Marker, [u8; 25])> {
         validate(path, sid()?, "FR", false)?;
         let mut file = read_reparse(path, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
@@ -2284,7 +2247,17 @@ mod native {
             mode,
             CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
         );
-        let mut ready = launch_reporter();
+        let selected =
+            std::env::var_os("DESK_MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
+        unsafe { std::env::remove_var("DESK_MOOR_DETACHED_HOLDER") };
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let output =
+            (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
+                .then(|| unsafe { File::from_raw_handle(handle) });
+        let mut ready = LaunchReporter {
+            output,
+            generation: 1,
+        };
         let child = ready.output.is_some();
         let geometry = creation_geometry(interactive, interactive || foreground, child)?;
         crate::return_if!(!foreground && !child, Ok(detached(geometry)?));
@@ -2305,11 +2278,34 @@ mod native {
             );
         }
         let synthetic = terminal_environment(invoked);
-        child_environment(invoked, path)?;
+        extend_ancestry(invoked, absolute(path)?, os_string, os_bytes)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
         let random = random_array::<64>()?;
-        let generation = launch_generation(invoked)?;
+        let generation = supervised_generation(
+            invoked,
+            false,
+            "supervised-launch acknowledgement was invalid",
+            |selector| {
+                let text = selector
+                    .to_str()
+                    .ok_or("invalid supervised-launch handle")?;
+                let raw = usize::from_str_radix(text, 16)
+                    .ok()
+                    .filter(|raw| {
+                        *raw != 0
+                            && text.len() <= 16
+                            && !text.starts_with('0')
+                            && lowercase_hex(text.as_bytes())
+                    })
+                    .ok_or("invalid supervised-launch handle")?;
+                let channel = unsafe { Handle::owned(raw as HANDLE) };
+                validate_pipe(channel.raw(), "supervised-launch channel")?;
+                decode_launch_record(&channel.record::<32>(true, "supervised-launch record")?)
+                    .ok_or_else(|| "supervised-launch acknowledgement was invalid".into())
+            },
+        )?
+        .0;
         ready.generation = generation;
         let marker = Marker::new(
             generation,

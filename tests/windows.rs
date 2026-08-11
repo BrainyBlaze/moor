@@ -989,12 +989,14 @@ mod launch_paths {
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
         use windows_sys::Win32::Foundation::{HANDLE, TRUE};
         use windows_sys::Win32::System::Console::{
-            AttachConsole, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole,
-            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-            ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FreeConsole,
-            GenerateConsoleCtrlEvent, GetConsoleMode, GetStdHandle, HPCON, ResizePseudoConsole,
-            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+            AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
+            CreatePseudoConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+            FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleMode,
+            GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD, KEY_EVENT,
+            ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
@@ -1218,6 +1220,57 @@ mod launch_paths {
         }
 
         #[test]
+        fn console_geometry_probe() {
+            let Some(mode) = std::env::var_os("MOOR_CONSOLE_GEOMETRY_PROBE") else {
+                return;
+            };
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            assert!(unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0);
+            let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+            let columns = info.srWindow.Right - info.srWindow.Left + 1;
+            println!("MOOR-GEOM:{rows}:{columns}");
+            if mode == "once" {
+                return;
+            }
+            let mut input_mode = 0;
+            assert!(unsafe { GetConsoleMode(input, &mut input_mode) } != 0);
+            assert!(unsafe {
+                SetConsoleMode(
+                    input,
+                    (input_mode | ENABLE_WINDOW_INPUT) & !ENABLE_VIRTUAL_TERMINAL_INPUT,
+                ) != 0
+            });
+            thread::sleep(Duration::from_millis(100));
+            assert!(unsafe { FlushConsoleInputBuffer(input) } != 0);
+            println!("MOOR-GEOM-READY");
+            let mut resized = 0;
+            loop {
+                let (mut record, mut read) = (INPUT_RECORD::default(), 0);
+                assert!(unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) } != 0);
+                if read == 0 {
+                    continue;
+                }
+                if record.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
+                    let size = unsafe { record.Event.WindowBufferSizeEvent.dwSize };
+                    resized += 1;
+                    println!("MOOR-RESIZE:{resized}:{}:{}", size.Y, size.X);
+                } else if record.EventType == KEY_EVENT as u16 {
+                    let key = unsafe { record.Event.KeyEvent };
+                    let character = unsafe { key.uChar.UnicodeChar };
+                    if key.bKeyDown != 0 && character != 0 {
+                        println!(
+                            "MOOR-KEY:{}:{resized}",
+                            char::from_u32(character as u32).unwrap()
+                        );
+                    }
+                }
+                io::stdout().flush().unwrap();
+            }
+        }
+
+        #[test]
         fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
             let mut console = Console::new(37, 93).unwrap();
             let mut before = probe(&console, "before").unwrap();
@@ -1228,23 +1281,46 @@ mod launch_paths {
             );
             let before_modes = wait_modes(&mut console, "before");
 
-            let session = format!("console-e2e-{}", std::process::id());
-            let _cleanup = Cleanup(session.clone());
-            let script = "$s=$Host.UI.RawUI.WindowSize; [Console]::WriteLine(('MOOR-GEOM:{0}:{1}' -f $s.Height,$s.Width)); while ($true) { $k=[Console]::ReadKey($true); $s=$Host.UI.RawUI.WindowSize; [Console]::WriteLine(('MOOR-KEY:{0}:{1}:{2}' -f $k.KeyChar,$s.Height,$s.Width)) }";
-            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
-            command.args([
-                "new",
-                &session,
-                "powershell.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ]);
-            let mut viewer = console.spawn(command).unwrap();
+            let foreground_session = format!("console-run-e2e-{}", std::process::id());
+            let _foreground_cleanup = Cleanup(foreground_session.clone());
+            let executable = std::env::current_exe().unwrap();
+            let mut foreground = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            foreground
+                .args([
+                    "run".as_ref(),
+                    foreground_session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_geometry_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "once");
+            let mut foreground = console.spawn(foreground).unwrap();
             console
                 .wait_for(b"MOOR-GEOM:37:93", Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                wait_spawn(&mut foreground, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+
+            let session = format!("console-e2e-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .args([
+                    "new".as_ref(),
+                    session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_geometry_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "resize");
+            let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"MOOR-GEOM-READY", Duration::from_secs(10))
                 .unwrap();
 
             let mut live = probe(&console, "live").unwrap();
@@ -1272,15 +1348,19 @@ mod launch_paths {
                 ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
             );
 
+            console.resize(37, 93).unwrap();
+            thread::sleep(Duration::from_millis(500));
             console.write(b"A").unwrap();
             console
-                .wait_for(b"MOOR-KEY:A:37:93", Duration::from_secs(5))
+                .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
                 .unwrap();
             console.resize(41, 101).unwrap();
-            thread::sleep(Duration::from_millis(500));
+            console
+                .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
+                .unwrap();
             console.write(b"B").unwrap();
             console
-                .wait_for(b"MOOR-KEY:B:41:101", Duration::from_secs(5))
+                .wait_for(b"MOOR-KEY:B:1", Duration::from_secs(5))
                 .unwrap();
             console.write(&[0x1c]).unwrap();
             assert!(
