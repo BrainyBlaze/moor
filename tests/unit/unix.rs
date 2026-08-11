@@ -9,6 +9,15 @@ mod headless_terminal_tests {
         let terminal = headless_termios();
         assert_eq!(terminal.c_iflag, libc::ICRNL | libc::IXON, "c_iflag");
         assert_eq!(terminal.c_oflag, libc::OPOST | libc::ONLCR, "c_oflag");
+        // Darwin keeps speeds outside c_cflag, so the word compares exactly;
+        // Linux encodes them as CBAUD/CBAUDEX bits which must be masked out.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            terminal.c_cflag,
+            libc::CS8 | libc::CREAD,
+            "c_cflag holds exactly CS8|CREAD"
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             terminal.c_cflag & !(libc::CBAUD | libc::CBAUDEX),
             libc::CS8 | libc::CREAD,
@@ -65,6 +74,13 @@ mod headless_terminal_tests {
         }
         assert_eq!(terminal.c_cc[libc::VEOL], disabled, "VEOL stays disabled");
         assert_eq!(terminal.c_cc[libc::VEOL2], disabled, "VEOL2 stays disabled");
+        // The macOS-specific controls carry their frozen values, not merely an
+        // exemption from the disabled loop.
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(terminal.c_cc[libc::VDSUSP], 0x19, "VDSUSP");
+            assert_eq!(terminal.c_cc[libc::VSTATUS], 0x14, "VSTATUS");
+        }
     }
 
     #[test]

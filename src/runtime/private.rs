@@ -626,10 +626,20 @@ pub fn holder_artifacts(
         let event = config
             .event_path
             .map(|path| {
-                config
-                    .event_store
-                    .take()
-                    .map_or_else(|| create(path, Kind::Event, event_header().as_bytes()), Ok)
+                config.event_store.take().map_or_else(
+                    || {
+                        // The event target is caller-supplied, so its creation
+                        // failure reports the frozen closure §6.2 row rather
+                        // than a generic store message.
+                        create(path, Kind::Event, event_header().as_bytes()).map_err(|_| {
+                            format!(
+                                "event store rejected: {} (io-error)",
+                                crate::name::render(path.as_os_str())
+                            )
+                        })
+                    },
+                    Ok,
+                )
             })
             .transpose()?;
         let log = (config.log_cap != 0)

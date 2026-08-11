@@ -495,3 +495,22 @@ fn native_name_rendering_and_final_component_rules_are_byte_exact() {
         assert!(!moor::name::valid_session(OsStr::new(invalid)), "{invalid}");
     }
 }
+
+#[test]
+fn trailing_terminator_is_accepted_by_every_non_creating_command() {
+    // OB-4: `--` is a grammar terminator in every phase, never an
+    // operand-count participant. Parser-only on purpose: exercising these at
+    // runtime would read (and for `rm -a` mutate) the shared default session
+    // root under the parallel suite.
+    for args in [
+        vec!["list", "--"],
+        vec!["rm", "-a", "--"],
+        vec!["clear", "--"],
+        vec!["kill", "terminator-check", "--"],
+        vec!["current", "--"],
+        vec!["tail", "-f", "terminator-check", "--"],
+        vec!["attach", "terminator-check", "--"],
+    ] {
+        assert!(parses(&args), "{args:?} rejected the trailing terminator");
+    }
+}
