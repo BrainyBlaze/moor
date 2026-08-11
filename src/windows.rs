@@ -1719,9 +1719,7 @@ mod native {
             live_holder_ancestor(pid)
         }
         fn terminate(&mut self, force: bool) -> (u8, bool) {
-            if !force && self.bootstrap.exchange(2).is_ok() {
-                return (0, false);
-            }
+            crate::return_if!(!force && self.bootstrap.exchange(2).is_ok(), (0, false));
             let terminated = self
                 .job
                 .as_ref()
@@ -1729,7 +1727,12 @@ mod native {
             (u8::from(terminated) << 1, true)
         }
         fn exited(&mut self) -> Result<Option<NativeExit>> {
-            process_exit(self.process.raw()).map(|value| value.map(NativeExit::Code))
+            let exit = process_exit(self.process.raw())?;
+            // EOF releases the bootstrap's console attachment so the holder
+            // can drain the requested child's final output without waiting
+            // for the whole-shutdown deadline.
+            drop(exit.and_then(|_| self.bootstrap.control.0.take()));
+            Ok(exit.map(NativeExit::Code))
         }
     }
 

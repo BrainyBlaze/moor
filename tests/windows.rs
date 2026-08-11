@@ -1345,9 +1345,10 @@ mod launch_paths {
                 .env("MOOR_CONSOLE_GEOMETRY_PROBE", "foreground")
                 .env("MOOR_CONSOLE_GEOMETRY_RELEASE", &foreground_release);
             let mut foreground = console.spawn(foreground).unwrap();
-            console
-                .wait_for(b"MOOR-GEOM-foreground:37:93", Duration::from_secs(10))
-                .unwrap();
+            wait_log(
+                &invoked_root().join(&foreground_session),
+                b"MOOR-GEOM-foreground:37:93",
+            );
             std::fs::write(&foreground_release, b"release").unwrap();
             assert!(
                 wait_spawn(&mut foreground, Duration::from_secs(5))
