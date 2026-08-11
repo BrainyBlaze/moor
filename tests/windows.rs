@@ -1423,12 +1423,12 @@ mod launch_paths {
                 .unwrap();
             console.resize(41, 101).unwrap();
             let mut resized = probe(&console, "resized").unwrap();
+            wait_modes(&mut console, "resized");
             assert!(
                 wait_spawn(&mut resized, Duration::from_secs(5))
                     .unwrap()
                     .success()
             );
-            wait_modes(&mut console, "resized");
             console
                 .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
                 .unwrap();
