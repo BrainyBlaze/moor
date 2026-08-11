@@ -63,8 +63,10 @@ jobs:
           # shellcheck disable=SC2016
           grep -F '`moor-wire-schema.md` | `8cc57dca672929ffab5d869e4c883d0e28d89070df9aa2fd619558a5f766869b`' README.md
 
-      - name: Build both release command names
-        run: cargo build --release --bin moor --bin atch
+      - name: Verify and build the sole release command
+        run: |
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "moor") | .targets[] | select(.kind == ["bin"]) | .name')" = moor
+          cargo build --release --bin moor
 
   production-loc:
     name: Production LOC / hard maximum 12,000
