@@ -206,7 +206,7 @@ impl Store {
         #[cfg(windows)]
         {
             let (selected, hash) = initial_commit(kind, generation, initial, start..end)?;
-            let directory = crate::windows::store_directory(path)?;
+            let directory = crate::windows::store_directory(path, kind != Kind::Event)?;
             let mut created = Vec::with_capacity(4);
             for (at, name) in NAMES.into_iter().enumerate() {
                 match crate::windows::create_store_file(&path.join(name), at == 2) {
@@ -804,7 +804,7 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(windows)]
-    crate::windows::store_directory(path)?.sync_all()?;
+    crate::windows::store_directory(path, false)?.sync_all()?;
     Ok(())
 }
 

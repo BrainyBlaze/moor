@@ -827,11 +827,10 @@ mod native {
         })();
         result.map_err(io::Error::other)
     }
-    pub(crate) fn store_directory(path: &Path) -> io::Result<File> {
+    pub(crate) fn store_directory(path: &Path, delete: bool) -> io::Result<File> {
+        let access = GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL;
         OpenOptions::new()
-            .access_mode(
-                GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
-            )
+            .access_mode(access | if delete { DELETE } else { 0 })
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
@@ -1869,7 +1868,7 @@ mod native {
                 &mut status,
                 ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null(),
