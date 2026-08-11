@@ -289,6 +289,27 @@ __attribute__((constructor)) static void ack(void) {
     library
 }
 
+fn inert_instrumentation(dir: &Path) -> PathBuf {
+    // A valid, loadable shared object with no constructor: it loads cleanly and
+    // never writes an ACK, so §4.7 fails closed on the acknowledgement deadline.
+    // An invalid-byte file is NOT portable — on Darwin the loader/child hangs
+    // rather than terminating — so a real empty dylib is used instead.
+    let source = dir.join("inert-instrument.c");
+    let library = dir.join("inert-instrument.so");
+    fs::write(&source, "int moor_inert_marker = 0;\n").unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::set_permissions(&library, fs::Permissions::from_mode(0o500)).unwrap();
+    library
+}
+
 fn instrumentable_program(dir: &Path) -> PathBuf {
     let source = dir.join("instrument-child.c");
     let program = dir.join("instrument-child");
@@ -2895,26 +2916,31 @@ fn unacknowledged_instrumentation_uses_the_frozen_row_with_the_operand() {
     // and §4.7 fails closed. The frozen row must name the caller's operand
     // with cause load-unacknowledged — not leak a raw record diagnostic.
     let dir = temp();
-    let object = dir.join("inert.so");
-    fs::write(&object, b"not an object").unwrap();
-    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
-    let out = moor(&[
-        "run",
-        dir.join("ack").to_str().unwrap(),
-        "-S",
-        object.to_str().unwrap(),
-        true_program(),
-    ]);
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let object = inert_instrumentation(&dir);
+    let program = instrumentable_program(&dir);
+    let out = invoked(
+        alias,
+        &[
+            "run",
+            "ack",
+            "-S",
+            object.to_str().unwrap(),
+            program.to_str().unwrap(),
+        ],
+    );
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
         format!(
-            "moor: instrumentation rejected: {} (load-unacknowledged)\n",
+            "{alias}: instrumentation rejected: {} (load-unacknowledged)\n",
             object.display()
         ),
         "{out:?}"
     );
+    let _ = fs::remove_dir_all(&root);
     fs::remove_dir_all(dir).unwrap();
 }
 
