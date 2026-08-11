@@ -2022,8 +2022,8 @@ mod native {
                 && validate(target, user, access, directory).is_ok()
         })
     }
-    fn viewer_modes(input: u32, output: u32) -> (u32, u32) {
-        (
+    fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
+        [
             (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
                 & !(ENABLE_LINE_INPUT
                     | ENABLE_ECHO_INPUT
@@ -2034,7 +2034,7 @@ mod native {
                 | ENABLE_PROCESSED_OUTPUT
                 | ENABLE_VIRTUAL_TERMINAL_PROCESSING
                 | DISABLE_NEWLINE_AUTO_RETURN,
-        )
+        ]
     }
     fn valid_size(&(rows, columns): &(u16, u16)) -> bool {
         [rows, columns]
@@ -2042,7 +2042,7 @@ mod native {
             .all(|value| value != 0 && value <= i16::MAX as u16)
             && u32::from(rows) * u32::from(columns) <= 2_000_000
     }
-    fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
+    fn console_geometry(output: HANDLE, buffer: bool) -> Result<(u16, u16)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         check(
             unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
@@ -2052,46 +2052,44 @@ mod native {
             u16::try_from(i32::from(last) - i32::from(first) + 1)
                 .map_err(|_| "viewer console geometry is invalid")
         };
+        let mut window = info.srWindow;
+        if buffer {
+            window.Bottom = info.dwSize.Y.saturating_sub(1);
+            window.Right = info.dwSize.X.saturating_sub(1);
+            window.Top = 0;
+            window.Left = 0;
+        }
         let size = (
-            extent(info.srWindow.Bottom, info.srWindow.Top)?,
-            extent(info.srWindow.Right, info.srWindow.Left)?,
+            extent(window.Bottom, window.Top)?,
+            extent(window.Right, window.Left)?,
         );
-        drop(fs::write("ci-output/g", [info.dwSize.X as u8]));
-        require(valid_size(&size), "viewer console geometry is invalid")?;
-        Ok(size)
+        require(valid_size(&size), "viewer console geometry is invalid").map(|_| size)
     }
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
     impl ViewerConsole {
         fn detect() -> Option<Self> {
-            let mut console = Self(
-                unsafe {
-                    [
-                        GetStdHandle(STD_INPUT_HANDLE),
-                        GetStdHandle(STD_OUTPUT_HANDLE),
-                    ]
-                },
-                [0; 2],
-            );
+            let handles =
+                [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE].map(|kind| unsafe { GetStdHandle(kind) });
+            let mut modes = [0; 2];
             (0..2)
-                .all(|at| unsafe { GetConsoleMode(console.0[at], &mut console.1[at]) } != 0)
-                .then_some(console)
+                .all(|at| unsafe { GetConsoleMode(handles[at], &mut modes[at]) } != 0)
+                .then_some(Self(handles, modes))
         }
         fn geometry(&self) -> Result<(u16, u16)> {
-            console_geometry(self.0[1])
+            console_geometry(self.0[1], false)
         }
-        fn set(&self, modes: (u32, u32)) -> Result<()> {
-            for (handle, mode) in self.0.into_iter().zip([modes.0, modes.1]) {
+        fn set(&self, modes: [u32; 2]) -> Result<()> {
+            (0..2).try_for_each(|at| {
                 check(
-                    unsafe { SetConsoleMode(handle, mode) } != 0,
+                    unsafe { SetConsoleMode(self.0[at], modes[at]) } != 0,
                     "configure viewer console",
-                )?;
-            }
-            Ok(())
+                )
+            })
         }
     }
     impl Drop for ViewerConsole {
         fn drop(&mut self) {
-            self.set((self.1[0], self.1[1])).ok();
+            self.set(self.1).ok();
         }
     }
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
@@ -2114,6 +2112,7 @@ mod native {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
             let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } as usize;
+            let buffer = console_geometry(output as HANDLE, true).ok() == Some(geometry);
             run_viewer_input(
                 io::stdin(),
                 sender,
@@ -2127,7 +2126,7 @@ mod native {
                     WAIT_TIMEOUT => InputState::Pending,
                     _ => InputState::Closed,
                 },
-                move || console_geometry(output as HANDLE).ok(),
+                move || console_geometry(output as HANDLE, buffer).ok(),
                 || {},
                 Instant::now,
             );

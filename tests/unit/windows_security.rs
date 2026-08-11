@@ -57,7 +57,7 @@ fn file_descriptor_query_validates_a_created_store_directory() {
 
 #[test]
 fn viewer_modes_are_raw_input_and_vt_output() {
-    let (input, output) = viewer_modes(
+    let [input, output] = viewer_modes(
         ENABLE_PROCESSED_INPUT
             | ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
