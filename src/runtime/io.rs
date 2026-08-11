@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
-schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Byte(u8), Resize(u16, u16), Closed);
+schema!(enum pub InputState [Clone, Debug, Eq, PartialEq]; Ready, Pending, Bytes(Vec<u8>), Resize(u16, u16), Closed);
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
@@ -468,11 +468,12 @@ pub fn run_viewer_input(
         {
             break true;
         }
+        let mut native = None;
         let count = match ready() {
             InputState::Pending => continue,
-            InputState::Byte(byte) => {
-                bytes[0] = byte;
-                1
+            InputState::Bytes(value) => {
+                native = Some(value);
+                0
             }
             InputState::Resize(rows, columns) => {
                 let next = Some((rows, columns));
@@ -490,8 +491,9 @@ pub fn run_viewer_input(
                 Err(_) => break false,
             },
         };
+        let input = native.as_deref().unwrap_or(&bytes[..count]);
         output.clear();
-        for byte in bytes[..count].iter().copied() {
+        for byte in input.iter().copied() {
             if armed.take().is_some() {
                 output.push(byte);
                 if Some(byte) != config.detach {

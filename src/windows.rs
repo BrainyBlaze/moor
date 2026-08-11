@@ -214,6 +214,7 @@ mod native {
     use windows_sys::Wdk::{Foundation::*, Storage::FileSystem::*};
     use windows_sys::Win32::{
         Foundation::*,
+        Globalization::*,
         Security::{ACE_HEADER, *},
         Storage::FileSystem::*,
         System::{
@@ -2066,38 +2067,282 @@ mod native {
             self.set(self.1).ok();
         }
     }
-    fn console_byte(key: KEY_EVENT_RECORD) -> Option<u8> {
-        let byte = unsafe { key.uChar.AsciiChar } as u8;
-        let zero = unsafe { VkKeyScanW(0) } as u16;
-        let chord = key.wVirtualKeyCode
-            | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
-            | u16::from(key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0) << 9
-            | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0) << 10;
-        (key.bKeyDown != 0 && (byte != 0 || chord == zero)).then_some(byte)
+
+    fn console_wide_with_nul(key: KEY_EVENT_RECORD, nul: i16) -> Option<(u16, u16)> {
+        let unit = unsafe { key.uChar.UnicodeChar };
+        let null = unit == 0 && {
+            let expected = nul as u16 & 0x7ff;
+            let chord = key.wVirtualKeyCode
+                | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
+                | u16::from(key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
+                    << 9
+                | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
+                    << 10;
+            chord == expected
+        };
+        (key.bKeyDown != 0 && key.wRepeatCount != 0 && (unit != 0 || null))
+            .then_some((unit, key.wRepeatCount))
     }
-    fn viewer_input_state(input: HANDLE) -> InputState {
-        loop {
-            let wait = unsafe { WaitForSingleObject(input, 50) };
-            crate::return_if!(wait == WAIT_TIMEOUT, InputState::Pending);
-            crate::return_if!(wait != WAIT_OBJECT_0, InputState::Closed);
-            let (mut event, mut count) = (INPUT_RECORD::default(), 0);
-            let read = unsafe { ReadConsoleInputA(input, &mut event, 1, &mut count) };
-            crate::return_if!(read == 0, InputState::Closed);
-            if event.EventType == KEY_EVENT as u16 {
-                let key = unsafe { event.Event.KeyEvent };
-                if let Some(byte) = console_byte(key) {
-                    return InputState::Byte(byte);
-                }
-            } else if event.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
-                let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
-                let size = (size.Y as u16, size.X as u16);
-                crate::return_if!(
-                    crate::wire::valid_size(size),
-                    InputState::Resize(size.0, size.1)
-                );
+
+    fn console_wide(key: KEY_EVENT_RECORD) -> Option<(u16, u16)> {
+        console_wide_with_nul(key, unsafe { VkKeyScanW(0) })
+    }
+
+    const CONSOLE_READ_RECORDS: usize = 256;
+    const CONSOLE_RECORD_BUDGET: usize = 16_384;
+    const CONSOLE_WIDE_TARGET: usize = 16 * 1024;
+    const CONSOLE_BYTE_TARGET: usize = 64 * 1024;
+
+    struct ConsoleInput {
+        handle: HANDLE,
+        pending_high: Option<(u16, u32)>,
+        deferred: Option<InputState>,
+        records: [INPUT_RECORD; CONSOLE_READ_RECORDS],
+        next: usize,
+        count: usize,
+        codepage: u32,
+    }
+
+    impl ConsoleInput {
+        fn new(handle: HANDLE) -> Self {
+            Self {
+                handle,
+                pending_high: None,
+                deferred: None,
+                records: [INPUT_RECORD::default(); CONSOLE_READ_RECORDS],
+                next: 0,
+                count: 0,
+                codepage: 0,
             }
         }
+
+        fn finish(&mut self, output: Vec<u8>, next: InputState) -> InputState {
+            if output.is_empty() {
+                next
+            } else {
+                if next != InputState::Pending {
+                    self.deferred = Some(next);
+                }
+                InputState::Bytes(output)
+            }
+        }
+
+        fn record(
+            &mut self,
+            event: INPUT_RECORD,
+            codepage: u32,
+            wide: &mut Vec<u16>,
+        ) -> std::result::Result<Option<(u16, u16)>, ()> {
+            if self
+                .pending_high
+                .is_some_and(|(_, high_codepage)| high_codepage != codepage)
+            {
+                self.pending_high = None;
+            }
+            if event.EventType != KEY_EVENT as u16 {
+                if event.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
+                    self.pending_high = None;
+                    let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
+                    let size = (size.Y as u16, size.X as u16);
+                    return Ok(crate::wire::valid_size(size).then_some(size));
+                }
+                return Ok(None);
+            }
+            let key = unsafe { event.Event.KeyEvent };
+            let Some((unit, repeat)) = console_wide(key) else {
+                return Ok(None);
+            };
+            if codepage == 0 {
+                return Err(());
+            }
+            if (0xd800..=0xdbff).contains(&unit) {
+                self.pending_high = (repeat == 1).then_some((unit, codepage));
+                return Ok(None);
+            }
+            let high = self.pending_high.take();
+            let low = (0xdc00..=0xdfff).contains(&unit);
+            let mut scalar = [unit; 2];
+            if low {
+                let Some((high, high_codepage)) = high else {
+                    return Ok(None);
+                };
+                if repeat != 1 || high_codepage != codepage {
+                    return Ok(None);
+                }
+                scalar[0] = high;
+                wide.extend_from_slice(&scalar);
+            } else {
+                wide.extend(std::iter::repeat_n(unit, repeat.into()));
+            }
+            Ok(None)
+        }
+
+        fn encode(
+            codepage: u32,
+            wide: &[u16],
+            output: &mut Vec<u8>,
+        ) -> std::result::Result<(), ()> {
+            if wide.is_empty() {
+                return Ok(());
+            }
+            let wide_length = i32::try_from(wide.len()).map_err(|_| ())?;
+            let (default, used) = (ptr::null(), ptr::null_mut());
+            let required = unsafe {
+                WideCharToMultiByte(
+                    codepage,
+                    0,
+                    wide.as_ptr(),
+                    wide_length,
+                    ptr::null_mut(),
+                    0,
+                    default,
+                    used,
+                )
+            };
+            if required <= 0 {
+                return Err(());
+            }
+            let mut bytes = SmallVec::<[u8; 8]>::new();
+            bytes.resize(required as usize, 0);
+            let length = unsafe {
+                WideCharToMultiByte(
+                    codepage,
+                    0,
+                    wide.as_ptr(),
+                    wide_length,
+                    bytes.as_mut_ptr(),
+                    required,
+                    default,
+                    used,
+                )
+            };
+            if length != required {
+                return Err(());
+            }
+            output.extend_from_slice(&bytes);
+            Ok(())
+        }
+
+        fn refill(&mut self, timeout: u32) -> std::result::Result<bool, ()> {
+            let wait = unsafe { WaitForSingleObject(self.handle, timeout) };
+            if wait == WAIT_TIMEOUT {
+                return Ok(false);
+            }
+            if wait != WAIT_OBJECT_0 {
+                return Err(());
+            }
+            let codepage = unsafe { GetConsoleCP() };
+            if codepage == 0 {
+                return Err(());
+            }
+            let mut count = 0;
+            let read = unsafe {
+                ReadConsoleInputW(
+                    self.handle,
+                    self.records.as_mut_ptr(),
+                    self.records.len() as u32,
+                    &mut count,
+                )
+            };
+            if read == 0 || count == 0 || count as usize > self.records.len() {
+                return Err(());
+            }
+            self.next = 0;
+            self.count = count as usize;
+            self.codepage = codepage;
+            Ok(true)
+        }
+
+        fn flush(
+            &mut self,
+            codepage: &mut Option<u32>,
+            wide: &mut Vec<u16>,
+            output: &mut Vec<u8>,
+        ) -> std::result::Result<(), ()> {
+            if let Some(codepage) = codepage.take() {
+                Self::encode(codepage, wide, output)?;
+                wide.clear();
+            }
+            Ok(())
+        }
+
+        fn state_with(
+            &mut self,
+            mut refill: impl FnMut(&mut Self, u32) -> std::result::Result<bool, ()>,
+        ) -> InputState {
+            if let Some(next) = self.deferred.take() {
+                return next;
+            }
+            let mut output = Vec::new();
+            let mut wide = Vec::new();
+            let mut codepage = None;
+            // A larger processing budget coalesces ordinary paste input across
+            // many native reads. The fixed budget still yields periodically so
+            // ignored-event floods cannot starve keepalives or detach timing.
+            for _ in 0..CONSOLE_RECORD_BUDGET {
+                if self.next == self.count {
+                    let wait = u32::from(output.is_empty() && wide.is_empty()) * 50;
+                    match refill(self, wait) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let next = match self.flush(&mut codepage, &mut wide, &mut output) {
+                                Ok(()) => InputState::Pending,
+                                Err(()) => InputState::Closed,
+                            };
+                            return self.finish(output, next);
+                        }
+                        Err(()) => {
+                            self.flush(&mut codepage, &mut wide, &mut output).ok();
+                            return self.finish(output, InputState::Closed);
+                        }
+                    }
+                }
+                if codepage.is_some_and(|value| value != self.codepage) {
+                    if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                        return self.finish(output, InputState::Closed);
+                    }
+                    if output.len() >= CONSOLE_BYTE_TARGET {
+                        return InputState::Bytes(output);
+                    }
+                }
+                codepage = Some(self.codepage);
+                let event = self.records[self.next];
+                self.next += 1;
+                match self.record(event, self.codepage, &mut wide) {
+                    Ok(Some((rows, columns))) => {
+                        if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                            return self.finish(output, InputState::Closed);
+                        }
+                        return self.finish(output, InputState::Resize(rows, columns));
+                    }
+                    Ok(None) => {}
+                    Err(()) => {
+                        self.flush(&mut codepage, &mut wide, &mut output).ok();
+                        return self.finish(output, InputState::Closed);
+                    }
+                }
+                if wide.len() >= CONSOLE_WIDE_TARGET
+                    && self.flush(&mut codepage, &mut wide, &mut output).is_err()
+                {
+                    return self.finish(output, InputState::Closed);
+                }
+                crate::return_if!(
+                    output.len() >= CONSOLE_BYTE_TARGET,
+                    InputState::Bytes(output)
+                );
+            }
+            let next = match self.flush(&mut codepage, &mut wide, &mut output) {
+                Ok(()) => InputState::Pending,
+                Err(()) => InputState::Closed,
+            };
+            self.finish(output, next)
+        }
+
+        fn state(&mut self) -> InputState {
+            self.state_with(|input, timeout| input.refill(timeout))
+        }
     }
+
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
@@ -2118,6 +2363,7 @@ mod native {
     fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
+            let mut input = ConsoleInput::new(input as HANDLE);
             run_viewer_input(
                 io::empty(),
                 sender,
@@ -2126,7 +2372,7 @@ mod native {
                     pass_suspend: true,
                     last_size: crate::wire::valid_size(geometry).then_some(geometry),
                 },
-                move || viewer_input_state(input as HANDLE),
+                move || input.state(),
                 || None,
                 || {},
                 Instant::now,

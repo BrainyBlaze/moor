@@ -82,29 +82,271 @@ fn viewer_modes_are_raw_input_and_vt_output() {
 }
 
 #[test]
-fn console_bytes_reject_raw_zero_events_but_preserve_text_and_nul() {
+fn console_records_preserve_text_repeats_and_nul_but_reject_raw_zero_events() {
     let mut key = KEY_EVENT_RECORD {
         bKeyDown: 1,
         wRepeatCount: 1,
         ..KEY_EVENT_RECORD::default()
     };
-    key.uChar.AsciiChar = b'A' as i8;
-    assert_eq!(console_byte(key), Some(b'A'));
+    let zero = unsafe { VkKeyScanW(0) } as u16;
+    key.uChar.UnicodeChar = u16::from(b'A');
+    assert_eq!(console_wide(key), Some((u16::from(b'A'), 1)));
+    key.wRepeatCount = 3;
+    assert_eq!(console_wide(key), Some((u16::from(b'A'), 3)));
+    key.wRepeatCount = 0;
+    assert_eq!(console_wide(key), None);
     key.bKeyDown = 0;
-    assert_eq!(console_byte(key), None);
+    assert_eq!(console_wide(key), None);
 
     key.bKeyDown = 1;
-    key.uChar.AsciiChar = 0;
+    key.wRepeatCount = 1;
+    key.uChar.UnicodeChar = 0;
     key.wVirtualKeyCode = 0x10;
+    key.wVirtualScanCode = 0x2a;
     key.dwControlKeyState = SHIFT_PRESSED;
-    assert_eq!(console_byte(key), None);
+    assert_eq!(console_wide(key), None);
+    key.wVirtualKeyCode = 0x26;
+    key.wVirtualScanCode = 0x48;
+    key.dwControlKeyState = 0;
+    assert_eq!(console_wide(key), None);
 
-    let zero = unsafe { VkKeyScanW(0) } as u16;
     key.wVirtualKeyCode = zero & 0xff;
+    key.wVirtualScanCode = 0x2a;
     key.dwControlKeyState = (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
         | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
-        | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED);
-    assert_eq!(console_byte(key), Some(0));
+        | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED)
+        | CAPSLOCK_ON
+        | NUMLOCK_ON
+        | SCROLLLOCK_ON;
+    assert_eq!(console_wide(key), Some((0, 1)));
+    key.wRepeatCount = 3;
+    key.dwControlKeyState = (key.dwControlKeyState
+        & !(LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED))
+        | (u32::from(zero & 0x200 != 0) * RIGHT_CTRL_PRESSED)
+        | (u32::from(zero & 0x400 != 0) * RIGHT_ALT_PRESSED);
+    assert_eq!(console_wide(key), Some((0, 3)));
+
+    key.wVirtualKeyCode = 0xff;
+    key.dwControlKeyState = SHIFT_PRESSED | RIGHT_CTRL_PRESSED | RIGHT_ALT_PRESSED | CAPSLOCK_ON;
+    assert_eq!(console_wide_with_nul(key, -1), Some((0, 3)));
+}
+
+fn key_record(key: KEY_EVENT_RECORD) -> INPUT_RECORD {
+    INPUT_RECORD {
+        EventType: KEY_EVENT as u16,
+        Event: INPUT_RECORD_0 { KeyEvent: key },
+    }
+}
+
+fn text_record(unit: u16, repeat: u16) -> INPUT_RECORD {
+    let mut key = KEY_EVENT_RECORD {
+        bKeyDown: 1,
+        wRepeatCount: repeat,
+        ..KEY_EVENT_RECORD::default()
+    };
+    key.uChar.UnicodeChar = unit;
+    key_record(key)
+}
+
+fn resize_record(rows: i16, columns: i16) -> INPUT_RECORD {
+    INPUT_RECORD {
+        EventType: WINDOW_BUFFER_SIZE_EVENT as u16,
+        Event: INPUT_RECORD_0 {
+            WindowBufferSizeEvent: WINDOW_BUFFER_SIZE_RECORD {
+                dwSize: COORD {
+                    X: columns,
+                    Y: rows,
+                },
+            },
+        },
+    }
+}
+
+#[test]
+fn console_record_translation_preserves_scalars_repeats_nul_and_event_boundaries() {
+    let zero = unsafe { VkKeyScanW(0) } as u16;
+    let mut input = ConsoleInput::new(ptr::null_mut());
+    let mut wide = Vec::new();
+    let mut output = Vec::new();
+
+    assert_eq!(
+        input.record(text_record(b'A'.into(), 3), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    let mut nul = KEY_EVENT_RECORD {
+        bKeyDown: 1,
+        wRepeatCount: 2,
+        wVirtualKeyCode: zero & 0xff,
+        dwControlKeyState: (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
+            | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
+            | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED),
+        ..KEY_EVENT_RECORD::default()
+    };
+    nul.uChar.UnicodeChar = 0;
+    assert_eq!(
+        input.record(key_record(nul), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xd83d, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    ConsoleInput::encode(CP_UTF8, &wide, &mut output).unwrap();
+    assert_eq!(output, b"AAA\0\0\xf0\x9f\x99\x82");
+
+    wide.clear();
+    output.clear();
+    assert_eq!(
+        input.record(text_record(0xd83d, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    let resize = resize_record(41, 101);
+    assert_eq!(
+        input.record(resize, CP_UTF8, &mut wide),
+        Ok(Some((41, 101)))
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert!(wide.is_empty(), "surrogate pair crossed a resize event");
+
+    assert_eq!(
+        input.record(text_record(0xd83d, 2), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 2), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert!(wide.is_empty(), "repeated surrogate halves were paired");
+
+    wide.clear();
+    output.clear();
+    assert_eq!(
+        input.record(text_record(0xd83d, 2), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert!(wide.is_empty(), "mismatched surrogate repeats were paired");
+
+    assert_eq!(
+        input.record(text_record(0xd83d, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    let ignored = INPUT_RECORD {
+        EventType: FOCUS_EVENT as u16,
+        ..INPUT_RECORD::default()
+    };
+    assert_eq!(input.record(ignored, CP_UTF8, &mut wide), Ok(None));
+    let mut release = KEY_EVENT_RECORD {
+        bKeyDown: 0,
+        wRepeatCount: 1,
+        ..KEY_EVENT_RECORD::default()
+    };
+    release.uChar.UnicodeChar = 0xde42;
+    assert_eq!(
+        input.record(key_record(release), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    ConsoleInput::encode(CP_UTF8, &wide, &mut output).unwrap();
+    assert_eq!(output, b"\xf0\x9f\x99\x82");
+
+    wide.clear();
+    output.clear();
+    assert_eq!(
+        input.record(text_record(0xd83d, 1), CP_UTF8, &mut wide),
+        Ok(None)
+    );
+    assert_eq!(
+        input.record(text_record(0xde42, 1), 437, &mut wide),
+        Ok(None)
+    );
+    assert!(wide.is_empty(), "surrogate pair crossed a code-page change");
+    assert_eq!(
+        input.record(text_record(b'B'.into(), 1), 0, &mut wide),
+        Err(())
+    );
+    assert!(wide.is_empty());
+}
+
+#[test]
+fn console_batch_preserves_prefetched_text_resize_text_order() {
+    let mut input = ConsoleInput::new(ptr::null_mut());
+    input.records[0] = text_record(b'A'.into(), 1);
+    input.records[1] = resize_record(41, 101);
+    input.records[2] = text_record(b'B'.into(), 1);
+    input.count = 3;
+    input.codepage = CP_UTF8;
+
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Bytes(b"A".to_vec())
+    );
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Resize(41, 101)
+    );
+    assert_eq!(
+        input.state_with(|_, timeout| {
+            assert_eq!(timeout, 0, "buffered text incurred an input delay");
+            Ok(false)
+        }),
+        InputState::Bytes(b"B".to_vec())
+    );
+    assert_eq!(
+        input.state_with(|_, timeout| {
+            assert_eq!(timeout, 50, "idle input did not use the bounded wait");
+            Ok(false)
+        }),
+        InputState::Pending
+    );
+}
+
+#[test]
+fn console_batch_preserves_first_record_after_codepage_threshold() {
+    let mut input = ConsoleInput::new(ptr::null_mut());
+    input.records[0] = text_record(b'A'.into(), u16::MAX);
+    input.records[1] = text_record(b'A'.into(), 1);
+    input.count = 2;
+    input.codepage = CP_UTF8;
+    let mut loaded = false;
+
+    let first = input.state_with(|input, timeout| {
+        assert_eq!(timeout, 0, "buffered output incurred an input delay");
+        assert!(!loaded, "unexpected second native refill");
+        input.records[0] = text_record(b'B'.into(), 1);
+        input.next = 0;
+        input.count = 1;
+        input.codepage = 437;
+        loaded = true;
+        Ok(true)
+    });
+    let InputState::Bytes(first) = first else {
+        panic!("old-code-page bytes were not returned first");
+    };
+    assert_eq!(first.len(), CONSOLE_BYTE_TARGET);
+    assert!(first.iter().all(|byte| *byte == b'A'));
+    assert_eq!(input.next, 0, "first new-code-page record was consumed");
+
+    assert_eq!(
+        input.state_with(|_, timeout| {
+            assert_eq!(timeout, 0, "buffered text incurred an input delay");
+            Ok(false)
+        }),
+        InputState::Bytes(b"B".to_vec())
+    );
 }
 
 #[test]
