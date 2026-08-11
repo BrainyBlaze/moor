@@ -400,3 +400,45 @@ fn portable_event_status_advertises_the_selected_commit_frontier() {
     drop(storage);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn rejected_status_identity_is_preflighted_before_any_store_is_created() {
+    let root = std::env::temp_dir().join(format!(
+        "moor-status-preflight-{}-{}",
+        std::process::id(),
+        now()
+    ));
+    fs::create_dir(&root).unwrap();
+    let marker = root.join("session");
+    let identity = b"\x01/status-preflight";
+    let oversized = vec![7; (1 << 20) + 1];
+    let result = holder_artifacts(
+        identity,
+        (None, 1),
+        [3; 16],
+        [0; 16],
+        (4, 5, [6; 16]),
+        ArtifactConfig {
+            marker: &marker,
+            event_path: None,
+            encoding: "posix-bytes",
+            event_identity: Some(&oversized),
+            instrument_identity: None,
+            event_store: None,
+            stores: None,
+            event_layout: 2,
+            log_cap: 1,
+        },
+    );
+    let Err(error) = result else {
+        panic!("oversized status identity was accepted")
+    };
+    assert!(error.starts_with("protocol error:"), "{error}");
+    let leaked = [".exit", ".log"]
+        .into_iter()
+        .map(|suffix| companion(&marker, suffix))
+        .filter(|path| fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+    fs::remove_dir_all(root).unwrap();
+    assert!(leaked.is_empty(), "leaked {leaked:?}");
+}

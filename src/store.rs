@@ -27,6 +27,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 type Slots = [File; 4];
 type Meta = (u8, u8, u32, [u64; 3]);
 type Mutation<'a> = (Commit, Sha256, u64, &'a [u8], bool);
+type Rollback = (File, Vec<[u8; 24]>, bool);
 
 fn require(valid: bool) -> Result<()> {
     valid.then_some(()).ok_or(StoreError::Corrupt)
@@ -113,7 +114,7 @@ fn commit(kind: Kind, generation: u32, meta: Meta, bytes: &[u8]) -> Result<(Comm
     Ok((selected, hash))
 }
 
-schema!(struct pub Store fields; slots: Slots, selected: Commit, hash: Sha256, directory: Option<File>);
+schema!(struct pub Store fields; slots: Slots, selected: Commit, hash: Sha256, _rollback: Option<Rollback>);
 
 #[cfg(unix)]
 pub struct PreparedStore(Slots);
@@ -181,18 +182,13 @@ impl Store {
         end: u64,
     ) -> Result<Self> {
         initial_commit(kind, generation, initial, start..end)?;
-        if kind == Kind::Event && path.exists() {
-            let meta = fs::symlink_metadata(path)?;
-            require(
-                meta.is_dir()
-                    && protected(path, &meta, 0o700)
-                    && fs::read_dir(path)?.next().is_none(),
-            )?;
-        } else {
-            create_directory(path)?;
-        }
         #[cfg(unix)]
         {
+            if kind == Kind::Event && path.exists() {
+                validate_event_directory(path)?;
+            } else {
+                create_directory(path)?;
+            }
             let directory = crate::unix::open_directory(path)?;
             let prepared = Self::prepare_at(&directory)?;
             let store = prepared
@@ -206,28 +202,31 @@ impl Store {
         #[cfg(windows)]
         {
             let (selected, hash) = initial_commit(kind, generation, initial, start..end)?;
-            let directory = crate::windows::store_directory(path, kind != Kind::Event)?;
-            let mut created = Vec::with_capacity(4);
-            for (at, name) in NAMES.into_iter().enumerate() {
-                match crate::windows::create_store_file(&path.join(name), at == 2) {
-                    Ok(file) => created.push(file),
-                    Err(error) => {
-                        created.iter().for_each(|file| {
-                            crate::windows::delete_file(file);
-                        });
-                        drop(created);
-                        if kind != Kind::Event {
-                            crate::windows::delete_file(&directory);
-                        }
-                        return Err(error.into());
-                    }
-                }
+            let (directory, owned) =
+                crate::windows::create_store_directory(path, kind == Kind::Event)?;
+            if !owned {
+                validate_event_directory(path)?;
             }
-            let slots = created.try_into().unwrap();
+            let mut created = Vec::with_capacity(4);
+            if let Err(error) = NAMES.into_iter().try_for_each(|name| {
+                crate::windows::create_store_file(&directory, name).map(|file| created.push(file))
+            }) {
+                let identities = created
+                    .iter()
+                    .map(|(_, identity)| *identity)
+                    .collect::<Vec<_>>();
+                drop(created);
+                crate::windows::rollback_store(directory, &identities, owned);
+                return Err(error.into());
+            }
+            let (slots, identities): (Vec<_>, Vec<_>) = created.into_iter().unzip();
+            let slots = slots.try_into().unwrap();
             let mut store = Self::from_parts(slots, selected, hash);
-            store.directory = (kind != Kind::Event).then_some(directory);
+            store._rollback = Some((directory, identities, owned));
+            let rollback = store._rollback.as_ref().unwrap();
             let initialized = (|| {
-                sync_dir(path)?;
+                rollback.0.sync_all()?;
+                require(crate::windows::valid_store_directory(path, &rollback.0))?;
                 validate_slots(path, &store.slots, true)?;
                 durable(&store.slots[0], 0, initial)?;
                 durable(&store.slots[2], 0, &store.selected.encode())
@@ -265,10 +264,8 @@ impl Store {
     }
 
     pub fn duplicate(&self) -> Result<Self> {
-        let slots = four(|at| self.slots[at].try_clone().map_err(Into::into))?;
-        let mut store = Self::from_parts(slots, self.selected, self.hash.clone());
-        store.directory = self.directory.as_ref().map(File::try_clone).transpose()?;
-        Ok(store)
+        four(|at| self.slots[at].try_clone().map_err(Into::into))
+            .map(|slots| Self::from_parts(slots, self.selected, self.hash.clone()))
     }
 
     pub fn selected_result(&self) -> Result<Commit> {
@@ -374,21 +371,18 @@ impl Store {
             slots,
             selected,
             hash,
-            directory: None,
+            _rollback: None,
         }
     }
 
     #[cfg(windows)]
     pub(crate) fn rollback(self) {
         let Self {
-            slots, directory, ..
+            slots, _rollback, ..
         } = self;
-        slots.iter().for_each(|slot| {
-            crate::windows::delete_file(slot);
-        });
         drop(slots);
-        if let Some(directory) = directory {
-            crate::windows::delete_file(&directory);
+        if let Some((directory, identities, owned)) = _rollback {
+            crate::windows::rollback_store(directory, &identities, owned);
         }
     }
 }
@@ -800,11 +794,14 @@ fn create_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_event_directory(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    require(meta.is_dir() && protected(path, &meta, 0o700) && fs::read_dir(path)?.next().is_none())
+}
+
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
     File::open(path)?.sync_all()?;
-    #[cfg(windows)]
-    crate::windows::store_directory(path, false)?.sync_all()?;
     Ok(())
 }
 

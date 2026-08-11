@@ -103,63 +103,40 @@ impl BootstrapRecord {
 }
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectoryCause {
-    Missing = 1,
-    NotDirectory = 2,
-    NotSearchable = 3,
-    Io = 4,
-}
-
-#[cfg(any(windows, test))]
-impl DirectoryCause {
-    #[cfg(windows)]
-    fn label(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::NotDirectory => "not-directory",
-            Self::NotSearchable => "not-searchable",
-            Self::Io => "io-error",
-        }
-    }
-}
+schema!(enum ordinal DirectoryCause; Missing, NotDirectory, NotSearchable, Io);
 
 #[cfg(any(windows, test))]
 schema!(enum BootstrapFailure [Clone, Copy, Debug, Eq, PartialEq]; Directory(DirectoryCause), Execution(u32));
+#[cfg(any(windows, test))]
+schema!(struct BootstrapFailureRecord fields; nonce: [u8; 16], kind: u8, value: u32, reserved: [u8; 23]);
+#[cfg(any(windows, test))]
+binary_record!(RawBootstrapFailure => BootstrapFailureRecord[56] error () = (); fixed { magic: [u8; 12] = *b"MOORERR1\x01\0\0\0" } fields { nonce: [u8; 16], kind: u8, value: U32<LE>, reserved: [u8; 23] });
 
 #[cfg(any(windows, test))]
 fn bootstrap_failure_record(nonce: [u8; 16], failure: BootstrapFailure) -> [u8; 56] {
     let (kind, value) = match failure {
-        BootstrapFailure::Directory(cause) => (1, cause as u32),
+        BootstrapFailure::Directory(cause) => (1, cause as u32 + 1),
         BootstrapFailure::Execution(code) => (2, code),
     };
-    let mut record = [0; 56];
-    record[..12].copy_from_slice(b"MOORERR1\x01\0\0\0");
-    record[12..28].copy_from_slice(&nonce);
-    record[28] = kind;
-    record[29..33].copy_from_slice(&value.to_le_bytes());
-    record
+    BootstrapFailureRecord {
+        nonce,
+        kind,
+        value,
+        reserved: [0; 23],
+    }
+    .encode_raw()
 }
 
 #[cfg(any(windows, test))]
 fn bootstrap_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<BootstrapFailure> {
-    crate::return_if!(
-        bytes.len() != 56
-            || bytes[..12] != *b"MOORERR1\x01\0\0\0"
-            || bytes[12..28] != nonce
-            || bytes[33..].iter().any(|byte| *byte != 0),
-        None
-    );
-    let value = u32::from_le_bytes(bytes[29..33].try_into().unwrap());
-    match bytes[28] {
-        1 => Some(BootstrapFailure::Directory(match value {
-            1 => DirectoryCause::Missing,
-            2 => DirectoryCause::NotDirectory,
-            3 => DirectoryCause::NotSearchable,
-            4 => DirectoryCause::Io,
-            _ => return None,
-        })),
-        2 if value != 0 => Some(BootstrapFailure::Execution(value)),
+    let record = BootstrapFailureRecord::decode_raw(bytes)
+        .ok()
+        .filter(|record| record.nonce == nonce && record.reserved == [0; 23])?;
+    match record.kind {
+        1 if (1..=4).contains(&record.value) => Some(BootstrapFailure::Directory(
+            DirectoryCause::from_ordinal(record.value as u8 - 1),
+        )),
+        2 if record.value != 0 => Some(BootstrapFailure::Execution(record.value)),
         _ => None,
     }
 }
@@ -175,12 +152,9 @@ pub fn bootstrap_command(kind: u8, nonce: [u8; 16]) -> [u8; 17] {
 #[doc(hidden)]
 pub fn accept_bootstrap_command(bytes: &[u8], nonce: [u8; 16], resumed: &mut bool) -> Option<u8> {
     let kind = *bytes.first()?;
-    crate::return_if!(bytes.len() != 17 || bytes[1..] != nonce, None);
-    match (kind, *resumed) {
-        (1, false) => *resumed = true,
-        (2, true) => {}
-        _ => return None,
-    }
+    let valid = matches!((kind, *resumed), (1, false) | (2, true));
+    crate::return_if!(bytes.len() != 17 || bytes[1..] != nonce || !valid, None);
+    *resumed |= kind == 1;
     Some(kind)
 }
 
@@ -215,74 +189,39 @@ mod descriptor_semantics_tests {
 #[cfg(windows)]
 #[allow(unused_unsafe)]
 mod native {
-    use super::{
-        BootstrapFailure, BootstrapRecord, DirectoryCause, Marker, Result,
-        accept_bootstrap_command, bootstrap_command, bootstrap_failure, bootstrap_failure_record,
-        cim_boot_identity, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
-    };
+    use super::*;
     use crate::{
-        cli::{CreateMode, Options},
+        cli::*,
         name, require,
         runtime::{
-            client::{Client as WireClient, CommandError, CommandResult, missing, probe_session},
+            client::{Client, CommandError, CommandResult, missing, probe_session},
             holder::{Native as HolderNative, NativeExit},
-            io::{
-                Duplex, InputConfig, InputState, ViewerSender, attach_viewer_to, run_viewer_input,
-            },
+            io::*,
             private::*,
         },
         wire::put_wide,
     };
-    use interprocess::local_socket::prelude::*;
-    use interprocess::local_socket::{
-        GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
-        Stream as LocalStream,
-    };
+    use interprocess::local_socket::{prelude::*, *};
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt, BorrowedSecurityDescriptor,
-    };
+    use interprocess::os::windows::security_descriptor::*;
     use smallvec::SmallVec;
-    use std::{
-        ffi::{OsStr, OsString, c_void},
-        fs::{self, File, OpenOptions},
-        io::{self, Read, Write},
-        mem::size_of,
-        os::windows::{
-            ffi::{OsStrExt, OsStringExt},
-            fs::OpenOptionsExt,
-            io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle},
-        },
-        path::{Path, PathBuf},
-        ptr,
-        sync::{
-            OnceLock,
-            atomic::{AtomicU8, Ordering},
-            mpsc,
-        },
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::ffi::*;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::windows::{ffi::*, fs::*, io::*};
+    use std::path::*;
+    use std::sync::{OnceLock, atomic::*, mpsc};
+    use std::thread;
+    use std::time::*;
+    use std::{mem::*, ptr};
     use windows_permissions::{
-        LocalBox, SecurityDescriptor,
-        constants::{SeObjectType, SecurityInformation},
-        utilities::buf_from_os as wide,
-        wrappers,
+        LocalBox, SecurityDescriptor, constants::*, utilities::buf_from_os as wide, wrappers,
     };
-    use windows_spawn::{
-        AsPseudoConsole, Child, Command as SpawnCommand, CreationFlags, Job, SpawnOptions,
-        Stdio as SpawnStdio,
-    };
-    use windows_sys::Wdk::{
-        Foundation::OBJECT_ATTRIBUTES,
-        Storage::FileSystem::{
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-            FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
-        },
-    };
+    use windows_spawn::{Command as SpawnCommand, Stdio as SpawnStdio, *};
+    use windows_sys::Wdk::{Foundation::*, Storage::FileSystem::*};
     use windows_sys::Win32::{
         Foundation::*,
-        Security::*,
+        Security::{ACE_HEADER, *},
         Storage::FileSystem::*,
         System::{
             Console::*,
@@ -484,6 +423,7 @@ mod native {
         }
     }
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
+    crate::schema!(tuple RelativePolicy [Clone, Copy]; fields; u32, u32, u32, u32);
     const OPEN_SLOT: OpenPolicy = OpenPolicy(
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -493,7 +433,29 @@ mod native {
         GENERIC_READ | GENERIC_WRITE | DELETE,
         FILE_SHARE_READ | FILE_SHARE_DELETE,
     );
+    const OPEN_STAGE: OpenPolicy = OpenPolicy(
+        GENERIC_READ | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    );
     const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+    const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    const CREATE_SLOT: RelativePolicy = RelativePolicy(
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    const OPEN_ROLLBACK_SLOT: RelativePolicy = RelativePolicy(
+        FILE_READ_ATTRIBUTES | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
     unsafe fn open_handle(
         path: &Path,
         policy: OpenPolicy,
@@ -528,6 +490,7 @@ mod native {
             _ => DirectoryCause::Io,
         }
     }
+    const CAUSES: [&str; 4] = ["missing", "not-directory", "not-searchable", "io-error"];
     fn read_reparse(path: &Path, share: u32) -> Result<File> {
         OpenOptions::new()
             .read(true)
@@ -730,7 +693,6 @@ mod native {
         .map_err(string)
     }
     fn protect(path: &Path, sid: &str, access: &str) -> Result<()> {
-        use windows_permissions::constants::SeObjectType;
         let (descriptor, _) = descriptor(sid, access)?;
         wrappers::SetNamedSecurityInfo(
             path.as_os_str(),
@@ -778,16 +740,10 @@ mod native {
                 .zip(slots)
                 .enumerate()
             {
-                let info: Result<FILE_STANDARD_INFO> = file_info(
-                    file.as_raw_handle(),
-                    FileStandardInfo,
-                    "inspect Windows store slot links",
-                );
-                let Ok(identity) = file_identity(file.as_raw_handle()) else {
+                let Ok(identity) = unique_file_identity(file.as_raw_handle()) else {
                     return false;
                 };
-                if !info.is_ok_and(|info| info.NumberOfLinks == 1)
-                    || identities[..at].contains(&identity)
+                if identities[..at].contains(&identity)
                     || store_file_identity(&path.join(name)) != Ok(identity)
                 {
                     return false;
@@ -807,33 +763,127 @@ mod native {
         })();
         result.map_err(io::Error::other)
     }
-    pub(crate) fn create_store_file(path: &Path, lease: bool) -> io::Result<File> {
-        let result = (|| unsafe {
-            let (_descriptor, sa) = descriptor(sid()?, "FA")?;
-            open_handle(
-                path,
-                OpenPolicy(
-                    GENERIC_READ | GENERIC_WRITE | DELETE,
-                    if lease {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE
-                    } else {
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                    },
-                ),
-                Some(&sa),
-                "create protected store file",
-            )
-            .map(Handle::into_file)
-        })();
-        result.map_err(io::Error::other)
-    }
-    pub(crate) fn store_directory(path: &Path, delete: bool) -> io::Result<File> {
+    fn directory_handle(path: &Path, delete: bool, share_delete: bool) -> io::Result<File> {
         let access = GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL;
         OpenOptions::new()
             .access_mode(access | if delete { DELETE } else { 0 })
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(
+                FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | if share_delete { FILE_SHARE_DELETE } else { 0 },
+            )
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
+    }
+    pub(crate) fn store_directory(path: &Path, delete: bool) -> io::Result<File> {
+        directory_handle(path, delete, true)
+    }
+    fn relative_file(
+        parent: &File,
+        name: &OsStr,
+        user: &str,
+        policy: RelativePolicy,
+    ) -> Result<File> {
+        let RelativePolicy(access, share, disposition, options) = policy;
+        let mut name = name.encode_wide().collect::<Vec<_>>();
+        let length = u16::try_from(name.len().saturating_mul(2))
+            .map_err(|_| "store object name is too long")?;
+        let unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: name.as_mut_ptr(),
+        };
+        let (security, _) = descriptor(user, "FA")?;
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: (&*security as *const SecurityDescriptor).cast(),
+            SecurityQualityOfService: ptr::null(),
+        };
+        let (mut raw, mut status) = (INVALID_HANDLE_VALUE, IO_STATUS_BLOCK::default());
+        let result = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access | SYNCHRONIZE,
+                &attributes,
+                &mut status,
+                ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | options,
+                ptr::null(),
+                0,
+            )
+        };
+        let handle = unsafe { Handle::owned(raw) };
+        require(
+            result == STATUS_SUCCESS && !handle.is_null(),
+            "open protected store object",
+        )?;
+        Ok(handle.into_file())
+    }
+    pub(crate) fn create_store_directory(path: &Path, event: bool) -> io::Result<(File, bool)> {
+        if event {
+            let opened = store_directory(path, false);
+            if !matches!(&opened, Err(error) if error.kind() == io::ErrorKind::NotFound) {
+                return opened.map(|directory| (directory, false));
+            }
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::other("store directory has no parent"))?;
+        let parent = directory_handle(parent, false, false)?;
+        relative_file(
+            &parent,
+            path.file_name()
+                .ok_or_else(|| io::Error::other("store directory has no name"))?,
+            sid().map_err(io::Error::other)?,
+            CREATE_DIRECTORY,
+        )
+        .map(|directory| (directory, true))
+        .map_err(io::Error::other)
+    }
+    pub(crate) fn create_store_file(directory: &File, name: &str) -> io::Result<(File, [u8; 24])> {
+        let file = relative_file(
+            directory,
+            OsStr::new(name),
+            sid().map_err(io::Error::other)?,
+            CREATE_SLOT,
+        )
+        .map_err(io::Error::other)?;
+        let identity = unsafe { file_identity(file.as_raw_handle()) }.map_err(io::Error::other)?;
+        Ok((file, identity))
+    }
+    pub(crate) fn valid_store_directory(path: &Path, directory: &File) -> bool {
+        store_directory(path, false)
+            .and_then(|current| {
+                unsafe { file_identity(current.as_raw_handle()) }.map_err(io::Error::other)
+            })
+            .is_ok_and(|current| unsafe { file_identity(directory.as_raw_handle()) } == Ok(current))
+    }
+    pub(crate) fn rollback_store(directory: File, identities: &[[u8; 24]], owned: bool) {
+        let Ok(user) = sid() else {
+            return;
+        };
+        for (name, expected) in ["body.0", "body.1", "commit.0", "commit.1"]
+            .into_iter()
+            .zip(identities)
+        {
+            let Ok(file) = relative_file(&directory, OsStr::new(name), user, OPEN_ROLLBACK_SLOT)
+            else {
+                continue;
+            };
+            if unsafe { unique_file_identity(file.as_raw_handle()) } == Ok(*expected) {
+                delete_file(&file);
+            }
+        }
+        if owned {
+            delete_file(&directory);
+        }
     }
     pub(crate) fn delete_file(file: &File) -> bool {
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
@@ -868,7 +918,18 @@ mod native {
         let (identity, value) = staged.inspect_err(|_| {
             delete_file(&file);
         })?;
-        Ok((file, identity, value))
+        let exact = unsafe { open_handle(path, OPEN_STAGE, None, "reopen staged object") }
+            .and_then(|exact| unsafe {
+                require(
+                    file_identity(exact.raw())? == identity,
+                    "staged object identity changed",
+                )?;
+                Ok(exact.into_file())
+            })
+            .inspect_err(|_| {
+                delete_file(&file);
+            })?;
+        Ok((exact, identity, value))
     }
     unsafe fn file_identity(handle: HANDLE) -> Result<[u8; 24]> {
         let info: FILE_ID_INFO =
@@ -878,6 +939,12 @@ mod native {
         identity[8..].copy_from_slice(&info.FileId.Identifier);
         Ok(identity)
     }
+    unsafe fn unique_file_identity(handle: HANDLE) -> Result<[u8; 24]> {
+        let info: FILE_STANDARD_INFO =
+            unsafe { file_info(handle, FileStandardInfo, "inspect Windows store slot links")? };
+        require(info.NumberOfLinks == 1, "hard-linked Windows store slot")?;
+        unsafe { file_identity(handle) }
+    }
     fn session_identity(file: [u8; 24]) -> [u8; 25] {
         let mut identity = [0; 25];
         identity[0] = 2;
@@ -886,15 +953,7 @@ mod native {
     }
     unsafe fn store_file_identity(path: &Path) -> Result<[u8; 24]> {
         let file = unsafe { open_handle(path, OPEN_SLOT, None, "open Windows store slot")? };
-        let info: FILE_STANDARD_INFO = unsafe {
-            file_info(
-                file.raw(),
-                FileStandardInfo,
-                "inspect Windows store slot links",
-            )?
-        };
-        require(info.NumberOfLinks == 1, "hard-linked Windows store slot")?;
-        unsafe { file_identity(file.raw()) }
+        unsafe { unique_file_identity(file.raw()) }
     }
     fn selector_decimal(text: &str) -> Result<usize> {
         crate::canonical_u64(text)
@@ -1117,8 +1176,8 @@ mod native {
         Err("instrumentation module was not loaded into requested child".into())
     }
 
-    fn stream_handle(stream: &LocalStream) -> HANDLE {
-        let LocalStream::NamedPipe(pipe) = stream;
+    fn stream_handle(stream: &Stream) -> HANDLE {
+        let Stream::NamedPipe(pipe) = stream;
         pipe.inner().as_handle().as_raw_handle()
     }
 
@@ -1129,7 +1188,7 @@ mod native {
             .map_err(string)
     }
 
-    fn same_user(stream: &LocalStream, user: &str) -> std::result::Result<bool, ()> {
+    fn same_user(stream: &Stream, user: &str) -> std::result::Result<bool, ()> {
         unsafe {
             if ImpersonateNamedPipeClient(stream_handle(stream)) == 0 {
                 return Err(());
@@ -1146,8 +1205,8 @@ mod native {
         }
     }
 
-    type Authentication = (LocalStream, [u8; 4], bool, Option<u32>);
-    fn authenticate(mut stream: LocalStream, user: &str) -> Option<Authentication> {
+    type Authentication = (Stream, [u8; 4], bool, Option<u32>);
+    fn authenticate(mut stream: Stream, user: &str) -> Option<Authentication> {
         let handle = stream_handle(&stream);
         let preface = fixed_record(
             &mut stream,
@@ -1217,7 +1276,7 @@ mod native {
         false
     }
 
-    fn cancel(stream: &LocalStream) {
+    fn cancel(stream: &Stream) {
         unsafe { windows_sys::Win32::System::IO::CancelIoEx(stream_handle(stream), ptr::null()) };
     }
     fn stop_job(job: &Job) -> bool {
@@ -1266,21 +1325,14 @@ mod native {
     crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
-            let (write, read, rejected) = match kind {
-                1 => (
-                    "command bootstrap to resume child",
-                    "bootstrap resume acknowledgement",
-                    "bootstrap failed to resume child",
-                ),
-                _ => (
-                    "command bootstrap to break child",
-                    "bootstrap break acknowledgement",
-                    "bootstrap failed to break child",
-                ),
-            };
             self.control
-                .write(&bootstrap_command(kind, self.nonce), write)?;
-            require(self.result.record::<1>(false, read)? == [0], rejected)
+                .write(&bootstrap_command(kind, self.nonce), "command bootstrap")?;
+            require(
+                self.result
+                    .record::<1>(false, "bootstrap acknowledgement")?
+                    == [0],
+                "bootstrap command failed",
+            )
         }
     }
     impl Native {
@@ -1293,7 +1345,7 @@ mod native {
                 .instrument
                 .as_ref()
                 .map(|instrument| os_bytes(instrument.path.as_os_str()));
-            let mut artifacts = holder_artifacts(
+            self.artifacts = Some(holder_artifacts(
                 &self.identity,
                 (
                     (self.generation != 1).then_some(self.generation),
@@ -1313,7 +1365,8 @@ mod native {
                     event_layout: 2,
                     log_cap: self.options.log_cap,
                 },
-            )?;
+            )?);
+            let artifacts = self.artifacts.as_mut().unwrap();
             let cwd = absolute(self.options.directory.as_deref().unwrap_or(Path::new(".")))?;
             let containment = u32::from_le_bytes(random_array::<4>()?).max(1);
             put_wide(&mut artifacts.status, &os_bytes(cwd.as_os_str())).map_err(crate::protocol)?;
@@ -1321,7 +1374,6 @@ mod native {
                 artifacts.status.extend_from_slice(&bytes);
             }
             artifacts.status.extend_from_slice(&self.birth);
-            self.artifacts = Some(artifacts);
             Ok(())
         }
         fn launch(
@@ -1329,7 +1381,7 @@ mod native {
             marker: &Marker,
             command: &[OsString],
             nonce: [u8; 16],
-        ) -> Result<LocalListener> {
+        ) -> Result<Listener> {
             let instrument = self.options.instrument.take();
             let listener = self.first_protected_pipe(&marker.pipe)?;
             self.stage = Some(self.stage_marker(&marker.encode())?);
@@ -1347,7 +1399,7 @@ mod native {
             Ok(listener)
         }
 
-        fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<LocalListener> {
+        fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<Listener> {
             ListenerOptions::new()
                 .name(local_name(pipe)?)
                 .security_descriptor(pipe_descriptor(&self.sid)?)
@@ -1455,7 +1507,7 @@ mod native {
                     return Err(format!(
                         "could not enter {} ({})",
                         name::render(directory.as_os_str()),
-                        cause.label()
+                        CAUSES[cause as usize]
                     ));
                 }
                 if let Some(BootstrapFailure::Execution(code)) =
@@ -1535,7 +1587,10 @@ mod native {
             verified.inspect_err(|_| {
                 delete_file(&staged);
             })?;
-            let (read, write) = Pipe::pair("create instrumentation acknowledgement pipe")?;
+            let (read, write) = Pipe::pair("create instrumentation acknowledgement pipe")
+                .inspect_err(|_| {
+                    delete_file(&staged);
+                })?;
             self.instrument = Some(Instrument {
                 path: stage,
                 file: staged,
@@ -1644,7 +1699,6 @@ mod native {
                     file_identity(final_file.raw())? == staged_identity,
                     "marker identity changed",
                 )?;
-                (self.stage, self.event) = (None, None);
                 Ok(())
             }
         }
@@ -1741,8 +1795,8 @@ mod native {
     fn event_target(operand: &Path, root: &Path) -> Result<EventTarget> {
         let reject = |cause| event_rejection(operand, cause);
         let event = absolute(operand).map_err(|_| reject("io-error"))?;
-        let root_handle =
-            event_component(root).map_err(|error| reject(directory_cause(&error).label()))?;
+        let root_handle = event_component(root)
+            .map_err(|error| reject(CAUSES[directory_cause(&error) as usize]))?;
         let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
             .map_err(|_| reject("io-error"))?;
         let mut all = event.components();
@@ -1787,7 +1841,7 @@ mod native {
                     present = false;
                     break;
                 }
-                Err(error) => return Err(reject(directory_cause(&error).label())),
+                Err(error) => return Err(reject(CAUSES[directory_cause(&error) as usize])),
             };
             let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
             crate::ensure!(
@@ -1838,50 +1892,11 @@ mod native {
     ) -> Result<()> {
         crate::return_if!(target.present, validate_event(target, user));
         let rejected = event_rejection(&target.path, "identity-changed");
-        let mut name = target
-            .path
-            .file_name()
-            .ok_or_else(|| rejected.clone())?
-            .encode_wide()
-            .collect::<Vec<_>>();
-        let length = u16::try_from(name.len().saturating_mul(2)).map_err(|_| rejected.clone())?;
-        let unicode = UNICODE_STRING {
-            Length: length,
-            MaximumLength: length,
-            Buffer: name.as_mut_ptr(),
-        };
-        let (descriptor, _) = descriptor(user, "FA").map_err(|_| rejected.clone())?;
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: target.guards.last().unwrap().as_raw_handle(),
-            ObjectName: &unicode,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: (&*descriptor as *const SecurityDescriptor).cast(),
-            SecurityQualityOfService: ptr::null(),
-        };
-        let (mut raw, mut status) = (INVALID_HANDLE_VALUE, IO_STATUS_BLOCK::default());
-        let result = unsafe {
-            NtCreateFile(
-                &mut raw,
-                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE,
-                &attributes,
-                &mut status,
-                ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_CREATE,
-                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-                ptr::null(),
-                0,
-            )
-        };
-        let handle = unsafe { Handle::owned(raw) };
-        crate::ensure!(
-            result == STATUS_SUCCESS && !handle.is_null(),
-            rejected.clone()
-        );
+        let name = target.path.file_name().ok_or_else(|| rejected.clone())?;
+        let handle = relative_file(target.guards.last().unwrap(), name, user, CREATE_DIRECTORY)
+            .map_err(|_| rejected.clone())?;
         after_create(&target.path);
-        target.guards.push(handle.into_file());
+        target.guards.push(handle);
         target.created = true;
         let verified = (|| {
             let attributes =
@@ -1968,7 +1983,7 @@ mod native {
     fn pipe_name(marker: &Marker) -> [u16; 47] {
         std::array::from_fn(|at| marker.pipe.get(at).copied().map(u16::from).unwrap_or(0))
     }
-    fn controller(path: &Path, timeout: u32) -> Result<WireClient> {
+    fn controller(path: &Path, timeout: u32) -> Result<Client> {
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
         let (marker, identity) = read_marker(path)?;
         let pipe = pipe_name(&marker);
@@ -1981,14 +1996,14 @@ mod native {
             WaitNamedPipeW(pipe.as_ptr(), remaining),
             "wait for holder pipe"
         )?;
-        let stream = LocalStream::connect(local_name(&marker.pipe)?).map_err(string)?;
+        let stream = Stream::connect(local_name(&marker.pipe)?).map_err(string)?;
         require(
             read_marker(path)?.1 == identity,
             "marker identity changed during connection",
         )?;
-        WireClient::from_stream(stream, identity.to_vec(), deadline, cancel)
+        Client::from_stream(stream, identity.to_vec(), deadline, cancel)
     }
-    pub(crate) fn connect(path: &Path) -> Result<WireClient> {
+    pub(crate) fn connect(path: &Path) -> Result<Client> {
         controller(path, 2000)
     }
     fn inspect(path: &Path, status: bool, timeout: u32) -> SessionState {
@@ -2051,10 +2066,9 @@ mod native {
         )
     }
     fn valid_size(&(rows, columns): &(u16, u16)) -> bool {
-        rows != 0
-            && columns != 0
-            && rows <= i16::MAX as u16
-            && columns <= i16::MAX as u16
+        [rows, columns]
+            .into_iter()
+            .all(|value| value != 0 && value <= i16::MAX as u16)
             && u32::from(rows) * u32::from(columns) <= 2_000_000
     }
     fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
@@ -2063,55 +2077,55 @@ mod native {
             unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
             "inspect viewer console geometry",
         )?;
-        let extent = |last, first| u16::try_from(i32::from(last) - i32::from(first) + 1).ok();
+        let extent = |last, first| {
+            u16::try_from(i32::from(last) - i32::from(first) + 1)
+                .map_err(|_| "viewer console geometry is invalid")
+        };
         let size = (
-            extent(info.srWindow.Bottom, info.srWindow.Top)
-                .ok_or("viewer console geometry is invalid")?,
-            extent(info.srWindow.Right, info.srWindow.Left)
-                .ok_or("viewer console geometry is invalid")?,
+            extent(info.srWindow.Bottom, info.srWindow.Top)?,
+            extent(info.srWindow.Right, info.srWindow.Left)?,
         );
         require(valid_size(&size), "viewer console geometry is invalid")?;
         Ok(size)
     }
-    struct ViewerConsole(HANDLE, HANDLE, (u32, u32));
+    struct ViewerConsole([HANDLE; 2], [u32; 2]);
     impl ViewerConsole {
         fn detect() -> Option<Self> {
             let mut console = Self(
-                unsafe { GetStdHandle(STD_INPUT_HANDLE) },
-                unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
-                (0, 0),
+                unsafe {
+                    [
+                        GetStdHandle(STD_INPUT_HANDLE),
+                        GetStdHandle(STD_OUTPUT_HANDLE),
+                    ]
+                },
+                [0; 2],
             );
-            (unsafe { GetConsoleMode(console.0, &mut console.2.0) } != 0
-                && unsafe { GetConsoleMode(console.1, &mut console.2.1) } != 0)
+            (0..2)
+                .all(|at| unsafe { GetConsoleMode(console.0[at], &mut console.1[at]) } != 0)
                 .then_some(console)
         }
         fn geometry(&self) -> Result<(u16, u16)> {
-            console_geometry(self.1)
+            console_geometry(self.0[1])
         }
-        fn raw(&self) -> Result<()> {
-            let modes = viewer_modes(self.2.0, self.2.1);
-            check(
-                unsafe { SetConsoleMode(self.0, modes.0) } != 0,
-                "configure viewer console input",
-            )?;
-            check(
-                unsafe { SetConsoleMode(self.1, modes.1) } != 0,
-                "configure viewer console output",
-            )
+        fn set(&self, modes: (u32, u32)) -> Result<()> {
+            for (handle, mode) in self.0.into_iter().zip([modes.0, modes.1]) {
+                check(
+                    unsafe { SetConsoleMode(handle, mode) } != 0,
+                    "configure viewer console",
+                )?;
+            }
+            Ok(())
         }
     }
     impl Drop for ViewerConsole {
         fn drop(&mut self) {
-            unsafe {
-                SetConsoleMode(self.1, self.2.1);
-                SetConsoleMode(self.0, self.2.0);
-            }
+            self.set((self.1[0], self.1[1])).ok();
         }
     }
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
-        terminal.raw()?;
+        terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let geometry = terminal.geometry().unwrap_or((0, 0));
         let mut output = io::stdout();
@@ -2160,22 +2174,18 @@ mod native {
             command.spawn_with(SpawnOptions::new().creation_flags(flags)),
             "start detached holder",
         )?;
-        Ok(i32::from(
-            await_launch(
-                child
-                    .stdout
-                    .take()
-                    .ok_or("launch result pipe is unavailable")?,
-            )?
-            .0,
-        ))
+        let Some(output) = child.stdout.take() else {
+            return Err("launch result pipe is unavailable".into());
+        };
+        Ok(i32::from(await_launch(output)?.0))
     }
     fn creation_size(required: bool, geometry: Option<(u16, u16)>) -> Result<(u16, u16)> {
-        if let Some(size) = geometry {
-            return Ok(size);
-        }
-        crate::ensure!(!required, "no controlling terminal");
-        Ok((24, 80))
+        crate::ensure!(geometry.is_some() || !required, "no controlling terminal");
+        Ok(geometry.unwrap_or((24, 80)))
+    }
+    fn parse_geometry(value: &OsStr) -> Option<(u16, u16)> {
+        let (rows, columns) = value.to_str()?.split_once(':')?;
+        Some((rows.parse().ok()?, columns.parse().ok()?)).filter(valid_size)
     }
     fn creation_geometry(required: bool, capture: bool, child: bool) -> Result<(u16, u16)> {
         let inherited = std::env::var_os(DETACHED_GEOMETRY);
@@ -2183,30 +2193,23 @@ mod native {
         if child {
             return inherited
                 .as_deref()
-                .and_then(OsStr::to_str)
-                .and_then(|value| value.split_once(':'))
-                .and_then(|(rows, columns)| {
-                    Some((rows.parse::<u16>().ok()?, columns.parse::<u16>().ok()?))
-                })
-                .filter(valid_size)
+                .and_then(parse_geometry)
                 .ok_or_else(|| "detached holder geometry is invalid".into());
         }
-        let geometry = if capture {
-            ViewerConsole::detect()
-                .map(|console| console.geometry())
-                .transpose()?
-        } else {
-            None
-        };
+        let geometry = capture
+            .then(ViewerConsole::detect)
+            .flatten()
+            .map(|console| console.geometry())
+            .transpose()?;
         creation_size(required, geometry)
     }
-    fn holder(mut host: Native, listener: LocalListener) -> Result<i32> {
+    fn holder(mut host: Native, listener: Listener) -> Result<i32> {
+        let marker_path = std::mem::take(&mut host.marker);
+        let marker = host.stage.take().unwrap();
         let user = std::mem::take(&mut host.sid);
         let reader = std::mem::take(&mut host.output).into_file();
         let writer = std::mem::take(&mut host.input).into_file();
         let pty = Duplex::tracked(reader, writer, 1 << 20);
-        let marker_path = std::mem::take(&mut host.marker);
-        let identity = host.identity;
         let mut artifacts = host.artifacts.take().unwrap();
         let running = std::mem::take(&mut artifacts.running);
         let (authenticated, clients) = mpsc::channel::<(bool, Option<Authentication>)>();
@@ -2260,8 +2263,12 @@ mod native {
         let termination = runtime.termination_method();
         let (exit, durable) = runtime.finish_exit(&running, NativeExit::Code(code), termination);
         let unlinked = durable
-            && read_marker(&marker_path).is_ok_and(|(_, final_id)| final_id == identity)
-            && fs::remove_file(&marker_path).is_ok();
+            && {
+                let deleted = delete_file(&marker.file);
+                drop(marker);
+                deleted
+                    && matches!(fs::symlink_metadata(marker_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            };
         runtime.retired(unlinked, false);
         Ok(exit)
     }
@@ -2301,15 +2308,6 @@ mod native {
         child_environment(invoked, path)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
-        let event = options
-            .events
-            .as_deref()
-            .map(|operand| -> Result<EventTarget> {
-                let mut target = event_target(operand, &stage_root)?;
-                materialize_event(&mut target, user, |_| {})?;
-                Ok(target)
-            })
-            .transpose()?;
         let random = random_array::<64>()?;
         let generation = launch_generation(invoked)?;
         ready.generation = generation;
@@ -2323,6 +2321,15 @@ mod native {
         } else {
             Default::default()
         };
+        let event = options
+            .events
+            .as_deref()
+            .map(|operand| -> Result<EventTarget> {
+                let mut target = event_target(operand, &stage_root)?;
+                materialize_event(&mut target, user, |_| {})?;
+                Ok(target)
+            })
+            .transpose()?;
         let mut host = Native {
             marker: path.to_owned(),
             stage_root,
@@ -2396,7 +2403,7 @@ mod native {
 pub use native::bootstrap;
 #[cfg(windows)]
 pub(crate) use native::{
-    attach, classify, cleanup, clock, connect, create, create_store_file, create_store_path,
-    current_paths, delete_file, preflight_create, protected_store_path, resolve, sessions,
-    store_directory, valid_store_slots,
+    attach, classify, cleanup, clock, connect, create, create_store_directory, create_store_file,
+    create_store_path, current_paths, preflight_create, protected_store_path, resolve,
+    rollback_store, sessions, valid_store_directory, valid_store_slots,
 };
