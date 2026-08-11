@@ -417,8 +417,7 @@ mod native {
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
     crate::schema!(tuple RelativePolicy [Clone, Copy]; fields; u32, u32, u32, u32);
     type StoreFile = (File, [u8; 24]);
-    type StoreFileFailure = (io::Error, Option<StoreFile>);
-    type StoreFileResult = std::result::Result<StoreFile, StoreFileFailure>;
+    type StoreFileResult = std::result::Result<StoreFile, (io::Error, Option<StoreFile>)>;
     const SHARE_RW: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
     const SHARE_ALL: u32 = SHARE_RW | FILE_SHARE_DELETE;
     const NO_FOLLOW: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
@@ -431,6 +430,7 @@ mod native {
     const OPEN_STAGE: OpenPolicy = OpenPolicy(GENERIC_READ | DELETE, SHARE_ALL);
     const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
     const OPEN_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, SHARE_RW);
+    const OPEN_RB: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES | DELETE, SHARE_ALL);
     const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
         GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
         SHARE_RW,
@@ -826,10 +826,12 @@ mod native {
             .is_ok_and(|current| unsafe { file_identity(directory.as_raw_handle()) } == Ok(current))
     }
     pub(crate) fn rollback_store(directory: File, ids: &[[u8; 24]], state: (Option<File>, bool)) {
-        let (guard, owned) = state;
         let Ok(user) = sid() else {
             return;
         };
+        if let Some(file) = state.0.as_ref().and_then(|file| reopen(file, OPEN_RB).ok()) {
+            delete_file(&file);
+        }
         for (name, expected) in ["body.0", "body.1", "commit.0", "commit.1"]
             .into_iter()
             .zip(ids)
@@ -842,8 +844,8 @@ mod native {
                 delete_file(&file);
             }
         }
-        drop(guard);
-        if owned {
+        drop(state.0);
+        if state.1 {
             delete_file(&directory);
         }
     }
