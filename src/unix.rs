@@ -747,6 +747,27 @@ fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (St
     ))
 }
 
+fn enter_directory(directory: &Path) -> std::result::Result<(), SetupError> {
+    let cause = match fs::metadata(directory) {
+        Ok(meta) if !meta.is_dir() => "not-directory",
+        Ok(_) => match CString::new(directory.as_os_str().as_bytes()) {
+            Ok(path) if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 => return Ok(()),
+            _ => "not-searchable",
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
+        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => "not-directory",
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => "not-searchable",
+        Err(_) => "io-error",
+    };
+    Err(SetupError(
+        format!(
+            "could not enter {} ({cause})",
+            name::render(directory.as_os_str())
+        ),
+        false,
+    ))
+}
+
 fn holder_setup(
     config: &mut Config<'_>,
     mut adopt: impl FnMut(u32),
@@ -781,6 +802,10 @@ fn holder_setup(
         .stdout(Stdio::from(slave))
         .stderr(Stdio::from(stderr));
     if let Some(directory) = &options.directory {
+        // §3.5/OB-32: a rejected working directory must name the directory,
+        // distinctly from a child that could not be executed, so it is
+        // validated here rather than surfacing from spawn() as exec failure.
+        enter_directory(directory)?;
         process.current_dir(directory);
     }
     let generation_key = shared::environment_key(invoked, "_GENERATION");
@@ -1108,10 +1133,19 @@ fn root(invoked: &OsStr) -> Result<PathBuf> {
     directory.push(base);
     directory.push(format!("-{}", uid()));
     let root = std::env::temp_dir().join(directory);
-    crate::ensure!(
-        crate::store::private_directory(&root, true).text()?,
-        format!("session root '{}' is not owner-only", root.display())
-    );
+    let private = crate::store::private_directory(&root, true)
+        .map_err(|_| rejected("session root", &root, "io-error"))?;
+    if !private {
+        // Classify what private_directory found unacceptable so the frozen
+        // template names a cause instead of one undifferentiated phrase.
+        let cause = match fs::symlink_metadata(&root) {
+            Ok(meta) if !meta.file_type().is_dir() => "wrong-type",
+            Ok(meta) if !owned(&meta) => "wrong-owner",
+            Ok(_) => "wrong-mode",
+            Err(_) => "io-error",
+        };
+        return Err(rejected("session root", &root, cause));
+    }
     Ok(root)
 }
 
@@ -1532,6 +1566,18 @@ impl PreparedInstrument {
         let (loader, separator) = ("DYLD_INSERT_LIBRARIES", ":");
         #[cfg(not(target_os = "macos"))]
         let (loader, separator) = ("LD_PRELOAD", " ");
+        // §4.7/closure §6.5: the value placed in the loader variable is the
+        // staged path, so the loader-encoding refusal applies to it — not to
+        // the caller's operand, whose spelling never reaches the loader.
+        let staged_path = self.path.as_os_str().as_bytes();
+        crate::ensure!(
+            !staged_path.iter().any(|byte| {
+                *byte == b':'
+                    || cfg!(not(target_os = "macos"))
+                        && (*byte == b'$' || byte.is_ascii_whitespace())
+            }),
+            rejected("instrumentation", &self.path, "loader-encoding")
+        );
         let mut preload = self.path.as_os_str().to_owned();
         if let Some(prior) = std::env::var_os(loader).filter(|value| !value.is_empty()) {
             preload.push(separator);
@@ -1914,8 +1960,60 @@ fn fixed_record<const N: usize>(mut file: File) -> Result<[u8; N]> {
     )
 }
 
+// Closure §6.3: a headless creation uses this frozen terminal configuration,
+// not the kernel default, which differs between platforms. Every mode word
+// starts zero and every control slot starts _POSIX_VDISABLE; only the listed
+// flags and controls are then set.
+fn headless_termios() -> libc::termios {
+    #[cfg(target_os = "macos")]
+    const DISABLED: libc::cc_t = 0xff;
+    #[cfg(not(target_os = "macos"))]
+    const DISABLED: libc::cc_t = 0;
+    let mut terminal: libc::termios = unsafe { std::mem::zeroed() };
+    terminal.c_cc = [DISABLED; libc::NCCS];
+    terminal.c_iflag = libc::ICRNL | libc::IXON;
+    terminal.c_oflag = libc::OPOST | libc::ONLCR;
+    terminal.c_cflag = libc::CS8 | libc::CREAD;
+    terminal.c_lflag = libc::ISIG
+        | libc::ICANON
+        | libc::IEXTEN
+        | libc::ECHO
+        | libc::ECHOE
+        | libc::ECHOK
+        | libc::ECHOCTL
+        | libc::ECHOKE;
+    unsafe {
+        libc::cfsetispeed(&mut terminal, libc::B38400);
+        libc::cfsetospeed(&mut terminal, libc::B38400);
+    }
+    for (slot, byte) in [
+        (libc::VINTR, 0x03),
+        (libc::VQUIT, 0x1C),
+        (libc::VERASE, 0x7F),
+        (libc::VKILL, 0x15),
+        (libc::VEOF, 0x04),
+        (libc::VSTART, 0x11),
+        (libc::VSTOP, 0x13),
+        (libc::VSUSP, 0x1A),
+        (libc::VREPRINT, 0x12),
+        (libc::VDISCARD, 0x0F),
+        (libc::VWERASE, 0x17),
+        (libc::VLNEXT, 0x16),
+        (libc::VMIN, 0x01),
+        (libc::VTIME, 0x00),
+    ] {
+        terminal.c_cc[slot] = byte;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        terminal.c_cc[libc::VDSUSP] = 0x19;
+        terminal.c_cc[libc::VSTATUS] = 0x14;
+    }
+    terminal
+}
+
 fn terminal_config(interactive: bool) -> Result<(Option<libc::termios>, libc::winsize)> {
-    crate::return_if!(!interactive, Ok((None, window(24, 80))));
+    crate::return_if!(!interactive, Ok((Some(headless_termios()), window(24, 80))));
     let terminal = ViewerTerminal::detect(libc::STDIN_FILENO).ok_or("no controlling terminal")?;
     let (rows, columns) = terminal
         .size()
@@ -1962,43 +2060,49 @@ fn child_process(inherited: i32) -> io::Result<()> {
     Ok(())
 }
 
+// Closure §6.2: rejection diagnostics use the frozen `<surface> rejected:
+// <path> (<cause>)` templates with causes from the closed enum.
+fn rejected(surface: &str, path: &Path, cause: &str) -> String {
+    format!(
+        "{surface} rejected: {} ({cause})",
+        name::render(path.as_os_str())
+    )
+}
+
+fn open_cause(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "missing",
+        _ if error.raw_os_error() == Some(libc::ELOOP) => "link",
+        _ => "io-error",
+    }
+}
+
 fn open_stderr(path: &Path) -> Result<File> {
+    let reject = |cause| rejected("standard-error sink", path, cause);
     let file = OpenOptions::new()
         .append(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .text()?;
-    let meta = file.metadata().text()?;
-    crate::ensure!(
-        meta.file_type().is_file() && protected(&meta, 0o600),
-        format!(
-            "stderr sink '{}' is not a protected regular file",
-            path.display()
-        )
-    );
+        .map_err(|error| reject(open_cause(&error)))?;
+    let meta = file.metadata().map_err(|_| reject("io-error"))?;
+    crate::ensure!(meta.file_type().is_file(), reject("wrong-type"));
+    crate::ensure!(owned(&meta), reject("wrong-owner"));
+    crate::ensure!(protected(&meta, 0o600), reject("wrong-mode"));
     Ok(file)
 }
 
 fn open_instrument(path: &Path) -> Result<File> {
-    let raw = path.as_os_str().as_bytes();
-    let bad_path = raw.iter().any(|byte| {
-        *byte == b':'
-            || cfg!(not(target_os = "macos")) && (*byte == b'$' || byte.is_ascii_whitespace())
-    });
+    let reject = |cause| rejected("instrumentation", path, cause);
+    crate::ensure!(path.is_absolute(), reject("not-absolute"));
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .text()?;
-    let meta = file.metadata().text()?;
-    crate::ensure!(
-        path.is_absolute()
-            && !bad_path
-            && meta.file_type().is_file()
-            && owned(&meta)
-            && meta.mode() & 0o022 == 0,
-        "instrumentation object is not a protected loadable path"
-    );
+        .map_err(|error| reject(open_cause(&error)))?;
+    let meta = file.metadata().map_err(|_| reject("io-error"))?;
+    crate::ensure!(meta.file_type().is_file(), reject("wrong-type"));
+    crate::ensure!(owned(&meta), reject("wrong-owner"));
+    crate::ensure!(meta.mode() & 0o022 == 0, reject("wrong-mode"));
     Ok(file)
 }
 
@@ -2180,3 +2284,6 @@ mod tests {
         fs::remove_dir(path).unwrap();
     }
 }
+
+#[cfg(test)]
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/unix.rs"));

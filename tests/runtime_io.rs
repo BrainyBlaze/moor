@@ -1367,3 +1367,66 @@ fn concurrent_shutdown_drains_every_accepted_send() {
     assert_eq!(pump.try_send(vec![0]), Err(SendError::Closed));
     read_gate.open();
 }
+
+#[test]
+#[cfg(unix)]
+fn move_reset_homes_the_cursor_even_after_an_empty_preamble() {
+    use moor::cli::Reset;
+    // Closure §6.3 orders `move` after TERMINAL_STATE unconditionally; an
+    // inexactly tracked session's empty preamble is a legal branch, not an
+    // implicit downgrade to `-R none`.
+    for (preamble, reset, expected) in [
+        (b"".as_slice(), Reset::Move, b"\x1b[Hx".as_slice()),
+        (b"p".as_slice(), Reset::Move, b"p\x1b[Hx".as_slice()),
+        (b"".as_slice(), Reset::None, b"x".as_slice()),
+    ] {
+        let body = [&(preamble.len() as u16).to_le_bytes(), preamble].concat();
+        let (mut client, server) = viewer_pair(move |mut peer| {
+            assert_eq!(peer.recv().kind, 1);
+            peer.send(
+                7,
+                2,
+                &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
+            );
+            assert_eq!(peer.recv().kind, 3);
+            peer.send(7, 5, &body);
+            peer.send(7, 4, &status(1, 1, 0, 1, 1));
+            let output = [
+                1_u64.to_le_bytes().as_slice(),
+                0_u64.to_le_bytes().as_slice(),
+                b"x",
+            ]
+            .concat();
+            peer.send(7, 6, &output);
+            let ack = peer.recv();
+            assert_eq!(
+                (ack.kind, ack.payload.as_ref()),
+                (7, 1_u64.to_le_bytes().as_slice())
+            );
+        });
+        let mut output = Vec::new();
+        let options = Options {
+            reset,
+            ..Options::default()
+        };
+        assert!(
+            io::attach_viewer_to(
+                &mut client,
+                &options,
+                (0, 0),
+                &mut output,
+                Duration::from_secs(15),
+                |_| Err("reconnect unavailable".into()),
+                |_| {},
+            )
+            .is_err()
+        );
+        assert_eq!(
+            output,
+            expected,
+            "reset {reset:?} after {}-byte preamble",
+            preamble.len()
+        );
+        server.join().unwrap();
+    }
+}

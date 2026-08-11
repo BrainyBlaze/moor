@@ -1284,6 +1284,23 @@ mod native {
                 let mut bootstrap = SpawnCommand::new(executable);
                 bootstrap.args(command);
                 if let Some(directory) = &self.options.directory {
+                    // §3.5/OB-32: a rejected working directory names the
+                    // directory with status 1, never the executable with 127.
+                    let cause = match std::fs::metadata(directory) {
+                        Ok(meta) if !meta.is_dir() => Some("not-directory"),
+                        Ok(_) => None,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            Some("missing")
+                        }
+                        Err(_) => Some("io-error"),
+                    };
+                    if let Some(cause) = cause {
+                        return Err(format!(
+                            "could not enter {} ({cause})",
+                            name::render(directory.as_os_str())
+                        )
+                        .into());
+                    }
                     bootstrap.current_dir(directory);
                 }
                 bootstrap
