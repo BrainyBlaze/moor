@@ -200,10 +200,16 @@ fn exact_descriptor_semantics(
     true
 }
 
+#[cfg(any(windows, test))]
+fn event_within_root(event: &std::path::Path, root: &std::path::Path) -> bool {
+    event != root && event.starts_with(root)
+}
+
 #[cfg(test)]
 mod descriptor_semantics_tests {
     use super::{
-        DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
+        DirectoryCause, directory_failure, directory_failure_record, event_within_root,
+        exact_descriptor_semantics,
     };
 
     #[test]
@@ -255,6 +261,19 @@ mod descriptor_semantics_tests {
             record[at] ^= 0xff;
         }
     }
+
+    #[test]
+    fn event_containment_uses_the_enforced_root_not_the_marker_parent() {
+        use std::path::Path;
+
+        let root = Path::new("C:/private-root");
+        assert!(event_within_root(Path::new("C:/private-root/events"), root));
+        assert!(!event_within_root(root, root));
+        assert!(!event_within_root(
+            Path::new("C:/path-form-parent/events"),
+            root
+        ));
+    }
 }
 
 #[cfg(windows)]
@@ -263,7 +282,7 @@ mod native {
     use super::{
         BootstrapRecord, DirectoryCause, Marker, Result, accept_bootstrap_command,
         bootstrap_command, cim_boot_identity, directory_failure, directory_failure_record,
-        exact_descriptor_semantics, wtf8_decode, wtf8_encode,
+        event_within_root, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
     };
     use crate::{
         cli::{CreateMode, Options},
@@ -1967,13 +1986,14 @@ mod native {
         child_environment(invoked, path)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
-        if let Some(event) = options.events.as_deref().map(absolute).transpose()? {
-            let namespace = path
-                .parent()
-                .ok_or_else(|| "session has no parent".to_string())?;
+        if let Some(operand) = options.events.as_deref() {
+            let event = absolute(operand)?;
             require(
-                event.starts_with(namespace),
-                "event store is outside the session root",
+                event_within_root(&event, &stage_root),
+                &format!(
+                    "event store rejected: {} (outside-root)",
+                    name::render(operand.as_os_str())
+                ),
             )?;
             validate(&event, user, "FA", true)?;
         }

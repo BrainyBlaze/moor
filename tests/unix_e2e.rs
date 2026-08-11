@@ -679,6 +679,11 @@ fn creation_never_replaces_a_dangling_rendezvous_symlink() {
         let _ = invoked(alias, &["kill", "-f", "dangling-create"]);
     }
     assert_eq!(created.status.code(), Some(1), "{created:?}");
+    assert_eq!(
+        created.stdout,
+        format!("{alias}: session 'dangling-create' could not be identified\n").as_bytes()
+    );
+    assert!(created.stderr.is_empty(), "{created:?}");
     assert!(preserved, "publication replaced the dangling symlink");
 
     fs::remove_dir_all(root).unwrap();
