@@ -978,6 +978,27 @@ fn a_reader_recovers_while_the_writer_holds_its_lease() {
     fs::remove_dir_all(path).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn a_created_windows_store_pins_its_directory_and_slot_names() {
+    let path = temp("windows-pinned-store");
+    let moved_directory = path.with_extension("moved");
+    let moved_slot = path.join("moved-body.0");
+    let store = Store::create(&path, Kind::Log, 7, b"", 0, 0).unwrap();
+    let directory_moved = fs::rename(&path, &moved_directory).is_ok();
+    if directory_moved {
+        fs::rename(&moved_directory, &path).unwrap();
+    }
+    let slot_moved = fs::rename(path.join("body.0"), &moved_slot).is_ok();
+    if slot_moved {
+        fs::rename(&moved_slot, path.join("body.0")).unwrap();
+    }
+    drop(store);
+    fs::remove_dir_all(path).unwrap();
+    assert!(!directory_moved, "live store directory was renameable");
+    assert!(!slot_moved, "live store slot was renameable");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_writer_keeps_using_its_validated_slot_handles_after_path_replacement() {

@@ -569,6 +569,79 @@ mod launch_paths {
     }
 
     #[test]
+    fn rejected_supervised_generation_does_not_materialize_the_event_directory() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("generation-preflight-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let invoked = Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap();
+        let generation = moor::runtime::private::environment_key(invoked, "_GENERATION");
+        let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .env("DESK_MOOR_LAUNCH_CHANNEL", "not-a-handle")
+            .env(&generation, "2")
+            .env("DESK_SESSION_GENERATION", "2")
+            .args([
+                "start",
+                &session,
+                "-T",
+                event.to_str().unwrap(),
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "exit 0",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        for path in [marker, event] {
+            assert!(std::fs::symlink_metadata(&path).is_err(), "leaked {path:?}");
+        }
+    }
+
+    #[test]
+    fn normal_retirement_deletes_only_the_published_marker_identity() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("retirement-identity-{}", std::process::id());
+        let marker = root.join(&session);
+        let displaced = root.join(format!("{session}-displaced"));
+        let release = root.join(format!("{session}-release"));
+        let out = moor(&[
+            "start",
+            &session,
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "while (!(Test-Path -LiteralPath $args[0])) { Start-Sleep -Milliseconds 10 }",
+            release.to_str().unwrap(),
+        ]);
+        assert!(out.status.success(), "{out:?}");
+        std::fs::rename(&marker, &displaced).unwrap();
+        std::fs::write(&marker, b"successor").unwrap();
+        std::fs::write(&release, b"go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while displaced.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let successor = std::fs::read(&marker);
+        let original_survived = displaced.exists();
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&displaced);
+        let _ = std::fs::remove_file(&release);
+        for suffix in [".log", ".exit"] {
+            let _ = std::fs::remove_dir_all(companion(&marker, suffix));
+        }
+        assert_eq!(successor.unwrap(), b"successor");
+        assert!(
+            !original_survived,
+            "published marker identity survived retirement"
+        );
+    }
+
+    #[test]
     fn publication_conflict_rolls_back_owned_artifacts_but_preserves_the_conflict() {
         let root = invoked_root();
         let _ = moor(&["list"]);
@@ -901,5 +974,434 @@ mod launch_paths {
         let removed = moor(&["rm", &session]);
         assert_eq!(removed.status.code(), Some(0), "{removed:?}");
         assert!(!event.exists(), "event store survived removal: {event:?}");
+    }
+
+    mod native_console {
+        use super::{companion, invoked_root, moor};
+        use moor::store::{Kind, Store};
+        use std::fs::File;
+        use std::io::{self, Read, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, ExitStatus, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+        use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
+        use windows_sys::Win32::Foundation::{HANDLE, TRUE};
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole, CreatePseudoConsole,
+            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+            ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, FreeConsole,
+            GenerateConsoleCtrlEvent, GetConsoleMode, GetStdHandle, HPCON, ResizePseudoConsole,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+        };
+        use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+        use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
+
+        struct Console {
+            value: HPCON,
+            input: Option<File>,
+            output: Option<File>,
+            received: Vec<u8>,
+        }
+
+        impl Console {
+            fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
+                let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+                if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(unsafe {
+                    (
+                        OwnedHandle::from_raw_handle(read as RawHandle),
+                        OwnedHandle::from_raw_handle(write as RawHandle),
+                    )
+                })
+            }
+
+            fn new(rows: i16, columns: i16) -> io::Result<Self> {
+                let (input_reader, input_writer) = Self::pipe()?;
+                let (output_reader, output_writer) = Self::pipe()?;
+                let mut value = 0;
+                let result = unsafe {
+                    CreatePseudoConsole(
+                        COORD {
+                            X: columns,
+                            Y: rows,
+                        },
+                        input_reader.as_raw_handle() as HANDLE,
+                        output_writer.as_raw_handle() as HANDLE,
+                        0,
+                        &mut value,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::other(format!(
+                        "CreatePseudoConsole failed with HRESULT {result:#x}"
+                    )));
+                }
+                drop((input_reader, output_writer));
+                Ok(Self {
+                    value,
+                    input: Some(input_writer.into()),
+                    output: Some(output_reader.into()),
+                    received: Vec::new(),
+                })
+            }
+
+            fn write(&self, bytes: &[u8]) -> io::Result<()> {
+                let mut input = self.input.as_ref().unwrap();
+                input.write_all(bytes)
+            }
+
+            fn resize(&self, rows: i16, columns: i16) -> io::Result<()> {
+                let result = unsafe {
+                    ResizePseudoConsole(
+                        self.value,
+                        COORD {
+                            X: columns,
+                            Y: rows,
+                        },
+                    )
+                };
+                (result >= 0)
+                    .then_some(())
+                    .ok_or_else(|| io::Error::other(format!("ResizePseudoConsole: {result:#x}")))
+            }
+
+            fn wait_for(&mut self, marker: &[u8], timeout: Duration) -> io::Result<()> {
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline {
+                    let output = self.output.as_mut().unwrap();
+                    let mut available = 0;
+                    if unsafe {
+                        PeekNamedPipe(
+                            output.as_raw_handle() as HANDLE,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            &mut available,
+                            std::ptr::null_mut(),
+                        )
+                    } == 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if available != 0 {
+                        let mut bytes = vec![0; available as usize];
+                        output.read_exact(&mut bytes)?;
+                        self.received.extend_from_slice(&bytes);
+                        if self
+                            .received
+                            .windows(marker.len())
+                            .any(|window| window == marker)
+                        {
+                            return Ok(());
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "missing {:?} in {:?}",
+                        String::from_utf8_lossy(marker),
+                        String::from_utf8_lossy(&self.received)
+                    ),
+                ))
+            }
+
+            fn spawn(&self, mut command: SpawnCommand) -> io::Result<Child> {
+                command.spawn_with(SpawnOptions::new().pseudoconsole(self))
+            }
+        }
+
+        impl Drop for Console {
+            fn drop(&mut self) {
+                drop(self.input.take());
+                drop(self.output.take());
+                let value = self.value;
+                let _ = thread::spawn(move || unsafe { ClosePseudoConsole(value) });
+            }
+        }
+
+        unsafe impl AsPseudoConsole for Console {
+            fn raw_pseudoconsole(&self) -> isize {
+                self.value
+            }
+        }
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = moor(&["kill", "-f", "-q", &self.0]);
+                let _ = moor(&["rm", "-q", &self.0]);
+            }
+        }
+
+        fn wait_spawn(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(io::ErrorKind::TimedOut, "child timed out"))
+        }
+
+        fn wait_std(child: &mut std::process::Child, timeout: Duration) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "moor run timed out",
+            ))
+        }
+
+        fn probe(console: &Console, label: &str) -> io::Result<Child> {
+            let mut command = SpawnCommand::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_mode_probe",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_MODE_PROBE", label);
+            console.spawn(command)
+        }
+
+        fn modes(bytes: &[u8], label: &str) -> (u32, u32) {
+            let text = String::from_utf8_lossy(bytes);
+            let prefix = format!("MOOR-MODE-{label}:");
+            let value = &text[text.rfind(&prefix).unwrap() + prefix.len()..];
+            let mut fields = value.split(':');
+            (
+                u32::from_str_radix(fields.next().unwrap(), 16).unwrap(),
+                u32::from_str_radix(fields.next().unwrap(), 16).unwrap(),
+            )
+        }
+
+        fn wait_modes(console: &mut Console, label: &str) -> (u32, u32) {
+            let end = format!("MOOR-MODE-{label}-END");
+            console
+                .wait_for(end.as_bytes(), Duration::from_secs(5))
+                .unwrap();
+            modes(&console.received, label)
+        }
+
+        #[test]
+        fn console_mode_probe() {
+            let Some(label) = std::env::var_os("MOOR_CONSOLE_MODE_PROBE") else {
+                return;
+            };
+            let (mut input, mut output) = (0, 0);
+            assert!(unsafe {
+                GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
+                    && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut output) != 0
+            });
+            println!(
+                "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
+                label.to_string_lossy()
+            );
+            println!("MOOR-MODE-{}-END", label.to_string_lossy());
+        }
+
+        #[test]
+        fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
+            let mut console = Console::new(37, 93).unwrap();
+            let mut before = probe(&console, "before").unwrap();
+            assert!(
+                wait_spawn(&mut before, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let before_modes = wait_modes(&mut console, "before");
+
+            let session = format!("console-e2e-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let script = "$s=$Host.UI.RawUI.WindowSize; [Console]::WriteLine(('MOOR-GEOM:{0}:{1}' -f $s.Height,$s.Width)); while ($true) { $k=[Console]::ReadKey($true); $s=$Host.UI.RawUI.WindowSize; [Console]::WriteLine(('MOOR-KEY:{0}:{1}:{2}' -f $k.KeyChar,$s.Height,$s.Width)) }";
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command.args([
+                "new",
+                &session,
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ]);
+            let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"MOOR-GEOM:37:93", Duration::from_secs(10))
+                .unwrap();
+
+            let mut live = probe(&console, "live").unwrap();
+            assert!(
+                wait_spawn(&mut live, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let (input, output) = wait_modes(&mut console, "live");
+            assert_eq!(
+                input & (ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS),
+                ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS
+            );
+            assert_eq!(
+                input
+                    & (ENABLE_LINE_INPUT
+                        | ENABLE_ECHO_INPUT
+                        | ENABLE_PROCESSED_INPUT
+                        | ENABLE_QUICK_EDIT_MODE
+                        | ENABLE_WINDOW_INPUT),
+                0
+            );
+            assert_eq!(
+                output & (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING),
+                ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            );
+
+            console.write(b"A").unwrap();
+            console
+                .wait_for(b"MOOR-KEY:A:37:93", Duration::from_secs(5))
+                .unwrap();
+            console.resize(41, 101).unwrap();
+            thread::sleep(Duration::from_millis(500));
+            console.write(b"B").unwrap();
+            console
+                .wait_for(b"MOOR-KEY:B:41:101", Duration::from_secs(5))
+                .unwrap();
+            console.write(&[0x1c]).unwrap();
+            assert!(
+                wait_spawn(&mut viewer, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+
+            let mut after = probe(&console, "after").unwrap();
+            assert!(
+                wait_spawn(&mut after, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(wait_modes(&mut console, "after"), before_modes);
+        }
+
+        #[test]
+        fn console_signal_sender() {
+            let Some(target) = std::env::var_os("MOOR_CONSOLE_SIGNAL_TARGET") else {
+                return;
+            };
+            let target = target.to_string_lossy().parse::<u32>().unwrap();
+            unsafe {
+                FreeConsole();
+                assert!(AttachConsole(target) != 0);
+                assert!(SetConsoleCtrlHandler(None, TRUE) != 0);
+                assert!(GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, target) != 0);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        fn signal(target: u32) {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_signal_sender",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_SIGNAL_TARGET", target.to_string())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "signal sender failed: {out:?}");
+        }
+
+        fn wait_log(marker: &std::path::Path, needle: &[u8]) {
+            let log = companion(marker, ".log");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if Store::read_only(&log, Kind::Log, 1)
+                    .is_ok_and(|(_, body)| body.windows(needle.len()).any(|part| part == needle))
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("child readiness was not logged at {log:?}");
+        }
+
+        fn control_case(label: &str, ignore: bool, second: bool) -> (Duration, String) {
+            let session = format!("console-control-{label}-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let handler = if ignore {
+                "$h=[ConsoleCancelEventHandler]{param($sender,$event) $event.Cancel=$true}; [Console]::add_CancelKeyPress($h);"
+            } else {
+                ""
+            };
+            let script = format!(
+                "{handler} [Console]::WriteLine('MOOR-CONTROL-READY'); while ($true) {{ Start-Sleep -Milliseconds 50 }}"
+            );
+            let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args([
+                    "run",
+                    &session,
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+                .unwrap();
+            wait_log(&marker, b"MOOR-CONTROL-READY");
+            let started = Instant::now();
+            signal(child.id());
+            if second {
+                thread::sleep(Duration::from_millis(250));
+                signal(child.id());
+            }
+            let status = wait_std(&mut child, Duration::from_secs(10)).unwrap();
+            assert!(status.code().is_some(), "holder has no exit status");
+            let elapsed = started.elapsed();
+            let body = String::from_utf8(
+                Store::read_only(&companion(&marker, ".exit"), Kind::Exit, 1)
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            (elapsed, body)
+        }
+
+        #[test]
+        fn shipped_console_control_is_graceful_then_bounded_and_immediately_escalated() {
+            let (graceful, lifecycle) = control_case("graceful", false, false);
+            assert!(graceful < Duration::from_secs(5), "{graceful:?}");
+            assert!(lifecycle.contains("\"method\":\"graceful\""), "{lifecycle}");
+
+            let (bounded, lifecycle) = control_case("bounded", true, false);
+            assert!(bounded >= Duration::from_secs(4), "{bounded:?}");
+            assert!(bounded < Duration::from_secs(10), "{bounded:?}");
+            assert!(lifecycle.contains("\"method\":\"forced\""), "{lifecycle}");
+
+            let (immediate, lifecycle) = control_case("immediate", true, true);
+            assert!(immediate < Duration::from_secs(5), "{immediate:?}");
+            assert!(lifecycle.contains("\"method\":\"forced\""), "{lifecycle}");
+        }
     }
 }

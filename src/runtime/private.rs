@@ -607,6 +607,14 @@ pub fn holder_artifacts(
         ),
     );
     let session = STANDARD.encode(identity);
+    let event_len = config.event_identity.map_or(0, <[u8]>::len);
+    let mut status = Vec::with_capacity(identity.len() + event_len + 110);
+    put_wide(&mut status, identity).map_err(crate::protocol)?;
+    status.extend_from_slice(&generation.1.to_le_bytes());
+    status.extend_from_slice(&incarnation);
+    status.push(config.event_path.map_or(0, |_| config.event_layout));
+    put_wide(&mut status, config.event_identity.unwrap_or_default()).map_err(crate::protocol)?;
+    let commit_at = status.len();
     let ArtifactStores {
         lifecycle,
         event,
@@ -689,14 +697,6 @@ pub fn holder_artifacts(
         events,
         lifecycle,
     };
-    let event_len = config.event_identity.map_or(0, <[u8]>::len);
-    let mut status = Vec::with_capacity(identity.len() + event_len + 110);
-    put_wide(&mut status, identity).map_err(crate::protocol)?;
-    status.extend_from_slice(&generation.1.to_le_bytes());
-    status.extend_from_slice(&incarnation);
-    status.push(config.event_path.map_or(0, |_| config.event_layout));
-    put_wide(&mut status, config.event_identity.unwrap_or_default()).map_err(crate::protocol)?;
-    let commit_at = status.len();
     if let Some(commit) = commit.filter(|_| config.event_layout == 2) {
         status.push(commit.body);
         status.extend_from_slice(&commit.index.to_le_bytes());

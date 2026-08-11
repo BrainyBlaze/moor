@@ -41,9 +41,7 @@ impl ViewerSender {
     }
 }
 
-schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
-    phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream,
-    lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
+schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write, phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream, lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
