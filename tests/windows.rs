@@ -1485,7 +1485,8 @@ mod launch_paths {
                     "launch_paths::native_console::console_geometry_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached")
+                .env("MOOR_TRACE_CONSOLE_RECORDS", "1");
             let mut viewer = console.spawn(command).unwrap();
             console
                 .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
@@ -1539,11 +1540,14 @@ mod launch_paths {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
             console.write(&[0x1c]).unwrap();
-            assert!(
-                wait_spawn(&mut viewer, Duration::from_secs(5))
-                    .unwrap()
-                    .success()
-            );
+            let detached =
+                wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
+                    panic!(
+                        "{error}; console output: {:?}",
+                        String::from_utf8_lossy(&console.received)
+                    )
+                });
+            assert!(detached.success());
 
             let mut after = probe(&console, "after").unwrap();
             assert!(

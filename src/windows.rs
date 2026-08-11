@@ -207,7 +207,7 @@ mod native {
     use std::io::{self, Read, Write};
     use std::os::windows::{ffi::*, fs::*, io::*};
     use std::sync::{OnceLock, atomic::*, mpsc};
-    use std::{ffi::*, mem::*, path::*, ptr, thread, time::*};
+    use std::{env, ffi::*, mem::*, path::*, ptr, thread, time::*};
     use windows_permissions::utilities::buf_from_os as wide;
     use windows_permissions::{LocalBox, SecurityDescriptor, constants::*, wrappers};
     use windows_spawn::{Command as SpawnCommand, Stdio as SpawnStdio, *};
@@ -2149,6 +2149,13 @@ mod native {
                 return Ok(None);
             }
             let key = unsafe { event.Event.KeyEvent };
+            if env::var_os("MOOR_TRACE_CONSOLE_RECORDS").is_some() {
+                let unit = unsafe { key.uChar.UnicodeChar };
+                eprintln!(
+                    "MOOR-CONSOLE-RECORD:{:04X}:{:04X}:{unit:04X}:{:08X}",
+                    key.wVirtualKeyCode, key.wVirtualScanCode, key.dwControlKeyState
+                );
+            }
             let Some((unit, repeat)) = console_wide(key) else {
                 return Ok(None);
             };
