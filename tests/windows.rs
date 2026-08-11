@@ -1029,6 +1029,7 @@ mod launch_paths {
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
         use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE};
         use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
             CreatePseudoConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
@@ -1368,7 +1369,21 @@ mod launch_paths {
             let mut received = Vec::new();
             while !received.ends_with(b"Z") {
                 let mut bytes = [0; 64];
-                let count = io::stdin().read(&mut bytes).unwrap();
+                let mut count = 0;
+                // Rust's console stdin uses ReadConsoleW; this probe needs the
+                // VT byte stream before another console-record translation.
+                assert!(
+                    unsafe {
+                        ReadFile(
+                            input,
+                            bytes.as_mut_ptr(),
+                            bytes.len() as u32,
+                            &mut count,
+                            std::ptr::null_mut(),
+                        )
+                    } != 0
+                );
+                let count = count as usize;
                 assert_ne!(count, 0, "console input closed before the sentinel");
                 received.extend_from_slice(&bytes[..count]);
                 assert!(received.len() <= 64, "console input exceeded its bound");
