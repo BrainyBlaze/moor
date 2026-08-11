@@ -321,6 +321,7 @@ fn storage_delay_shim(dir: &Path) -> PathBuf {
     fs::write(
         &source,
         r#"#define _GNU_SOURCE
+#include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -349,7 +350,13 @@ static void trace_lock(int fd) {
   int out=open(trace,O_WRONLY|O_CREAT|O_APPEND,0600); if(out<0) return;
   write(out,path,n); write(out,"\n",1); close(out);
 }
-int fsync(int fd) { delay(fd,"MOOR_TEST_FSYNC_DELAY_MS","/body.0"); return syscall(SYS_fsync,fd); }
+static int fail_fsync(int fd) {
+  char *needle=getenv("MOOR_TEST_FSYNC_FAIL_SUBSTR"); if(!needle) return 0;
+  char link[64], path[PATH_MAX]; snprintf(link,sizeof(link),"/proc/self/fd/%d",fd);
+  ssize_t n=readlink(link,path,sizeof(path)-1); if(n<0) return 0; path[n]=0;
+  return strstr(path,needle)!=0;
+}
+int fsync(int fd) { if(fail_fsync(fd)) { errno=EIO; return -1; } delay(fd,"MOOR_TEST_FSYNC_DELAY_MS","/body.0"); return syscall(SYS_fsync,fd); }
 int flock(int fd,int operation) { trace_lock(fd); delay(fd,"MOOR_TEST_FLOCK_DELAY_MS",".exit/commit.0"); return syscall(SYS_flock,fd,operation); }
 int fstatat(int fd,const char *path,struct stat *meta,int flags) {
   int result=syscall(SYS_newfstatat,fd,path,meta,flags); char *name=getenv("MOOR_TEST_DIRECTORY_SWAP_NAME");
@@ -2724,6 +2731,28 @@ fn launch_rejections_use_the_frozen_templates_with_causes() {
         "{out:?}"
     );
 
+    // standard-error sink: wrong-type (a directory cannot be a sink; the
+    // append-open fails with EISDIR before fstat, which must not surface as
+    // io-error)
+    let sink_dir = dir.join("sink-dir");
+    fs::create_dir(&sink_dir).unwrap();
+    let out = moor(&[
+        "start",
+        session.to_str().unwrap(),
+        "-2",
+        sink_dir.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: standard-error sink rejected: {} (wrong-type)\n",
+            sink_dir.display()
+        ),
+        "{out:?}"
+    );
+
     // instrumentation: missing
     let gone = dir.join("absent-object.so");
     let out = moor(&[
@@ -2779,6 +2808,10 @@ fn loader_encoding_refusal_applies_to_the_staged_path() {
     let object = dir.join("object.so");
     fs::write(&object, b"not a real library").unwrap();
     fs::set_permissions(&object, fs::Permissions::from_mode(0o644)).unwrap();
+    // §4.7: the Darwin delimiter is the colon; elsewhere whitespace/dollar.
+    #[cfg(target_os = "macos")]
+    let hostile = dir.join("host:ile");
+    #[cfg(not(target_os = "macos"))]
     let hostile = dir.join("host ile");
     fs::create_dir(&hostile).unwrap();
     let session = dir.join("stage-check");
@@ -2794,11 +2827,184 @@ fn loader_encoding_refusal_applies_to_the_staged_path() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.starts_with("moor: instrumentation rejected: ")
-            && stderr.trim_end().ends_with("(loader-encoding)"),
-        "the staged path must be refused with the loader-encoding cause: {out:?}"
+    // Exact equality: the row must display the caller's operand, not leak the
+    // generated stage path whose spelling caused the refusal.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: instrumentation rejected: {} (io-error)\n",
+            object.display()
+        ),
+        "{out:?}"
     );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rejected_session_root_reports_a_symlink_as_link() {
+    // §2.2 and the closed cause enum distinguish a symlinked root (`link`)
+    // from a non-directory occupant (`wrong-type`).
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let target = marker.join("elsewhere");
+    fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &root).unwrap();
+    let out = invoked(alias, &["start", "root-link", true_program()]);
+    fs::remove_file(&root).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "{alias}: session root rejected: {} (link)\n",
+            root.display()
+        ),
+        "{out:?}"
+    );
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn execute_only_working_directory_is_accepted() {
+    // chdir needs only search permission: an execute-only directory is valid
+    // even though it cannot be read, so validation must not demand O_RDONLY.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = temp();
+    let sealed = dir.join("exec-only");
+    fs::create_dir(&sealed).unwrap();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o111)).unwrap();
+    let out = moor(&[
+        "run",
+        dir.join("xo").to_str().unwrap(),
+        "-d",
+        sealed.to_str().unwrap(),
+        true_program(),
+    ]);
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unacknowledged_instrumentation_uses_the_frozen_row_with_the_operand() {
+    // Review reproduction: a protected regular file that is not a loadable
+    // object passes every static check, the loader skips it, no ACK arrives,
+    // and §4.7 fails closed. The frozen row must name the caller's operand
+    // with cause load-unacknowledged — not leak a raw record diagnostic.
+    let dir = temp();
+    let object = dir.join("inert.so");
+    fs::write(&object, b"not an object").unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o600)).unwrap();
+    let out = moor(&[
+        "run",
+        dir.join("ack").to_str().unwrap(),
+        "-S",
+        object.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: instrumentation rejected: {} (load-unacknowledged)\n",
+            object.display()
+        ),
+        "{out:?}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn attach_without_controlling_terminal_refuses_and_leaves_the_session_live() {
+    // Closure §6.4: attach validates the controlling terminal before touching
+    // anything; the refusal is `no controlling terminal` on stderr, status 1,
+    // and the live session must remain undisturbed.
+    let dir = temp();
+    let session = dir.join("keepalive");
+    let started = moor(&[
+        "start",
+        session.to_str().unwrap(),
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    assert!(started.status.success(), "{started:?}");
+    let out = unsafe {
+        use std::os::unix::process::CommandExt;
+        Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["attach", session.to_str().unwrap()])
+            .stdin(Stdio::null())
+            .pre_exec(|| {
+                // A fresh session guarantees the child has no controlling
+                // terminal regardless of how the harness was launched.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .output()
+            .unwrap()
+    };
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "moor: no controlling terminal\n",
+        "{out:?}"
+    );
+    // The session survived the refusal: rm against a live session is refused
+    // with `is running`, which is simultaneously the liveness probe and the
+    // proof the refusal did not disturb it.
+    let probe = moor(&["rm", session.to_str().unwrap()]);
+    assert_eq!(probe.status.code(), Some(1), "{probe:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&probe.stdout),
+        format!("moor: session '{}' is running\n", session.display()),
+        "the session must still be live after the refused attach: {probe:?}"
+    );
+    let _ = moor(&["kill", "-f", "-q", session.to_str().unwrap()]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+#[test]
+fn failed_event_initializer_names_the_caller_operand() {
+    // Review blocker: an event-store initializer failure inside the forked
+    // worker must surface as the frozen `event store rejected: <operand>
+    // (io-error)` row, not the generic store diagnostic — the event target is
+    // the caller-supplied one. The shim fails fsync only for paths under the
+    // event directory, so lifecycle/log initialize normally.
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let event = root.join("failing-events");
+    let shim = storage_delay_shim(&dir);
+    let output = invoked_command(alias)
+        .args([
+            "start",
+            "event-fail",
+            "-T",
+            event.to_str().unwrap(),
+            true_program(),
+        ])
+        .env("LD_PRELOAD", &shim)
+        .env("MOOR_TEST_FSYNC_FAIL_SUBSTR", "failing-events")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "{alias}: event store rejected: {} (io-error)\n",
+            event.display()
+        ),
+        "{output:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
     fs::remove_dir_all(dir).unwrap();
 }

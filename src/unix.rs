@@ -361,7 +361,10 @@ pub(crate) fn create(
     let lifecycle = StoreTarget::prepare(&stage.0, &shared::companion(path, ".exit"))?;
     let instrument = instrument_source
         .zip(instrument_path.as_deref())
-        .map(|(source, path)| PreparedInstrument::prepare(source, &root, path))
+        .map(|(source, path)| {
+            let operand = options.instrument.as_deref().expect("instrument operand");
+            PreparedInstrument::prepare(source, &root, path, operand)
+        })
         .transpose()?;
     let mut config = Config {
         path,
@@ -682,11 +685,19 @@ fn abort_unpublished(
 
 struct InitialStore<'a>(&'a StoreTarget, &'a Store, &'a [u8]);
 
-fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (String, bool)> {
+struct InitFailure {
+    // Store indices that failed or were still unfinished at the deadline, so
+    // the caller can name the caller-supplied event target distinctly.
+    offenders: Vec<usize>,
+    timed_out: bool,
+    rollback: bool,
+}
+
+fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), InitFailure> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut workers = Vec::with_capacity(stores.len());
-    let mut failed = false;
-    for store in stores {
+    let mut offenders = Vec::new();
+    for (index, store) in stores.iter().enumerate() {
         let mut descriptors = Vec::from(store.0.prepared.raw_descriptors());
         descriptors.extend(store.1.raw_descriptors());
         descriptors.extend([store.0.parent.as_raw_fd(), store.0.directory.as_raw_fd()]);
@@ -694,78 +705,103 @@ fn initialize_stores(stores: &[InitialStore<'_>]) -> std::result::Result<(), (St
         descriptors.dedup();
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            failed = true;
+            offenders.push(index);
             break;
         }
         if pid == 0 {
             unsafe { close_fds::close_open_fds(3, &descriptors) };
             unsafe { libc::_exit(store.0.initialize(store.1, store.2).is_err() as i32) }
         }
-        workers.push(pid);
+        workers.push((pid, index));
     }
-    while !workers.is_empty() && !failed && Instant::now() < deadline {
-        workers.retain(|pid| {
+    while !workers.is_empty() && offenders.is_empty() && Instant::now() < deadline {
+        workers.retain(|(pid, index)| {
             let mut observed = 0;
             match unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) } {
                 result if result == *pid => {
-                    let success = libc::WIFEXITED(observed) && libc::WEXITSTATUS(observed) == 0;
-                    failed |= !success;
+                    if !(libc::WIFEXITED(observed) && libc::WEXITSTATUS(observed) == 0) {
+                        offenders.push(*index);
+                    }
                     false
                 }
                 -1 if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted => {
-                    failed = true;
+                    offenders.push(*index);
                     false
                 }
                 _ => true,
             }
         });
-        if !failed {
+        if offenders.is_empty() {
             thread::sleep(Duration::from_millis(2));
         }
     }
-    if !failed && workers.is_empty() {
+    if offenders.is_empty() && workers.is_empty() {
         return Ok(());
     }
-    for pid in &workers {
+    // A prior explicit failure cancels the rest; those workers are merely
+    // cancelled, not offenders. Only when the shared deadline expired with no
+    // offender do the still-running stores become the (timeout) offenders.
+    let timed_out = offenders.is_empty();
+    if timed_out {
+        offenders.extend(workers.iter().map(|(_, index)| *index));
+    }
+    for (pid, _) in &workers {
         unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
     let reap_deadline = Instant::now() + Duration::from_millis(250);
     while !workers.is_empty() && Instant::now() < reap_deadline {
-        workers.retain(|pid| {
+        workers.retain(|(pid, _)| {
             let mut observed = 0;
             (unsafe { libc::waitpid(*pid, &mut observed, libc::WNOHANG) }) != *pid
         });
         thread::sleep(Duration::from_millis(2));
     }
-    Err((
-        if failed {
-            "store initialization failed".into()
-        } else {
-            "store initialization timed out".into()
-        },
-        workers.is_empty(),
-    ))
+    Err(InitFailure {
+        offenders,
+        timed_out,
+        rollback: workers.is_empty(),
+    })
 }
 
-fn enter_directory(directory: &Path) -> std::result::Result<(), SetupError> {
-    let cause = match fs::metadata(directory) {
-        Ok(meta) if !meta.is_dir() => "not-directory",
-        Ok(_) => match CString::new(directory.as_os_str().as_bytes()) {
-            Ok(path) if unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0 => return Ok(()),
-            _ => "not-searchable",
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => "missing",
-        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => "not-directory",
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => "not-searchable",
-        Err(_) => "io-error",
+fn enter_directory(directory: &Path) -> std::result::Result<OwnedFd, SetupError> {
+    // Descriptor-bound: the directory is opened once, every check runs on that
+    // descriptor, and the child enters it with fchdir in pre_exec — so nothing
+    // can be substituted between validation and entry.
+    let reject = |cause: &str| {
+        SetupError(
+            format!(
+                "could not enter {} ({cause})",
+                name::render(directory.as_os_str())
+            ),
+            false,
+        )
     };
-    Err(SetupError(
-        format!(
-            "could not enter {} ({cause})",
-            name::render(directory.as_os_str())
-        ),
-        false,
-    ))
+    // O_PATH (Linux) / O_SEARCH (Darwin) admit an execute-only directory,
+    // which chdir accepts even though it is unreadable; O_RDONLY would
+    // wrongly reject that valid POSIX case.
+    #[cfg(target_os = "macos")]
+    let mode = OFlag::from_bits_retain(libc::O_SEARCH);
+    #[cfg(not(target_os = "macos"))]
+    let mode = OFlag::O_PATH;
+    let fd = open(
+        directory,
+        mode | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| {
+        reject(match errno {
+            nix::errno::Errno::ENOENT => "missing",
+            nix::errno::Errno::ENOTDIR => "not-directory",
+            nix::errno::Errno::EACCES => "not-searchable",
+            nix::errno::Errno::ELOOP => "link",
+            _ => "io-error",
+        })
+    })?;
+    crate::ensure!(
+        unsafe { libc::faccessat(fd.as_raw_fd(), c".".as_ptr(), libc::X_OK, 0) } == 0,
+        reject("not-searchable")
+    );
+    Ok(fd)
 }
 
 fn holder_setup(
@@ -801,13 +837,16 @@ fn holder_setup(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(slave))
         .stderr(Stdio::from(stderr));
-    if let Some(directory) = &options.directory {
-        // §3.5/OB-32: a rejected working directory must name the directory,
-        // distinctly from a child that could not be executed, so it is
-        // validated here rather than surfacing from spawn() as exec failure.
-        enter_directory(directory)?;
-        process.current_dir(directory);
-    }
+    // §3.5/OB-32: a rejected working directory must name the directory,
+    // distinctly from a child that could not be executed, so it is validated
+    // here rather than surfacing from spawn() as exec failure. The guard keeps
+    // the descriptor open until the child has entered it.
+    let directory_guard = options
+        .directory
+        .as_deref()
+        .map(enter_directory)
+        .transpose()?;
+    let directory_fd = directory_guard.as_ref().map(|fd| fd.as_raw_fd());
     let generation_key = shared::environment_key(invoked, "_GENERATION");
     process
         .env_remove(&generation_key)
@@ -874,20 +913,37 @@ fn holder_setup(
         &lifecycle_store,
         running_body,
     )];
+    let mut event_index = None;
     if let (Some(target), Some(store), Some(body)) = (
         config.event.as_ref(),
         event_store.as_ref(),
         event_initial.as_deref(),
     ) {
+        event_index = Some(initial.len());
         initial.push(InitialStore(&target.target, store, body.as_bytes()));
     }
     if let (Some(target), Some(store)) = (config.log.as_ref(), log_store.as_ref()) {
         initial.push(InitialStore(target, store, &[]));
     }
-    if let Err((error, rollback)) = initialize_stores(&initial) {
-        if !rollback {
+    if let Err(failure) = initialize_stores(&initial) {
+        if !failure.rollback {
             config.retain_store_targets();
         }
+        // Closure §6.2: the event target is caller-supplied, so its
+        // initializer failure or timeout reports the frozen row naming the
+        // caller's operand; lifecycle/log keep the internal diagnostic.
+        let event_offends = event_index.is_some_and(|index| failure.offenders.contains(&index));
+        let error = if event_offends {
+            let operand = config.options.events.as_deref().expect("event operand");
+            format!(
+                "event store rejected: {} (io-error)",
+                name::render(operand.as_os_str())
+            )
+        } else if failure.timed_out {
+            "store initialization timed out".into()
+        } else {
+            "store initialization failed".into()
+        };
         return Err(error.into());
     }
     let mut artifacts = shared::holder_artifacts(
@@ -915,7 +971,10 @@ fn holder_setup(
     let instrument = config
         .instrument
         .as_mut()
-        .map(|source| source.configure(&mut process))
+        .map(|source| {
+            let operand = options.instrument.as_deref().expect("instrument operand");
+            source.configure(&mut process, operand)
+        })
         .transpose()?;
     if let Some(event) = config.event.as_ref() {
         event.revalidate(&config.root)?;
@@ -925,7 +984,14 @@ fn holder_setup(
         .map_or(-1, |instrument| instrument.write.as_raw_fd());
     unsafe {
         use std::os::unix::process::CommandExt;
-        process.pre_exec(move || child_process(inherited));
+        process.pre_exec(move || {
+            if let Some(fd) = directory_fd
+                && libc::fchdir(fd) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            child_process(inherited)
+        });
     }
     let child = process.spawn().map_err(|error| {
         SetupError(
@@ -934,7 +1000,12 @@ fn holder_setup(
         )
     })?;
     let mut child = ChildGuard(Some(child));
-    instrument_ack(instrument, child.child().id(), generation)?;
+    instrument_ack(
+        instrument,
+        child.child().id(),
+        generation,
+        options.instrument.as_deref(),
+    )?;
     let reader = master.try_clone().text()?;
     let pty = Duplex::tracked(reader, master.try_clone().text()?, 1 << 20);
     let cwd = absolute(options.directory.as_deref().unwrap_or(Path::new(".")))?;
@@ -1139,6 +1210,7 @@ fn root(invoked: &OsStr) -> Result<PathBuf> {
         // Classify what private_directory found unacceptable so the frozen
         // template names a cause instead of one undifferentiated phrase.
         let cause = match fs::symlink_metadata(&root) {
+            Ok(meta) if meta.file_type().is_symlink() => "link",
             Ok(meta) if !meta.file_type().is_dir() => "wrong-type",
             Ok(meta) if !owned(&meta) => "wrong-owner",
             Ok(_) => "wrong-mode",
@@ -1503,29 +1575,34 @@ impl EventTarget {
 }
 
 impl PreparedInstrument {
-    fn prepare(source: File, root: &Path, path: &Path) -> Result<Self> {
-        crate::ensure!(
-            path.parent() == Some(root),
-            "instrumentation stage escaped root"
-        );
+    fn prepare(source: File, root: &Path, path: &Path, operand: &Path) -> Result<Self> {
+        // Closure §6.2: every staging failure reports the frozen
+        // instrumentation row, displaying the caller's operand.
+        let reject = |cause| rejected("instrumentation", operand, cause);
+        crate::ensure!(path.parent() == Some(root), reject("outside-root"));
         let leaf = path
             .file_name()
-            .ok_or("instrumentation stage has no name")?
+            .ok_or_else(|| reject("io-error"))?
             .to_owned();
-        let parent = open_directory(root).text()?;
+        let parent = open_directory(root).map_err(|_| reject("io-error"))?;
         let stage = open_file_at(
             &parent,
             leaf.as_os_str(),
             INSTRUMENT_FLAGS,
             Mode::from_bits_retain(0o500),
         )
-        .text()?;
+        .map_err(|error| {
+            reject(match error.raw_os_error() {
+                Some(libc::EEXIST) => "pre-existing-slot",
+                _ => "io-error",
+            })
+        })?;
         let identity = (|| -> Result<_> {
-            os(fchmod(&stage, Mode::from_bits_retain(0o500))).text()?;
-            let meta = stage.metadata().text()?;
+            os(fchmod(&stage, Mode::from_bits_retain(0o500))).map_err(|_| reject("io-error"))?;
+            let meta = stage.metadata().map_err(|_| reject("io-error"))?;
             crate::ensure!(
                 meta.is_file() && protected(&meta, 0o500),
-                "instrumentation stage identity changed"
+                reject("identity-changed")
             );
             Ok(file_id(&meta))
         })()
@@ -1543,20 +1620,22 @@ impl PreparedInstrument {
         })
     }
 
-    fn configure(&mut self, process: &mut Command) -> Result<Instrument> {
-        let hash = shared::copy_digest(&mut self.source, Some(&mut self.stage))?;
-        self.stage.sync_all().text()?;
+    fn configure(&mut self, process: &mut Command, operand: &Path) -> Result<Instrument> {
+        let reject = |cause| rejected("instrumentation", operand, cause);
+        let hash = shared::copy_digest(&mut self.source, Some(&mut self.stage))
+            .map_err(|_| reject("io-error"))?;
+        self.stage.sync_all().map_err(|_| reject("io-error"))?;
         crate::ensure!(
             file_entry_matches(&self.parent, &self.leaf, self.identity, 0o500),
-            "instrumentation stage identity changed"
+            reject("identity-changed")
         );
-        let mut staged = self.stage.try_clone().text()?;
+        let mut staged = self.stage.try_clone().map_err(|_| reject("io-error"))?;
         crate::ensure!(
-            shared::copy_digest(&mut staged, None)? == hash,
-            "instrumentation stage identity changed"
+            shared::copy_digest(&mut staged, None).map_err(|_| reject("io-error"))? == hash,
+            reject("identity-changed")
         );
-        let (read, write) = nix::unistd::pipe().text()?;
-        let nonce = shared::random_array::<16>()?;
+        let (read, write) = nix::unistd::pipe().map_err(|_| reject("io-error"))?;
+        let nonce = shared::random_array::<16>().map_err(|_| reject("io-error"))?;
         process.env(
             "DESK_MOOR_INSTRUMENT_CHANNEL",
             write.as_raw_fd().to_string(),
@@ -1576,7 +1655,10 @@ impl PreparedInstrument {
                     || cfg!(not(target_os = "macos"))
                         && (*byte == b'$' || byte.is_ascii_whitespace())
             }),
-            rejected("instrumentation", &self.path, "loader-encoding")
+            // The closed cause enum has no loader-spelling entry; an
+            // unrepresentable staged path is reported as io-error (ratified in
+            // the #17 review verdict rather than a new token).
+            reject("io-error")
         );
         let mut preload = self.path.as_os_str().to_owned();
         if let Some(prior) = std::env::var_os(loader).filter(|value| !value.is_empty()) {
@@ -1588,7 +1670,7 @@ impl PreparedInstrument {
             read: read.into(),
             write: write.into(),
             stage: staged,
-            parent: self.parent.try_clone().text()?,
+            parent: self.parent.try_clone().map_err(|_| reject("io-error"))?,
             leaf: self.leaf.clone(),
             identity: self.identity,
             hash,
@@ -2073,6 +2155,7 @@ fn open_cause(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::NotFound => "missing",
         _ if error.raw_os_error() == Some(libc::ELOOP) => "link",
+        _ if error.raw_os_error() == Some(libc::EISDIR) => "wrong-type",
         _ => "io-error",
     }
 }
@@ -2106,26 +2189,33 @@ fn open_instrument(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn instrument_ack(instrument: Option<Instrument>, pid: u32, generation: u32) -> Result<()> {
+fn instrument_ack(
+    instrument: Option<Instrument>,
+    pid: u32,
+    generation: u32,
+    operand: Option<&Path>,
+) -> Result<()> {
     let Some(mut instrument) = instrument else {
         return Ok(());
     };
+    // §4.7 fails closed through the frozen instrumentation row: a missing,
+    // short, or mismatched acknowledgement is load-unacknowledged, and a stage
+    // that no longer matches its recorded identity is identity-changed.
+    let operand = operand.expect("instrument implies an operand");
+    let reject = |cause| rejected("instrumentation", operand, cause);
     drop(instrument.write);
-    shared::validate_instrument_ack(
-        &fixed_record::<36>(instrument.read)?,
-        true,
-        generation,
-        pid,
-        instrument.nonce,
-    )?;
+    let record = fixed_record::<36>(instrument.read).map_err(|_| reject("load-unacknowledged"))?;
+    shared::validate_instrument_ack(&record, true, generation, pid, instrument.nonce)
+        .map_err(|_| reject("load-unacknowledged"))?;
     crate::ensure!(
         file_entry_matches(
             &instrument.parent,
             &instrument.leaf,
             instrument.identity,
             0o500,
-        ) && shared::copy_digest(&mut instrument.stage, None)? == instrument.hash,
-        "instrumentation stage identity changed"
+        ) && shared::copy_digest(&mut instrument.stage, None).map_err(|_| reject("io-error"))?
+            == instrument.hash,
+        reject("identity-changed")
     );
     Ok(())
 }

@@ -471,6 +471,61 @@ mod native {
             )
         }
     }
+    // §3.5/OB-32: validate a working directory by its opened handle, not by a
+    // pathname re-lookup. FILE_TRAVERSE is the directory-only search right —
+    // distinct from FILE_LIST_DIRECTORY, which a traverse-only grant lacks —
+    // and the directory type is read from that same handle. Returns the
+    // canonical identity-bound spelling so a later reparse-point substitution
+    // of the caller's name cannot redirect entry. FILE_FLAG_BACKUP_SEMANTICS
+    // is required to open a directory handle; OPEN_REPARSE_POINT is absent so
+    // junctions/symlinks resolve the way SetCurrentDirectory does.
+    fn enter_directory(directory: &Path) -> std::result::Result<OsString, &'static str> {
+        let handle = unsafe {
+            CreateFileW(
+                wide(directory.as_os_str()).as_ptr(),
+                FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                ptr::null_mut(),
+            )
+        };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(match unsafe { GetLastError() } {
+                ERROR_ACCESS_DENIED => "not-searchable",
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME => "missing",
+                ERROR_DIRECTORY => "not-directory",
+                _ => "io-error",
+            });
+        }
+        let guard = unsafe { Handle::owned(handle) };
+        let raw = guard
+            .0
+            .as_ref()
+            .expect("checked non-null handle")
+            .as_raw_handle() as HANDLE;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(raw, &mut info) } == 0 {
+            return Err("io-error");
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err("not-directory");
+        }
+        let mut buffer = [0u16; 1024];
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                raw,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 || length as usize >= buffer.len() {
+            return Err("io-error");
+        }
+        Ok(OsString::from_wide(&buffer[..length as usize]))
+    }
     fn read_reparse(path: &Path, share: u32) -> Result<File> {
         OpenOptions::new()
             .read(true)
@@ -1286,22 +1341,16 @@ mod native {
                 if let Some(directory) = &self.options.directory {
                     // §3.5/OB-32: a rejected working directory names the
                     // directory with status 1, never the executable with 127.
-                    let cause = match std::fs::metadata(directory) {
-                        Ok(meta) if !meta.is_dir() => Some("not-directory"),
-                        Ok(_) => None,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            Some("missing")
-                        }
-                        Err(_) => Some("io-error"),
-                    };
-                    if let Some(cause) = cause {
-                        return Err(format!(
+                    let resolved = enter_directory(directory).map_err(|cause| {
+                        format!(
                             "could not enter {} ({cause})",
                             name::render(directory.as_os_str())
                         )
-                        .into());
-                    }
-                    bootstrap.current_dir(directory);
+                    })?;
+                    // Enter the canonical identity-bound spelling resolved from
+                    // the opened directory, so a later reparse-point
+                    // substitution of the caller's name cannot redirect entry.
+                    bootstrap.current_dir(&resolved);
                 }
                 bootstrap
                     .env_remove(BOOTSTRAP_SELECTOR)
@@ -1927,10 +1976,14 @@ mod native {
                     1
                 };
                 host.ready.notice(3, result);
-                eprintln!("{}: {error}", name::program(invoked));
                 return if result == 127 {
+                    // 127 returns Ok, bypassing the common run()->report()
+                    // layer, so this path owns its single diagnostic.
+                    eprintln!("{}: {error}", name::program(invoked));
                     Ok(127)
                 } else {
+                    // status 1 propagates as Err; the common report layer
+                    // prints it exactly once. Printing here too would double it.
                     Err(error.into())
                 };
             }

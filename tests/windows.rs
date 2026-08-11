@@ -458,3 +458,130 @@ fn storage_reports_the_selected_log_commit() {
     drop(storage);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(windows)]
+mod working_directory {
+    use std::process::Command;
+
+    fn moor(args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn rejected_working_directory_names_the_directory_not_the_executable() {
+        // Closure §6.2 / OB-32 on Windows: `could not enter <path> (<cause>)`,
+        // stderr, status 1 — never 127, never the executable's name.
+        let dir = std::env::temp_dir().join(format!("moor-win-wd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let session = dir.join("wd");
+        // OB-29: expectations use name::render, which escapes Windows
+        // backslashes; Path::display would pin the wrong contract.
+        let rendered = |path: &std::path::Path| moor::name::render(path.as_os_str());
+        // OB-29: the diagnostic prefix is the invoked basename, which is
+        // moor.exe under CARGO_BIN_EXE, not a hardcoded "moor".
+        let program =
+            moor::name::program(std::path::Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+
+        let gone = dir.join("nonexistent");
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-d",
+            gone.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr,
+            format!("{program}: could not enter {} (missing)\n", rendered(&gone)),
+            "{out:?}"
+        );
+
+        let file = dir.join("plain");
+        std::fs::write(&file, b"x").unwrap();
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-d",
+            file.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "{program}: could not enter {} (not-directory)\n",
+                rendered(&file)
+            ),
+            "{out:?}"
+        );
+
+        // Precedence: a rejected directory wins over a missing executable —
+        // status 1 with the directory row, not 127 with the exec row.
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-d",
+            gone.to_str().unwrap(),
+            "no-such-executable-anywhere",
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .starts_with(&format!("{program}: could not enter ")),
+            "directory validation must precede executable resolution: {out:?}"
+        );
+
+        // Denied traverse is exactly not-searchable: deny the execute right
+        // to the current user, probe, then restore so cleanup succeeds.
+        let sealed = dir.join("no-traverse");
+        std::fs::create_dir(&sealed).unwrap();
+        let user = std::env::var("USERNAME").unwrap();
+        let denied = Command::new("icacls")
+            .args([sealed.to_str().unwrap(), "/deny", &format!("{user}:(X)")])
+            .output()
+            .unwrap();
+        // Fixture setup is mandatory: a silent skip would turn the required
+        // behaviour into an unreported pass on the supported lanes.
+        assert!(
+            denied.status.success(),
+            "icacls deny failed; the denied-traverse fixture is required: {denied:?}"
+        );
+        {
+            let out = moor(&[
+                "run",
+                session.to_str().unwrap(),
+                "-d",
+                sealed.to_str().unwrap(),
+                "cmd",
+                "/c",
+                "exit",
+            ]);
+            let restored = Command::new("icacls")
+                .args([sealed.to_str().unwrap(), "/remove:d", &user])
+                .output()
+                .unwrap();
+            assert!(restored.status.success(), "{restored:?}");
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                format!(
+                    "{program}: could not enter {} (not-searchable)\n",
+                    rendered(&sealed)
+                ),
+                "{out:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
