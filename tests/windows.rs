@@ -461,9 +461,9 @@ fn storage_reports_the_selected_log_commit() {
 
 #[cfg(windows)]
 mod launch_paths {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Output, Stdio};
 
     fn moor(args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_moor"))
@@ -496,6 +496,53 @@ mod launch_paths {
         leaf.push("-");
         leaf.push(sid.trim());
         std::env::temp_dir().join(leaf)
+    }
+
+    const PUBLICATION_RELEASE: &str = "MOOR_TEST_PUBLICATION_RELEASE";
+
+    #[test]
+    fn publication_waiter() {
+        let Some(release) = std::env::var_os(PUBLICATION_RELEASE) else {
+            return;
+        };
+        while !Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn published_run(session: &OsStr, event: Option<&Path>, marker: &Path) -> Output {
+        let release = companion(marker, ".release");
+        let _ = std::fs::remove_file(&release);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
+        command.arg("run").arg(session);
+        if let Some(event) = event {
+            command.arg("-T").arg(event);
+        }
+        let mut child = command
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!("child exited before publication: {status:?}: {output:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("marker publication timed out: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(&release, b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_file(release);
+        output
     }
 
     #[test]
@@ -607,17 +654,14 @@ mod launch_paths {
         let marker = root.join(&session);
         let displaced = root.join(format!("{session}-displaced"));
         let release = root.join(format!("{session}-release"));
-        let out = moor(&[
-            "start",
-            &session,
-            "powershell.exe",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "while (!(Test-Path -LiteralPath $args[0])) { Start-Sleep -Milliseconds 10 }",
-            release.to_str().unwrap(),
-        ]);
+        let _ = std::fs::remove_file(&release);
+        let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["start", &session])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "{out:?}");
         std::fs::rename(&marker, &displaced).unwrap();
         std::fs::write(&marker, b"successor").unwrap();
@@ -862,7 +906,7 @@ mod launch_paths {
         std::fs::create_dir(&dir).unwrap();
         let session = dir.join("path-form-session");
         let event = dir.join("outside-events");
-        let initial = moor(&["run", session.to_str().unwrap(), "cmd", "/c", "exit"]);
+        let initial = published_run(session.as_os_str(), None, &session);
         assert_eq!(initial.status.code(), Some(0), "{initial:?}");
         let lifecycle = companion(&session, ".exit");
         assert!(lifecycle.is_dir(), "missing stale fixture {lifecycle:?}");
@@ -959,15 +1003,8 @@ mod launch_paths {
         let _ = std::fs::remove_dir_all(&event);
         let session = format!("case-session-{}", std::process::id());
 
-        let out = moor(&[
-            "run",
-            &session,
-            "-T",
-            event.to_str().unwrap(),
-            "cmd",
-            "/c",
-            "exit",
-        ]);
+        let marker = root.join(&session);
+        let out = published_run(OsStr::new(&session), Some(&event), &marker);
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert!(event.is_dir(), "event store was not created at {event:?}");
 
@@ -984,10 +1021,11 @@ mod launch_paths {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
         use std::os::windows::process::CommandExt;
         use std::process::{Command, ExitStatus, Stdio};
+        use std::sync::atomic::{AtomicU8, Ordering};
         use std::thread;
         use std::time::{Duration, Instant};
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
-        use windows_sys::Win32::Foundation::{HANDLE, TRUE};
+        use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE};
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
             CreatePseudoConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
@@ -1231,7 +1269,12 @@ mod launch_paths {
             let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
             let columns = info.srWindow.Right - info.srWindow.Left + 1;
             println!("MOOR-GEOM-{}:{rows}:{columns}", mode.to_string_lossy());
-            if mode == "foreground" {
+            io::stdout().flush().unwrap();
+            if mode.as_os_str() == "foreground" {
+                let release = std::env::var_os("MOOR_CONSOLE_GEOMETRY_RELEASE").unwrap();
+                while !std::path::Path::new(&release).exists() {
+                    thread::sleep(Duration::from_millis(10));
+                }
                 return;
             }
             let mut input_mode = 0;
@@ -1283,6 +1326,9 @@ mod launch_paths {
 
             let foreground_session = format!("console-run-e2e-{}", std::process::id());
             let _foreground_cleanup = Cleanup(foreground_session.clone());
+            let foreground_release =
+                invoked_root().join(format!("console-run-release-{}", std::process::id()));
+            let _ = std::fs::remove_file(&foreground_release);
             let executable = std::env::current_exe().unwrap();
             let mut foreground = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
             foreground
@@ -1294,16 +1340,19 @@ mod launch_paths {
                     "launch_paths::native_console::console_geometry_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "foreground");
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "foreground")
+                .env("MOOR_CONSOLE_GEOMETRY_RELEASE", &foreground_release);
             let mut foreground = console.spawn(foreground).unwrap();
             console
                 .wait_for(b"MOOR-GEOM-foreground:37:93", Duration::from_secs(10))
                 .unwrap();
+            std::fs::write(&foreground_release, b"release").unwrap();
             assert!(
                 wait_spawn(&mut foreground, Duration::from_secs(5))
                     .unwrap()
                     .success()
             );
+            let _ = std::fs::remove_file(foreground_release);
 
             let session = format!("console-e2e-{}", std::process::id());
             let _cleanup = Cleanup(session.clone());
@@ -1381,6 +1430,33 @@ mod launch_paths {
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
         }
 
+        static CONTROL_BREAKS: AtomicU8 = AtomicU8::new(0);
+
+        unsafe extern "system" fn control_probe_handler(kind: u32) -> i32 {
+            if kind == CTRL_BREAK_EVENT {
+                CONTROL_BREAKS.fetch_add(1, Ordering::Relaxed);
+                TRUE
+            } else {
+                FALSE
+            }
+        }
+
+        #[test]
+        fn console_control_probe() {
+            let Some(mode) = std::env::var_os("MOOR_CONSOLE_CONTROL_PROBE") else {
+                return;
+            };
+            let graceful = mode.as_os_str() == "graceful";
+            assert!(graceful || mode.as_os_str() == "ignore");
+            CONTROL_BREAKS.store(0, Ordering::Relaxed);
+            assert!(unsafe { SetConsoleCtrlHandler(Some(control_probe_handler), TRUE) } != 0);
+            println!("MOOR-CONTROL-READY");
+            io::stdout().flush().unwrap();
+            while !graceful || CONTROL_BREAKS.load(Ordering::Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
         #[test]
         fn console_signal_sender() {
             let Some(target) = std::env::var_os("MOOR_CONSOLE_SIGNAL_TARGET") else {
@@ -1427,25 +1503,18 @@ mod launch_paths {
             let session = format!("console-control-{label}-{}", std::process::id());
             let _cleanup = Cleanup(session.clone());
             let marker = invoked_root().join(&session);
-            let handler = if ignore {
-                "$h=[ConsoleCancelEventHandler]{param($sender,$event) $event.Cancel=$true}; [Console]::add_CancelKeyPress($h);"
-            } else {
-                ""
-            };
-            let script = format!(
-                "{handler} [Console]::WriteLine('MOOR-CONTROL-READY'); while ($true) {{ Start-Sleep -Milliseconds 50 }}"
-            );
             let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["run", &session])
+                .arg(std::env::current_exe().unwrap())
                 .args([
-                    "run",
-                    &session,
-                    "powershell.exe",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &script,
+                    "--exact",
+                    "launch_paths::native_console::console_control_probe",
+                    "--nocapture",
                 ])
+                .env(
+                    "MOOR_CONSOLE_CONTROL_PROBE",
+                    if ignore { "ignore" } else { "graceful" },
+                )
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
