@@ -1114,7 +1114,17 @@ mod launch_paths {
 
             fn wait_for(&mut self, marker: &[u8], timeout: Duration) -> io::Result<()> {
                 let deadline = Instant::now() + timeout;
-                while Instant::now() < deadline {
+                loop {
+                    if self
+                        .received
+                        .windows(marker.len())
+                        .any(|window| window == marker)
+                    {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     let output = self.output.as_mut().unwrap();
                     let mut available = 0;
                     if unsafe {
@@ -1134,13 +1144,7 @@ mod launch_paths {
                         let mut bytes = vec![0; available as usize];
                         output.read_exact(&mut bytes)?;
                         self.received.extend_from_slice(&bytes);
-                        if self
-                            .received
-                            .windows(marker.len())
-                            .any(|window| window == marker)
-                        {
-                            return Ok(());
-                        }
+                        continue;
                     }
                     thread::sleep(Duration::from_millis(10));
                 }

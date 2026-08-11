@@ -2036,13 +2036,14 @@ mod native {
                 | DISABLE_NEWLINE_AUTO_RETURN,
         ]
     }
-    fn valid_size(&(rows, columns): &(u16, u16)) -> bool {
+    type Size = (u16, u16);
+    fn valid_size(&(rows, columns): &Size) -> bool {
         [rows, columns]
             .into_iter()
             .all(|value| value != 0 && value <= i16::MAX as u16)
             && u32::from(rows) * u32::from(columns) <= 2_000_000
     }
-    fn console_geometry(output: HANDLE, buffer: bool) -> Result<(u16, u16)> {
+    fn console_geometry(output: HANDLE) -> Result<[Size; 2]> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         check(
             unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
@@ -2052,18 +2053,18 @@ mod native {
             u16::try_from(i32::from(last) - i32::from(first) + 1)
                 .map_err(|_| "viewer console geometry is invalid")
         };
-        let mut window = info.srWindow;
-        if buffer {
-            window.Bottom = info.dwSize.Y.saturating_sub(1);
-            window.Right = info.dwSize.X.saturating_sub(1);
-            window.Top = 0;
-            window.Left = 0;
-        }
-        let size = (
-            extent(window.Bottom, window.Top)?,
-            extent(window.Right, window.Left)?,
-        );
-        require(valid_size(&size), "viewer console geometry is invalid").map(|_| size)
+        let (w, b) = (info.srWindow, info.dwSize);
+        let window = (extent(w.Bottom, w.Top)?, extent(w.Right, w.Left)?);
+        let buffer = (b.Y.try_into().unwrap_or(0), b.X.try_into().unwrap_or(0));
+        let sizes = [window, buffer];
+        require(valid_size(&sizes[0]), "viewer console geometry is invalid").map(|_| sizes)
+    }
+    fn select_size(state: &mut ([Size; 2], Size), next: [Size; 2]) -> Option<Size> {
+        let selected = (0..2)
+            .find(|&at| state.0[at] != next[at])
+            .map_or(state.1, |at| next[at]);
+        *state = (next, selected);
+        valid_size(&selected).then_some(selected)
     }
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
     impl ViewerConsole {
@@ -2074,9 +2075,6 @@ mod native {
             (0..2)
                 .all(|at| unsafe { GetConsoleMode(handles[at], &mut modes[at]) } != 0)
                 .then_some(Self(handles, modes))
-        }
-        fn geometry(&self) -> Result<(u16, u16)> {
-            console_geometry(self.0[1], false)
         }
         fn set(&self, modes: [u32; 2]) -> Result<()> {
             (0..2).try_for_each(|at| {
@@ -2097,7 +2095,8 @@ mod native {
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
-        let (geometry, mut output) = (terminal.geometry().unwrap_or((0, 0)), io::stdout());
+        let geometries = console_geometry(terminal.0[1]).unwrap_or([(0, 0); 2]);
+        let (geometry, mut output) = (geometries[0], io::stdout());
         Ok(attach_viewer_to(
             &mut client,
             &options,
@@ -2105,28 +2104,28 @@ mod native {
             &mut output,
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
-            |sender| viewer_input(sender, options.detach, geometry),
+            |sender| viewer_input(sender, options.detach, geometries),
         )?)
     }
-    fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
+    fn viewer_input(sender: ViewerSender, detach: Option<u8>, observed: [Size; 2]) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
             let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } as usize;
-            let buffer = console_geometry(output as HANDLE, true).ok() == Some(geometry);
+            let mut state = (observed, observed[0]);
             run_viewer_input(
                 io::stdin(),
                 sender,
                 InputConfig {
                     detach,
                     pass_suspend: true,
-                    last_size: valid_size(&geometry).then_some(geometry),
+                    last_size: valid_size(&state.1).then_some(state.1),
                 },
                 move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
                     WAIT_OBJECT_0 => InputState::Ready,
                     WAIT_TIMEOUT => InputState::Pending,
                     _ => InputState::Closed,
                 },
-                move || console_geometry(output as HANDLE, buffer).ok(),
+                move || select_size(&mut state, console_geometry(output as HANDLE).ok()?),
                 || {},
                 Instant::now,
             );
@@ -2169,7 +2168,7 @@ mod native {
         let geometry = capture
             .then(ViewerConsole::detect)
             .flatten()
-            .map(|console| console.geometry())
+            .map(|console| console_geometry(console.0[1]).map(|sizes| sizes[0]))
             .transpose()?;
         creation_size(required, geometry)
     }
