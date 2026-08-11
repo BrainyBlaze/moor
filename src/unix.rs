@@ -659,7 +659,9 @@ fn abort_unpublished(
     error: String,
     diagnose: bool,
 ) -> Result<i32> {
-    let deadline = Instant::now() + Duration::from_millis(25);
+    // Give an already-triggered natural exit the same bounded scheduling
+    // allowance used by launch teardown before forcing the unpublished group.
+    let deadline = Instant::now() + Duration::from_millis(250);
     let observed = loop {
         if let Some(observed) = state.observe_exit()? {
             break Some(observed);
