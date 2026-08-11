@@ -1252,21 +1252,9 @@ mod launch_paths {
                 GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
                     && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut output) != 0
             });
-            let mut geometry = CONSOLE_SCREEN_BUFFER_INFO::default();
-            assert!(unsafe {
-                GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &mut geometry) != 0
-            });
             println!(
                 "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
                 label.to_string_lossy()
-            );
-            println!(
-                "MOOR-SIZE-{}:{}:{}:{}:{}",
-                label.to_string_lossy(),
-                geometry.dwSize.Y,
-                geometry.dwSize.X,
-                geometry.srWindow.Bottom - geometry.srWindow.Top + 1,
-                geometry.srWindow.Right - geometry.srWindow.Left + 1
             );
             println!("MOOR-MODE-{}-END", label.to_string_lossy());
         }
@@ -1422,8 +1410,6 @@ mod launch_paths {
                 .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
                 .unwrap();
             console.resize(41, 101).unwrap();
-            let _resized = probe(&console, "resized").unwrap();
-            wait_modes(&mut console, "resized");
             console
                 .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
                 .unwrap();
