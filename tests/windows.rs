@@ -1230,8 +1230,8 @@ mod launch_paths {
             assert!(unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0);
             let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
             let columns = info.srWindow.Right - info.srWindow.Left + 1;
-            println!("MOOR-GEOM:{rows}:{columns}");
-            if mode == "once" {
+            println!("MOOR-GEOM-{}:{rows}:{columns}", mode.to_string_lossy());
+            if mode == "foreground" {
                 return;
             }
             let mut input_mode = 0;
@@ -1294,10 +1294,10 @@ mod launch_paths {
                     "launch_paths::native_console::console_geometry_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "once");
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "foreground");
             let mut foreground = console.spawn(foreground).unwrap();
             console
-                .wait_for(b"MOOR-GEOM:37:93", Duration::from_secs(10))
+                .wait_for(b"MOOR-GEOM-foreground:37:93", Duration::from_secs(10))
                 .unwrap();
             assert!(
                 wait_spawn(&mut foreground, Duration::from_secs(5))
@@ -1317,8 +1317,11 @@ mod launch_paths {
                     "launch_paths::native_console::console_geometry_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "resize");
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
             let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
+                .unwrap();
             console
                 .wait_for(b"MOOR-GEOM-READY", Duration::from_secs(10))
                 .unwrap();
