@@ -744,4 +744,31 @@ mod launch_paths {
         std::fs::remove_dir(&junction).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn equivalent_case_event_root_is_accepted() {
+        let root = invoked_root();
+        let leaf = root.file_name().unwrap().to_string_lossy();
+        let alias = root.with_file_name(leaf.to_ascii_uppercase());
+        assert_ne!(root, alias, "fixture must use different path spelling");
+        let event = alias.join(format!("case-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&event);
+        let session = format!("case-session-{}", std::process::id());
+
+        let out = moor(&[
+            "run",
+            &session,
+            "-T",
+            event.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(event.is_dir(), "event store was not created at {event:?}");
+
+        let removed = moor(&["rm", &session]);
+        assert_eq!(removed.status.code(), Some(0), "{removed:?}");
+        assert!(!event.exists(), "event store survived removal: {event:?}");
+    }
 }
