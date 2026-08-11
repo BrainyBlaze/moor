@@ -156,8 +156,7 @@ macro_rules! syscall {
     };
 }
 
-crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: StoreTarget, log: Option<StoreTarget>, stage: Stage,
-    command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
+crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: StoreTarget, log: Option<StoreTarget>, stage: Stage, command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
 crate::schema!(struct UnixNative fields; control: File, group: i32, child: Child);
 crate::schema!(struct ViewerTerminal derive [Clone, Copy] fields; fd: i32, saved: libc::termios);
 crate::schema!(struct LaunchSeed fields; generation: u32, supervised: bool, incarnation: [u8; 16], semantic_token: [u8; 16], identity: Vec<u8>, start: (u64, u64, [u8; 16]));
@@ -2311,11 +2310,8 @@ fn uid() -> u32 {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/unix_macos.rs"
-    ));
+    include!("../tests/unit/unix_macos.rs");
 }
 
 #[cfg(test)]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/unix.rs"));
+include!("../tests/unit/unix.rs");

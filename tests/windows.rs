@@ -505,6 +505,17 @@ mod launch_paths {
         let missing = root.join(format!("missing-child-{}", std::process::id()));
         let system = Command::new(&missing).spawn().unwrap_err().to_string();
         let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        let instruments = || {
+            let mut paths = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|value| value == "instrument"))
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let prior_instruments = instruments();
 
         for mode in ["run", "start"] {
             let session = format!("exec-failure-{mode}-{}", std::process::id());
@@ -515,6 +526,8 @@ mod launch_paths {
                 &session,
                 "-T",
                 event.to_str().unwrap(),
+                "-S",
+                env!("CARGO_BIN_EXE_moor"),
                 missing.to_str().unwrap(),
             ]);
             assert_eq!(out.status.code(), Some(127), "{out:?}");
@@ -547,7 +560,73 @@ mod launch_paths {
                 }),
                 "leaked marker stage for {session}"
             );
+            assert_eq!(
+                instruments(),
+                prior_instruments,
+                "leaked instrumentation stage"
+            );
         }
+    }
+
+    #[test]
+    fn publication_conflict_rolls_back_owned_artifacts_but_preserves_the_conflict() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("publish-race-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let watched = event.clone();
+        let competing = marker.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if watched.is_dir() {
+                    return std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(competing)
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, b"competing"))
+                        .is_ok();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        });
+        let out = moor(&[
+            "start",
+            &session,
+            "-T",
+            event.to_str().unwrap(),
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 10",
+        ]);
+        assert!(racer.join().unwrap(), "publication race was not installed");
+        let competing = std::fs::read(&marker);
+        let leaked = [
+            companion(&marker, ".log"),
+            companion(&marker, ".exit"),
+            event,
+        ]
+        .into_iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+        let stage = format!("{session}.stage-");
+        let staged = std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&stage)
+        });
+        let _ = std::fs::remove_file(&marker);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(competing.unwrap(), b"competing");
+        assert!(leaked.is_empty(), "leaked {leaked:?}");
+        assert!(!staged, "leaked marker stage");
     }
 
     #[test]

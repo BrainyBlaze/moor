@@ -6,18 +6,9 @@ schema!(enum pub Redraw [Clone, Copy, Debug, Eq, PartialEq]; None, CtrlL, Winch)
 schema!(enum pub Reset [Clone, Copy, Debug, Eq, PartialEq]; None, Move);
 schema!(enum pub CreateMode [Clone, Copy, Debug, Eq, PartialEq]; Bare, New, Start, Run, LegacyA, LegacyC, LegacyStart, LegacyRun);
 
-schema!(struct default pub Options derive [Clone, Debug, Eq, PartialEq] pub fields;
-    detach: Option<u8> = Some(0x1c), redraw: Redraw = Redraw::None, reset: Reset = Reset::None,
-    pass_suspend: bool = false, quiet: bool = false, non_vt: bool = false, log_cap: u64 = 1 << 20,
-    stderr: Option<PathBuf> = None, events: Option<PathBuf> = None, instrument: Option<PathBuf> = None,
-    directory: Option<PathBuf> = None);
+schema!(struct default pub Options derive [Clone, Debug, Eq, PartialEq] pub fields; detach: Option<u8> = Some(0x1c), redraw: Redraw = Redraw::None, reset: Reset = Reset::None, pass_suspend: bool = false, quiet: bool = false, non_vt: bool = false, log_cap: u64 = 1 << 20, stderr: Option<PathBuf> = None, events: Option<PathBuf> = None, instrument: Option<PathBuf> = None, directory: Option<PathBuf> = None);
 
-schema!(enum pub Action [Clone, Debug, Eq, PartialEq]; Help, Version,
-    Create { mode: CreateMode, session: OsString, command: Vec<OsString>, options: Options },
-    Attach { session: OsString, options: Options }, Push(OsString),
-    Kill { session: OsString, force: bool, quiet: bool },
-    Remove { session: Option<OsString>, all: bool, quiet: bool }, List { all: bool }, Current,
-    Tail { session: OsString, follow: bool, lines: u32 }, Clear(Option<OsString>));
+schema!(enum pub Action [Clone, Debug, Eq, PartialEq]; Help, Version, Create { mode: CreateMode, session: OsString, command: Vec<OsString>, options: Options }, Attach { session: OsString, options: Options }, Push(OsString), Kill { session: OsString, force: bool, quiet: bool }, Remove { session: Option<OsString>, all: bool, quiet: bool }, List { all: bool }, Current, Tail { session: OsString, follow: bool, lines: u32 }, Clear(Option<OsString>));
 
 schema!(tuple pub Error [Debug]; fields pub; String);
 type CliResult<T> = Result<T, Error>;

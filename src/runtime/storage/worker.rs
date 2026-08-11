@@ -298,7 +298,4 @@ impl Lane {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/runtime_worker.rs"
-));
+include!("../../../tests/unit/runtime_worker.rs");

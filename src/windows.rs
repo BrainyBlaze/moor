@@ -38,9 +38,7 @@ pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
 }
 
 schema!(struct pub Marker derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46]);
-binary_record!(RawMarker => Marker[80] error () = ();
-    fixed { magic: [u8; 12] = *b"MOORMRK3\x01\0\0\0" }
-    fields { generation: U32<LE>, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46] });
+binary_record!(RawMarker => Marker[80] error () = (); fixed { magic: [u8; 12] = *b"MOORMRK3\x01\0\0\0" } fields { generation: U32<LE>, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46] });
 
 impl Marker {
     pub fn new(generation: u32, incarnation: [u8; 16], random: [u8; 16]) -> Result<Self> {
@@ -84,11 +82,8 @@ impl Marker {
 }
 
 #[doc(hidden)]
-schema!(struct pub BootstrapRecord derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; nonce: [u8; 16], pid: u32, process: u64,
-    thread: u64, created: u64);
-binary_record!(RawBootstrapRecord => BootstrapRecord[56] error () = ();
-    fixed { magic: [u8; 12] = *b"MOORBST1\x01\0\0\0" }
-    fields { nonce: [u8; 16], pid: U32<LE>, process: U64<LE>, thread: U64<LE>, created: U64<LE> });
+schema!(struct pub BootstrapRecord derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; nonce: [u8; 16], pid: u32, process: u64, thread: u64, created: u64);
+binary_record!(RawBootstrapRecord => BootstrapRecord[56] error () = (); fixed { magic: [u8; 12] = *b"MOORBST1\x01\0\0\0" } fields { nonce: [u8; 16], pid: U32<LE>, process: U64<LE>, thread: U64<LE>, created: U64<LE> });
 
 impl BootstrapRecord {
     pub fn encode(self) -> [u8; 56] {
@@ -130,29 +125,41 @@ impl DirectoryCause {
 }
 
 #[cfg(any(windows, test))]
-fn directory_failure_record(nonce: [u8; 16], cause: DirectoryCause) -> [u8; 56] {
+schema!(enum BootstrapFailure [Clone, Copy, Debug, Eq, PartialEq]; Directory(DirectoryCause), Execution(u32));
+
+#[cfg(any(windows, test))]
+fn bootstrap_failure_record(nonce: [u8; 16], failure: BootstrapFailure) -> [u8; 56] {
+    let (kind, value) = match failure {
+        BootstrapFailure::Directory(cause) => (1, cause as u32),
+        BootstrapFailure::Execution(code) => (2, code),
+    };
     let mut record = [0; 56];
-    record[..12].copy_from_slice(b"MOORCWD1\x01\0\0\0");
+    record[..12].copy_from_slice(b"MOORERR1\x01\0\0\0");
     record[12..28].copy_from_slice(&nonce);
-    record[28] = cause as u8;
+    record[28] = kind;
+    record[29..33].copy_from_slice(&value.to_le_bytes());
     record
 }
 
 #[cfg(any(windows, test))]
-fn directory_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<DirectoryCause> {
+fn bootstrap_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<BootstrapFailure> {
     crate::return_if!(
-        bytes.len() != 56 || bytes[..12] != *b"MOORCWD1\x01\0\0\0",
+        bytes.len() != 56
+            || bytes[..12] != *b"MOORERR1\x01\0\0\0"
+            || bytes[12..28] != nonce
+            || bytes[33..].iter().any(|byte| *byte != 0),
         None
     );
-    crate::return_if!(
-        bytes[12..28] != nonce || bytes[29..].iter().any(|byte| *byte != 0),
-        None
-    );
+    let value = u32::from_le_bytes(bytes[29..33].try_into().unwrap());
     match bytes[28] {
-        1 => Some(DirectoryCause::Missing),
-        2 => Some(DirectoryCause::NotDirectory),
-        3 => Some(DirectoryCause::NotSearchable),
-        4 => Some(DirectoryCause::Io),
+        1 => Some(BootstrapFailure::Directory(match value {
+            1 => DirectoryCause::Missing,
+            2 => DirectoryCause::NotDirectory,
+            3 => DirectoryCause::NotSearchable,
+            4 => DirectoryCause::Io,
+            _ => return None,
+        })),
+        2 if value != 0 => Some(BootstrapFailure::Execution(value)),
         _ => None,
     }
 }
@@ -202,19 +209,16 @@ fn exact_descriptor_semantics(
 
 #[cfg(test)]
 mod descriptor_semantics_tests {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/unit/windows_descriptor.rs"
-    ));
+    include!("../tests/unit/windows_descriptor.rs");
 }
 
 #[cfg(windows)]
 #[allow(unused_unsafe)]
 mod native {
     use super::{
-        BootstrapRecord, DirectoryCause, Marker, Result, accept_bootstrap_command,
-        bootstrap_command, cim_boot_identity, directory_failure, directory_failure_record,
-        exact_descriptor_semantics, wtf8_decode, wtf8_encode,
+        BootstrapFailure, BootstrapRecord, DirectoryCause, Marker, Result,
+        accept_bootstrap_command, bootstrap_command, bootstrap_failure, bootstrap_failure_record,
+        cim_boot_identity, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
     };
     use crate::{
         cli::{CreateMode, Options},
@@ -251,8 +255,11 @@ mod native {
         },
         path::{Path, PathBuf},
         ptr,
-        sync::OnceLock,
-        sync::mpsc,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU8, Ordering},
+            mpsc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -293,6 +300,12 @@ mod native {
     fn check(ok: bool, what: &str) -> Result<()> {
         ok.then_some(())
             .ok_or_else(|| format!("{what}: {}", io::Error::last_os_error()))
+    }
+    fn coordinate((rows, columns): (u16, u16)) -> Result<COORD> {
+        match (columns.try_into(), rows.try_into()) {
+            (Ok(x), Ok(y)) => Ok(COORD { X: x, Y: y }),
+            _ => Err("geometry exceeds the console interface limit".into()),
+        }
     }
     macro_rules! win32 {
         ($call:expr, $what:expr) => {
@@ -350,6 +363,7 @@ mod native {
     const BOOTSTRAP_DIRECTORY: &str = "DESK_MOOR_BOOTSTRAP_DIRECTORY";
     const INSTRUMENT_CHANNEL: &str = "DESK_MOOR_INSTRUMENT_CHANNEL";
     const INSTRUMENT_NONCE: &str = "DESK_MOOR_INSTRUMENT_NONCE";
+    const DETACHED_GEOMETRY: &str = "DESK_MOOR_DETACHED_GEOMETRY";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
         let size = fill(ptr::null_mut(), 0);
         check(size != 0, what)?;
@@ -470,17 +484,16 @@ mod native {
         }
     }
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
-    const CREATE_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, 0);
     const OPEN_SLOT: OpenPolicy = OpenPolicy(
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     );
     const OPEN_STDERR: OpenPolicy = OpenPolicy(FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ);
     const CREATE_STAGE: OpenPolicy = OpenPolicy(
-        GENERIC_READ | GENERIC_WRITE,
+        GENERIC_READ | GENERIC_WRITE | DELETE,
         FILE_SHARE_READ | FILE_SHARE_DELETE,
     );
-    const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ);
+    const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
     unsafe fn open_handle(
         path: &Path,
         policy: OpenPolicy,
@@ -704,10 +717,7 @@ mod native {
     #[cfg(test)]
     mod security_descriptor_tests {
         use super::*;
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/unit/windows_security.rs"
-        ));
+        include!("../tests/unit/windows_security.rs");
     }
     fn pipe_descriptor(
         sid: &str,
@@ -787,20 +797,79 @@ mod native {
             true
         }
     }
-    pub(crate) fn create_store_path(path: &Path, directory: bool) -> io::Result<()> {
+    pub(crate) fn create_store_path(path: &Path) -> io::Result<()> {
         let result = (|| unsafe {
-            let user = sid()?;
-            let (_descriptor, sa) = descriptor(user, "FA")?;
-            if directory {
-                check(
-                    CreateDirectoryW(wide(path.as_os_str()).as_ptr(), &sa) != 0,
-                    "create protected store directory",
-                )
-            } else {
-                open_handle(path, CREATE_STORE, Some(&sa), "create protected store file").map(drop)
-            }
+            let (_descriptor, sa) = descriptor(sid()?, "FA")?;
+            check(
+                CreateDirectoryW(wide(path.as_os_str()).as_ptr(), &sa) != 0,
+                "create protected store directory",
+            )
         })();
         result.map_err(io::Error::other)
+    }
+    pub(crate) fn create_store_file(path: &Path, lease: bool) -> io::Result<File> {
+        let result = (|| unsafe {
+            let (_descriptor, sa) = descriptor(sid()?, "FA")?;
+            open_handle(
+                path,
+                OpenPolicy(
+                    GENERIC_READ | GENERIC_WRITE | DELETE,
+                    if lease {
+                        FILE_SHARE_READ | FILE_SHARE_WRITE
+                    } else {
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                    },
+                ),
+                Some(&sa),
+                "create protected store file",
+            )
+            .map(Handle::into_file)
+        })();
+        result.map_err(io::Error::other)
+    }
+    pub(crate) fn store_directory(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(
+                GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+            )
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    pub(crate) fn delete_file(file: &File) -> bool {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            ) != 0
+        }
+    }
+    fn stage_file<T>(
+        path: &Path,
+        user: &str,
+        access: &str,
+        what: &str,
+        write: impl FnOnce(&mut File) -> Result<T>,
+    ) -> Result<(File, [u8; 24], T)> {
+        let mut file = unsafe {
+            let (_descriptor, sa) = descriptor(user, "GA")?;
+            open_handle(path, CREATE_STAGE, Some(&sa), what)?.into_file()
+        };
+        let staged: Result<([u8; 24], T)> = (|| {
+            let value = write(&mut file)?;
+            file.sync_all().map_err(string)?;
+            let identity = unsafe { file_identity(file.as_raw_handle())? };
+            protect(path, user, access)?;
+            validate(path, user, access, false)?;
+            Ok((identity, value))
+        })();
+        let (identity, value) = staged.inspect_err(|_| {
+            delete_file(&file);
+        })?;
+        Ok((file, identity, value))
     }
     unsafe fn file_identity(handle: HANDLE) -> Result<[u8; 24]> {
         let info: FILE_ID_INFO =
@@ -908,7 +977,10 @@ mod native {
                 std::env::remove_var(BOOTSTRAP_DIRECTORY);
                 if let Err(error) = std::env::set_current_dir(directory) {
                     result.write(
-                        &directory_failure_record(nonce, directory_cause(&error)),
+                        &bootstrap_failure_record(
+                            nonce,
+                            BootstrapFailure::Directory(directory_cause(&error)),
+                        ),
                         "report rejected working directory",
                     )?;
                     return Ok(1);
@@ -932,12 +1004,21 @@ mod native {
                     "transfer requested child stderr",
                 )?);
             }
-            let mut child = Some(win(
-                requested.spawn_suspended_with(
-                    SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
-                ),
-                "start requested child",
-            )?);
+            let mut child = match requested.spawn_suspended_with(
+                SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
+            ) {
+                Ok(child) => Some(child),
+                Err(error) => {
+                    let code = error
+                        .raw_os_error()
+                        .map_or(ERROR_GEN_FAILURE, |code| code as u32);
+                    result.write(
+                        &bootstrap_failure_record(nonce, BootstrapFailure::Execution(code)),
+                        "report requested child start failure",
+                    )?;
+                    return Ok(127);
+                }
+            };
             drop((requested, instrument));
             let holder = Handle::checked(
                 OpenProcess(PROCESS_DUP_HANDLE, 0, holder_pid),
@@ -1140,16 +1221,50 @@ mod native {
     fn cancel(stream: &LocalStream) {
         unsafe { windows_sys::Win32::System::IO::CancelIoEx(stream_handle(stream), ptr::null()) };
     }
+    fn stop_job(job: &Job) -> bool {
+        if job.terminate(0xc000013a).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let mut state = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            if unsafe {
+                QueryInformationJobObject(
+                    job.as_handle().as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut state as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return false;
+            }
+            if state.ActiveProcesses == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    static SHUTDOWN: AtomicU8 = AtomicU8::new(0);
+    unsafe extern "system" fn shutdown_handler(kind: u32) -> i32 {
+        if kind <= CTRL_CLOSE_EVENT || matches!(kind, CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+            let previous = SHUTDOWN.fetch_or(1, Ordering::Relaxed);
+            SHUTDOWN.fetch_or(u8::from(previous != 0) << 1, Ordering::Relaxed);
+            TRUE
+        } else {
+            FALSE
+        }
+    }
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
+    crate::schema!(struct Staged fields; path: PathBuf, file: File, identity: [u8; 24]);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
-    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, guards: Vec<File>);
-    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String,
-        generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8,
-        conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32,
-        early_exit: Option<u32>, birth: [u8; 16],
-        input: Pipe, output: Pipe, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>,
-        identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
+    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, created: bool, guards: Vec<File>);
+    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
             let (write, read, rejected) = match kind {
@@ -1208,7 +1323,6 @@ mod native {
             }
             artifacts.status.extend_from_slice(&self.birth);
             self.artifacts = Some(artifacts);
-            self.event = None;
             Ok(())
         }
         fn launch(
@@ -1219,7 +1333,8 @@ mod native {
         ) -> Result<LocalListener> {
             let instrument = self.options.instrument.take();
             let listener = self.first_protected_pipe(&marker.pipe)?;
-            let (marker_stage, marker_identity) = self.stage_marker(&marker.encode())?;
+            self.stage = Some(self.stage_marker(&marker.encode())?);
+            let marker_identity = self.stage.as_ref().unwrap().identity;
             if let Some(path) = &instrument {
                 self.stage_instrument(path, &session_identity(marker_identity))?;
             }
@@ -1229,7 +1344,7 @@ mod native {
             }
             self.bootstrap.exchange(1)?;
             self.prepublication_alive()?;
-            self.publish_marker(&marker_stage, marker_identity)?;
+            self.publish_marker()?;
             Ok(listener)
         }
 
@@ -1252,7 +1367,7 @@ mod native {
                 let mut conpty = 0;
                 check(
                     CreatePseudoConsole(
-                        COORD { X: 80, Y: 24 },
+                        coordinate(self.geometry)?,
                         cin.raw(),
                         cout.raw(),
                         0,
@@ -1330,7 +1445,9 @@ mod native {
                 }
                 let endpoint = &self.bootstrap;
                 let identity = endpoint.result.record::<56>(false, "bootstrap identity")?;
-                if let Some(cause) = directory_failure(&identity, endpoint.nonce) {
+                if let Some(BootstrapFailure::Directory(cause)) =
+                    bootstrap_failure(&identity, endpoint.nonce)
+                {
                     let directory = self
                         .options
                         .directory
@@ -1340,6 +1457,15 @@ mod native {
                         "could not enter {} ({})",
                         name::render(directory.as_os_str()),
                         cause.label()
+                    ));
+                }
+                if let Some(BootstrapFailure::Execution(code)) =
+                    bootstrap_failure(&identity, endpoint.nonce)
+                {
+                    return Err(format!(
+                        "could not execute {}: {}",
+                        name::render(command[0].as_os_str()),
+                        io::Error::from_raw_os_error(code as i32)
                     ));
                 }
                 let record = BootstrapRecord::decode(&identity, endpoint.nonce)
@@ -1392,30 +1518,24 @@ mod native {
                 self.generation,
                 self.incarnation,
             )?;
-            let (digest, staged_identity) = unsafe {
-                let (_descriptor, sa) = descriptor(&self.sid, "GA")?;
-                let mut output = open_handle(
-                    &stage,
-                    CREATE_STAGE,
-                    Some(&sa),
-                    "stage instrumentation object",
-                )?
-                .into_file();
-                let digest = copy_digest(&mut input, Some(&mut output))?;
-                output.sync_all().map_err(string)?;
-                (digest, file_identity(output.as_raw_handle())?)
-            };
-            protect(&stage, &self.sid, "FRFX")?;
-            validate(&stage, &self.sid, "FRFX", false)?;
-            let mut staged = read_reparse(&stage, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
-            require(
-                unsafe { file_identity(staged.as_raw_handle())? } == staged_identity,
-                "instrumentation identity changed",
+            let (mut staged, staged_identity, digest) = stage_file(
+                &stage,
+                &self.sid,
+                "FRFX",
+                "stage instrumentation object",
+                |output| copy_digest(&mut input, Some(output)),
             )?;
-            require(
-                copy_digest(&mut staged, None)? == digest,
-                "instrumentation content changed",
-            )?;
+            let verified: Result<()> = (|| {
+                let published = read_reparse(&stage, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+                require(
+                    unsafe { file_identity(published.as_raw_handle())? } == staged_identity
+                        && copy_digest(&mut staged, None)? == digest,
+                    "instrumentation identity or content changed",
+                )
+            })();
+            verified.inspect_err(|_| {
+                delete_file(&staged);
+            })?;
             let (read, write) = Pipe::pair("create instrumentation acknowledgement pipe")?;
             self.instrument = Some(Instrument {
                 path: stage,
@@ -1489,29 +1609,27 @@ mod native {
                 "instrumentation content changed after load",
             )
         }
-        fn stage_marker(&self, marker: &[u8; 84]) -> Result<(PathBuf, [u8; 24])> {
-            unsafe {
-                let mut stage = self.marker.as_os_str().to_owned();
-                stage.push(format!(".stage-{}", GetCurrentProcessId()));
-                let stage = PathBuf::from(stage);
-                let (_descriptor, sa) = descriptor(&self.sid, "FR")?;
-                let mut file =
-                    open_handle(&stage, CREATE_STAGE, Some(&sa), "stage protected marker")?
-                        .into_file();
-                win(file.write_all(marker), "write protected marker")?;
-                win32!(
-                    FlushFileBuffers(file.as_raw_handle()),
-                    "write protected marker"
-                )?;
-                let staged_identity = file_identity(file.as_raw_handle())?;
-                Ok((stage, staged_identity))
-            }
+        fn stage_marker(&self, marker: &[u8; 84]) -> Result<Staged> {
+            let mut stage = self.marker.as_os_str().to_owned();
+            stage.push(format!(".stage-{}", unsafe { GetCurrentProcessId() }));
+            let stage = PathBuf::from(stage);
+            let (file, identity, ()) =
+                stage_file(&stage, &self.sid, "FR", "stage protected marker", |file| {
+                    win(file.write_all(marker), "write protected marker")
+                })?;
+            Ok(Staged {
+                path: stage,
+                file,
+                identity,
+            })
         }
-        fn publish_marker(&mut self, stage: &Path, staged_identity: [u8; 24]) -> Result<()> {
+        fn publish_marker(&mut self) -> Result<()> {
             unsafe {
+                let staged_identity = self.stage.as_ref().unwrap().identity;
                 self.prepare_storage(staged_identity)?;
                 self.prepublication_alive()?;
                 self.ready.notice(1, 0);
+                let stage = &self.stage.as_ref().unwrap().path;
                 win32!(
                     MoveFileExW(
                         wide(stage.as_os_str()).as_ptr(),
@@ -1527,7 +1645,30 @@ mod native {
                     file_identity(final_file.raw())? == staged_identity,
                     "marker identity changed",
                 )?;
+                (self.stage, self.event) = (None, None);
                 Ok(())
+            }
+        }
+
+        fn rollback_unpublished(&mut self) {
+            if !self.job.as_ref().is_none_or(stop_job) {
+                return;
+            }
+            if let Some(artifacts) = self.artifacts.take() {
+                rollback_stores([
+                    artifacts.storage.log.map(|(store, _)| store),
+                    artifacts.storage.events.map(|events| events.store),
+                    Some(artifacts.storage.lifecycle),
+                ]);
+            }
+            if let Some(instrument) = self.instrument.take() {
+                delete_file(&instrument.file);
+            }
+            if let Some(stage) = self.stage.take() {
+                delete_file(&stage.file);
+            }
+            if let Some(event) = self.event.as_ref().filter(|event| event.created) {
+                delete_file(event.guards.last().unwrap());
             }
         }
 
@@ -1547,11 +1688,8 @@ mod native {
 
     impl HolderNative for Native {
         fn resize(&mut self, rows: u16, columns: u16) -> Result<()> {
-            let (Ok(x), Ok(y)) = (i16::try_from(columns), i16::try_from(rows)) else {
-                return Err("geometry exceeds the console interface limit".into());
-            };
             check(
-                unsafe { ResizePseudoConsole(self.conpty.0, COORD { X: x, Y: y }) } >= 0,
+                unsafe { ResizePseudoConsole(self.conpty.0, coordinate((rows, columns))?) } >= 0,
                 "resize ConPTY",
             )
         }
@@ -1591,14 +1729,6 @@ mod native {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
     }
-    fn event_component_cause(error: &io::Error) -> &'static str {
-        match error.raw_os_error().map(|code| code as u32) {
-            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => "missing",
-            Some(ERROR_DIRECTORY) => "not-directory",
-            Some(ERROR_ACCESS_DENIED) => "not-searchable",
-            _ => "io-error",
-        }
-    }
     fn event_attributes(handle: &File) -> Result<u32> {
         let info: FILE_ATTRIBUTE_TAG_INFO = unsafe {
             file_info(
@@ -1613,7 +1743,7 @@ mod native {
         let reject = |cause| event_rejection(operand, cause);
         let event = absolute(operand).map_err(|_| reject("io-error"))?;
         let root_handle =
-            event_component(root).map_err(|error| reject(event_component_cause(&error)))?;
+            event_component(root).map_err(|error| reject(directory_cause(&error).label()))?;
         let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
             .map_err(|_| reject("io-error"))?;
         let mut all = event.components();
@@ -1658,7 +1788,7 @@ mod native {
                     present = false;
                     break;
                 }
-                Err(error) => return Err(reject(event_component_cause(&error))),
+                Err(error) => return Err(reject(directory_cause(&error).label())),
             };
             let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
             crate::ensure!(
@@ -1674,6 +1804,7 @@ mod native {
         Ok(EventTarget {
             path: operand.to_owned(),
             present,
+            created: false,
             guards,
         })
     }
@@ -1733,12 +1864,12 @@ mod native {
         let result = unsafe {
             NtCreateFile(
                 &mut raw,
-                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE,
                 &attributes,
                 &mut status,
                 ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
                 ptr::null(),
@@ -1752,16 +1883,21 @@ mod native {
         );
         after_create(&target.path);
         target.guards.push(handle.into_file());
-        let attributes =
-            event_attributes(target.guards.last().unwrap()).map_err(|_| rejected.clone())?;
-        crate::ensure!(
-            attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
-                == FILE_ATTRIBUTE_DIRECTORY,
-            rejected.clone()
-        );
-        target.present = true;
-        validate_event(target, user).map_err(|_| rejected)?;
-        Ok(())
+        target.created = true;
+        let verified = (|| {
+            let attributes =
+                event_attributes(target.guards.last().unwrap()).map_err(|_| rejected.clone())?;
+            crate::ensure!(
+                attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+                    == FILE_ATTRIBUTE_DIRECTORY,
+                rejected.clone()
+            );
+            target.present = true;
+            validate_event(target, user).map_err(|_| rejected.clone())
+        })();
+        verified.inspect_err(|_| {
+            delete_file(target.guards.last().unwrap());
+        })
     }
     fn os_string(bytes: &[u8]) -> Result<OsString> {
         wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
@@ -1901,29 +2037,84 @@ mod native {
                 && validate(target, user, access, directory).is_ok()
         })
     }
-    pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
-        let (input, output) = unsafe {
-            (
-                GetStdHandle(STD_INPUT_HANDLE),
-                GetStdHandle(STD_OUTPUT_HANDLE),
-            )
-        };
-        let mut mode = 0;
-        crate::return_if!(
-            unsafe { GetConsoleMode(input, &mut mode) } == 0
-                || unsafe { GetConsoleMode(output, &mut mode) } == 0,
-            Err(CommandError::output("no controlling terminal"))
-        );
-        let mut client = controller(path, 2000).map_err(|_| missing(path))?;
+    fn viewer_modes(input: u32, output: u32) -> (u32, u32) {
+        (
+            (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
+                & !(ENABLE_LINE_INPUT
+                    | ENABLE_ECHO_INPUT
+                    | ENABLE_PROCESSED_INPUT
+                    | ENABLE_QUICK_EDIT_MODE
+                    | ENABLE_WINDOW_INPUT),
+            output
+                | ENABLE_PROCESSED_OUTPUT
+                | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | DISABLE_NEWLINE_AUTO_RETURN,
+        )
+    }
+    fn valid_size(&(rows, columns): &(u16, u16)) -> bool {
+        rows != 0
+            && columns != 0
+            && rows <= i16::MAX as u16
+            && columns <= i16::MAX as u16
+            && u32::from(rows) * u32::from(columns) <= 2_000_000
+    }
+    fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        let geometry = if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0 {
-            (
-                (info.srWindow.Bottom - info.srWindow.Top + 1) as u16,
-                (info.srWindow.Right - info.srWindow.Left + 1) as u16,
+        check(
+            unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
+            "inspect viewer console geometry",
+        )?;
+        let extent = |last, first| u16::try_from(i32::from(last) - i32::from(first) + 1).ok();
+        let size = (
+            extent(info.srWindow.Bottom, info.srWindow.Top)
+                .ok_or("viewer console geometry is invalid")?,
+            extent(info.srWindow.Right, info.srWindow.Left)
+                .ok_or("viewer console geometry is invalid")?,
+        );
+        require(valid_size(&size), "viewer console geometry is invalid")?;
+        Ok(size)
+    }
+    struct ViewerConsole(HANDLE, HANDLE, (u32, u32));
+    impl ViewerConsole {
+        fn detect() -> Option<Self> {
+            let mut console = Self(
+                unsafe { GetStdHandle(STD_INPUT_HANDLE) },
+                unsafe { GetStdHandle(STD_OUTPUT_HANDLE) },
+                (0, 0),
+            );
+            (unsafe { GetConsoleMode(console.0, &mut console.2.0) } != 0
+                && unsafe { GetConsoleMode(console.1, &mut console.2.1) } != 0)
+                .then_some(console)
+        }
+        fn geometry(&self) -> Result<(u16, u16)> {
+            console_geometry(self.1)
+        }
+        fn raw(&self) -> Result<()> {
+            let modes = viewer_modes(self.2.0, self.2.1);
+            check(
+                unsafe { SetConsoleMode(self.0, modes.0) } != 0,
+                "configure viewer console input",
+            )?;
+            check(
+                unsafe { SetConsoleMode(self.1, modes.1) } != 0,
+                "configure viewer console output",
             )
-        } else {
-            (0, 0)
-        };
+        }
+    }
+    impl Drop for ViewerConsole {
+        fn drop(&mut self) {
+            unsafe {
+                SetConsoleMode(self.1, self.2.1);
+                SetConsoleMode(self.0, self.2.0);
+            }
+        }
+    }
+    pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
+        let terminal = ViewerConsole::detect()
+            .ok_or_else(|| CommandError::output("no controlling terminal"))?;
+        terminal.raw()?;
+        let mut client = controller(path, 2000).map_err(|_| missing(path))?;
+        let geometry = terminal.geometry().unwrap_or((0, 0));
         let mut output = io::stdout();
         Ok(attach_viewer_to(
             &mut client,
@@ -1932,36 +2123,38 @@ mod native {
             &mut output,
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
-            |sender| viewer_input(sender, options.detach),
+            |sender| viewer_input(sender, options.detach, geometry),
         )?)
     }
-    fn viewer_input(sender: ViewerSender, detach: Option<u8>) {
+    fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
+            let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } as usize;
             run_viewer_input(
                 io::stdin(),
                 sender,
                 InputConfig {
                     detach,
                     pass_suspend: true,
-                    last_size: None,
+                    last_size: valid_size(&geometry).then_some(geometry),
                 },
                 move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
                     WAIT_OBJECT_0 => InputState::Ready,
                     WAIT_TIMEOUT => InputState::Pending,
                     _ => InputState::Closed,
                 },
-                || None,
+                move || console_geometry(output as HANDLE).ok(),
                 || {},
                 Instant::now,
             );
         });
     }
-    fn detached() -> Result<i32> {
+    fn detached(geometry: (u16, u16)) -> Result<i32> {
         let mut command = SpawnCommand::new(std::env::current_exe().map_err(string)?);
         command
             .args(std::env::args_os().skip(1))
             .env("DESK_MOOR_DETACHED_HOLDER", "1")
+            .env(DETACHED_GEOMETRY, format!("{}:{}", geometry.0, geometry.1))
             .stdout(SpawnStdio::piped());
         let flags = CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP;
         let mut child = win(
@@ -1978,6 +2171,36 @@ mod native {
             .0,
         ))
     }
+    fn creation_size(required: bool, geometry: Option<(u16, u16)>) -> Result<(u16, u16)> {
+        if let Some(size) = geometry {
+            return Ok(size);
+        }
+        crate::ensure!(!required, "no controlling terminal");
+        Ok((24, 80))
+    }
+    fn creation_geometry(required: bool, capture: bool, child: bool) -> Result<(u16, u16)> {
+        let inherited = std::env::var_os(DETACHED_GEOMETRY);
+        unsafe { std::env::remove_var(DETACHED_GEOMETRY) };
+        if child {
+            return inherited
+                .as_deref()
+                .and_then(OsStr::to_str)
+                .and_then(|value| value.split_once(':'))
+                .and_then(|(rows, columns)| {
+                    Some((rows.parse::<u16>().ok()?, columns.parse::<u16>().ok()?))
+                })
+                .filter(valid_size)
+                .ok_or_else(|| "detached holder geometry is invalid".into());
+        }
+        let geometry = if capture {
+            ViewerConsole::detect()
+                .map(|console| console.geometry())
+                .transpose()?
+        } else {
+            None
+        };
+        creation_size(required, geometry)
+    }
     fn holder(mut host: Native, listener: LocalListener) -> Result<i32> {
         let user = std::mem::take(&mut host.sid);
         let reader = std::mem::take(&mut host.output).into_file();
@@ -1991,7 +2214,10 @@ mod native {
         let mut authenticating = 0;
         let mut overflow_authenticating = false;
         let synthetic = host.synthetic;
+        let geometry = host.geometry;
+        let mut handled = false;
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
+        runtime.set_geometry(geometry.0, geometry.1);
         let Some(NativeExit::Code(code)) = runtime.drive(
             |pending, overflow| {
                 while let Ok((exhausted, client)) = clients.try_recv() {
@@ -2024,7 +2250,10 @@ mod native {
                 }
                 None
             },
-            || None,
+            || {
+                let count = SHUTDOWN.swap(0, Ordering::AcqRel);
+                (count != 0).then(|| count > 1 || std::mem::replace(&mut handled, true))
+            },
         )?
         else {
             return Ok(125);
@@ -2045,9 +2274,22 @@ mod native {
         invoked: &OsStr,
     ) -> CommandResult<i32> {
         let foreground = matches!(mode, CreateMode::Run | CreateMode::LegacyRun);
+        let interactive = matches!(
+            mode,
+            CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
+        );
         let mut ready = launch_reporter();
         let child = ready.output.is_some();
-        crate::return_if!(!foreground && !child, Ok(detached()?));
+        let geometry = creation_geometry(interactive, interactive || foreground, child)?;
+        crate::return_if!(!foreground && !child, Ok(detached(geometry)?));
+        SHUTDOWN.store(0, Ordering::Release);
+        check(
+            unsafe {
+                SetConsoleCtrlHandler(None, FALSE) != 0
+                    && SetConsoleCtrlHandler(Some(shutdown_handler), TRUE) != 0
+            },
+            "install console-control handler",
+        )?;
         if command.is_empty() {
             command.push(
                 std::env::var_os("SHELL")
@@ -2091,6 +2333,7 @@ mod native {
             incarnation: marker.incarnation,
             semantic_token: semantic,
             synthetic,
+            geometry,
             ready,
             event,
             ..Native::default()
@@ -2098,6 +2341,7 @@ mod native {
         let listener = match host.launch(&marker, &command, random[32..48].try_into().unwrap()) {
             Ok(listener) => listener,
             Err(error) => {
+                host.rollback_unpublished();
                 if let Some(code) = host.early_exit {
                     if child {
                         host.ready.notice(
@@ -2119,7 +2363,7 @@ mod native {
                 return if result == 127 {
                     // 127 returns Ok, bypassing the common run()->report()
                     // layer, so this path owns its single diagnostic.
-                    eprintln!("{}: {error}", name::program(invoked));
+                    let _ = write!(io::stderr(), "{}: {error}\r\n", name::program(invoked));
                     Ok(127)
                 } else {
                     // status 1 propagates as Err; the common report layer
@@ -2153,6 +2397,7 @@ mod native {
 pub use native::bootstrap;
 #[cfg(windows)]
 pub(crate) use native::{
-    attach, classify, cleanup, clock, connect, create, create_store_path, current_paths,
-    preflight_create, protected_store_path, resolve, sessions, valid_store_slots,
+    attach, classify, cleanup, clock, connect, create, create_store_file, create_store_path,
+    current_paths, delete_file, preflight_create, protected_store_path, resolve, sessions,
+    store_directory, valid_store_slots,
 };

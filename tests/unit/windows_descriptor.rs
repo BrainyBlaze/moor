@@ -1,5 +1,6 @@
 use super::{
-    DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
+    BootstrapFailure, DirectoryCause, bootstrap_failure, bootstrap_failure_record,
+    exact_descriptor_semantics,
 };
 
 #[test]
@@ -40,14 +41,41 @@ fn bootstrap_directory_failure_is_nonce_bound_and_closed() {
         DirectoryCause::NotSearchable,
         DirectoryCause::Io,
     ] {
-        let record = directory_failure_record(nonce, cause);
-        assert_eq!(directory_failure(&record, nonce), Some(cause));
-        assert_eq!(directory_failure(&record, [8; 16]), None);
+        let failure = BootstrapFailure::Directory(cause);
+        let record = bootstrap_failure_record(nonce, failure);
+        assert_eq!(bootstrap_failure(&record, nonce), Some(failure));
+        assert_eq!(bootstrap_failure(&record, [8; 16]), None);
     }
-    let mut record = directory_failure_record(nonce, DirectoryCause::Missing);
+    let mut record = bootstrap_failure_record(
+        nonce,
+        BootstrapFailure::Directory(DirectoryCause::Missing),
+    );
     for at in [0, 28, 55] {
         record[at] ^= 0xff;
-        assert_eq!(directory_failure(&record, nonce), None, "byte {at}");
+        assert_eq!(bootstrap_failure(&record, nonce), None, "byte {at}");
         record[at] ^= 0xff;
     }
+}
+
+#[test]
+fn bootstrap_execution_failure_preserves_the_nonce_and_os_error() {
+    let nonce = [9; 16];
+    let record = bootstrap_failure_record(nonce, BootstrapFailure::Execution(2));
+    assert_eq!(
+        bootstrap_failure(&record, nonce),
+        Some(BootstrapFailure::Execution(2))
+    );
+    assert_eq!(bootstrap_failure(&record, [8; 16]), None);
+    for at in [0, 12, 28, 33, 55] {
+        let mut corrupt = record;
+        corrupt[at] ^= 1;
+        assert_eq!(bootstrap_failure(&corrupt, nonce), None, "byte {at}");
+    }
+    assert_eq!(
+        bootstrap_failure(
+            &bootstrap_failure_record(nonce, BootstrapFailure::Execution(0)),
+            nonce
+        ),
+        None
+    );
 }

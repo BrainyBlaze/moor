@@ -33,11 +33,8 @@ schema!(enum ordinal pub LeaseOperation; Fresh, Resume);
 schema!(enum ordinal pub LeaseRole; Viewer, InputOnly);
 schema!(enum ordinal pub ResultOutcome; Granted, Resumed, Released, Refused);
 schema!(enum ordinal pub ResultReason; None, Busy, BadEpoch, BadToken, BadRole, NotHeld, Exhausted, BadIncarnation, BadSequence);
-schema!(struct default pub LeaseRequest derive [Clone, Debug, Eq, PartialEq] pub fields;
-    operation: LeaseOperation = LeaseOperation::Fresh, role: LeaseRole = LeaseRole::Viewer,
-    epoch: u32 = 0, incarnation: [u8; 16] = [0; 16], token: [u8; 16] = [0; 16]);
-schema!(struct pub LeaseResult derive [Clone, Debug, Eq, PartialEq] pub fields; outcome: ResultOutcome, reason: ResultReason, role: LeaseRole,
-    epoch: u32, token: [u8; 16]);
+schema!(struct default pub LeaseRequest derive [Clone, Debug, Eq, PartialEq] pub fields; operation: LeaseOperation = LeaseOperation::Fresh, role: LeaseRole = LeaseRole::Viewer, epoch: u32 = 0, incarnation: [u8; 16] = [0; 16], token: [u8; 16] = [0; 16]);
+schema!(struct pub LeaseResult derive [Clone, Debug, Eq, PartialEq] pub fields; outcome: ResultOutcome, reason: ResultReason, role: LeaseRole, epoch: u32, token: [u8; 16]);
 lease_codec!(LeaseRequest[40];
     valid this => { let resume = this.operation == LeaseOperation::Resume;
         (this.epoch != 0) == resume && (this.incarnation != [0; 16]) == resume && (this.token != [0; 16]) == resume };
@@ -82,8 +79,7 @@ impl LeaseResult {
     }
 }
 
-schema!(struct pub OwnedInput derive [Clone, Debug, Eq, PartialEq] pub fields; epoch: u32, request_id: u64,
-    exact_payload: Arc<[u8]>);
+schema!(struct pub OwnedInput derive [Clone, Debug, Eq, PartialEq] pub fields; epoch: u32, request_id: u64, exact_payload: Arc<[u8]>);
 impl OwnedInput {
     pub(crate) fn application_id(&self) -> Option<[u8; 16]> {
         (self.exact_payload.get(12) == Some(&1)).then_some(())?;
@@ -91,9 +87,7 @@ impl OwnedInput {
     }
 }
 
-schema!(struct default Lease fields; owner: Option<ConnId> = None, role: LeaseRole = LeaseRole::Viewer, epoch: u32 = 0,
-    token: [u8; 16] = [0; 16], deadline: u64 = 0, cached: Option<(OwnedInput, [u8; 43])> = None,
-    inflight: Option<OwnedInput> = None);
+schema!(struct default Lease fields; owner: Option<ConnId> = None, role: LeaseRole = LeaseRole::Viewer, epoch: u32 = 0, token: [u8; 16] = [0; 16], deadline: u64 = 0, cached: Option<(OwnedInput, [u8; 43])> = None, inflight: Option<OwnedInput> = None);
 
 schema!(enum ordinal pub Phase; Unattached, InputOnly, Resumed, Observer, Viewer, Closing);
 
@@ -127,20 +121,15 @@ pub const fn next_phase(phase: Phase, action: u8, flags: u8) -> Option<Phase> {
 schema!(enum ordinal pub SemanticMode; Edge, Stateful);
 schema!(enum ordinal pub SemanticEventKind; Transition, Snapshot, ApplicationReceipt);
 schema!(enum ordinal pub SemanticAckStatus; Accepted, Duplicate, Refused);
-schema!(enum ordinal pub SemanticRefusal; CapabilityAbsent, StaleToken, Generation, SourceConflict, ResourceExhausted, BadSequence,
-    EventConflict, SnapshotRequired, InvalidPayload, Superseded, ApplicationConflict, UnknownApplication, SourceUnavailable,
-    NotWritten);
+schema!(enum ordinal pub SemanticRefusal; CapabilityAbsent, StaleToken, Generation, SourceConflict, ResourceExhausted, BadSequence, EventConflict, SnapshotRequired, InvalidPayload, Superseded, ApplicationConflict, UnknownApplication, SourceUnavailable, NotWritten);
 type SemResult<T = ()> = Result<T, SemanticRefusal>;
 pub fn next_semantic_sequence(high: u64) -> Result<u64, SemanticRefusal> {
     high.checked_add(1)
         .ok_or(SemanticRefusal::ResourceExhausted)
 }
-schema!(struct pub SemanticHello derive [Clone, Debug, Eq, PartialEq] pub fields; token: [u8; 16], producer: [u8; 16], generation: u32,
-    mode: SemanticMode, capabilities: u8, source: Arc<[u8]>);
-schema!(struct pub SemanticEvent derive [Clone, Debug, Eq, PartialEq] pub fields; id: [u8; 16], sequence: u64, kind: SemanticEventKind,
-    exact_payload: Arc<[u8]>);
-schema!(struct pub SemanticAck derive [Clone, Debug, Eq, PartialEq] pub fields; id: [u8; 16], sequence: u64, status: SemanticAckStatus,
-    position: Option<EventPosition>);
+schema!(struct pub SemanticHello derive [Clone, Debug, Eq, PartialEq] pub fields; token: [u8; 16], producer: [u8; 16], generation: u32, mode: SemanticMode, capabilities: u8, source: Arc<[u8]>);
+schema!(struct pub SemanticEvent derive [Clone, Debug, Eq, PartialEq] pub fields; id: [u8; 16], sequence: u64, kind: SemanticEventKind, exact_payload: Arc<[u8]>);
+schema!(struct pub SemanticAck derive [Clone, Debug, Eq, PartialEq] pub fields; id: [u8; 16], sequence: u64, status: SemanticAckStatus, position: Option<EventPosition>);
 schema!(struct pub SemanticHelloAck derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; epoch: u32, snapshot_required: bool);
 schema!(struct pub EventPosition derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; epoch: u32, sequence: u64);
 impl SemanticAck {
@@ -164,22 +153,15 @@ impl Ticket {
         if value == 0 { None } else { Some(Self(value)) }
     }
 }
-schema!(struct pub ApplicationInput derive [Clone, Debug, Eq, PartialEq] pub fields;
-    receipt: ApplicationReceipt, source: Range<usize>, terminal_at: usize);
-schema!(struct pub InputNotice derive [Clone, Debug, Eq, PartialEq] pub fields; receipt: ApplicationReceipt,
-    byte_count: u64, digest: [u8; 32]);
-schema!(struct pub SemanticEffect derive [Clone, Debug, Eq, PartialEq] pub fields;
-    receipt: ApplicationReceipt, source: Arc<[u8]>, source_epoch: u32,
-    producer: [u8; 16], reason: MissingReason);
-schema!(struct pub ApplicationReceipt derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; application_id: [u8; 16], lease_epoch: u32,
-    request_id: u64);
-schema!(struct pub InputNoticeAck derive [Clone, Copy, Debug, Eq, PartialEq] pub fields;
-    receipt: ApplicationReceipt, prepared: bool);
+schema!(struct pub ApplicationInput derive [Clone, Debug, Eq, PartialEq] pub fields; receipt: ApplicationReceipt, source: Range<usize>, terminal_at: usize);
+schema!(struct pub InputNotice derive [Clone, Debug, Eq, PartialEq] pub fields; receipt: ApplicationReceipt, byte_count: u64, digest: [u8; 32]);
+schema!(struct pub SemanticEffect derive [Clone, Debug, Eq, PartialEq] pub fields; receipt: ApplicationReceipt, source: Arc<[u8]>, source_epoch: u32, producer: [u8; 16], reason: MissingReason);
+schema!(struct pub ApplicationReceipt derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; application_id: [u8; 16], lease_epoch: u32, request_id: u64);
+schema!(struct pub InputNoticeAck derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; receipt: ApplicationReceipt, prepared: bool);
 schema!(enum ordinal pub MissingReason; Deadline, SourceLost, RetentionExpired);
 schema!(enum ordinal pub SourceStatus; Connected, Exact, Degraded, Disconnected);
 schema!(enum ordinal pub SourceReason; None, HeartbeatTimeout, TransportClosed, Superseded, SessionEnding);
-schema!(struct pub SourceEffect derive [Clone, Debug, Eq, PartialEq] pub fields; source: Arc<[u8]>, producer: [u8; 16], source_epoch: u32,
-    status: SourceStatus, reason: SourceReason);
+schema!(struct pub SourceEffect derive [Clone, Debug, Eq, PartialEq] pub fields; source: Arc<[u8]>, producer: [u8; 16], source_epoch: u32, status: SourceStatus, reason: SourceReason);
 schema!(struct Binding derive [Clone, Copy, Eq, PartialEq] fields; conn: ConnId, epoch: u32, producer: [u8; 16]);
 impl Binding {
     fn change(
@@ -200,11 +182,8 @@ impl Binding {
 schema!(enum pub SemanticChange [Clone, Debug, Eq, PartialEq]; Source(SourceEffect), Missing(SemanticEffect));
 
 schema!(struct Retained fields; id: [u8; 16], sequence: u64, kind: SemanticEventKind, digest: [u8; 32], position: EventPosition);
-schema!(struct default Source fields; binding: Binding = Binding { conn: 0, epoch: 0, producer: [0; 16] },
-    mode: SemanticMode = SemanticMode::Edge, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected,
-    entries: VecDeque<Retained> = VecDeque::new(), pending: u8 = 0, last_seen: u64 = 0);
-schema!(struct PendingHello fields; name: Arc<[u8]>, source: Source, superseded: Option<ConnId>,
-    missing: Vec<[u8; 16]>);
+schema!(struct default Source fields; binding: Binding = Binding { conn: 0, epoch: 0, producer: [0; 16] }, mode: SemanticMode = SemanticMode::Edge, capabilities: u8 = 0, status: SourceStatus = SourceStatus::Connected, entries: VecDeque<Retained> = VecDeque::new(), pending: u8 = 0, last_seen: u64 = 0);
+schema!(struct PendingHello fields; name: Arc<[u8]>, source: Source, superseded: Option<ConnId>, missing: Vec<[u8; 16]>);
 const COMMIT_PENDING: u8 = 1;
 const ACK_PENDING: u8 = 2;
 pub const GEOMETRY_LIMIT: u16 = 32_767;
@@ -304,8 +283,7 @@ impl Source {
 }
 schema!(struct InputPending fields; controller: ConnId, input: OwnedInput, expected: u64, terminal_at: usize);
 schema!(enum AppState; Notice(InputPending), Writing, Written);
-schema!(struct Application fields; receipt: ApplicationReceipt, source: Arc<[u8]>, binding: Binding,
-    state: AppState, deadline: u64, emitted: u8);
+schema!(struct Application fields; receipt: ApplicationReceipt, source: Arc<[u8]>, binding: Binding, state: AppState, deadline: u64, emitted: u8);
 pub(crate) fn valid_source_id(source: &[u8]) -> bool {
     !source.is_empty()
         && source.len() <= 128
@@ -347,40 +325,19 @@ impl Application {
     }
 }
 
-schema!(struct pub ReceiptProjection pub fields; receipt: ApplicationReceipt, status: u8,
-    provider_session: Range<usize>, provider_turn: Range<usize>);
-schema!(struct pub PolicyStatus derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; owns_lease: bool,
-    viewers: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, query_available: bool,
-    replay: ReplayDescriptor);
-schema!(struct pub OutputRecord derive [Clone, Debug, Eq, PartialEq] pub fields; sequence: u64, offset: u64,
-    bytes: Arc<[u8]>);
-schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(Vec<u8>), Notice(InputNotice),
-    NoticeCancel(ApplicationReceipt), SemanticAck(SemanticAck), SemanticRefused(Option<SemanticEvent>, SemanticRefusal),
-    SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]),
-    Termination(u8, u8, u8, &'static [u8]));
-schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16),
-    Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool),
-    CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>),
-    QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64),
-    OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
+schema!(struct pub ReceiptProjection pub fields; receipt: ApplicationReceipt, status: u8, provider_session: Range<usize>, provider_turn: Range<usize>);
+schema!(struct pub PolicyStatus derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; owns_lease: bool, viewers: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, query_available: bool, replay: ReplayDescriptor);
+schema!(struct pub OutputRecord derive [Clone, Debug, Eq, PartialEq] pub fields; sequence: u64, offset: u64, bytes: Arc<[u8]>);
+schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(Vec<u8>), Notice(InputNotice), NoticeCancel(ApplicationReceipt), SemanticAck(SemanticAck), SemanticRefused(Option<SemanticEvent>, SemanticRefusal), SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]), Termination(u8, u8, u8, &'static [u8]));
+schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16), Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool), CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>), QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64), OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
 schema!(enum pub Completion; Write(u64, Option<u16>), Sources(bool), Semantic(Result<EventPosition, SemanticRefusal>));
-schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>),
-    Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16),
-    Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello),
-    SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat,
-    QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
-schema!(enum pub Transition<'a>; Peer(u64, ConnId, Request<'a>), Complete(u64, CommitTicket, Completion),
-    Query(u64, Arc<[u8]>, QueryShape, Option<Vec<u8>>), Output(u64, Vec<u8>), Shutdown(u64, bool),
-    TerminationApplied(u8, bool), ReportTermination(ConnId), Retired(bool, bool), Tick(u64),
-    Disconnect(ConnId), Writable(bool), Ending);
+schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>), Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16), Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello), SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat, QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
+schema!(enum pub Transition<'a>; Peer(u64, ConnId, Request<'a>), Complete(u64, CommitTicket, Completion), Query(u64, Arc<[u8]>, QueryShape, Option<Vec<u8>>), Output(u64, Vec<u8>), Shutdown(u64, bool), TerminationApplied(u8, bool), ReportTermination(ConnId), Retired(bool, bool), Tick(u64), Disconnect(ConnId), Writable(bool), Ending);
 pub type Effects = SmallVec<[Effect; 4]>;
 
 schema!(enum Peer; Controller(bool, bool), Semantic(Arc<[u8]>));
-schema!(enum Pending; Input(ConnId, OwnedInput), Application([u8; 16], InputPending),
-    Semantic(Arc<[u8]>, SemanticEvent, Option<[u8; 16]>),
-    Sources, Hello(Box<PendingHello>), Ack(Arc<[u8]>, SemanticAck));
-schema!(struct PendingQuery fields; conn: ConnId, correlation: u64, epoch: u32, shape: QueryShape,
-    fallback: Option<Vec<u8>>, deadline: u64);
+schema!(enum Pending; Input(ConnId, OwnedInput), Application([u8; 16], InputPending), Semantic(Arc<[u8]>, SemanticEvent, Option<[u8; 16]>), Sources, Hello(Box<PendingHello>), Ack(Arc<[u8]>, SemanticAck));
+schema!(struct PendingQuery fields; conn: ConnId, correlation: u64, epoch: u32, shape: QueryShape, fallback: Option<Vec<u8>>, deadline: u64);
 schema!(struct Termination fields; peer: Option<ConnId>, started: u64, containment: u8, method: u8, expired: bool);
 impl Termination {
     fn reply(&self, outcome: u8, message: &'static [u8]) -> Reply {
@@ -388,15 +345,7 @@ impl Termination {
     }
 }
 schema!(enum SourceTrigger [Clone, Copy]; Timeout(u64), Closed(ConnId), Ending);
-schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8; 16] = [0; 16], allocated: u32 = 0,
-    lease: Lease = Lease::default(), semantic_token: [u8; 16] = [0; 16], sources: BTreeMap<Arc<[u8]>, Source> = BTreeMap::new(),
-    applications: BTreeMap<[u8; 16], Application> = BTreeMap::new(), writable: bool = true,
-    peers: BTreeMap<ConnId, Peer> = BTreeMap::new(), pending: HashMap<Ticket, Pending> = HashMap::new(),
-    next_ticket: u64 = 1, queries: VecDeque<PendingQuery> = VecDeque::new(), query_next: u64 = 1,
-    query_exhaustion_pending: bool = false,
-    replay: VecDeque<OutputRecord> = VecDeque::new(), replay_limit: u64 = u64::MAX,
-    next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(),
-    termination: Option<Termination> = None, effects: Effects = Effects::new());
+schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8; 16] = [0; 16], allocated: u32 = 0, lease: Lease = Lease::default(), semantic_token: [u8; 16] = [0; 16], sources: BTreeMap<Arc<[u8]>, Source> = BTreeMap::new(), applications: BTreeMap<[u8; 16], Application> = BTreeMap::new(), writable: bool = true, peers: BTreeMap<ConnId, Peer> = BTreeMap::new(), pending: HashMap<Ticket, Pending> = HashMap::new(), next_ticket: u64 = 1, queries: VecDeque<PendingQuery> = VecDeque::new(), query_next: u64 = 1, query_exhaustion_pending: bool = false, replay: VecDeque<OutputRecord> = VecDeque::new(), replay_limit: u64 = u64::MAX, next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(), termination: Option<Termination> = None, effects: Effects = Effects::new());
 
 impl Machine {
     fn send(&mut self, conn: ConnId, reply: Reply) {
@@ -1520,7 +1469,4 @@ fn require_policy(valid: bool) -> Result<(), WireError> {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/session.rs"
-));
+include!("../tests/unit/session.rs");

@@ -3,7 +3,7 @@ fn absent_event_is_pinned_before_creation_becomes_observable() {
     let nonce = format!("{}-{}", std::process::id(), now());
     let base = std::env::temp_dir().join(format!("moor-event-root-{nonce}"));
     let outside = std::env::temp_dir().join(format!("moor-event-outside-{nonce}"));
-    create_store_path(&base, true).unwrap();
+    create_store_path(&base).unwrap();
     fs::create_dir(&outside).unwrap();
     let event = base.join("events");
     let mut target = event_target(&event, &base).unwrap();

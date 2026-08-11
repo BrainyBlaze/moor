@@ -344,10 +344,7 @@ fn reserve(used: Charge, charge: Charge, limit: Charge) -> Option<Charge> {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/runtime_io.rs"
-));
+include!("../../tests/unit/runtime_io.rs");
 
 pub fn attach_viewer_to(
     client: &mut Client,
