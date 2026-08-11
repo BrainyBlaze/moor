@@ -2056,6 +2056,7 @@ mod native {
             extent(info.srWindow.Bottom, info.srWindow.Top)?,
             extent(info.srWindow.Right, info.srWindow.Left)?,
         );
+        eprintln!("MSR:{}:{}", info.dwSize.Y, info.dwSize.X);
         require(valid_size(&size), "viewer console geometry is invalid")?;
         Ok(size)
     }
