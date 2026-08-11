@@ -40,8 +40,7 @@ impl From<io::Error> for StoreError {
 #[doc(hidden)]
 schema!(enum pub StoreStep [Clone, Copy, Debug, Eq, PartialEq]; Body, Commit, Flush);
 
-schema!(struct pub Commit derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; slot: u8, body: u8, kind: Kind, generation: u32, epoch: u32,
-    index: u64, length: u64, start: u64, end: u64, hash: [u8; 32]);
+schema!(struct pub Commit derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; slot: u8, body: u8, kind: Kind, generation: u32, epoch: u32, index: u64, length: u64, start: u64, end: u64, hash: [u8; 32]);
 
 impl Commit {
     fn valid(&self) -> bool {
@@ -114,7 +113,7 @@ fn commit(kind: Kind, generation: u32, meta: Meta, bytes: &[u8]) -> Result<(Comm
     Ok((selected, hash))
 }
 
-schema!(struct pub Store fields; slots: Slots, selected: Commit, hash: Sha256);
+schema!(struct pub Store fields; slots: Slots, selected: Commit, hash: Sha256, directory: Option<File>);
 
 #[cfg(unix)]
 pub struct PreparedStore(Slots);
@@ -207,14 +206,37 @@ impl Store {
         #[cfg(windows)]
         {
             let (selected, hash) = initial_commit(kind, generation, initial, start..end)?;
-            for name in NAMES {
-                crate::windows::create_store_path(&path.join(name), false)?;
+            let directory = crate::windows::store_directory(path)?;
+            let mut created = Vec::with_capacity(4);
+            for (at, name) in NAMES.into_iter().enumerate() {
+                match crate::windows::create_store_file(&path.join(name), at == 2) {
+                    Ok(file) => created.push(file),
+                    Err(error) => {
+                        created.iter().for_each(|file| {
+                            crate::windows::delete_file(file);
+                        });
+                        drop(created);
+                        if kind != Kind::Event {
+                            crate::windows::delete_file(&directory);
+                        }
+                        return Err(error.into());
+                    }
+                }
             }
-            sync_dir(path)?;
-            let slots = open_slots(path, true)?;
-            durable(&slots[0], 0, initial)?;
-            durable(&slots[2], 0, &selected.encode())?;
-            Ok(Self::from_parts(slots, selected, hash))
+            let slots = created.try_into().unwrap();
+            let mut store = Self::from_parts(slots, selected, hash);
+            store.directory = (kind != Kind::Event).then_some(directory);
+            let initialized = (|| {
+                sync_dir(path)?;
+                validate_slots(path, &store.slots, true)?;
+                durable(&store.slots[0], 0, initial)?;
+                durable(&store.slots[2], 0, &store.selected.encode())
+            })();
+            if let Err(error) = initialized {
+                store.rollback();
+                return Err(error);
+            }
+            Ok(store)
         }
     }
 
@@ -243,8 +265,10 @@ impl Store {
     }
 
     pub fn duplicate(&self) -> Result<Self> {
-        four(|at| self.slots[at].try_clone().map_err(Into::into))
-            .map(|slots| Self::from_parts(slots, self.selected, self.hash.clone()))
+        let slots = four(|at| self.slots[at].try_clone().map_err(Into::into))?;
+        let mut store = Self::from_parts(slots, self.selected, self.hash.clone());
+        store.directory = self.directory.as_ref().map(File::try_clone).transpose()?;
+        Ok(store)
     }
 
     pub fn selected_result(&self) -> Result<Commit> {
@@ -350,6 +374,21 @@ impl Store {
             slots,
             selected,
             hash,
+            directory: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn rollback(self) {
+        let Self {
+            slots, directory, ..
+        } = self;
+        slots.iter().for_each(|slot| {
+            crate::windows::delete_file(slot);
+        });
+        drop(slots);
+        if let Some(directory) = directory {
+            crate::windows::delete_file(&directory);
         }
     }
 }
@@ -427,6 +466,11 @@ fn open_slots(path: &Path, write: bool) -> Result<Slots> {
     let slots = four(|at| {
         open_slot(&path.join(NAMES[at]), write, write && at == 2).map_err(|_| StoreError::Corrupt)
     })?;
+    validate_slots(path, &slots, write)?;
+    Ok(slots)
+}
+
+fn validate_slots(path: &Path, slots: &Slots, write: bool) -> Result<()> {
     let directory = fs::symlink_metadata(path)?;
     require(directory.is_dir() && protected(path, &directory, 0o700))?;
     let mut seen = 0u8;
@@ -446,11 +490,11 @@ fn open_slots(path: &Path, write: bool) -> Result<Slots> {
     }
     require(seen == 0b1111)?;
     #[cfg(windows)]
-    require(crate::windows::valid_store_slots(path, &slots))?;
+    require(crate::windows::valid_store_slots(path, slots))?;
     if write {
         try_lease(&slots[2])?;
     }
-    Ok(slots)
+    Ok(())
 }
 
 fn open_slot(path: &Path, write: bool, _lease: bool) -> Result<File> {
@@ -752,7 +796,7 @@ fn create_directory(path: &Path) -> io::Result<()> {
         }
     }
     #[cfg(windows)]
-    crate::windows::create_store_path(path, true)?;
+    crate::windows::create_store_path(path)?;
     Ok(())
 }
 
@@ -760,16 +804,9 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        OpenOptions::new()
-            .write(true)
-            .custom_flags(0x02000000)
-            .open(path)?
-            .sync_all()?;
-    }
+    crate::windows::store_directory(path)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(test)]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/store.rs"));
+include!("../tests/unit/store.rs");

@@ -27,13 +27,16 @@ fn text_error(value: impl ToString) -> String {
 }
 
 crate::schema!(struct pub SessionEntry pub fields; name: OsString, path: PathBuf, state: SessionState);
-crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str,
-    event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_store: Option<Store>, stores: Option<ArtifactStores>, event_layout: u8, log_cap: u64);
+crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str, event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_store: Option<Store>, stores: Option<ArtifactStores>, event_layout: u8, log_cap: u64);
 crate::schema!(struct pub ArtifactStores pub fields; lifecycle: Store, event: Option<Store>, log: Option<Store>);
 crate::schema!(struct pub PreparedStorage pub fields; log: Option<(Store, u64)>, events: Option<EventConfig>, lifecycle: Store);
 crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: PreparedStorage, status: Vec<u8>, commit_at: usize, running: String);
-crate::schema!(struct Lifecycle derive [Deserialize] fields; session: String, wire_generation: u32, incarnation: String,
-    start_mono_ms: String, boot_id: String, event_path: Option<String>, instrument_path: Option<String>);
+
+#[cfg(windows)]
+pub fn rollback_stores(stores: [Option<Store>; 3]) {
+    stores.into_iter().flatten().for_each(Store::rollback);
+}
+crate::schema!(struct Lifecycle derive [Deserialize] fields; session: String, wire_generation: u32, incarnation: String, start_mono_ms: String, boot_id: String, event_path: Option<String>, instrument_path: Option<String>);
 
 pub fn copy_digest(input: &mut fs::File, mut output: Option<&mut fs::File>) -> Result<[u8; 32]> {
     input.rewind().map_err(text_error)?;
@@ -641,11 +644,31 @@ pub fn holder_artifacts(
                     Ok,
                 )
             })
-            .transpose()?;
+            .transpose();
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                #[cfg(windows)]
+                rollback_stores([None, None, Some(lifecycle)]);
+                return Err(error);
+            }
+        };
         let log = (config.log_cap != 0)
             .then(|| create(&companion(config.marker, ".log"), Kind::Log, &[]))
-            .transpose()?;
-        crate::ensure!(Instant::now() <= deadline, "store initialization timed out");
+            .transpose();
+        let log = match log {
+            Ok(log) if Instant::now() <= deadline => log,
+            result => {
+                let error = result
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .unwrap_or_else(|| "store initialization timed out".into());
+                #[cfg(windows)]
+                rollback_stores([result.ok().flatten(), event, Some(lifecycle)]);
+                return Err(error);
+            }
+        };
         ArtifactStores {
             lifecycle,
             event,
