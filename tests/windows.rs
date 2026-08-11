@@ -660,6 +660,8 @@ mod launch_paths {
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
             .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .output()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
