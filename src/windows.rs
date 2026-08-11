@@ -2038,10 +2038,8 @@ mod native {
     }
     type Size = (u16, u16);
     fn valid_size(&(rows, columns): &Size) -> bool {
-        [rows, columns]
-            .into_iter()
-            .all(|value| value != 0 && value <= i16::MAX as u16)
-            && u32::from(rows) * u32::from(columns) <= 2_000_000
+        let valid = |value| value != 0 && value <= i16::MAX as u16;
+        valid(rows) && valid(columns) && u32::from(rows) * u32::from(columns) <= 2_000_000
     }
     fn console_geometry(output: HANDLE) -> Result<[Size; 2]> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
@@ -2049,20 +2047,24 @@ mod native {
             unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
             "inspect viewer console geometry",
         )?;
-        let extent = |last, first| {
-            u16::try_from(i32::from(last) - i32::from(first) + 1)
-                .map_err(|_| "viewer console geometry is invalid")
-        };
+        let invalid = "viewer console geometry is invalid";
+        let extent = |a, b| u16::try_from(i32::from(a) - i32::from(b) + 1).map_err(|_| invalid);
         let (w, b) = (info.srWindow, info.dwSize);
         let window = (extent(w.Bottom, w.Top)?, extent(w.Right, w.Left)?);
         let buffer = (b.Y.try_into().unwrap_or(0), b.X.try_into().unwrap_or(0));
         let sizes = [window, buffer];
-        require(valid_size(&sizes[0]), "viewer console geometry is invalid").map(|_| sizes)
+        require(valid_size(&sizes[0]), invalid).map(|_| sizes)
     }
     fn select_size(state: &mut ([Size; 2], Size), next: [Size; 2]) -> Option<Size> {
-        let selected = (0..2)
-            .find(|&at| state.0[at] != next[at])
-            .map_or(state.1, |at| next[at]);
+        let selected = if state.0[0] != next[0] {
+            next[0]
+        } else if state.0[1] != next[1] {
+            let (s, old, new) = (state.1, state.0[1], next[1]);
+            let shift = |s, n, o| u16::try_from(i32::from(s) + i32::from(n) - i32::from(o)).ok();
+            (shift(s.0, new.0, old.0)?, shift(s.1, new.1, old.1)?)
+        } else {
+            state.1
+        };
         *state = (next, selected);
         valid_size(&selected).then_some(selected)
     }
@@ -2143,9 +2145,8 @@ mod native {
             command.spawn_with(SpawnOptions::new().creation_flags(flags)),
             "start detached holder",
         )?;
-        let Some(output) = child.stdout.take() else {
-            return Err("launch result pipe is unavailable".into());
-        };
+        let output = child.stdout.take();
+        let output = output.ok_or("launch result pipe is unavailable")?;
         Ok(i32::from(await_launch(output)?.0))
     }
     fn creation_size(required: bool, geometry: Option<(u16, u16)>) -> Result<(u16, u16)> {
