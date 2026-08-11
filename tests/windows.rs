@@ -1028,15 +1028,16 @@ mod launch_paths {
         use std::time::{Duration, Instant};
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
         use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE};
+        use windows_sys::Win32::Globalization::CP_UTF8;
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
             CreatePseudoConsole, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
             ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
             ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
-            FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleMode,
-            GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD, KEY_EVENT,
-            ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+            FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
+            GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD,
+            KEY_EVENT, ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
@@ -1251,6 +1252,10 @@ mod launch_paths {
             let Some(label) = std::env::var_os("MOOR_CONSOLE_MODE_PROBE") else {
                 return;
             };
+            if label == "before" {
+                assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
+            }
+            assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
             let (mut input, mut output) = (0, 0);
             assert!(unsafe {
                 GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
@@ -1308,11 +1313,11 @@ mod launch_paths {
                 } else if record.EventType == KEY_EVENT as u16 {
                     let key = unsafe { record.Event.KeyEvent };
                     let character = unsafe { key.uChar.UnicodeChar };
-                    if key.bKeyDown != 0 && character != 0 {
-                        println!(
-                            "MOOR-KEY:{}:{resized}",
-                            char::from_u32(character as u32).unwrap()
-                        );
+                    if key.bKeyDown != 0 {
+                        println!("MOOR-UNIT:{character:04X}:{resized}");
+                        if let Some(character) = char::from_u32(character as u32) {
+                            println!("MOOR-KEY:{character}:{resized}");
+                        }
                     }
                 }
                 io::stdout().flush().unwrap();
@@ -1409,18 +1414,39 @@ mod launch_paths {
 
             console.resize(37, 93).unwrap();
             thread::sleep(Duration::from_millis(500));
-            console.write(b"A").unwrap();
-            console.resize(41, 101).unwrap();
-            console.write(b"B").unwrap();
+            console.write("A🙂é".as_bytes()).unwrap();
             console
                 .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
                 .unwrap();
+            for unit in [b"D83D", b"DE42", b"00E9"] {
+                let marker = [b"MOOR-UNIT:".as_slice(), unit.as_slice(), b":0"].concat();
+                console.wait_for(&marker, Duration::from_secs(5)).unwrap();
+            }
+            console.write(&[0]).unwrap();
+            console
+                .wait_for(b"MOOR-UNIT:0000:0", Duration::from_secs(5))
+                .unwrap();
+            console.resize(41, 101).unwrap();
             console
                 .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
                 .unwrap();
+            console.write(b"B").unwrap();
             console
                 .wait_for(b"MOOR-KEY:B:1", Duration::from_secs(5))
                 .unwrap();
+            let trace = String::from_utf8_lossy(&console.received);
+            let mut after = 0;
+            for marker in [
+                "MOOR-KEY:A:0",
+                "MOOR-UNIT:D83D:0",
+                "MOOR-UNIT:DE42:0",
+                "MOOR-UNIT:00E9:0",
+                "MOOR-UNIT:0000:0",
+                "MOOR-RESIZE:1:41:101",
+                "MOOR-KEY:B:1",
+            ] {
+                after += trace[after..].find(marker).expect("input/resize order") + marker.len();
+            }
             console.write(&[0x1c]).unwrap();
             assert!(
                 wait_spawn(&mut viewer, Duration::from_secs(5))

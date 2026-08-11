@@ -29,10 +29,10 @@ fn viewer_preserves_native_input_resize_order_and_suppresses_duplicates() {
     let (send, receive) = unbounded();
     let worker = std::thread::spawn(move || {
         let mut ready = [
-            InputState::Byte(b'A'),
+            InputState::Bytes(b"A".to_vec()),
             InputState::Resize(37, 93),
             InputState::Resize(41, 101),
-            InputState::Byte(b'B'),
+            InputState::Bytes(b"B".to_vec()),
             InputState::Closed,
         ]
         .into_iter();
