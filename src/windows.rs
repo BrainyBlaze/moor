@@ -200,16 +200,10 @@ fn exact_descriptor_semantics(
     true
 }
 
-#[cfg(any(windows, test))]
-fn event_within_root(event: &std::path::Path, root: &std::path::Path) -> bool {
-    event != root && event.starts_with(root)
-}
-
 #[cfg(test)]
 mod descriptor_semantics_tests {
     use super::{
-        DirectoryCause, directory_failure, directory_failure_record, event_within_root,
-        exact_descriptor_semantics,
+        DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
     };
 
     #[test]
@@ -261,19 +255,6 @@ mod descriptor_semantics_tests {
             record[at] ^= 0xff;
         }
     }
-
-    #[test]
-    fn event_containment_uses_the_enforced_root_not_the_marker_parent() {
-        use std::path::Path;
-
-        let root = Path::new("C:/private-root");
-        assert!(event_within_root(Path::new("C:/private-root/events"), root));
-        assert!(!event_within_root(root, root));
-        assert!(!event_within_root(
-            Path::new("C:/path-form-parent/events"),
-            root
-        ));
-    }
 }
 
 #[cfg(windows)]
@@ -282,7 +263,7 @@ mod native {
     use super::{
         BootstrapRecord, DirectoryCause, Marker, Result, accept_bootstrap_command,
         bootstrap_command, cim_boot_identity, directory_failure, directory_failure_record,
-        event_within_root, exact_descriptor_semantics, wtf8_decode, wtf8_encode,
+        exact_descriptor_semantics, wtf8_decode, wtf8_encode,
     };
     use crate::{
         cli::{CreateMode, Options},
@@ -1689,6 +1670,87 @@ mod native {
             GetFullPathNameW(wide(path.as_os_str()).as_ptr(), size, out, ptr::null_mut())
         })
     }
+    fn event_rejection(path: &Path, cause: &str) -> String {
+        format!(
+            "event store rejected: {} ({cause})",
+            name::render(path.as_os_str())
+        )
+    }
+    fn event_component(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    fn event_handle_path(handle: &File) -> Result<PathBuf> {
+        path_buffer("resolve event path handle", |out, size| unsafe {
+            GetFinalPathNameByHandleW(handle.as_raw_handle(), out, size, 0)
+        })
+    }
+    fn event_component_cause(error: &io::Error) -> &'static str {
+        match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => "missing",
+            Some(ERROR_DIRECTORY) => "not-directory",
+            Some(ERROR_ACCESS_DENIED) => "not-searchable",
+            _ => "io-error",
+        }
+    }
+    fn event_target(operand: &Path, root: &Path) -> Result<(PathBuf, bool)> {
+        let reject = |cause| event_rejection(operand, cause);
+        let event = absolute(operand).map_err(|_| reject("io-error"))?;
+        let relative = event
+            .strip_prefix(root)
+            .ok()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| reject("outside-root"))?;
+        let root_handle =
+            event_component(root).map_err(|error| reject(event_component_cause(&error)))?;
+        let canonical_root = event_handle_path(&root_handle).map_err(|_| reject("io-error"))?;
+        let mut components = relative.components().peekable();
+        let mut current = root.to_owned();
+        let mut handles = vec![root_handle];
+        let mut present = true;
+        while let Some(component) = components.next() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(reject("outside-root"));
+            };
+            current.push(name);
+            let handle = match event_component(&current) {
+                Ok(handle) => handle,
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound && components.peek().is_none() =>
+                {
+                    present = false;
+                    break;
+                }
+                Err(error) => return Err(reject(event_component_cause(&error))),
+            };
+            let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
+                file_info(
+                    handle.as_raw_handle(),
+                    FileAttributeTagInfo,
+                    "inspect event path component",
+                )
+                .map_err(|_| reject("io-error"))?
+            };
+            crate::ensure!(
+                attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                reject("reparse-point")
+            );
+            crate::ensure!(
+                attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                reject("not-directory")
+            );
+            let canonical = event_handle_path(&handle).map_err(|_| reject("io-error"))?;
+            crate::ensure!(
+                canonical != canonical_root && canonical.starts_with(&canonical_root),
+                reject("outside-root")
+            );
+            handles.push(handle);
+        }
+        Ok((event, present))
+    }
     fn os_string(bytes: &[u8]) -> Result<OsString> {
         wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
     }
@@ -1987,15 +2049,10 @@ mod native {
         let user = sid()?;
         let stage_root = root(invoked)?;
         if let Some(operand) = options.events.as_deref() {
-            let event = absolute(operand)?;
-            require(
-                event_within_root(&event, &stage_root),
-                &format!(
-                    "event store rejected: {} (outside-root)",
-                    name::render(operand.as_os_str())
-                ),
-            )?;
-            validate(&event, user, "FA", true)?;
+            let (event, present) = event_target(operand, &stage_root)?;
+            if present {
+                validate(&event, user, "FA", true)?;
+            }
         }
         let random = random_array::<64>()?;
         let generation = launch_generation(invoked)?;
@@ -2063,15 +2120,11 @@ mod native {
         session: &OsStr,
         invoked: &OsStr,
     ) -> Result<PathBuf> {
-        if let Some(event) = options
-            .events
-            .as_deref()
-            .filter(|event| !event.is_absolute())
-        {
-            return Err(format!(
-                "event store rejected: {} (not-absolute)",
-                name::render(event.as_os_str())
-            ));
+        if let Some(event) = options.events.as_deref() {
+            if !event.is_absolute() {
+                return Err(event_rejection(event, "not-absolute"));
+            }
+            event_target(event, &root(invoked)?)?;
         }
         resolve(session, invoked)
     }

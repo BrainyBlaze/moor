@@ -460,7 +460,9 @@ fn storage_reports_the_selected_log_commit() {
 }
 
 #[cfg(windows)]
-mod working_directory {
+mod launch_paths {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     fn moor(args: &[&str]) -> std::process::Output {
@@ -468,6 +470,32 @@ mod working_directory {
             .args(args)
             .output()
             .unwrap()
+    }
+
+    fn companion(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_owned();
+        value.push(suffix);
+        value.into()
+    }
+
+    fn invoked_root() -> PathBuf {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let sid = String::from_utf8(output.stdout).unwrap();
+        let mut leaf = OsString::from(".");
+        leaf.push(Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap());
+        leaf.push("-");
+        leaf.push(sid.trim());
+        std::env::temp_dir().join(leaf)
     }
 
     #[test]
@@ -630,6 +658,10 @@ mod working_directory {
         std::fs::create_dir(&dir).unwrap();
         let session = dir.join("path-form-session");
         let event = dir.join("outside-events");
+        let initial = moor(&["run", session.to_str().unwrap(), "cmd", "/c", "exit"]);
+        assert_eq!(initial.status.code(), Some(0), "{initial:?}");
+        let lifecycle = companion(&session, ".exit");
+        assert!(lifecycle.is_dir(), "missing stale fixture {lifecycle:?}");
         let out = moor(&[
             "run",
             session.to_str().unwrap(),
@@ -653,6 +685,63 @@ mod working_directory {
         );
         assert!(!session.exists());
         assert!(!event.exists());
+        assert!(
+            lifecycle.is_dir(),
+            "outside-root rejection mutated stale lifecycle state"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn junction_cannot_escape_the_protected_event_root() {
+        let dir = std::env::temp_dir().join(format!("moor-win-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let listed = moor(&["list"]);
+        assert!(listed.status.success(), "{listed:?}");
+        let root = invoked_root();
+        assert!(root.is_dir(), "missing invoked root {root:?}");
+        let junction = root.join(format!("event-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&junction);
+        let linked = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            linked.status.success(),
+            "junction fixture failed: {linked:?}"
+        );
+
+        let session_name = format!("junction-session-{}", std::process::id());
+        let event = junction.join("events");
+        let out = moor(&[
+            "run",
+            &session_name,
+            "-T",
+            event.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "{program}: event store rejected: {} (reparse-point)\n",
+                moor::name::render(event.as_os_str())
+            ),
+            "{out:?}"
+        );
+        assert!(!outside.join("events").exists());
+        assert!(!root.join(&session_name).exists());
+
+        std::fs::remove_dir(&junction).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
