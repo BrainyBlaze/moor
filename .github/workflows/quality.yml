@@ -54,12 +54,12 @@ jobs:
         run: |
           cd spec
           sha256sum --check --strict <<'SUMS'
-          05f644d676beaa73d3bcd7a3aef6fb5c715ed53babf853333bb364bf37063433  moor-spec.md
+          cbd58d14aeaea17fae0400c07e70cf07ba60eb7c5bfe682655131bb198cdb2ae  moor-spec.md
           8cc57dca672929ffab5d869e4c883d0e28d89070df9aa2fd619558a5f766869b  moor-wire-schema.md
           SUMS
           # The literal README table cells intentionally include Markdown backticks.
           # shellcheck disable=SC2016
-          grep -F '`moor-spec.md` | `05f644d676beaa73d3bcd7a3aef6fb5c715ed53babf853333bb364bf37063433`' README.md
+          grep -F '`moor-spec.md` | `cbd58d14aeaea17fae0400c07e70cf07ba60eb7c5bfe682655131bb198cdb2ae`' README.md
           # shellcheck disable=SC2016
           grep -F '`moor-wire-schema.md` | `8cc57dca672929ffab5d869e4c883d0e28d89070df9aa2fd619558a5f766869b`' README.md
 
