@@ -32,6 +32,6 @@ Write failing shipped-binary tests first. Implement protected roots, durable sup
 
 Files: `src/windows.rs`, `src/instrument.rs`, `tests/conformance.rs`, CI configuration if present.
 
-Write shipped-binary/layout tests first. Implement the named-pipe/marker/ConPTY/job/bootstrap interfaces behind the shared policy, immutable instrumentation staging/ACK validation, and platform outcome encoding. Run the mandatory native Windows x64 and arm64 lanes (cross-compilation alone is not completion), plus Linux and macOS lanes. Package and test the same executable under both `moor` and `atch`. Recompute all vectors/hashes, run the full suite, run production LOC enforcement, and perform independent spec and quality reviews.
+Write shipped-binary/layout tests first. Implement the named-pipe/marker/ConPTY/job/bootstrap interfaces behind the shared policy, immutable instrumentation staging/ACK validation, and platform outcome encoding. Run the mandatory native Windows x64 and arm64 lanes (cross-compilation alone is not completion), plus Linux and macOS lanes. Package and test the sole `moor` executable while retaining an arbitrary renamed-copy CLI regression for basename-derived behavior. Recompute all vectors/hashes, run the full suite, run production LOC enforcement, and perform independent spec and quality reviews.
 
 No task may consume the 100-line normative safety margin. If an area exceeds budget, simplify shared code before continuing.

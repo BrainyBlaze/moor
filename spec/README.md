@@ -18,6 +18,10 @@ conforming implementation existed. No mixed old/amended dialect is supported.
 Every later change to a frozen layout requires the corresponding version
 increment.
 
+A later behavioural amendment retired the packaged compatibility command name.
+It changed no frozen wire or event layout, so only the behavioural-spec digest
+changed.
+
 ## Clean-room boundary
 
 Implement from this README and the two authoritative artifacts above only. Do
@@ -36,7 +40,7 @@ The reviewed handoff artifacts have these SHA-256 digests:
 
 | file | SHA-256 |
 |---|---|
-| `moor-spec.md` | `05f644d676beaa73d3bcd7a3aef6fb5c715ed53babf853333bb364bf37063433` |
+| `moor-spec.md` | `cbd58d14aeaea17fae0400c07e70cf07ba60eb7c5bfe682655131bb198cdb2ae` |
 | `moor-wire-schema.md` | `8cc57dca672929ffab5d869e4c883d0e28d89070df9aa2fd619558a5f766869b` |
 
 Verify them from this directory with:
