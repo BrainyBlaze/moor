@@ -1334,10 +1334,6 @@ mod launch_paths {
                     .success()
             );
             let before_modes = wait_modes(&mut console, "before");
-            console
-                .wait_for(b"\x1b[?9001h", Duration::from_secs(1))
-                .unwrap();
-
             let foreground_session = format!("console-run-e2e-{}", std::process::id());
             let _foreground_cleanup = Cleanup(foreground_session.clone());
             let foreground_release =
@@ -1383,6 +1379,9 @@ mod launch_paths {
                 ])
                 .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
             let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"\x1b[?9001h", Duration::from_secs(1))
+                .unwrap();
             console
                 .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
                 .unwrap();
