@@ -1720,18 +1720,20 @@ mod native {
         }
         fn terminate(&mut self, force: bool) -> (u8, bool) {
             crate::return_if!(!force && self.bootstrap.exchange(2).is_ok(), (0, false));
-            let terminated = self
-                .job
-                .as_ref()
-                .is_some_and(|job| job.terminate(0xc000013a).is_ok());
-            (u8::from(terminated) << 1, true)
+            let job = self.job.as_ref();
+            let killed = job.is_some_and(|job| job.terminate(0xc000013a).is_ok());
+            (u8::from(killed) << 1, true)
         }
         fn exited(&mut self) -> Result<Option<NativeExit>> {
             let exit = process_exit(self.process.raw())?;
-            // EOF releases the bootstrap's console attachment so the holder
-            // can drain the requested child's final output without waiting
-            // for the whole-shutdown deadline.
-            drop(exit.and_then(|_| self.bootstrap.control.0.take()));
+            if exit.is_some() {
+                // Closing HPCON can wait on older Windows, so the reader must
+                // keep draining concurrently while this detached close first
+                // releases the bootstrap and then the console ownership.
+                self.bootstrap.control = Pipe::default();
+                let conpty = std::mem::replace(&mut self.conpty.0, 0);
+                drop(thread::spawn(move || drop(Pseudo(conpty))));
+            }
             Ok(exit.map(NativeExit::Code))
         }
     }
@@ -2182,15 +2184,14 @@ mod native {
         let mut artifacts = host.artifacts.take().unwrap();
         let running = std::mem::take(&mut artifacts.running);
         let (authenticated, clients) = mpsc::channel::<(bool, Option<Authentication>)>();
-        let mut authenticating = 0;
-        let mut overflow_authenticating = false;
-        let synthetic = host.synthetic;
-        let geometry = host.geometry;
-        let mut handled = false;
+        let (mut authenticating, mut overflow_authenticating) = (0, false);
+        let (synthetic, geometry) = (host.synthetic, host.geometry);
+        let (mut handled, mut ready) = (false, std::mem::take(&mut host.ready));
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
         runtime.set_geometry(geometry.0, geometry.1);
         let Some(NativeExit::Code(code)) = runtime.drive(
             |pending, overflow| {
+                ready.notice(2, 0);
                 while let Ok((exhausted, client)) = clients.try_recv() {
                     if exhausted {
                         overflow_authenticating = false;
@@ -2380,7 +2381,6 @@ mod native {
                 };
             }
         };
-        host.ready.notice(2, 0);
         Ok(holder(host, listener)?)
     }
     pub(crate) fn preflight_create(
