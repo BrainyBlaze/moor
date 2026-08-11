@@ -355,17 +355,17 @@ fn invoked_dot_is_not_normalized_to_moor() {
 
 #[cfg(unix)]
 #[test]
-fn invoked_atch_name_drives_help_and_diagnostics() {
+fn invoked_renamed_copy_name_drives_help_and_diagnostics() {
     use std::os::unix::fs::symlink;
     let dir = std::env::temp_dir().join(format!("moor-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).unwrap();
-    let atch = dir.join("atch");
-    symlink(env!("CARGO_BIN_EXE_moor"), &atch).unwrap();
-    let out = Command::new(&atch).arg("--version").output().unwrap();
+    let renamed = dir.join("moor-copy");
+    symlink(env!("CARGO_BIN_EXE_moor"), &renamed).unwrap();
+    let out = Command::new(&renamed).arg("--version").output().unwrap();
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
-        format!("atch {}\n", env!("CARGO_PKG_VERSION"))
+        format!("moor-copy {}\n", env!("CARGO_PKG_VERSION"))
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
