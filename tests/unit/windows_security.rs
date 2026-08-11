@@ -82,6 +82,32 @@ fn viewer_modes_are_raw_input_and_vt_output() {
 }
 
 #[test]
+fn console_bytes_reject_raw_zero_events_but_preserve_text_and_nul() {
+    let mut key = KEY_EVENT_RECORD {
+        bKeyDown: 1,
+        wRepeatCount: 1,
+        ..KEY_EVENT_RECORD::default()
+    };
+    key.uChar.AsciiChar = b'A' as i8;
+    assert_eq!(console_byte(key), Some(b'A'));
+    key.bKeyDown = 0;
+    assert_eq!(console_byte(key), None);
+
+    key.bKeyDown = 1;
+    key.uChar.AsciiChar = 0;
+    key.wVirtualKeyCode = 0x10;
+    key.dwControlKeyState = SHIFT_PRESSED;
+    assert_eq!(console_byte(key), None);
+
+    let zero = unsafe { VkKeyScanW(0) } as u16;
+    key.wVirtualKeyCode = zero & 0xff;
+    key.dwControlKeyState = (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
+        | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
+        | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED);
+    assert_eq!(console_byte(key), Some(0));
+}
+
+#[test]
 fn creation_size_requires_attaching_viewers_but_defaults_headless_callers() {
     assert_eq!(creation_size(false, None).unwrap(), (24, 80));
     assert_eq!(creation_size(true, Some((33, 101))).unwrap(), (33, 101));
