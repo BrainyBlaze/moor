@@ -78,7 +78,10 @@ impl Viewer<'_> {
         match event {
             ViewerEvent::Terminal(bytes) => {
                 self.write(bytes)?;
-                if !bytes.is_empty() && self.options.reset == Reset::Move {
+                // Closure §6.3: `move` follows TERMINAL_STATE unconditionally;
+                // an empty preamble (inexact tracking) is a legal branch, not
+                // an implicit downgrade to `none`.
+                if self.options.reset == Reset::Move {
                     self.write(b"\x1b[H")?;
                 }
             }

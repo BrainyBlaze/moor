@@ -1575,7 +1575,8 @@ fn operational_errors_use_stdout_and_launch_validation_uses_stderr() {
     assert_eq!(launched.status.code(), Some(1));
     assert!(launched.stdout.is_empty());
     assert!(
-        String::from_utf8_lossy(&launched.stderr).starts_with("moor: No such file or directory"),
+        String::from_utf8_lossy(&launched.stderr)
+            .starts_with("moor: standard-error sink rejected: "),
         "{launched:?}"
     );
     fs::remove_dir_all(dir).unwrap();
@@ -1992,6 +1993,20 @@ fn headless_child_gets_sane_default_geometry_and_termios() {
     );
     assert!(
         logged.stdout.windows(6).any(|bytes| bytes == b"icanon"),
+        "{logged:?}"
+    );
+    // Closure §6.3 freezes the headless configuration rather than adopting the
+    // kernel default. HUPCL is the observable discriminator on Linux: the
+    // kernel's tty_std_termios sets it, the frozen set does not.
+    assert!(
+        logged.stdout.windows(6).any(|bytes| bytes == b"-hupcl"),
+        "kernel-default termios adopted where closure §6.3 freezes the set: {logged:?}"
+    );
+    assert!(
+        logged
+            .stdout
+            .windows(10)
+            .any(|bytes| bytes == b"38400 baud"),
         "{logged:?}"
     );
     fs::remove_dir_all(dir).unwrap();
@@ -2553,5 +2568,237 @@ fn attach_pins_every_liveness_cell_of_the_frozen_state_matrix() {
     fs::write(dir.join("indeterminate"), b"not a socket").unwrap();
     cell("indeterminate", "could not be identified");
 
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rejected_working_directory_names_the_directory_not_the_executable() {
+    // Closure §6.2 / OB-32: a failed directory change must be distinguishable
+    // from a failed command. Frozen template: `could not enter <path> (<cause>)`,
+    // stderr, LF, status 1 — never 127 and never the executable's name.
+    let dir = temp();
+    let session = dir.join("wd");
+
+    // <cause> = missing
+    let gone = dir.join("nonexistent");
+    let out = moor(&[
+        "run",
+        session.to_str().unwrap(),
+        "-d",
+        gone.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("moor: could not enter {} (missing)\n", gone.display()),
+        "{out:?}"
+    );
+
+    // <cause> = not-directory
+    let file = dir.join("plain");
+    fs::write(&file, b"x").unwrap();
+    let out = moor(&[
+        "run",
+        session.to_str().unwrap(),
+        "-d",
+        file.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("moor: could not enter {} (not-directory)\n", file.display()),
+        "{out:?}"
+    );
+
+    // <cause> = not-searchable (meaningless when running as root, so guard)
+    if unsafe { libc::geteuid() } != 0 {
+        let sealed = dir.join("sealed");
+        fs::create_dir(&sealed).unwrap();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).unwrap();
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-d",
+            sealed.to_str().unwrap(),
+            true_program(),
+        ]);
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "moor: could not enter {} (not-searchable)\n",
+                sealed.display()
+            ),
+            "{out:?}"
+        );
+    }
+
+    // Regression: a valid directory still works and the child's status is kept.
+    let out = moor(&[
+        "run",
+        session.to_str().unwrap(),
+        "-d",
+        dir.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn launch_rejections_use_the_frozen_templates_with_causes() {
+    // Closure §6.2 template matrix: `session root rejected`,
+    // `standard-error sink rejected`, `instrumentation rejected` — each as
+    // `<template>: <path> (<cause>)` on stderr, LF, status 1. Ad-hoc texts and
+    // raw OS error lines are nonconforming.
+    let dir = temp();
+    let session = dir.join("templates");
+
+    // standard-error sink: missing
+    let absent = dir.join("absent-sink");
+    let out = moor(&[
+        "start",
+        session.to_str().unwrap(),
+        "-2",
+        absent.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: standard-error sink rejected: {} (missing)\n",
+            absent.display()
+        ),
+        "{out:?}"
+    );
+
+    // standard-error sink: wrong-mode (0644 is broader than the protected 0600)
+    let broad = dir.join("broad-sink");
+    fs::write(&broad, b"").unwrap();
+    fs::set_permissions(&broad, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = moor(&[
+        "start",
+        session.to_str().unwrap(),
+        "-2",
+        broad.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: standard-error sink rejected: {} (wrong-mode)\n",
+            broad.display()
+        ),
+        "{out:?}"
+    );
+
+    // standard-error sink: link (a symlink must not be followed)
+    let target = dir.join("real-sink");
+    fs::write(&target, b"").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    let linked = dir.join("linked-sink");
+    std::os::unix::fs::symlink(&target, &linked).unwrap();
+    let out = moor(&[
+        "start",
+        session.to_str().unwrap(),
+        "-2",
+        linked.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: standard-error sink rejected: {} (link)\n",
+            linked.display()
+        ),
+        "{out:?}"
+    );
+
+    // instrumentation: missing
+    let gone = dir.join("absent-object.so");
+    let out = moor(&[
+        "run",
+        session.to_str().unwrap(),
+        "-S",
+        gone.to_str().unwrap(),
+        true_program(),
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: instrumentation rejected: {} (missing)\n",
+            gone.display()
+        ),
+        "{out:?}"
+    );
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rejected_session_root_uses_the_frozen_template() {
+    // A root path occupied by a plain file is the reproducible wrong-type
+    // rejection: the frozen template names the root, not an ad-hoc phrase.
+    let marker = temp();
+    let alias = marker.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    fs::write(&root, b"occupied").unwrap();
+    let out = invoked(alias, &["start", "root-check", true_program()]);
+    fs::remove_file(&root).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "{alias}: session root rejected: {} (wrong-type)\n",
+            root.display()
+        ),
+        "{out:?}"
+    );
+    fs::remove_dir_all(marker).unwrap();
+}
+
+#[test]
+fn loader_encoding_refusal_applies_to_the_staged_path() {
+    // Issue #17 item 8 / closure §6.5: the value placed in the loader variable
+    // is the staged path, so a per-user root whose spelling is loader-hostile
+    // (here: whitespace via TMPDIR) must be refused even though the caller's
+    // -S operand is loader-clean.
+    let dir = temp();
+    let object = dir.join("object.so");
+    fs::write(&object, b"not a real library").unwrap();
+    fs::set_permissions(&object, fs::Permissions::from_mode(0o644)).unwrap();
+    let hostile = dir.join("host ile");
+    fs::create_dir(&hostile).unwrap();
+    let session = dir.join("stage-check");
+    let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+        .env("TMPDIR", &hostile)
+        .args([
+            "run",
+            session.to_str().unwrap(),
+            "-S",
+            object.to_str().unwrap(),
+            true_program(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("moor: instrumentation rejected: ")
+            && stderr.trim_end().ends_with("(loader-encoding)"),
+        "the staged path must be refused with the loader-encoding cause: {out:?}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
