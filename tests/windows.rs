@@ -622,4 +622,37 @@ mod working_directory {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn path_form_session_does_not_move_the_event_root_boundary() {
+        let dir = std::env::temp_dir().join(format!("moor-win-event-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let session = dir.join("path-form-session");
+        let event = dir.join("outside-events");
+        let out = moor(&[
+            "run",
+            session.to_str().unwrap(),
+            "-T",
+            event.to_str().unwrap(),
+            "cmd",
+            "/c",
+            "exit",
+        ]);
+        let program =
+            moor::name::program(std::path::Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!(
+                "{program}: event store rejected: {} (outside-root)\n",
+                moor::name::render(event.as_os_str())
+            ),
+            "{out:?}"
+        );
+        assert!(!session.exists());
+        assert!(!event.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

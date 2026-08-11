@@ -441,8 +441,10 @@ pub fn probe_session(
     valid: impl FnOnce() -> bool,
     connect: impl FnOnce() -> std::result::Result<Client, bool>,
 ) -> SessionState {
-    if !path.exists() {
-        return if companion(path, ".exit").exists() {
+    if let Err(error) = std::fs::symlink_metadata(path) {
+        return if error.kind() != std::io::ErrorKind::NotFound {
+            SessionState::Indeterminate
+        } else if companion(path, ".exit").exists() {
             SessionState::Exited
         } else {
             SessionState::Missing
