@@ -802,6 +802,11 @@ mod native {
             validate(&path, sid().unwrap(), "FA", true).unwrap();
             fs::remove_dir(path).unwrap();
         }
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/unit/windows_event.rs"
+        ));
     }
     fn pipe_descriptor(
         sid: &str,
@@ -1237,13 +1242,36 @@ mod native {
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
-    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, guards: Vec<File>);
+    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, guards: Vec<File>, created: Option<bool>);
     crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String,
         generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8,
         conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32,
         early_exit: Option<u32>, birth: [u8; 16],
         input: Pipe, output: Pipe, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>,
         identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
+    impl Drop for EventTarget {
+        fn drop(&mut self) {
+            let Some(trusted) = self.created else {
+                return;
+            };
+            if trusted {
+                for name in ["body.0", "body.1", "commit.0", "commit.1"] {
+                    let _ = fs::remove_file(self.path.join(name));
+                }
+            }
+            let delete = FILE_DISPOSITION_INFO { DeleteFile: true };
+            if let Some(handle) = self.guards.last() {
+                unsafe {
+                    SetFileInformationByHandle(
+                        handle.as_raw_handle(),
+                        FileDispositionInfo,
+                        (&raw const delete).cast(),
+                        size_of::<FILE_DISPOSITION_INFO>() as u32,
+                    )
+                };
+            }
+        }
+    }
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
             let (write, read, rejected) = match kind {
@@ -1304,6 +1332,9 @@ mod native {
             self.artifacts = Some(artifacts);
             // Slot handles now carry storage identity; only now release the
             // no-delete component handles that fenced path-based provisioning.
+            if let Some(event) = &mut self.event {
+                event.created = None;
+            }
             self.event = None;
             Ok(())
         }
@@ -1680,9 +1711,9 @@ mod native {
             name::render(path.as_os_str())
         )
     }
-    fn event_component(path: &Path) -> io::Result<File> {
+    fn event_component(path: &Path, delete: bool) -> io::Result<File> {
         OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | if delete { DELETE } else { 0 })
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
@@ -1709,7 +1740,7 @@ mod native {
         let reject = |cause| event_rejection(operand, cause);
         let event = absolute(operand).map_err(|_| reject("io-error"))?;
         let root_handle =
-            event_component(root).map_err(|error| reject(event_component_cause(&error)))?;
+            event_component(root, false).map_err(|error| reject(event_component_cause(&error)))?;
         let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
             .map_err(|_| reject("io-error"))?;
         let mut all = event.components();
@@ -1723,7 +1754,7 @@ mod native {
             if !prefix.is_absolute() {
                 continue;
             }
-            let handle = event_component(&prefix).map_err(|_| reject("outside-root"))?;
+            let handle = event_component(&prefix, false).map_err(|_| reject("outside-root"))?;
             let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
             crate::ensure!(
                 attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
@@ -1746,7 +1777,7 @@ mod native {
                 return Err(reject("outside-root"));
             };
             current.push(name);
-            let handle = match event_component(&current) {
+            let handle = match event_component(&current, false) {
                 Ok(handle) => handle,
                 Err(error)
                     if error.kind() == io::ErrorKind::NotFound && components.peek().is_none() =>
@@ -1771,6 +1802,7 @@ mod native {
             path: operand.to_owned(),
             present,
             guards,
+            created: None,
         })
     }
     fn validate_event(target: &EventTarget, user: &str) -> Result<()> {
@@ -1795,6 +1827,30 @@ mod native {
             descriptor_matches(&actual, &expected).map_err(|_| reject("io-error"))?,
             reject("broad-dacl")
         );
+        Ok(())
+    }
+    fn materialize_event(
+        target: &mut EventTarget,
+        user: &str,
+        after_create: impl FnOnce(&Path),
+    ) -> Result<()> {
+        crate::return_if!(target.present, validate_event(target, user));
+        let rejected = event_rejection(&target.path, "identity-changed");
+        create_store_path(&target.path, true).map_err(|_| rejected.clone())?;
+        after_create(&target.path);
+        let handle = event_component(&target.path, true).map_err(|_| rejected.clone())?;
+        target.guards.push(handle);
+        target.created = Some(false);
+        let attributes =
+            event_attributes(target.guards.last().unwrap()).map_err(|_| rejected.clone())?;
+        crate::ensure!(
+            attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+                == FILE_ATTRIBUTE_DIRECTORY,
+            rejected.clone()
+        );
+        target.present = true;
+        validate_event(target, user).map_err(|_| rejected)?;
+        target.created = Some(true);
         Ok(())
     }
     fn os_string(bytes: &[u8]) -> Result<OsString> {
@@ -2098,8 +2154,8 @@ mod native {
             .events
             .as_deref()
             .map(|operand| -> Result<EventTarget> {
-                let target = event_target(operand, &stage_root)?;
-                validate_event(&target, user)?;
+                let mut target = event_target(operand, &stage_root)?;
+                materialize_event(&mut target, user, |_| {})?;
                 Ok(target)
             })
             .transpose()?;
