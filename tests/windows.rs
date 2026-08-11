@@ -1036,9 +1036,8 @@ mod launch_paths {
             ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
             FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
             GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD,
-            INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, ReadConsoleInputW, ResizePseudoConsole,
-            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler,
-            SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
+            KEY_EVENT, ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
@@ -1229,18 +1228,6 @@ mod launch_paths {
             console.spawn(command)
         }
 
-        fn send_detach(console: &Console) -> io::Result<Child> {
-            let mut command = SpawnCommand::new(std::env::current_exe()?);
-            command
-                .args([
-                    "--exact",
-                    "launch_paths::native_console::console_input_sender",
-                    "--nocapture",
-                ])
-                .env("MOOR_CONSOLE_INPUT_SENDER", "detach");
-            console.spawn(command)
-        }
-
         fn modes(bytes: &[u8], label: &str) -> (u32, u32) {
             let text = String::from_utf8_lossy(bytes);
             let prefix = format!("MOOR-MODE-{label}:");
@@ -1338,31 +1325,6 @@ mod launch_paths {
         }
 
         #[test]
-        fn console_input_sender() {
-            let Some(mode) = std::env::var_os("MOOR_CONSOLE_INPUT_SENDER") else {
-                return;
-            };
-            assert_eq!(mode, "detach");
-            let mut key = KEY_EVENT_RECORD {
-                bKeyDown: 1,
-                wRepeatCount: 1,
-                ..KEY_EVENT_RECORD::default()
-            };
-            key.uChar.UnicodeChar = 0x1c;
-            let mut record = INPUT_RECORD {
-                EventType: KEY_EVENT as u16,
-                Event: INPUT_RECORD_0 { KeyEvent: key },
-            };
-            let mut written = 0;
-            assert!(
-                unsafe {
-                    WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &mut record, 1, &mut written)
-                } != 0
-            );
-            assert_eq!(written, 1);
-        }
-
-        #[test]
         fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
             let mut console = Console::new(37, 93).unwrap();
             let mut before = probe(&console, "before").unwrap();
@@ -1372,6 +1334,9 @@ mod launch_paths {
                     .success()
             );
             let before_modes = wait_modes(&mut console, "before");
+            console
+                .wait_for(b"\x1b[?9001h", Duration::from_secs(1))
+                .unwrap();
 
             let foreground_session = format!("console-run-e2e-{}", std::process::id());
             let _foreground_cleanup = Cleanup(foreground_session.clone());
@@ -1469,12 +1434,9 @@ mod launch_paths {
             for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
-            let mut detach = send_detach(&console).unwrap();
-            assert!(
-                wait_spawn(&mut detach, Duration::from_secs(5))
-                    .unwrap()
-                    .success()
-            );
+            // ConPTY requested win32-input-mode with CSI ?9001h. Act as its
+            // terminal and encode a key-down U+001C INPUT_RECORD on that wire.
+            console.write(b"\x1b[0;0;28;1;0;1_").unwrap();
             let detached =
                 wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
                     panic!(
