@@ -70,10 +70,10 @@ fn viewer_modes_are_raw_input_and_vt_output() {
             & (ENABLE_PROCESSED_INPUT
                 | ENABLE_LINE_INPUT
                 | ENABLE_ECHO_INPUT
-                | ENABLE_QUICK_EDIT_MODE
-                | ENABLE_WINDOW_INPUT),
+                | ENABLE_QUICK_EDIT_MODE),
         0
     );
+    assert_ne!(input & ENABLE_WINDOW_INPUT, 0);
     assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     assert_ne!(input & ENABLE_EXTENDED_FLAGS, 0);
     assert_ne!(output & ENABLE_PROCESSED_OUTPUT, 0);

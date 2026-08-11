@@ -1398,10 +1398,10 @@ mod launch_paths {
                     & (ENABLE_LINE_INPUT
                         | ENABLE_ECHO_INPUT
                         | ENABLE_PROCESSED_INPUT
-                        | ENABLE_QUICK_EDIT_MODE
-                        | ENABLE_WINDOW_INPUT),
+                        | ENABLE_QUICK_EDIT_MODE),
                 0
             );
+            assert_ne!(input & ENABLE_WINDOW_INPUT, 0);
             assert_eq!(
                 output & (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING),
                 ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING

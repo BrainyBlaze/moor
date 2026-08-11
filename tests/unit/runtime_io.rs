@@ -24,166 +24,39 @@ fn viewer_flush_transfers_the_input_buffer() {
     assert_eq!(bytes.capacity(), 0, "the producer retained the allocation");
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum ObservedInput {
-    Bytes(Vec<u8>),
-    Resize(u16, u16),
-}
-
-struct InputChunks(std::collections::VecDeque<Vec<u8>>);
-
-impl Read for InputChunks {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let Some(chunk) = self.0.pop_front() else {
-            return Ok(0);
-        };
-        bytes[..chunk.len()].copy_from_slice(&chunk);
-        Ok(chunk.len())
-    }
-}
-
-fn observe_input(chunks: Vec<Vec<u8>>, last_size: Option<(u16, u16)>) -> Vec<ObservedInput> {
-    observe_input_with_detach(chunks, last_size, None)
-}
-
-fn observe_input_with_detach(
-    chunks: Vec<Vec<u8>>,
-    last_size: Option<(u16, u16)>,
-    detach: Option<u8>,
-) -> Vec<ObservedInput> {
+#[test]
+fn viewer_orders_native_resize_before_following_input_and_suppresses_duplicates() {
     let (send, receive) = unbounded();
     let worker = std::thread::spawn(move || {
-        run_viewer_input(
-            InputChunks(chunks.into()),
-            ViewerSender(send),
-            InputConfig {
-                detach,
-                pass_suspend: true,
-                last_size,
-                vt_resize: true,
-            },
-            || InputState::Ready,
-            || None,
-            || {},
-            Instant::now,
-        )
-    });
-    let mut observed = Vec::new();
-    loop {
-        match receive.recv().unwrap() {
-            Command::Input(bytes) => match observed.last_mut() {
-                Some(ObservedInput::Bytes(existing)) => existing.extend(bytes),
-                _ => observed.push(ObservedInput::Bytes(bytes)),
-            },
-            Command::Resize(rows, columns) => {
-                observed.push(ObservedInput::Resize(rows, columns))
-            }
-            Command::Release(done) => {
-                done.send(true).unwrap();
-                break;
-            }
-            Command::Keepalive | Command::Abort => panic!("unexpected viewer command"),
-        }
-    }
-    worker.join().unwrap();
-    observed
-}
-
-#[test]
-fn viewer_resize_sequence_takes_priority_over_an_interior_detach_byte() {
-    for detach in *b"8;1t" {
-        assert_eq!(
-            observe_input_with_detach(
-                vec![b"a\x1b[8;41;101tb".to_vec()],
-                Some((37, 93)),
-                Some(detach),
-            ),
-            vec![
-                ObservedInput::Bytes(b"a".to_vec()),
-                ObservedInput::Resize(41, 101),
-                ObservedInput::Bytes(b"b".to_vec()),
-            ],
-            "detach byte {detach:?}",
-        );
-    }
-}
-
-#[test]
-fn viewer_translates_fragmented_vt_resize_without_leaking_control_bytes() {
-    let sequence = b"\x1b[8;41;101t";
-    for split in 1..sequence.len() {
-        let mut first = b"a".to_vec();
-        first.extend_from_slice(&sequence[..split]);
-        let mut second = sequence[split..].to_vec();
-        second.push(b'b');
-        assert_eq!(
-            observe_input(vec![first, second], Some((37, 93))),
-            vec![
-                ObservedInput::Bytes(b"a".to_vec()),
-                ObservedInput::Resize(41, 101),
-                ObservedInput::Bytes(b"b".to_vec()),
-            ],
-            "split at {split}"
-        );
-    }
-}
-
-#[test]
-fn viewer_suppresses_same_size_vt_resize_and_preserves_invalid_sequences() {
-    let invalid = b"x\x1b[8;0;101ty\x1b[8;30000;100tz\x1b[8;99999;1t";
-    assert_eq!(
-        observe_input(vec![invalid.to_vec()], Some((37, 93))),
-        vec![ObservedInput::Bytes(invalid.to_vec())]
-    );
-    let partial = b"\x1b[8;41";
-    assert_eq!(
-        observe_input(vec![partial.to_vec()], Some((37, 93))),
-        vec![ObservedInput::Bytes(partial.to_vec())]
-    );
-    assert_eq!(
-        observe_input(
-            vec![b"a\x1b[8;37;93tb\x1bX\x1b[8;42;102tc".to_vec()],
-            Some((37, 93))
-        ),
-        vec![
-            ObservedInput::Bytes(b"ab\x1bX".to_vec()),
-            ObservedInput::Resize(42, 102),
-            ObservedInput::Bytes(b"c".to_vec()),
+        let mut ready = [
+            InputState::Resize(37, 93),
+            InputState::Resize(41, 101),
+            InputState::Ready,
+            InputState::Closed,
         ]
-    );
-}
-
-#[test]
-fn viewer_flushes_a_lone_escape_after_the_readiness_grace() {
-    let (send, receive) = unbounded();
-    let worker = std::thread::spawn(move || {
-        let mut polls = 0;
+        .into_iter();
         run_viewer_input(
-            std::io::Cursor::new(b"\x1b"),
+            std::io::Cursor::new(b"A"),
             ViewerSender(send),
             InputConfig {
                 detach: None,
                 pass_suspend: true,
                 last_size: Some((37, 93)),
-                vt_resize: true,
             },
-            move || {
-                polls += 1;
-                match polls {
-                    1 => InputState::Ready,
-                    2 => InputState::Pending,
-                    _ => InputState::Closed,
-                }
-            },
+            move || ready.next().unwrap(),
             || None,
             || {},
             Instant::now,
         )
     });
-    let Command::Input(bytes) = receive.recv().unwrap() else {
-        panic!("timed-out escape was not forwarded");
+    let Command::Resize(rows, columns) = receive.recv().unwrap() else {
+        panic!("native resize was not forwarded first");
     };
-    assert_eq!(bytes, b"\x1b");
+    assert_eq!((rows, columns), (41, 101));
+    let Command::Input(bytes) = receive.recv().unwrap() else {
+        panic!("input was not forwarded after the resize");
+    };
+    assert_eq!(bytes, b"A");
     let Command::Release(done) = receive.recv().unwrap() else {
         panic!("viewer did not release cleanly");
     };
