@@ -2023,50 +2023,28 @@ mod native {
         })
     }
     fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
-        [
-            (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS)
-                & !(ENABLE_LINE_INPUT
-                    | ENABLE_ECHO_INPUT
-                    | ENABLE_PROCESSED_INPUT
-                    | ENABLE_QUICK_EDIT_MODE
-                    | ENABLE_WINDOW_INPUT),
-            output
-                | ENABLE_PROCESSED_OUTPUT
-                | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                | DISABLE_NEWLINE_AUTO_RETURN,
-        ]
+        let raw = ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_PROCESSED_INPUT
+            | ENABLE_QUICK_EDIT_MODE
+            | ENABLE_WINDOW_INPUT;
+        let input = (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) & !raw;
+        let output = output
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | DISABLE_NEWLINE_AUTO_RETURN;
+        [input, output]
     }
-    type Size = (u16, u16);
-    fn valid_size(&(rows, columns): &Size) -> bool {
-        let valid = |value| value != 0 && value <= i16::MAX as u16;
-        valid(rows) && valid(columns) && u32::from(rows) * u32::from(columns) <= 2_000_000
-    }
-    fn console_geometry(output: HANDLE) -> Result<[Size; 2]> {
+    fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        check(
-            unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0,
-            "inspect viewer console geometry",
-        )?;
+        let read = unsafe { GetConsoleScreenBufferInfo(output, &mut info) };
+        check(read != 0, "inspect viewer console geometry")?;
         let invalid = "viewer console geometry is invalid";
         let extent = |a, b| u16::try_from(i32::from(a) - i32::from(b) + 1).map_err(|_| invalid);
-        let (w, b) = (info.srWindow, info.dwSize);
-        let window = (extent(w.Bottom, w.Top)?, extent(w.Right, w.Left)?);
-        let buffer = (b.Y.try_into().unwrap_or(0), b.X.try_into().unwrap_or(0));
-        let sizes = [window, buffer];
-        require(valid_size(&sizes[0]), invalid).map(|_| sizes)
-    }
-    fn select_size(state: &mut ([Size; 2], Size), next: [Size; 2]) -> Option<Size> {
-        let selected = if state.0[0] != next[0] {
-            next[0]
-        } else if state.0[1] != next[1] {
-            let (s, old, new) = (state.1, state.0[1], next[1]);
-            let shift = |s, n, o| u16::try_from(i32::from(s) + i32::from(n) - i32::from(o)).ok();
-            (shift(s.0, new.0, old.0)?, shift(s.1, new.1, old.1)?)
-        } else {
-            state.1
-        };
-        *state = (next, selected);
-        valid_size(&selected).then_some(selected)
+        let window = info.srWindow;
+        let rows = extent(window.Bottom, window.Top)?;
+        let size = (rows, extent(window.Right, window.Left)?);
+        require(crate::wire::valid_size(size), invalid).map(|_| size)
     }
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
     impl ViewerConsole {
@@ -2097,8 +2075,8 @@ mod native {
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
-        let geometries = console_geometry(terminal.0[1]).unwrap_or([(0, 0); 2]);
-        let (geometry, mut output) = (geometries[0], io::stdout());
+        let geometry = console_geometry(terminal.0[1]).unwrap_or((0, 0));
+        let mut output = io::stdout();
         Ok(attach_viewer_to(
             &mut client,
             &options,
@@ -2106,28 +2084,27 @@ mod native {
             &mut output,
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
-            |sender| viewer_input(sender, options.detach, geometries),
+            |sender| viewer_input(sender, options.detach, geometry),
         )?)
     }
-    fn viewer_input(sender: ViewerSender, detach: Option<u8>, observed: [Size; 2]) {
+    fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
-            let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) } as usize;
-            let mut state = (observed, observed[0]);
             run_viewer_input(
                 io::stdin(),
                 sender,
                 InputConfig {
                     detach,
                     pass_suspend: true,
-                    last_size: valid_size(&state.1).then_some(state.1),
+                    last_size: crate::wire::valid_size(geometry).then_some(geometry),
+                    vt_resize: true,
                 },
                 move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
                     WAIT_OBJECT_0 => InputState::Ready,
                     WAIT_TIMEOUT => InputState::Pending,
                     _ => InputState::Closed,
                 },
-                move || select_size(&mut state, console_geometry(output as HANDLE).ok()?),
+                || None,
                 || {},
                 Instant::now,
             );
@@ -2155,7 +2132,8 @@ mod native {
     }
     fn parse_geometry(value: &OsStr) -> Option<(u16, u16)> {
         let (rows, columns) = value.to_str()?.split_once(':')?;
-        Some((rows.parse().ok()?, columns.parse().ok()?)).filter(valid_size)
+        let size = (rows.parse().ok()?, columns.parse().ok()?);
+        crate::wire::valid_size(size).then_some(size)
     }
     fn creation_geometry(required: bool, capture: bool, child: bool) -> Result<(u16, u16)> {
         let inherited = std::env::var_os(DETACHED_GEOMETRY);
@@ -2169,7 +2147,7 @@ mod native {
         let geometry = capture
             .then(ViewerConsole::detect)
             .flatten()
-            .map(|console| console_geometry(console.0[1]).map(|sizes| sizes[0]))
+            .map(|console| console_geometry(console.0[1]))
             .transpose()?;
         creation_size(required, geometry)
     }

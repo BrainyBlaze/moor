@@ -89,44 +89,6 @@ fn creation_size_requires_attaching_viewers_but_defaults_headless_callers() {
     assert_eq!(creation_size(true, None).unwrap_err(), "no controlling terminal");
 }
 
-#[test]
-fn geometry_selection_observes_a_buffer_resize_racing_viewer_startup() {
-    let mut state = ([(37, 93), (9001, 93)], (37, 93));
-    let selected = select_size(&mut state, [(37, 93), (9005, 101)]).unwrap();
-    assert_eq!(selected, (41, 101));
-    assert_eq!(
-        select_size(&mut state, [(37, 93), (9005, 101)]),
-        Some((41, 101))
-    );
-    assert_eq!(
-        select_size(&mut state, [(37, 93), (9001, 93)]),
-        Some((37, 93))
-    );
-}
-
-#[test]
-fn geometry_selection_prefers_and_remembers_a_legacy_window_resize() {
-    let mut state = ([(37, 93); 2], (37, 93));
-    let selected = select_size(&mut state, [(31, 80), (37, 93)]).unwrap();
-    assert_eq!(selected, (31, 80));
-    assert_eq!(
-        select_size(&mut state, [(31, 80), (37, 93)]),
-        Some((31, 80))
-    );
-    assert_eq!(
-        select_size(&mut state, [(29, 79), (41, 101)]),
-        Some((29, 79))
-    );
-}
-
-#[test]
-fn geometry_selection_rejects_buffer_delta_underflow_and_oversize() {
-    let mut underflow = ([(1, 1), (100, 1)], (1, 1));
-    assert_eq!(select_size(&mut underflow, [(1, 1), (98, 1)]), None);
-    let mut oversize = ([(20_000, 1), (1, 1)], (20_000, 1));
-    assert_eq!(select_size(&mut oversize, [(20_000, 1), (20_001, 1)]), None);
-}
-
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/unit/windows_event.rs"

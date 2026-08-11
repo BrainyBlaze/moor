@@ -15,7 +15,7 @@ schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
 schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Closed);
 
-schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
+schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>, vt_resize: bool);
 
 type Charge = (usize, usize);
 pub type SendResult = Result<(), SendError>;
@@ -354,10 +354,7 @@ pub fn attach_viewer_to(
     mut start: impl FnMut(ViewerSender),
 ) -> Result<i32, String> {
     let (sender, commands) = bounded(1);
-    let mut request = [0; 5];
-    request[..2].copy_from_slice(&geometry.1.to_le_bytes());
-    request[2..4].copy_from_slice(&geometry.0.to_le_bytes());
-    request[4] = 1 | u8::from(options.non_vt) << 1;
+    let mut request = crate::wire::attach_payload(geometry, 1 | u8::from(options.non_vt) << 1);
     let mut stream = Viewer {
         client,
         options,
@@ -425,11 +422,8 @@ pub fn attach_viewer_to(
             };
             let recovered: Result<(), String> = (|| {
                 lease.resume(stream.client, &mut reconnect)?;
-                if let Some((rows, columns)) = stream.size {
-                    request[..2].copy_from_slice(&columns.to_le_bytes());
-                    request[2..4].copy_from_slice(&rows.to_le_bytes());
-                }
-                request[4] &= !1;
+                request =
+                    crate::wire::attach_payload(stream.size.unwrap_or(geometry), request[4] & !1);
                 stream.client.send(3, &request)?;
                 stream.lease = Some(lease);
                 stream.phase = ViewerPhase::Reattaching;
@@ -456,10 +450,14 @@ pub fn run_viewer_input(
         detach,
         pass_suspend,
         mut last_size,
+        vt_resize,
     } = config;
     let mut armed = None;
     let mut bytes = vec![0; 65536];
     let mut output = Vec::with_capacity(bytes.len());
+    let mut plain = Vec::with_capacity(bytes.len());
+    let mut filter = crate::wire::ResizeInput::default();
+    let mut resizes = Vec::new();
     let mut renewed = now();
     let graceful = 'input: loop {
         let current = now();
@@ -469,7 +467,7 @@ pub fn run_viewer_input(
             }
             renewed = current;
         }
-        let next_size = size();
+        let next_size = if vt_resize { last_size } else { size() };
         if next_size != last_size {
             if let Some((rows, columns)) = next_size {
                 let _ = sender.0.send(Command::Resize(rows, columns));
@@ -481,19 +479,33 @@ pub fn run_viewer_input(
         {
             break true;
         }
-        match ready() {
+        let closing = match ready() {
+            InputState::Pending if !filter.probe.is_empty() => filter.flush(&mut plain, false),
             InputState::Pending => continue,
-            InputState::Closed => break true,
-            InputState::Ready => {}
-        }
-        let count = match input.read(&mut bytes) {
-            Ok(0) => break true,
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break false,
+            InputState::Closed => filter.flush(&mut plain, true),
+            InputState::Ready => match input.read(&mut bytes) {
+                Ok(0) => filter.flush(&mut plain, true),
+                Ok(count) => {
+                    filter.input(&bytes[..count], vt_resize, detach, &mut plain, &mut resizes);
+                    false
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break false,
+            },
         };
-        output.clear();
-        for byte in bytes[..count].iter().copied() {
+        let mut changes = resizes.drain(..).peekable();
+        for at in 0..=plain.len() {
+            while let Some((_, rows, columns)) = changes.next_if(|change| change.0 == at) {
+                let next = Some((rows, columns));
+                if next != last_size
+                    && (!sender.flush(&mut output)
+                        || sender.0.send(Command::Resize(rows, columns)).is_err())
+                {
+                    break 'input false;
+                }
+                last_size = next;
+            }
+            let Some(&byte) = plain.get(at) else { break };
             if armed.take().is_some() {
                 output.push(byte);
                 if Some(byte) != detach {
@@ -513,12 +525,13 @@ pub fn run_viewer_input(
                 output.push(byte);
             }
         }
-        if !sender.flush(&mut output) {
-            break false;
+        plain.clear();
+        let sent = sender.flush(&mut output);
+        if !sent || closing {
+            break sent;
         }
     };
-    let released = graceful && sender.release();
-    if !released {
+    if !(graceful && sender.release()) {
         let _ = sender.0.send(Command::Abort);
     }
 }
