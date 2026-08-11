@@ -91,7 +91,7 @@ fn observe_input_with_detach(
 
 #[test]
 fn viewer_resize_sequence_takes_priority_over_an_interior_detach_byte() {
-    for detach in [b'8', b';', b'1', b't'] {
+    for detach in *b"8;1t" {
         assert_eq!(
             observe_input_with_detach(
                 vec![b"a\x1b[8;41;101tb".to_vec()],
