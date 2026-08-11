@@ -25,18 +25,19 @@ fn viewer_flush_transfers_the_input_buffer() {
 }
 
 #[test]
-fn viewer_orders_native_resize_before_following_input_and_suppresses_duplicates() {
+fn viewer_preserves_native_input_resize_order_and_suppresses_duplicates() {
     let (send, receive) = unbounded();
     let worker = std::thread::spawn(move || {
         let mut ready = [
+            InputState::Byte(b'A'),
             InputState::Resize(37, 93),
             InputState::Resize(41, 101),
-            InputState::Ready,
+            InputState::Byte(b'B'),
             InputState::Closed,
         ]
         .into_iter();
         run_viewer_input(
-            std::io::Cursor::new(b"A"),
+            std::io::empty(),
             ViewerSender(send),
             InputConfig {
                 detach: None,
@@ -49,14 +50,18 @@ fn viewer_orders_native_resize_before_following_input_and_suppresses_duplicates(
             Instant::now,
         )
     });
+    let Command::Input(bytes) = receive.recv().unwrap() else {
+        panic!("input preceding the resize was not forwarded first");
+    };
+    assert_eq!(bytes, b"A");
     let Command::Resize(rows, columns) = receive.recv().unwrap() else {
-        panic!("native resize was not forwarded first");
+        panic!("native resize was not forwarded in order");
     };
     assert_eq!((rows, columns), (41, 101));
     let Command::Input(bytes) = receive.recv().unwrap() else {
         panic!("input was not forwarded after the resize");
     };
-    assert_eq!(bytes, b"A");
+    assert_eq!(bytes, b"B");
     let Command::Release(done) = receive.recv().unwrap() else {
         panic!("viewer did not release cleanly");
     };

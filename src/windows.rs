@@ -227,6 +227,7 @@ mod native {
             SystemInformation::*,
             Threading::*,
         },
+        UI::Input::KeyboardAndMouse::VkKeyScanW,
     };
 
     fn check(ok: bool, what: &str) -> Result<()> {
@@ -2025,14 +2026,14 @@ mod native {
     fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
         let raw =
             ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
-        let input =
+        [
             (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-                & !raw;
-        let output = output
-            | ENABLE_PROCESSED_OUTPUT
-            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            | DISABLE_NEWLINE_AUTO_RETURN;
-        [input, output]
+                & !raw,
+            output
+                | ENABLE_PROCESSED_OUTPUT
+                | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | DISABLE_NEWLINE_AUTO_RETURN,
+        ]
     }
     fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
@@ -2056,12 +2057,8 @@ mod native {
                 .then_some(Self(handles, modes))
         }
         fn set(&self, modes: [u32; 2]) -> Result<()> {
-            (0..2).try_for_each(|at| {
-                check(
-                    unsafe { SetConsoleMode(self.0[at], modes[at]) } != 0,
-                    "configure viewer console",
-                )
-            })
+            let set = |at| unsafe { SetConsoleMode(self.0[at], modes[at]) } != 0;
+            (0..2).try_for_each(|at| check(set(at), "configure viewer console"))
         }
     }
     impl Drop for ViewerConsole {
@@ -2069,29 +2066,37 @@ mod native {
             self.set(self.1).ok();
         }
     }
+    fn console_byte(key: KEY_EVENT_RECORD) -> Option<u8> {
+        let byte = unsafe { key.uChar.AsciiChar } as u8;
+        let zero = unsafe { VkKeyScanW(0) } as u16;
+        let chord = key.wVirtualKeyCode
+            | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
+            | u16::from(key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0) << 9
+            | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0) << 10;
+        (key.bKeyDown != 0 && (byte != 0 || chord == zero)).then_some(byte)
+    }
     fn viewer_input_state(input: HANDLE) -> InputState {
-        let wait = unsafe { WaitForSingleObject(input, 50) };
-        crate::return_if!(wait == WAIT_TIMEOUT, InputState::Pending);
-        crate::return_if!(wait != WAIT_OBJECT_0, InputState::Closed);
-        let (mut event, mut count) = (INPUT_RECORD::default(), 0);
-        let window = WINDOW_BUFFER_SIZE_EVENT as u16;
-        let peeked = unsafe { PeekConsoleInputW(input, &mut event, 1, &mut count) };
-        crate::return_if!(peeked == 0, InputState::Closed);
-        crate::return_if!(count == 0, InputState::Pending);
-        crate::return_if!(event.EventType != window, InputState::Ready);
-        let read = unsafe { ReadConsoleInputW(input, &mut event, 1, &mut count) };
-        crate::return_if!(
-            read == 0 || count != 1 || event.EventType != window,
-            InputState::Closed
-        );
-        let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
-        u16::try_from(size.Y)
-            .ok()
-            .zip(u16::try_from(size.X).ok())
-            .filter(|size| crate::wire::valid_size(*size))
-            .map_or(InputState::Pending, |size| {
-                InputState::Resize(size.0, size.1)
-            })
+        loop {
+            let wait = unsafe { WaitForSingleObject(input, 50) };
+            crate::return_if!(wait == WAIT_TIMEOUT, InputState::Pending);
+            crate::return_if!(wait != WAIT_OBJECT_0, InputState::Closed);
+            let (mut event, mut count) = (INPUT_RECORD::default(), 0);
+            let read = unsafe { ReadConsoleInputA(input, &mut event, 1, &mut count) };
+            crate::return_if!(read == 0, InputState::Closed);
+            if event.EventType == KEY_EVENT as u16 {
+                let key = unsafe { event.Event.KeyEvent };
+                if let Some(byte) = console_byte(key) {
+                    return InputState::Byte(byte);
+                }
+            } else if event.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
+                let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
+                let size = (size.Y as u16, size.X as u16);
+                crate::return_if!(
+                    crate::wire::valid_size(size),
+                    InputState::Resize(size.0, size.1)
+                );
+            }
+        }
     }
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
         let terminal = ViewerConsole::detect()
@@ -2114,7 +2119,7 @@ mod native {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
             run_viewer_input(
-                io::stdin(),
+                io::empty(),
                 sender,
                 InputConfig {
                     detach,

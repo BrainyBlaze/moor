@@ -1410,14 +1410,14 @@ mod launch_paths {
             console.resize(37, 93).unwrap();
             thread::sleep(Duration::from_millis(500));
             console.write(b"A").unwrap();
+            console.resize(41, 101).unwrap();
+            console.write(b"B").unwrap();
             console
                 .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
                 .unwrap();
-            console.resize(41, 101).unwrap();
             console
                 .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
                 .unwrap();
-            console.write(b"B").unwrap();
             console
                 .wait_for(b"MOOR-KEY:B:1", Duration::from_secs(5))
                 .unwrap();

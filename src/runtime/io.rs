@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
-schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Resize(u16, u16), Closed);
+schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Byte(u8), Resize(u16, u16), Closed);
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
@@ -446,11 +446,7 @@ pub fn run_viewer_input(
     mut suspend: impl FnMut(),
     mut now: impl FnMut() -> Instant,
 ) {
-    let InputConfig {
-        detach,
-        pass_suspend,
-        mut last_size,
-    } = config;
+    let mut last_size = config.last_size;
     let mut armed = None;
     let mut bytes = vec![0; 65536];
     let mut output = Vec::with_capacity(bytes.len());
@@ -472,8 +468,12 @@ pub fn run_viewer_input(
         {
             break true;
         }
-        match ready() {
+        let count = match ready() {
             InputState::Pending => continue,
+            InputState::Byte(byte) => {
+                bytes[0] = byte;
+                1
+            }
             InputState::Resize(rows, columns) => {
                 let next = Some((rows, columns));
                 if next != last_size && sender.0.send(Command::Resize(rows, columns)).is_err() {
@@ -483,26 +483,25 @@ pub fn run_viewer_input(
                 continue;
             }
             InputState::Closed => break true,
-            InputState::Ready => {}
-        }
-        let count = match input.read(&mut bytes) {
-            Ok(0) => break true,
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break false,
+            InputState::Ready => match input.read(&mut bytes) {
+                Ok(0) => break true,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break false,
+            },
         };
         output.clear();
         for byte in bytes[..count].iter().copied() {
             if armed.take().is_some() {
                 output.push(byte);
-                if Some(byte) != detach {
+                if Some(byte) != config.detach {
                     break 'input sender.flush(&mut output);
                 }
-            } else if Some(byte) == detach || byte == 0x1a && !pass_suspend {
+            } else if Some(byte) == config.detach || byte == 0x1a && !config.pass_suspend {
                 if !sender.flush(&mut output) {
                     break 'input false;
                 }
-                if Some(byte) == detach {
+                if Some(byte) == config.detach {
                     armed = Some(current);
                 } else {
                     suspend();
@@ -516,8 +515,7 @@ pub fn run_viewer_input(
             break false;
         }
     };
-    let released = graceful && sender.release();
-    if !released {
+    if !(graceful && sender.release()) {
         let _ = sender.0.send(Command::Abort);
     }
 }
