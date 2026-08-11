@@ -192,7 +192,7 @@ mod native {
         cli::*,
         name, require,
         runtime::{
-            client::{Client, CommandError as E, CommandResult, missing as M, probe_session},
+            client::{Client, CommandError, CommandResult, missing, probe_session},
             holder::{Native as HolderNative, NativeExit},
             io::*,
             private::*,
@@ -1364,7 +1364,7 @@ mod native {
         }
 
         fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<Listener> {
-            let (descriptor, _) = descriptor(&self.sid, "0x12019b")?;
+            let (descriptor, _) = descriptor(&self.sid, "0x12019f")?;
             let pipe_descriptor = unsafe {
                 BorrowedSecurityDescriptor::from_ptr(
                     (&*descriptor as *const SecurityDescriptor).cast(),
@@ -2094,11 +2094,10 @@ mod native {
         }
     }
     pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
-        let terminal =
-            ViewerConsole::detect().ok_or_else(|| E::output("no controlling terminal"))?;
+        let terminal = ViewerConsole::detect()
+            .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
-        let diagnostic = |e: String| if e.is_empty() { M(path) } else { E::output(e) };
-        let mut client = controller(path, 2000).map_err(diagnostic)?;
+        let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let (geometry, mut output) = (terminal.geometry().unwrap_or((0, 0)), io::stdout());
         Ok(attach_viewer_to(
             &mut client,
