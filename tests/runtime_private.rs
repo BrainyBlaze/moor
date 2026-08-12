@@ -261,6 +261,16 @@ fn environment_keys_transform_encoded_bytes_not_unicode_characters() {
 }
 
 #[test]
+fn launch_channel_key_uses_the_full_environment_name_boundary() {
+    let basename = "a".repeat(113);
+    let key = environment_key(std::ffi::OsStr::new(&basename), "_LAUNCH_CHANNEL");
+    let bytes = key.as_encoded_bytes();
+    assert_eq!(bytes.len(), 127);
+    assert_eq!(&bytes[..112], "A".repeat(112).as_bytes());
+    assert_eq!(&bytes[112..], b"_LAUNCH_CHANNEL");
+}
+
+#[test]
 fn wide_values_can_require_or_ignore_a_trailing_payload() {
     let mut bytes = Vec::new();
     put_wide(&mut bytes, b"identity").unwrap();

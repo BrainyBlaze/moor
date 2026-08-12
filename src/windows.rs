@@ -399,6 +399,7 @@ mod native {
     const BOOTSTRAP_DIRECTORY: &str = "MOOR_BOOTSTRAP_DIRECTORY";
     const INSTRUMENT_CHANNEL: &str = "MOOR_INSTRUMENT_CHANNEL";
     const INSTRUMENT_NONCE: &str = "MOOR_INSTRUMENT_NONCE";
+    const SEMANTIC_TOKEN: &str = "MOOR_SESSION_SEMANTIC_TOKEN";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
         let size = fill(ptr::null_mut(), 0);
         check(size != 0, what)?;
@@ -991,6 +992,8 @@ mod native {
         let holder_pid =
             u32::try_from(selector_decimal(holder)?).map_err(|_| "invalid holder pid")?;
         let command = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let semantic_token = std::env::var_os(SEMANTIC_TOKEN);
+        unsafe { std::env::remove_var(SEMANTIC_TOKEN) };
         require(!command.is_empty(), "empty bootstrap command")?;
         unsafe {
             let required =
@@ -1022,7 +1025,10 @@ mod native {
             }
             let (program, args) = command.split_first().unwrap();
             let mut requested = SpawnCommand::new(program);
-            requested.args(args).env_remove(INSTRUMENT_NONCE);
+            requested
+                .args(args)
+                .env_remove(INSTRUMENT_NONCE)
+                .env_remove(SEMANTIC_TOKEN);
             transfer_handles!(requested;
                 INSTRUMENT_CHANNEL => instrument.as_ref(), "instrumentation channel"
             );
@@ -1031,6 +1037,9 @@ mod native {
                     INSTRUMENT_NONCE,
                     format!("{:032x}", u128::from_be_bytes(instrument_nonce)),
                 );
+            }
+            if let Some(token) = semantic_token {
+                requested.env(SEMANTIC_TOKEN, token);
             }
             if let Some(handle) = &stderr {
                 requested.stderr(win(
@@ -1404,7 +1413,14 @@ mod native {
                 bootstrap
                     .env_remove(BOOTSTRAP_SELECTOR)
                     .env_remove(INSTRUMENT_CHANNEL)
-                    .env_remove(INSTRUMENT_NONCE);
+                    .env_remove(INSTRUMENT_NONCE)
+                    .env_remove(SEMANTIC_TOKEN);
+                if self.semantic_token != [0; 16] {
+                    bootstrap.env(
+                        SEMANTIC_TOKEN,
+                        format!("{:032x}", u128::from_be_bytes(self.semantic_token)),
+                    );
+                }
                 bootstrap.env(
                     BOOTSTRAP_SELECTOR,
                     format!(

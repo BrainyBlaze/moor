@@ -498,6 +498,71 @@ mod launch_paths {
         std::env::temp_dir().join(leaf)
     }
 
+    const SEMANTIC_TOKEN_PROBE: &str = "MOOR_TEST_SEMANTIC_TOKEN_PROBE";
+
+    #[test]
+    fn semantic_token_probe() {
+        let Some(output) = std::env::var_os(SEMANTIC_TOKEN_PROBE) else {
+            return;
+        };
+        let actual = std::env::var_os("MOOR_SESSION_SEMANTIC_TOKEN").map_or_else(
+            || "absent".into(),
+            |value| value.to_string_lossy().into_owned(),
+        );
+        std::fs::write(output, actual).unwrap();
+    }
+
+    #[test]
+    fn requested_child_semantic_token_is_fresh_iff_events_are_enabled() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let mut enabled_tokens = Vec::new();
+        for (at, events) in [false, true, true].into_iter().enumerate() {
+            let label = if events { "enabled" } else { "disabled" };
+            let session = format!("semantic-token-{label}-{}-{at}", std::process::id());
+            let event = root.join(format!("{session}-events"));
+            let probe = root.join(format!("{session}-probe"));
+            let _ = std::fs::remove_file(&probe);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .env("MOOR_SESSION_SEMANTIC_TOKEN", "poison")
+                .env(SEMANTIC_TOKEN_PROBE, &probe)
+                .args(["run", &session]);
+            if events {
+                command.arg("-T").arg(&event);
+            }
+            let output = command
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::semantic_token_probe",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let token = std::fs::read_to_string(&probe).unwrap();
+            if events {
+                assert_ne!(token, "poison", "inherited semantic token was not replaced");
+                assert!(
+                    token.len() == 32
+                        && token
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "semantic token is not lowercase 32-hex: {token:?}"
+                );
+                enabled_tokens.push(token);
+            } else {
+                assert_eq!(token, "absent", "inherited semantic token: {token:?}");
+            }
+            let removed = moor(&["rm", "-q", &session]);
+            assert!(removed.status.success(), "{removed:?}");
+            assert!(!event.exists(), "event store survived removal: {event:?}");
+            std::fs::remove_file(probe).unwrap();
+        }
+        assert_ne!(enabled_tokens[0], enabled_tokens[1]);
+    }
+
     #[test]
     fn rejected_working_directory_names_the_directory_not_the_executable() {
         // Closure §6.2 / OB-32 on Windows: `could not enter <path> (<cause>)`,
