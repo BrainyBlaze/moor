@@ -1814,6 +1814,43 @@ mod launch_paths {
             modes(&console.received, label)
         }
 
+        fn query_win32_input_mode() -> String {
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            assert!(unsafe { FlushConsoleInputBuffer(input) } != 0);
+            let mut output = io::stdout();
+            output.write_all(b"\x1b[?9001$p").unwrap();
+            output.flush().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut response = Vec::new();
+            while !response.ends_with(&[u16::from(b'$'), u16::from(b'y')]) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "win32 input-mode query timed out");
+                let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
+                assert_eq!(
+                    unsafe { WaitForSingleObject(input, timeout) },
+                    WAIT_OBJECT_0,
+                    "win32 input-mode query was not answered"
+                );
+                let mut records = [INPUT_RECORD::default(); 32];
+                let mut read = 0;
+                assert!(unsafe {
+                    ReadConsoleInputW(input, records.as_mut_ptr(), records.len() as u32, &mut read)
+                        != 0
+                });
+                for record in &records[..read as usize] {
+                    if record.EventType != KEY_EVENT as u16 {
+                        continue;
+                    }
+                    let key = unsafe { record.Event.KeyEvent };
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    if key.bKeyDown != 0 && unit != 0 {
+                        response.extend(std::iter::repeat_n(unit, usize::from(key.wRepeatCount)));
+                    }
+                }
+            }
+            String::from_utf16(&response).unwrap()
+        }
+
         #[test]
         fn console_mode_probe() {
             let Some(label) = std::env::var_os("MOOR_CONSOLE_MODE_PROBE") else {
@@ -1828,6 +1865,10 @@ mod launch_paths {
                 GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
                     && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut output) != 0
             });
+            if label != "live" {
+                assert_eq!(query_win32_input_mode(), "\x1b[?9001;2$y");
+                println!("MOOR-W32IM-{}:reset", label.to_string_lossy());
+            }
             println!(
                 "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
                 label.to_string_lossy()
@@ -2007,10 +2048,6 @@ mod launch_paths {
                     )
                 });
             assert!(detached.success(), "{detached:?}");
-            console
-                .wait_for(WIN32_INPUT_DISABLE, Duration::from_secs(5))
-                .unwrap();
-            let disabled_at = last_marker(&console.received, WIN32_INPUT_DISABLE);
             assert!(
                 marker.is_file(),
                 "detach retired the session marker: {marker:?}"
@@ -2030,10 +2067,6 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
-            assert!(
-                disabled_at < last_marker(&console.received, b"MOOR-MODE-after:"),
-                "input-mode disable did not precede console restoration evidence"
-            );
             let killed = moor(&["kill", "-f", "-q", &session]);
             assert!(killed.status.success(), "{killed:?}");
         }
@@ -2046,7 +2079,6 @@ mod launch_paths {
         const VT_INPUT_EXPECTED: &[u8] = b"A\x1bOAZ";
         const WIN32_INPUT_MODE: u32 = 4;
         const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
-        const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
         const WIN32_INPUT_VECTOR: &[u8] =
             b"\x1b[65;30;65;1;0;1_\x1b[38;72;0;1;256;1_\x1b[90;44;90;1;0;1_";
         const LEGACY_OUTER_CODEPAGE: u32 = 437;
@@ -2060,19 +2092,6 @@ mod launch_paths {
                 thread::sleep(Duration::from_millis(10));
             }
             panic!("timed out waiting for {path:?}");
-        }
-
-        fn last_marker(bytes: &[u8], marker: &[u8]) -> usize {
-            bytes
-                .windows(marker.len())
-                .rposition(|window| window == marker)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "missing {:?} in {:?}",
-                        String::from_utf8_lossy(marker),
-                        String::from_utf8_lossy(bytes)
-                    )
-                })
         }
 
         #[test]
@@ -2372,10 +2391,6 @@ mod launch_paths {
                 "default detach failed: {viewer_status:?}; console output: {:?}",
                 String::from_utf8_lossy(&console.received)
             );
-            console
-                .wait_for(WIN32_INPUT_DISABLE, Duration::from_secs(5))
-                .unwrap();
-            let disabled_at = last_marker(&console.received, WIN32_INPUT_DISABLE);
             assert!(
                 marker.is_file(),
                 "detach retired the session marker: {marker:?}"
@@ -2394,10 +2409,6 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
-            assert!(
-                disabled_at < last_marker(&console.received, b"MOOR-MODE-after:"),
-                "input-mode disable did not precede console restoration evidence"
-            );
 
             std::fs::write(&release, b"release").unwrap();
             let lifecycle = wait_lifecycle_exit(&marker, Duration::from_secs(10));
