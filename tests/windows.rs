@@ -488,18 +488,9 @@ mod launch_paths {
     }
 
     fn current_sid() -> String {
-        let output = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        String::from_utf8(output.stdout).unwrap().trim().into()
+        windows_permissions::utilities::current_process_sid()
+            .unwrap()
+            .to_string()
     }
 
     fn invoked_root_for(executable: &Path) -> PathBuf {
@@ -516,38 +507,41 @@ mod launch_paths {
     }
 
     fn protect_file(path: &Path) {
-        let output = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$ErrorActionPreference='Stop'; $user=New-Object System.Security.Principal.SecurityIdentifier($env:MOOR_PROTECT_SID); $system=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18'); $acl=New-Object System.Security.AccessControl.FileSecurity; $acl.SetOwner($user); $acl.SetAccessRuleProtection($true,$false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($user,'FullControl','Allow'))); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system,'FullControl','Allow'))); Set-Acl -LiteralPath $env:MOOR_PROTECT_FILE -AclObject $acl",
-            ])
-            .env("MOOR_PROTECT_FILE", path)
-            .env("MOOR_PROTECT_SID", current_sid())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "protect fixture {path:?}: {output:?}"
-        );
+        use windows_permissions::{LocalBox, SecurityDescriptor, constants::*, wrappers};
+
+        let sid = current_sid();
+        let descriptor: LocalBox<SecurityDescriptor> =
+            format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})")
+                .parse()
+                .unwrap();
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner
+                | SecurityInformation::Dacl
+                | SecurityInformation::ProtectedDacl,
+            descriptor.owner(),
+            None,
+            descriptor.dacl(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("protect fixture {path:?}: {error}"));
     }
 
     fn own_file(path: &Path) {
-        let output = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$ErrorActionPreference='Stop'; $sid=New-Object System.Security.Principal.SecurityIdentifier($env:MOOR_PROTECT_SID); $acl=Get-Acl -LiteralPath $env:MOOR_PROTECT_FILE; $acl.SetOwner($sid); Set-Acl -LiteralPath $env:MOOR_PROTECT_FILE -AclObject $acl",
-            ])
-            .env("MOOR_PROTECT_FILE", path)
-            .env("MOOR_PROTECT_SID", current_sid())
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "own fixture {path:?}: {output:?}");
+        use windows_permissions::{LocalBox, Sid, constants::*, wrappers};
+
+        let sid: LocalBox<Sid> = current_sid().parse().unwrap();
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner,
+            Some(&sid),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("own fixture {path:?}: {error}"));
     }
 
     fn instrumentation_fixture() -> &'static Path {
