@@ -1,0 +1,45 @@
+version = 1
+
+[[annotations]]
+path = [
+  ".github/**",
+  ".cargo/**",
+  ".gitattributes",
+  ".gitignore",
+  "_typos.toml",
+  "Cargo.toml",
+  "CHANGELOG.md",
+  "CONTRIBUTING.md",
+  "README.md",
+  "SECURITY.md",
+  "SUPPORT.md",
+  "deny.toml",
+  "docs/**",
+  "examples/**",
+  "justfile",
+  "public-api/**",
+  "src/**",
+  "tests/**",
+  "xtask/**",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Yasunobu Sakashita"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "Cargo.lock"
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "CC0-1.0"
+
+[[annotations]]
+path = "LICENSE-APACHE"
+precedence = "override"
+SPDX-FileCopyrightText = "NONE"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "LICENSE-MIT"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Yasunobu Sakashita"
+SPDX-License-Identifier = "MIT"

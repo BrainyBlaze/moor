@@ -54,12 +54,12 @@ jobs:
         run: |
           cd spec
           sha256sum --check --strict <<'SUMS'
-          ec1e9bd3ae2cf9207e42480ef909099cf7d13403e5c993ed407d539ed28fefba  moor-spec.md
+          9ec8425d99d89a78c2d7bf1cadabf08c48c703eee9b5be327d8eb08af21f5a76  moor-spec.md
           d87ed30d764cafc300859b10c087dd36224328207a2a4bb3abd6073a67e8daed  moor-wire-schema.md
           SUMS
           # The literal README table cells intentionally include Markdown backticks.
           # shellcheck disable=SC2016
-          grep -F '`moor-spec.md` | `ec1e9bd3ae2cf9207e42480ef909099cf7d13403e5c993ed407d539ed28fefba`' README.md
+          grep -F '`moor-spec.md` | `9ec8425d99d89a78c2d7bf1cadabf08c48c703eee9b5be327d8eb08af21f5a76`' README.md
           # shellcheck disable=SC2016
           grep -F '`moor-wire-schema.md` | `d87ed30d764cafc300859b10c087dd36224328207a2a4bb3abd6073a67e8daed`' README.md
 
@@ -69,7 +69,7 @@ jobs:
           cargo build --release --bin moor
 
   production-loc:
-    name: Production LOC / hard maximum 12,000
+    name: Production source report
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:

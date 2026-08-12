@@ -3,12 +3,10 @@ use std::io::Write as _;
 
 const PRIVATE: [u32; 12] = [1, 6, 7, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1049, 2004];
 
-schema!(enum pub Observation [Clone, Debug, Eq, PartialEq]; Ready, State(&'static str, String, bool), Link(String, bool),
-    Query(u8, Vec<u8>), Degraded(&'static str, &'static str));
+schema!(enum pub Observation [Clone, Debug, Eq, PartialEq]; Ready, State(&'static str, String, bool), Link(String, bool), Query(u8, Vec<u8>), Degraded(&'static str, &'static str));
 schema!(enum pub Scan [Clone, Debug, Eq, PartialEq]; Observation(Observation), Release(Vec<u8>));
 
-schema!(struct default pub Modes derive [Clone, Debug] fields; inexact: bool = false,
-    charset: [bool; 2] = [false; 2], private: u16 = 0b1100, scroll: Option<(u16, u16)> = None);
+schema!(struct default pub Modes derive [Clone, Debug] fields; inexact: bool = false, charset: [bool; 2] = [false; 2], private: u16 = 0b1100, scroll: Option<(u16, u16)> = None);
 
 impl Modes {
     pub fn exact(&self) -> bool {
@@ -80,8 +78,7 @@ fn flag(out: &mut Vec<u8>, mode: u16, set: bool) {
     write!(out, "\x1b[?{mode}{}", if set { 'h' } else { 'l' }).unwrap();
 }
 
-schema!(struct pub Scanner derive [Default] fields; rows: u16, buf: smallvec::SmallVec<[u8; 36]>, sent: usize, since: u64,
-    ready: bool, busy: Option<bool>, modes: Modes, episode: [bool; 2]);
+schema!(struct pub Scanner derive [Default] fields; rows: u16, buf: smallvec::SmallVec<[u8; 36]>, sent: usize, since: u64, ready: bool, busy: Option<bool>, modes: Modes, episode: [bool; 2]);
 
 impl Scanner {
     pub fn new(rows: u16) -> Self {

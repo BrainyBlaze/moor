@@ -138,8 +138,7 @@ impl Work {
     }
 }
 
-schema!(struct pub(crate) Lane fields; submit: Sender<Submitted>, limits: (usize, usize), pending: VecDeque<Job>,
-    bytes: usize, failure: Option<ErrorKind>, state: Arc<State>);
+schema!(struct pub(crate) Lane fields; submit: Sender<Submitted>, limits: (usize, usize), pending: VecDeque<Job>, bytes: usize, failure: Option<ErrorKind>, state: Arc<State>);
 
 impl Lane {
     pub(crate) fn new(mut store: Store, jobs: usize, bytes: usize) -> Self {
@@ -298,7 +297,4 @@ impl Lane {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/runtime_worker.rs"
-));
+include!("../../../tests/unit/runtime_worker.rs");

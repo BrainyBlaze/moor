@@ -15,8 +15,7 @@ schema!(enum pub Purpose [Clone, Copy, Debug, Eq, PartialEq]; Background, Clear(
 schema!(enum pub StorageError [Clone, Copy, Debug, Eq, PartialEq]; Disabled, Busy);
 schema!(struct pub Done pub fields; lane: usize, purpose: Purpose, result: Result<(Commit, bool), StoreError>);
 schema!(struct pub EventConfig pub fields; store: Store, stream: EventStream, created: u64, session: String, generation: Option<u32>);
-schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String,
-    generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
+schema!(struct Events fields; stream: EventStream, records: String, created: u64, session: String, generation: Option<u32>, reserved: usize, snapshots: [Option<Event>; 3], semantic: BTreeMap<(usize, Arc<[u8]>), (Event, usize)>);
 schema!(struct pub SessionStorage fields; lanes: [Option<Lane>; 3], log_cap: u64, events: Option<Events>);
 schema!(struct pub(crate) StatusSnapshot derive [Clone, Copy] pub(crate) fields; health: u8, event: Option<Commit>, log: Option<Commit>);
 schema!(enum pub(crate) SnapshotState; Ready(StatusSnapshot), Busy, Failed);

@@ -11,10 +11,8 @@ pub fn wtf8_encode(wide: &[u16]) -> Vec<u8> {
 pub fn wtf8_decode(bytes: &[u8]) -> Result<Vec<u16>> {
     let value = Wtf8::from_bytes(bytes).ok_or("malformed WTF-8")?;
     let wide = value.encode_wide().collect::<Vec<_>>();
-    require(
-        Wtf8Buf::from_wide(&wide).as_bytes() == bytes,
-        "noncanonical WTF-8",
-    )?;
+    let canonical = Wtf8Buf::from_wide(&wide).as_bytes() == bytes;
+    crate::ensure!(canonical, "noncanonical WTF-8");
     Ok(wide)
 }
 
@@ -38,9 +36,7 @@ pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
 }
 
 schema!(struct pub Marker derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46]);
-binary_record!(RawMarker => Marker[80] error () = ();
-    fixed { magic: [u8; 12] = *b"MOORMRK3\x01\0\0\0" }
-    fields { generation: U32<LE>, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46] });
+binary_record!(RawMarker => Marker[80] error () = (); fixed { magic: [u8; 12] = *b"MOORMRK3\x01\0\0\0" } fields { generation: U32<LE>, incarnation: [u8; 16], pipe_length: [u8; 2], pipe: [u8; 46] });
 
 impl Marker {
     pub fn new(generation: u32, incarnation: [u8; 16], random: [u8; 16]) -> Result<Self> {
@@ -84,11 +80,8 @@ impl Marker {
 }
 
 #[doc(hidden)]
-schema!(struct pub BootstrapRecord derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; nonce: [u8; 16], pid: u32, process: u64,
-    thread: u64, created: u64);
-binary_record!(RawBootstrapRecord => BootstrapRecord[56] error () = ();
-    fixed { magic: [u8; 12] = *b"MOORBST1\x01\0\0\0" }
-    fields { nonce: [u8; 16], pid: U32<LE>, process: U64<LE>, thread: U64<LE>, created: U64<LE> });
+schema!(struct pub BootstrapRecord derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; nonce: [u8; 16], pid: u32, process: u64, thread: u64, created: u64);
+binary_record!(RawBootstrapRecord => BootstrapRecord[56] error () = (); fixed { magic: [u8; 12] = *b"MOORBST1\x01\0\0\0" } fields { nonce: [u8; 16], pid: U32<LE>, process: U64<LE>, thread: U64<LE>, created: U64<LE> });
 
 impl BootstrapRecord {
     pub fn encode(self) -> [u8; 56] {
@@ -108,51 +101,40 @@ impl BootstrapRecord {
 }
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectoryCause {
-    Missing = 1,
-    NotDirectory = 2,
-    NotSearchable = 3,
-    Io = 4,
-}
+schema!(enum ordinal DirectoryCause; Missing, NotDirectory, NotSearchable, Io);
 
 #[cfg(any(windows, test))]
-impl DirectoryCause {
-    #[cfg(windows)]
-    fn label(self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::NotDirectory => "not-directory",
-            Self::NotSearchable => "not-searchable",
-            Self::Io => "io-error",
-        }
+schema!(enum BootstrapFailure [Clone, Copy, Debug, Eq, PartialEq]; Directory(DirectoryCause), Execution(u32));
+#[cfg(any(windows, test))]
+schema!(struct BootstrapFailureRecord fields; nonce: [u8; 16], kind: u8, value: u32, reserved: [u8; 23]);
+#[cfg(any(windows, test))]
+binary_record!(RawBootstrapFailure => BootstrapFailureRecord[56] error () = (); fixed { magic: [u8; 12] = *b"MOORERR1\x01\0\0\0" } fields { nonce: [u8; 16], kind: u8, value: U32<LE>, reserved: [u8; 23] });
+
+#[cfg(any(windows, test))]
+fn bootstrap_failure_record(nonce: [u8; 16], failure: BootstrapFailure) -> [u8; 56] {
+    let (kind, value) = match failure {
+        BootstrapFailure::Directory(cause) => (1, cause as u32 + 1),
+        BootstrapFailure::Execution(code) => (2, code),
+    };
+    BootstrapFailureRecord {
+        nonce,
+        kind,
+        value,
+        reserved: [0; 23],
     }
+    .encode_raw()
 }
 
 #[cfg(any(windows, test))]
-fn directory_failure_record(nonce: [u8; 16], cause: DirectoryCause) -> [u8; 56] {
-    let mut record = [0; 56];
-    record[..12].copy_from_slice(b"MOORCWD1\x01\0\0\0");
-    record[12..28].copy_from_slice(&nonce);
-    record[28] = cause as u8;
-    record
-}
-
-#[cfg(any(windows, test))]
-fn directory_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<DirectoryCause> {
-    crate::return_if!(
-        bytes.len() != 56 || bytes[..12] != *b"MOORCWD1\x01\0\0\0",
-        None
-    );
-    crate::return_if!(
-        bytes[12..28] != nonce || bytes[29..].iter().any(|byte| *byte != 0),
-        None
-    );
-    match bytes[28] {
-        1 => Some(DirectoryCause::Missing),
-        2 => Some(DirectoryCause::NotDirectory),
-        3 => Some(DirectoryCause::NotSearchable),
-        4 => Some(DirectoryCause::Io),
+fn bootstrap_failure(bytes: &[u8], nonce: [u8; 16]) -> Option<BootstrapFailure> {
+    let record = BootstrapFailureRecord::decode_raw(bytes)
+        .ok()
+        .filter(|record| record.nonce == nonce && record.reserved == [0; 23])?;
+    match record.kind {
+        1 if (1..=4).contains(&record.value) => Some(BootstrapFailure::Directory(
+            DirectoryCause::from_ordinal(record.value as u8 - 1),
+        )),
+        2 if record.value != 0 => Some(BootstrapFailure::Execution(record.value)),
         _ => None,
     }
 }
@@ -168,13 +150,23 @@ pub fn bootstrap_command(kind: u8, nonce: [u8; 16]) -> [u8; 17] {
 #[doc(hidden)]
 pub fn accept_bootstrap_command(bytes: &[u8], nonce: [u8; 16], resumed: &mut bool) -> Option<u8> {
     let kind = *bytes.first()?;
-    crate::return_if!(bytes.len() != 17 || bytes[1..] != nonce, None);
-    match (kind, *resumed) {
-        (1, false) => *resumed = true,
-        (2, true) => {}
-        _ => return None,
-    }
+    let valid = matches!((kind, *resumed), (1, false) | (2, true));
+    crate::return_if!(bytes.len() != 17 || bytes[1..] != nonce || !valid, None);
+    *resumed |= kind == 1;
     Some(kind)
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn console_control_kind(kind: u32) -> Option<bool> {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    match kind {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(false),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(true),
+        _ => None,
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -202,129 +194,42 @@ fn exact_descriptor_semantics(
 
 #[cfg(test)]
 mod descriptor_semantics_tests {
-    use super::{
-        DirectoryCause, directory_failure, directory_failure_record, exact_descriptor_semantics,
-    };
-
-    #[test]
-    fn exact_dacl_semantics_ignore_order_and_reject_every_difference() {
-        let expected = [(0u8, 0u8, 0x1f01ffu32, 18u32), (0, 0, 0x1f01ff, 42)];
-        let reversed = [expected[1], expected[0]];
-        let matches = |actual: &[_], owner, protected| {
-            exact_descriptor_semantics(
-                owner,
-                protected,
-                actual.len(),
-                expected.len(),
-                |left, right| actual[left] == expected[right],
-            )
-        };
-
-        assert!(matches(&reversed, true, true));
-        assert!(!matches(&expected, false, true));
-        assert!(!matches(&expected, true, false));
-        assert!(!matches(&expected[..1], true, true));
-        assert!(!matches(
-            &[expected[0], expected[1], (0, 0, 0x1f01ff, 1)],
-            true,
-            true
-        ));
-        assert!(!matches(&[expected[0], expected[0]], true, true));
-        assert!(!matches(&[expected[0], (0, 0, 0x120089, 42)], true, true));
-        assert!(!matches(&[expected[0], (0, 2, 0x1f01ff, 42)], true, true));
-        assert!(!matches(&[expected[0], (1, 0, 0x1f01ff, 42)], true, true));
-    }
-
-    #[test]
-    fn bootstrap_directory_failure_is_nonce_bound_and_closed() {
-        let nonce = [7; 16];
-        for cause in [
-            DirectoryCause::Missing,
-            DirectoryCause::NotDirectory,
-            DirectoryCause::NotSearchable,
-            DirectoryCause::Io,
-        ] {
-            let record = directory_failure_record(nonce, cause);
-            assert_eq!(directory_failure(&record, nonce), Some(cause));
-            assert_eq!(directory_failure(&record, [8; 16]), None);
-        }
-        let mut record = directory_failure_record(nonce, DirectoryCause::Missing);
-        for at in [0, 28, 55] {
-            record[at] ^= 0xff;
-            assert_eq!(directory_failure(&record, nonce), None, "byte {at}");
-            record[at] ^= 0xff;
-        }
-    }
+    include!("../tests/unit/windows_descriptor.rs");
 }
 
 #[cfg(windows)]
 #[allow(unused_unsafe)]
 mod native {
-    use super::{
-        BootstrapRecord, DirectoryCause, Marker, Result, accept_bootstrap_command,
-        bootstrap_command, cim_boot_identity, directory_failure, directory_failure_record,
-        exact_descriptor_semantics, wtf8_decode, wtf8_encode,
-    };
+    use super::*;
     use crate::{
-        cli::{CreateMode, Options},
+        cli::*,
         name, require,
         runtime::{
-            client::{Client as WireClient, CommandError, CommandResult, missing, probe_session},
+            client::{Client, CommandError, CommandResult, missing, probe_session},
             holder::{Native as HolderNative, NativeExit},
-            io::{
-                Duplex, InputConfig, InputState, ViewerSender, attach_viewer_to, run_viewer_input,
-            },
+            io::*,
             private::*,
         },
         wire::put_wide,
     };
-    use interprocess::local_socket::prelude::*;
-    use interprocess::local_socket::{
-        GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
-        Stream as LocalStream,
-    };
+    use interprocess::local_socket::{prelude::*, *};
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt, BorrowedSecurityDescriptor,
-    };
+    use interprocess::os::windows::security_descriptor::*;
     use smallvec::SmallVec;
-    use std::{
-        ffi::{OsStr, OsString, c_void},
-        fs::{self, File, OpenOptions},
-        io::{self, Read, Write},
-        mem::size_of,
-        os::windows::{
-            ffi::{OsStrExt, OsStringExt},
-            fs::OpenOptionsExt,
-            io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle},
-        },
-        path::{Path, PathBuf},
-        ptr,
-        sync::OnceLock,
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
-    use windows_permissions::{
-        LocalBox, SecurityDescriptor,
-        constants::{SeObjectType, SecurityInformation},
-        utilities::buf_from_os as wide,
-        wrappers,
-    };
-    use windows_spawn::{
-        AsPseudoConsole, Child, Command as SpawnCommand, CreationFlags, Job, SpawnOptions,
-        Stdio as SpawnStdio,
-    };
-    use windows_sys::Wdk::{
-        Foundation::OBJECT_ATTRIBUTES,
-        Storage::FileSystem::{
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-            FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
-        },
-    };
+    use std::collections::VecDeque;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::windows::{ffi::*, fs::*, io::*};
+    use std::sync::{OnceLock, atomic::*, mpsc};
+    use std::{ffi::*, mem::*, path::*, ptr, thread, time::*};
+    use windows_permissions::utilities::buf_from_os as wide;
+    use windows_permissions::{LocalBox, SecurityDescriptor, constants::*, wrappers};
+    use windows_spawn::{Command as SpawnCommand, Stdio as SpawnStdio, *};
+    use windows_sys::Wdk::{Foundation::*, Storage::FileSystem::*};
     use windows_sys::Win32::{
         Foundation::*,
-        Security::*,
+        Globalization::*,
+        Security::{ACE_HEADER, *},
         Storage::FileSystem::*,
         System::{
             Console::*,
@@ -337,11 +242,21 @@ mod native {
             SystemInformation::*,
             Threading::*,
         },
+        UI::Input::KeyboardAndMouse::{
+            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
+            VK_RSHIFT, VK_RWIN, VK_SHIFT, VkKeyScanW,
+        },
     };
 
     fn check(ok: bool, what: &str) -> Result<()> {
         ok.then_some(())
             .ok_or_else(|| format!("{what}: {}", io::Error::last_os_error()))
+    }
+    fn coordinate((rows, columns): (u16, u16)) -> Result<COORD> {
+        match (columns.try_into(), rows.try_into()) {
+            (Ok(x), Ok(y)) => Ok(COORD { X: x, Y: y }),
+            _ => Err("geometry exceeds the console interface limit".into()),
+        }
     }
     macro_rules! win32 {
         ($call:expr, $what:expr) => {
@@ -363,8 +278,7 @@ mod native {
         error.to_string()
     }
     fn os_bytes(value: &OsStr) -> Vec<u8> {
-        let wide: SmallVec<[u16; 256]> = value.encode_wide().collect();
-        wtf8_encode(&wide)
+        wtf8_encode(&value.encode_wide().collect::<SmallVec<[u16; 256]>>())
     }
     fn process_birth(handle: HANDLE, what: &str) -> Result<u64> {
         let (mut created, mut exit, mut kernel, mut user) = Default::default();
@@ -400,6 +314,8 @@ mod native {
     const INSTRUMENT_CHANNEL: &str = "MOOR_INSTRUMENT_CHANNEL";
     const INSTRUMENT_NONCE: &str = "MOOR_INSTRUMENT_NONCE";
     const SEMANTIC_TOKEN: &str = "MOOR_SESSION_SEMANTIC_TOKEN";
+    const DETACHED_GEOMETRY: &str = "MOOR_DETACHED_GEOMETRY";
+    const DETACHED_HOLDER: &str = "MOOR_DETACHED_HOLDER";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
         let size = fill(ptr::null_mut(), 0);
         check(size != 0, what)?;
@@ -507,11 +423,22 @@ mod native {
     type Pipe = Handle;
     #[derive(Default)]
     struct Pseudo(HPCON);
+    fn retire_pseudo_with(handle: HPCON, close: impl FnOnce(HPCON) + Send + 'static) {
+        if handle != 0 {
+            let _ = thread::Builder::new()
+                .name("moor-conpty-close".into())
+                .spawn(move || close(handle));
+        }
+    }
+    impl Pseudo {
+        fn retire(&mut self) {
+            let handle = std::mem::replace(&mut self.0, 0);
+            retire_pseudo_with(handle, |handle| unsafe { ClosePseudoConsole(handle) });
+        }
+    }
     impl Drop for Pseudo {
         fn drop(&mut self) {
-            if self.0 != 0 {
-                unsafe { ClosePseudoConsole(self.0) };
-            }
+            self.retire();
         }
     }
     unsafe impl AsPseudoConsole for Pseudo {
@@ -520,17 +447,43 @@ mod native {
         }
     }
     crate::schema!(tuple OpenPolicy [Clone, Copy]; fields; u32, u32);
-    const CREATE_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, 0);
-    const OPEN_SLOT: OpenPolicy = OpenPolicy(
-        FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    crate::schema!(tuple RelativePolicy [Clone, Copy]; fields; u32, u32, u32, u32);
+    type StoreFile = (File, [u8; 24]);
+    type StoreFileResult = std::result::Result<StoreFile, (io::Error, Option<StoreFile>)>;
+    const SHARE_RW: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    const SHARE_ALL: u32 = SHARE_RW | FILE_SHARE_DELETE;
+    const NO_FOLLOW: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
+    const OPEN_SLOT: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES, SHARE_ALL);
+    const OPEN_STDERR: OpenPolicy = OpenPolicy(
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+        FILE_SHARE_READ,
     );
-    const OPEN_STDERR: OpenPolicy = OpenPolicy(FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ);
     const CREATE_STAGE: OpenPolicy = OpenPolicy(
-        GENERIC_READ | GENERIC_WRITE,
+        GENERIC_READ | GENERIC_WRITE | DELETE,
         FILE_SHARE_READ | FILE_SHARE_DELETE,
     );
-    const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ);
+    const OPEN_STAGE: OpenPolicy = OpenPolicy(GENERIC_READ | DELETE, SHARE_ALL);
+    const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+    const OPEN_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, SHARE_RW);
+    const OPEN_RB: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES | DELETE, SHARE_ALL);
+    const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
+        GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
+        SHARE_RW,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE,
+    );
+    const CREATE_SLOT: RelativePolicy = RelativePolicy(
+        GENERIC_READ | GENERIC_WRITE | DELETE,
+        SHARE_ALL,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE,
+    );
+    const OPEN_ROLLBACK_SLOT: RelativePolicy = RelativePolicy(
+        FILE_READ_ATTRIBUTES | DELETE,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
     unsafe fn open_handle(
         path: &Path,
         policy: OpenPolicy,
@@ -555,6 +508,10 @@ mod native {
             )
         }
     }
+    fn reopen(file: &File, policy: OpenPolicy) -> Result<File> {
+        let raw = unsafe { ReOpenFile(file.as_raw_handle(), policy.0, policy.1, NO_FOLLOW) };
+        Handle::checked(raw, "reopen exact Windows object").map(Handle::into_file)
+    }
     fn directory_cause(error: &io::Error) -> DirectoryCause {
         match error.raw_os_error().map(|code| code as u32) {
             Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND | ERROR_INVALID_NAME) => {
@@ -565,6 +522,7 @@ mod native {
             _ => DirectoryCause::Io,
         }
     }
+    const CAUSES: [&str; 4] = ["missing", "not-directory", "not-searchable", "io-error"];
     fn read_reparse(path: &Path, share: u32) -> Result<File> {
         OpenOptions::new()
             .read(true)
@@ -589,44 +547,6 @@ mod native {
             what
         )?;
         Ok(info)
-    }
-    fn launch_reporter() -> LaunchReporter<File> {
-        let selected = std::env::var_os("MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
-        unsafe { std::env::remove_var("MOOR_DETACHED_HOLDER") };
-        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        let output =
-            (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
-                .then(|| unsafe { File::from_raw_handle(handle) });
-        LaunchReporter {
-            output,
-            generation: 1,
-        }
-    }
-    fn launch_generation(invoked: &OsStr) -> Result<u32> {
-        supervised_generation(
-            invoked,
-            false,
-            "supervised-launch acknowledgement was invalid",
-            |selector| {
-                let text = selector
-                    .to_str()
-                    .ok_or("invalid supervised-launch handle")?;
-                let raw = usize::from_str_radix(text, 16)
-                    .ok()
-                    .filter(|raw| {
-                        *raw != 0
-                            && text.len() <= 16
-                            && !text.starts_with('0')
-                            && lowercase_hex(text.as_bytes())
-                    })
-                    .ok_or("invalid supervised-launch handle")?;
-                let channel = unsafe { Handle::owned(raw as HANDLE) };
-                validate_pipe(channel.raw(), "supervised-launch channel")?;
-                decode_launch_record(&channel.record::<32>(true, "supervised-launch record")?)
-                    .ok_or_else(|| "supervised-launch acknowledgement was invalid".into())
-            },
-        )
-        .map(|result| result.0)
     }
     unsafe fn token_user(token: Handle) -> Result<String> {
         let mut size = 0;
@@ -750,84 +670,141 @@ mod native {
             },
         ))
     }
+    fn instrument_descriptor_matches(
+        actual: &SecurityDescriptor,
+        expected: &SecurityDescriptor,
+    ) -> Result<bool> {
+        use windows_permissions::constants::AceType::{
+            ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        };
+        let protected = descriptor_control(actual)? & SE_DACL_PROTECTED != 0;
+        let (Some(actual_owner), Some(expected_owner), Some(dacl)) =
+            (actual.owner(), expected.owner(), actual.dacl())
+        else {
+            return Ok(false);
+        };
+        if !protected || actual_owner != expected_owner {
+            return Ok(false);
+        }
+        let system: LocalBox<windows_permissions::Sid> = "S-1-5-18"
+            .parse()
+            .map_err(|error: io::Error| format!("build system SID: {error}"))?;
+        let write = GENERIC_ALL
+            | GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER;
+        for at in 0..dacl.len() {
+            let Some(ace) = dacl.get_ace(at) else {
+                return Ok(false);
+            };
+            if !matches!(
+                ace.ace_type(),
+                ACCESS_ALLOWED_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+                    | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            ) {
+                continue;
+            }
+            let trusted = ace
+                .sid()
+                .is_some_and(|sid| sid == actual_owner || sid == &*system);
+            if !trusted && ace.mask().bits() & write != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn handle_attributes(file: &File) -> std::result::Result<u32, &'static str> {
+        let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
+            file_info(
+                file.as_raw_handle(),
+                FileAttributeTagInfo,
+                "inspect protected Windows object",
+            )
+            .map_err(|_| "io-error")?
+        };
+        Ok(attributes.FileAttributes)
+    }
+    fn validate_stderr_handle(file: &File, user: &str) -> std::result::Result<(), &'static str> {
+        let attributes = handle_attributes(file).map_err(|_| "io-error")?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("reparse-point");
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err("wrong-type");
+        }
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|_| "io-error")?;
+        let (expected, _) = descriptor(user, "FA").map_err(|_| "io-error")?;
+        if actual
+            .owner()
+            .zip(expected.owner())
+            .is_none_or(|(actual, expected)| actual != expected)
+        {
+            return Err("wrong-owner");
+        }
+        if !descriptor_matches(&actual, &expected).map_err(|_| "io-error")? {
+            return Err("broad-dacl");
+        }
+        Ok(())
+    }
+    fn validate_instrument_handle(
+        file: &File,
+        user: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let attributes = handle_attributes(file).map_err(|_| "io-error")?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("reparse-point");
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err("wrong-type");
+        }
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|_| "io-error")?;
+        let (expected, _) = descriptor(user, "FA").map_err(|_| "io-error")?;
+        if actual
+            .owner()
+            .zip(expected.owner())
+            .is_none_or(|(actual, expected)| actual != expected)
+        {
+            return Err("wrong-owner");
+        }
+        if !instrument_descriptor_matches(&actual, &expected).map_err(|_| "io-error")? {
+            return Err("broad-dacl");
+        }
+        Ok(())
+    }
+    fn validate_exact_handle(file: &File, user: &str, access: &str, directory: bool) -> Result<()> {
+        let attributes = handle_attributes(file).map_err(str::to_owned)?;
+        require(
+            attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) == directory,
+            "reject Windows reparse point",
+        )?;
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|error| format!("read protected DACL: {error}"))?;
+        let (expected, _) = descriptor(user, access)?;
+        require(
+            descriptor_matches(&actual, &expected)?,
+            "unexpected Windows owner/DACL",
+        )
+    }
     #[cfg(test)]
     mod security_descriptor_tests {
         use super::*;
-
-        const USER: &str = "S-1-5-21-1-2-3-42";
-
-        fn parsed(value: impl AsRef<str>) -> LocalBox<SecurityDescriptor> {
-            value.as_ref().parse().unwrap()
-        }
-
-        fn first_ace(descriptor: &SecurityDescriptor) -> *mut ACE_HEADER {
-            let acl = descriptor.dacl().unwrap() as *const windows_permissions::Acl;
-            let mut ace = ptr::null_mut();
-            assert_ne!(unsafe { GetAce(acl.cast(), 0, &mut ace) }, 0);
-            ace.cast()
-        }
-
-        #[test]
-        fn structural_validation_accepts_only_the_exact_protected_owner_and_aces() {
-            let (expected, _) = descriptor(USER, "FA").unwrap();
-            let reordered = parsed(format!("O:{USER}D:PAI(A;;FA;;;{USER})(A;;FA;;;SY)"));
-            assert!(descriptor_matches(&expected, &expected).unwrap());
-            assert!(descriptor_matches(&reordered, &expected).unwrap());
-
-            for invalid in [
-                format!("O:S-1-5-21-1-2-3-43D:P(A;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:AI(A;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;{USER})(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;FA;;;WD)"),
-                format!("O:{USER}D:P(A;;FA;;;SY)(A;;FR;;;{USER})"),
-                format!("O:{USER}D:P(D;;FA;;;SY)(A;;FA;;;{USER})"),
-                format!("O:{USER}D:P(A;CI;FA;;;SY)(A;;FA;;;{USER})"),
-            ] {
-                assert!(
-                    !descriptor_matches(&parsed(&invalid), &expected).unwrap(),
-                    "accepted {invalid}"
-                );
-            }
-
-            let invalid_flags = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
-            unsafe { (*first_ace(&invalid_flags)).AceFlags = 0x20 };
-            assert!(!descriptor_matches(&invalid_flags, &expected).unwrap());
-
-            let invalid_type = parsed(format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"));
-            unsafe { (*first_ace(&invalid_type)).AceType = u8::MAX };
-            assert!(!descriptor_matches(&invalid_type, &expected).unwrap());
-        }
-
-        #[test]
-        fn file_descriptor_query_validates_a_created_store_directory() {
-            let path = std::env::temp_dir().join(format!(
-                "moor-windows-descriptor-{}-{}",
-                std::process::id(),
-                now()
-            ));
-            create_store_path(&path, true).unwrap();
-            validate(&path, sid().unwrap(), "FA", true).unwrap();
-            fs::remove_dir(path).unwrap();
-        }
-
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/unit/windows_event.rs"
-        ));
-    }
-    fn pipe_descriptor(
-        sid: &str,
-    ) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-        let (descriptor, _) = descriptor(sid, "0x12019f")?;
-        unsafe {
-            BorrowedSecurityDescriptor::from_ptr((&*descriptor as *const SecurityDescriptor).cast())
-        }
-        .to_owned_sd()
-        .map_err(string)
+        include!("../tests/unit/windows_security.rs");
     }
     fn protect(path: &Path, sid: &str, access: &str) -> Result<()> {
-        use windows_permissions::constants::SeObjectType;
         let (descriptor, _) = descriptor(sid, access)?;
         wrappers::SetNamedSecurityInfo(
             path.as_os_str(),
@@ -875,16 +852,10 @@ mod native {
                 .zip(slots)
                 .enumerate()
             {
-                let info: Result<FILE_STANDARD_INFO> = file_info(
-                    file.as_raw_handle(),
-                    FileStandardInfo,
-                    "inspect Windows store slot links",
-                );
-                let Ok(identity) = file_identity(file.as_raw_handle()) else {
+                let Ok(identity) = unique_file_identity(file.as_raw_handle()) else {
                     return false;
                 };
-                if !info.is_ok_and(|info| info.NumberOfLinks == 1)
-                    || identities[..at].contains(&identity)
+                if identities[..at].contains(&identity)
                     || store_file_identity(&path.join(name)) != Ok(identity)
                 {
                     return false;
@@ -894,20 +865,205 @@ mod native {
             true
         }
     }
-    pub(crate) fn create_store_path(path: &Path, directory: bool) -> io::Result<()> {
+    pub(crate) fn create_store_path(path: &Path) -> io::Result<()> {
         let result = (|| unsafe {
-            let user = sid()?;
-            let (_descriptor, sa) = descriptor(user, "FA")?;
-            if directory {
-                check(
-                    CreateDirectoryW(wide(path.as_os_str()).as_ptr(), &sa) != 0,
-                    "create protected store directory",
-                )
-            } else {
-                open_handle(path, CREATE_STORE, Some(&sa), "create protected store file").map(drop)
-            }
+            let (_descriptor, sa) = descriptor(sid()?, "FA")?;
+            check(
+                CreateDirectoryW(wide(path.as_os_str()).as_ptr(), &sa) != 0,
+                "create protected store directory",
+            )
         })();
         result.map_err(io::Error::other)
+    }
+    fn directory_handle(path: &Path, delete: bool, share_delete: bool) -> io::Result<File> {
+        let access = GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL;
+        OpenOptions::new()
+            .access_mode(access | if delete { DELETE } else { 0 })
+            .share_mode(
+                FILE_SHARE_READ
+                    | FILE_SHARE_WRITE
+                    | if share_delete { FILE_SHARE_DELETE } else { 0 },
+            )
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    pub(crate) fn store_directory(path: &Path, delete: bool) -> io::Result<File> {
+        directory_handle(path, delete, true)
+    }
+    fn relative_file(
+        parent: &File,
+        name: &OsStr,
+        user: &str,
+        policy: RelativePolicy,
+    ) -> Result<File> {
+        let RelativePolicy(access, share, disposition, options) = policy;
+        let mut name = name.encode_wide().collect::<Vec<_>>();
+        let length = u16::try_from(name.len().saturating_mul(2))
+            .map_err(|_| "store object name is too long")?;
+        let unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: length,
+            Buffer: name.as_mut_ptr(),
+        };
+        let (security, _) = descriptor(user, "FA")?;
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &unicode,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: (&*security as *const SecurityDescriptor).cast(),
+            SecurityQualityOfService: ptr::null(),
+        };
+        let (mut raw, mut status) = (INVALID_HANDLE_VALUE, IO_STATUS_BLOCK::default());
+        let result = unsafe {
+            NtCreateFile(
+                &mut raw,
+                access | SYNCHRONIZE,
+                &attributes,
+                &mut status,
+                ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share,
+                disposition,
+                FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | options,
+                ptr::null(),
+                0,
+            )
+        };
+        let handle = unsafe { Handle::owned(raw) };
+        require(
+            result == STATUS_SUCCESS && !handle.is_null(),
+            "open protected store object",
+        )?;
+        Ok(handle.into_file())
+    }
+    pub(crate) fn create_store_directory(path: &Path, event: bool) -> io::Result<(File, bool)> {
+        if event {
+            let opened = store_directory(path, false);
+            if !matches!(&opened, Err(error) if error.kind() == io::ErrorKind::NotFound) {
+                return opened.map(|directory| (directory, false));
+            }
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| io::Error::other("store directory has no parent"))?;
+        let parent = directory_handle(parent, false, false)?;
+        relative_file(
+            &parent,
+            path.file_name()
+                .ok_or_else(|| io::Error::other("store directory has no name"))?,
+            sid().map_err(io::Error::other)?,
+            CREATE_DIRECTORY,
+        )
+        .map(|directory| (directory, true))
+        .map_err(io::Error::other)
+    }
+    pub(crate) fn create_store_file(directory: &File, name: &str) -> StoreFileResult {
+        let failure = |error| (io::Error::other(error), None);
+        let created = relative_file(
+            directory,
+            OsStr::new(name),
+            sid().map_err(failure)?,
+            CREATE_SLOT,
+        )
+        .map_err(failure)?;
+        let rollback = || {
+            delete_file(&created);
+        };
+        let identity = unsafe { unique_file_identity(created.as_raw_handle()) }
+            .inspect_err(|_| rollback())
+            .map_err(failure)?;
+        let guard = reopen(&created, OPEN_SLOT)
+            .inspect_err(|_| rollback())
+            .map_err(failure)?;
+        drop(created);
+        reopen(&guard, OPEN_STORE)
+            .map(|file| (file, identity))
+            .map_err(|error| (io::Error::other(error), Some((guard, identity))))
+    }
+    pub(crate) fn valid_store_directory(path: &Path, directory: &File) -> bool {
+        store_directory(path, false)
+            .and_then(|current| {
+                unsafe { file_identity(current.as_raw_handle()) }.map_err(io::Error::other)
+            })
+            .is_ok_and(|current| unsafe { file_identity(directory.as_raw_handle()) } == Ok(current))
+    }
+    pub(crate) fn rollback_store(directory: File, ids: &[[u8; 24]], state: (Option<File>, bool)) {
+        let Ok(user) = sid() else {
+            return;
+        };
+        if let Some(file) = state.0.as_ref().and_then(|file| reopen(file, OPEN_RB).ok()) {
+            delete_file(&file);
+        }
+        for (name, expected) in ["body.0", "body.1", "commit.0", "commit.1"]
+            .into_iter()
+            .zip(ids)
+        {
+            let Ok(file) = relative_file(&directory, OsStr::new(name), user, OPEN_ROLLBACK_SLOT)
+            else {
+                continue;
+            };
+            if unsafe { unique_file_identity(file.as_raw_handle()) } == Ok(*expected) {
+                delete_file(&file);
+            }
+        }
+        drop(state.0);
+        if state.1 {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !delete_file(&directory) && Instant::now() < deadline {
+                // Slot dispositions become visible asynchronously under
+                // filesystem load. Keep the exact owned-directory handle
+                // pinned while waiting for its namespace to become empty.
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    pub(crate) fn delete_file(file: &File) -> bool {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            ) != 0
+        }
+    }
+    fn stage_file<T>(
+        path: &Path,
+        user: &str,
+        access: &str,
+        what: &str,
+        write: impl FnOnce(&mut File) -> Result<T>,
+    ) -> Result<(File, [u8; 24], T)> {
+        let mut file = unsafe {
+            let (_descriptor, sa) = descriptor(user, "GA")?;
+            open_handle(path, CREATE_STAGE, Some(&sa), what)?.into_file()
+        };
+        let staged: Result<([u8; 24], T)> = (|| {
+            let value = write(&mut file)?;
+            file.sync_all().map_err(string)?;
+            let identity = unsafe { file_identity(file.as_raw_handle())? };
+            protect(path, user, access)?;
+            validate(path, user, access, false)?;
+            Ok((identity, value))
+        })();
+        let (identity, value) = staged.inspect_err(|_| {
+            delete_file(&file);
+        })?;
+        let exact = unsafe { open_handle(path, OPEN_STAGE, None, "reopen staged object") }
+            .and_then(|exact| unsafe {
+                require(
+                    file_identity(exact.raw())? == identity,
+                    "staged object identity changed",
+                )?;
+                Ok(exact.into_file())
+            })
+            .inspect_err(|_| {
+                delete_file(&file);
+            })?;
+        Ok((exact, identity, value))
     }
     unsafe fn file_identity(handle: HANDLE) -> Result<[u8; 24]> {
         let info: FILE_ID_INFO =
@@ -917,6 +1073,12 @@ mod native {
         identity[8..].copy_from_slice(&info.FileId.Identifier);
         Ok(identity)
     }
+    unsafe fn unique_file_identity(handle: HANDLE) -> Result<[u8; 24]> {
+        let info: FILE_STANDARD_INFO =
+            unsafe { file_info(handle, FileStandardInfo, "inspect Windows store slot links")? };
+        require(info.NumberOfLinks == 1, "hard-linked Windows store slot")?;
+        unsafe { file_identity(handle) }
+    }
     fn session_identity(file: [u8; 24]) -> [u8; 25] {
         let mut identity = [0; 25];
         identity[0] = 2;
@@ -925,15 +1087,7 @@ mod native {
     }
     unsafe fn store_file_identity(path: &Path) -> Result<[u8; 24]> {
         let file = unsafe { open_handle(path, OPEN_SLOT, None, "open Windows store slot")? };
-        let info: FILE_STANDARD_INFO = unsafe {
-            file_info(
-                file.raw(),
-                FileStandardInfo,
-                "inspect Windows store slot links",
-            )?
-        };
-        require(info.NumberOfLinks == 1, "hard-linked Windows store slot")?;
-        unsafe { file_identity(file.raw()) }
+        unsafe { unique_file_identity(file.raw()) }
     }
     fn selector_decimal(text: &str) -> Result<usize> {
         crate::canonical_u64(text)
@@ -1017,7 +1171,10 @@ mod native {
                 std::env::remove_var(BOOTSTRAP_DIRECTORY);
                 if let Err(error) = std::env::set_current_dir(directory) {
                     result.write(
-                        &directory_failure_record(nonce, directory_cause(&error)),
+                        &bootstrap_failure_record(
+                            nonce,
+                            BootstrapFailure::Directory(directory_cause(&error)),
+                        ),
                         "report rejected working directory",
                     )?;
                     return Ok(1);
@@ -1029,9 +1186,13 @@ mod native {
                 .args(args)
                 .env_remove(INSTRUMENT_NONCE)
                 .env_remove(SEMANTIC_TOKEN);
-            transfer_handles!(requested;
-                INSTRUMENT_CHANNEL => instrument.as_ref(), "instrumentation channel"
-            );
+            requested.env_remove(INSTRUMENT_CHANNEL);
+            if let Some(instrument) = instrument.as_ref() {
+                win(
+                    requested.env_handle_lower_hex(INSTRUMENT_CHANNEL, instrument),
+                    "transfer instrumentation channel",
+                )?;
+            }
             if instrument.is_some() {
                 requested.env(
                     INSTRUMENT_NONCE,
@@ -1047,12 +1208,21 @@ mod native {
                     "transfer requested child stderr",
                 )?);
             }
-            let mut child = Some(win(
-                requested.spawn_suspended_with(
-                    SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
-                ),
-                "start requested child",
-            )?);
+            let mut child = match requested.spawn_suspended_with(
+                SpawnOptions::new().creation_flags(CreationFlags::NEW_PROCESS_GROUP),
+            ) {
+                Ok(child) => Some(child),
+                Err(error) => {
+                    let code = error
+                        .raw_os_error()
+                        .map_or(ERROR_GEN_FAILURE, |code| code as u32);
+                    result.write(
+                        &bootstrap_failure_record(nonce, BootstrapFailure::Execution(code)),
+                        "report requested child start failure",
+                    )?;
+                    return Ok(127);
+                }
+            };
             drop((requested, instrument));
             let holder = Handle::checked(
                 OpenProcess(PROCESS_DUP_HANDLE, 0, holder_pid),
@@ -1152,8 +1322,8 @@ mod native {
         Err("instrumentation module was not loaded into requested child".into())
     }
 
-    fn stream_handle(stream: &LocalStream) -> HANDLE {
-        let LocalStream::NamedPipe(pipe) = stream;
+    fn stream_handle(stream: &Stream) -> HANDLE {
+        let Stream::NamedPipe(pipe) = stream;
         pipe.inner().as_handle().as_raw_handle()
     }
 
@@ -1164,7 +1334,7 @@ mod native {
             .map_err(string)
     }
 
-    fn same_user(stream: &LocalStream, user: &str) -> std::result::Result<bool, ()> {
+    fn same_user(stream: &Stream, user: &str) -> std::result::Result<bool, ()> {
         unsafe {
             if ImpersonateNamedPipeClient(stream_handle(stream)) == 0 {
                 return Err(());
@@ -1181,8 +1351,8 @@ mod native {
         }
     }
 
-    type Authentication = (LocalStream, [u8; 4], bool, Option<u32>);
-    fn authenticate(mut stream: LocalStream, user: &str) -> Option<Authentication> {
+    type Authentication = (Stream, [u8; 4], bool, Option<u32>);
+    fn authenticate(mut stream: Stream, user: &str) -> Option<Authentication> {
         let handle = stream_handle(&stream);
         let preface = fixed_record(
             &mut stream,
@@ -1252,36 +1422,99 @@ mod native {
         false
     }
 
-    fn cancel(stream: &LocalStream) {
+    fn cancel(stream: &Stream) {
         unsafe { windows_sys::Win32::System::IO::CancelIoEx(stream_handle(stream), ptr::null()) };
+    }
+    fn stop_job(job: &Job) -> bool {
+        if job.terminate(0xc000013a).is_err() {
+            return false;
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            let mut state = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            if unsafe {
+                QueryInformationJobObject(
+                    job.as_handle().as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut state as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return false;
+            }
+            if state.ActiveProcesses == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    static SHUTDOWN: AtomicU8 = AtomicU8::new(0);
+    unsafe extern "system" fn shutdown_handler(kind: u32) -> i32 {
+        let Some(terminal) = super::console_control_kind(kind) else {
+            return FALSE;
+        };
+        let previous = SHUTDOWN.fetch_or(1, Ordering::Relaxed);
+        SHUTDOWN.fetch_or(u8::from(previous != 0) << 1, Ordering::Relaxed);
+        if terminal {
+            // Returning TRUE for CLOSE/LOGOFF/SHUTDOWN authorizes Windows to
+            // terminate the process immediately. This callback owns no
+            // cleanup; it gives the normal loop a short graceful interval,
+            // then requests force early enough for durable retirement before
+            // Windows' shorter terminal-control deadline. Ctrl-C/Break retain
+            // the ordinary five-/ten-second schedule in the state machine.
+            unsafe { Sleep(2_000) };
+            SHUTDOWN.fetch_or(2, Ordering::Release);
+            loop {
+                unsafe { Sleep(INFINITE) };
+            }
+        }
+        TRUE
     }
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
+    crate::schema!(struct Staged fields; path: PathBuf, file: File, identity: [u8; 24]);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
-    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, guards: Vec<File>);
-    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String,
-        generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8,
-        conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32,
-        early_exit: Option<u32>, birth: [u8; 16],
-        input: Pipe, output: Pipe, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>,
-        identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
+    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, created: bool, guards: Vec<File>);
+    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, child_released: bool, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
-            let (write, read, rejected) = match kind {
-                1 => (
-                    "command bootstrap to resume child",
-                    "bootstrap resume acknowledgement",
-                    "bootstrap failed to resume child",
-                ),
-                _ => (
-                    "command bootstrap to break child",
-                    "bootstrap break acknowledgement",
-                    "bootstrap failed to break child",
-                ),
-            };
             self.control
-                .write(&bootstrap_command(kind, self.nonce), write)?;
-            require(self.result.record::<1>(false, read)? == [0], rejected)
+                .write(&bootstrap_command(kind, self.nonce), "command bootstrap")?;
+            require(
+                self.result
+                    .record::<1>(false, "bootstrap acknowledgement")?
+                    == [0],
+                "bootstrap command failed",
+            )
+        }
+    }
+    fn publish_marker_stage(
+        stage: &Staged,
+        marker: &Path,
+        user: &str,
+        after_move: impl FnOnce(&Path),
+    ) -> Result<()> {
+        unsafe {
+            win32!(
+                MoveFileExW(
+                    wide(stage.path.as_os_str()).as_ptr(),
+                    wide(marker.as_os_str()).as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                ),
+                "publish protected marker"
+            )?;
+            after_move(marker);
+            let final_file = open_handle(marker, OPEN_MARKER, None, "reopen protected marker")?;
+            validate_exact_handle(final_file.0.as_ref().unwrap(), user, "FR", false)?;
+            require(
+                file_identity(final_file.raw())? == stage.identity,
+                "marker identity changed",
+            )
         }
     }
     impl Native {
@@ -1289,12 +1522,13 @@ mod native {
             self.identity = session_identity(marker_identity);
             let start = (now(), unsafe { GetTickCount64() }, boot_identity());
             let event_path = self.event.as_ref().map(|target| target.path.as_path());
+            let event_directory = self.event.as_ref().and_then(|target| target.guards.last());
             let event_identity = event_path.map(|path| os_bytes(path.as_os_str()));
             let instrument_identity = self
                 .instrument
                 .as_ref()
                 .map(|instrument| os_bytes(instrument.path.as_os_str()));
-            let mut artifacts = holder_artifacts(
+            self.artifacts = Some(holder_artifacts(
                 &self.identity,
                 (
                     (self.generation != 1).then_some(self.generation),
@@ -1310,11 +1544,13 @@ mod native {
                     event_identity: event_identity.as_deref(),
                     instrument_identity: instrument_identity.as_deref(),
                     event_store: None,
+                    event_directory,
                     stores: None,
                     event_layout: 2,
                     log_cap: self.options.log_cap,
                 },
-            )?;
+            )?);
+            let artifacts = self.artifacts.as_mut().unwrap();
             let cwd = absolute(self.options.directory.as_deref().unwrap_or(Path::new(".")))?;
             let containment = u32::from_le_bytes(random_array::<4>()?).max(1);
             put_wide(&mut artifacts.status, &os_bytes(cwd.as_os_str())).map_err(crate::protocol)?;
@@ -1322,8 +1558,6 @@ mod native {
                 artifacts.status.extend_from_slice(&bytes);
             }
             artifacts.status.extend_from_slice(&self.birth);
-            self.artifacts = Some(artifacts);
-            self.event = None;
             Ok(())
         }
         fn launch(
@@ -1331,10 +1565,11 @@ mod native {
             marker: &Marker,
             command: &[OsString],
             nonce: [u8; 16],
-        ) -> Result<LocalListener> {
+        ) -> Result<Listener> {
             let instrument = self.options.instrument.take();
             let listener = self.first_protected_pipe(&marker.pipe)?;
-            let (marker_stage, marker_identity) = self.stage_marker(&marker.encode())?;
+            self.stage = Some(self.stage_marker(&marker.encode())?);
+            let marker_identity = self.stage.as_ref().unwrap().identity;
             if let Some(path) = &instrument {
                 self.stage_instrument(path, &session_identity(marker_identity))?;
             }
@@ -1343,15 +1578,24 @@ mod native {
                 self.inject_and_ack(pid, nonce)?;
             }
             self.bootstrap.exchange(1)?;
+            self.child_released = true;
             self.prepublication_alive()?;
-            self.publish_marker(&marker_stage, marker_identity)?;
+            self.publish_marker()?;
             Ok(listener)
         }
 
-        fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<LocalListener> {
+        fn first_protected_pipe(&self, pipe: &[u8; 46]) -> Result<Listener> {
+            let (descriptor, _) = descriptor(&self.sid, "0x12019f")?;
+            let pipe_descriptor = unsafe {
+                BorrowedSecurityDescriptor::from_ptr(
+                    (&*descriptor as *const SecurityDescriptor).cast(),
+                )
+            }
+            .to_owned_sd()
+            .map_err(string)?;
             ListenerOptions::new()
                 .name(local_name(pipe)?)
-                .security_descriptor(pipe_descriptor(&self.sid)?)
+                .security_descriptor(pipe_descriptor)
                 .nonblocking(ListenerNonblockingMode::Accept)
                 .create_sync()
                 .map_err(string)
@@ -1367,7 +1611,7 @@ mod native {
                 let mut conpty = 0;
                 check(
                     CreatePseudoConsole(
-                        COORD { X: 80, Y: 24 },
+                        coordinate(self.geometry)?,
                         cin.raw(),
                         cout.raw(),
                         0,
@@ -1383,10 +1627,7 @@ mod native {
                 )?;
                 self.job = Some(job);
                 if let Some(path) = &self.options.stderr {
-                    let path = absolute(path)?;
-                    validate(&path, &self.sid, "FA", false)?;
-                    self.stderr =
-                        open_handle(&path, OPEN_STDERR, None, "open protected stderr sink")?;
+                    self.stderr = open_stderr_operand(path, &self.sid, |_| {})?;
                 }
                 let (command_read, bootstrap_control) =
                     Pipe::pair("create bootstrap control channel")?;
@@ -1452,7 +1693,9 @@ mod native {
                 }
                 let endpoint = &self.bootstrap;
                 let identity = endpoint.result.record::<56>(false, "bootstrap identity")?;
-                if let Some(cause) = directory_failure(&identity, endpoint.nonce) {
+                if let Some(BootstrapFailure::Directory(cause)) =
+                    bootstrap_failure(&identity, endpoint.nonce)
+                {
                     let directory = self
                         .options
                         .directory
@@ -1461,7 +1704,16 @@ mod native {
                     return Err(format!(
                         "could not enter {} ({})",
                         name::render(directory.as_os_str()),
-                        cause.label()
+                        CAUSES[cause as usize]
+                    ));
+                }
+                if let Some(BootstrapFailure::Execution(code)) =
+                    bootstrap_failure(&identity, endpoint.nonce)
+                {
+                    return Err(format!(
+                        "could not execute {}: {}",
+                        name::render(command[0].as_os_str()),
+                        io::Error::from_raw_os_error(code as i32)
                     ));
                 }
                 let record = BootstrapRecord::decode(&identity, endpoint.nonce)
@@ -1490,55 +1742,35 @@ mod native {
             }
         }
         fn stage_instrument(&mut self, source: &Path, identity: &[u8]) -> Result<()> {
-            require(source.is_absolute(), "instrumentation path is not absolute")?;
-            let mut input = read_reparse(
-                source,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            )?;
-            let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
-                file_info(
-                    input.as_raw_handle(),
-                    FileAttributeTagInfo,
-                    "inspect instrumentation object",
-                )?
-            };
-            require(
-                attributes.FileAttributes
-                    & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-                    == 0,
-                "validate instrumentation object",
-            )?;
+            let mut input = open_instrument_operand(source, &self.sid, |_| {})?;
             let stage = instrument_stage(
                 &self.stage_root,
                 identity,
                 self.generation,
                 self.incarnation,
             )?;
-            let (digest, staged_identity) = unsafe {
-                let (_descriptor, sa) = descriptor(&self.sid, "GA")?;
-                let mut output = open_handle(
-                    &stage,
-                    CREATE_STAGE,
-                    Some(&sa),
-                    "stage instrumentation object",
-                )?
-                .into_file();
-                let digest = copy_digest(&mut input, Some(&mut output))?;
-                output.sync_all().map_err(string)?;
-                (digest, file_identity(output.as_raw_handle())?)
-            };
-            protect(&stage, &self.sid, "FRFX")?;
-            validate(&stage, &self.sid, "FRFX", false)?;
-            let mut staged = read_reparse(&stage, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
-            require(
-                unsafe { file_identity(staged.as_raw_handle())? } == staged_identity,
-                "instrumentation identity changed",
+            let (mut staged, staged_identity, digest) = stage_file(
+                &stage,
+                &self.sid,
+                "FRFX",
+                "stage instrumentation object",
+                |output| copy_digest(&mut input, Some(output)),
             )?;
-            require(
-                copy_digest(&mut staged, None)? == digest,
-                "instrumentation content changed",
-            )?;
-            let (read, write) = Pipe::pair("create instrumentation acknowledgement pipe")?;
+            let verified: Result<()> = (|| {
+                let published = read_reparse(&stage, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+                require(
+                    unsafe { file_identity(published.as_raw_handle())? } == staged_identity
+                        && copy_digest(&mut staged, None)? == digest,
+                    "instrumentation identity or content changed",
+                )
+            })();
+            verified.inspect_err(|_| {
+                delete_file(&staged);
+            })?;
+            let (read, write) = Pipe::pair("create instrumentation acknowledgement pipe")
+                .inspect_err(|_| {
+                    delete_file(&staged);
+                })?;
             self.instrument = Some(Instrument {
                 path: stage,
                 file: staged,
@@ -1611,45 +1843,52 @@ mod native {
                 "instrumentation content changed after load",
             )
         }
-        fn stage_marker(&self, marker: &[u8; 84]) -> Result<(PathBuf, [u8; 24])> {
-            unsafe {
-                let mut stage = self.marker.as_os_str().to_owned();
-                stage.push(format!(".stage-{}", GetCurrentProcessId()));
-                let stage = PathBuf::from(stage);
-                let (_descriptor, sa) = descriptor(&self.sid, "FR")?;
-                let mut file =
-                    open_handle(&stage, CREATE_STAGE, Some(&sa), "stage protected marker")?
-                        .into_file();
-                win(file.write_all(marker), "write protected marker")?;
-                win32!(
-                    FlushFileBuffers(file.as_raw_handle()),
-                    "write protected marker"
-                )?;
-                let staged_identity = file_identity(file.as_raw_handle())?;
-                Ok((stage, staged_identity))
-            }
+        fn stage_marker(&self, marker: &[u8; 84]) -> Result<Staged> {
+            let mut stage = self.marker.as_os_str().to_owned();
+            stage.push(format!(".stage-{}", unsafe { GetCurrentProcessId() }));
+            let stage = PathBuf::from(stage);
+            let (file, identity, ()) =
+                stage_file(&stage, &self.sid, "FR", "stage protected marker", |file| {
+                    win(file.write_all(marker), "write protected marker")
+                })?;
+            Ok(Staged {
+                path: stage,
+                file,
+                identity,
+            })
         }
-        fn publish_marker(&mut self, stage: &Path, staged_identity: [u8; 24]) -> Result<()> {
-            unsafe {
-                self.prepare_storage(staged_identity)?;
-                self.prepublication_alive()?;
-                self.ready.notice(1, 0);
-                win32!(
-                    MoveFileExW(
-                        wide(stage.as_os_str()).as_ptr(),
-                        wide(self.marker.as_os_str()).as_ptr(),
-                        MOVEFILE_WRITE_THROUGH,
-                    ),
-                    "publish protected marker"
-                )?;
-                validate(&self.marker, &self.sid, "FR", false)?;
-                let final_file =
-                    open_handle(&self.marker, OPEN_MARKER, None, "reopen protected marker")?;
-                require(
-                    file_identity(final_file.raw())? == staged_identity,
-                    "marker identity changed",
-                )?;
-                Ok(())
+        fn publish_marker(&mut self) -> Result<()> {
+            let staged_identity = self.stage.as_ref().unwrap().identity;
+            self.prepare_storage(staged_identity)?;
+            self.prepublication_alive()?;
+            self.ready.notice(1, 0);
+            publish_marker_stage(
+                self.stage.as_ref().unwrap(),
+                &self.marker,
+                &self.sid,
+                |_| {},
+            )
+        }
+
+        fn rollback_unpublished(&mut self) {
+            if !self.job.as_ref().is_none_or(stop_job) {
+                return;
+            }
+            if let Some(artifacts) = self.artifacts.take() {
+                rollback_stores([
+                    artifacts.storage.log.map(|(store, _)| store),
+                    artifacts.storage.events.map(|events| events.store),
+                    Some(artifacts.storage.lifecycle),
+                ]);
+            }
+            if let Some(instrument) = self.instrument.take() {
+                delete_file(&instrument.file);
+            }
+            if let Some(stage) = self.stage.take() {
+                delete_file(&stage.file);
+            }
+            if let Some(event) = self.event.as_ref().filter(|event| event.created) {
+                delete_file(event.guards.last().unwrap());
             }
         }
 
@@ -1669,11 +1908,8 @@ mod native {
 
     impl HolderNative for Native {
         fn resize(&mut self, rows: u16, columns: u16) -> Result<()> {
-            let (Ok(x), Ok(y)) = (i16::try_from(columns), i16::try_from(rows)) else {
-                return Err("geometry exceeds the console interface limit".into());
-            };
             check(
-                unsafe { ResizePseudoConsole(self.conpty.0, COORD { X: x, Y: y }) } >= 0,
+                unsafe { ResizePseudoConsole(self.conpty.0, coordinate((rows, columns))?) } >= 0,
                 "resize ConPTY",
             )
         }
@@ -1681,17 +1917,26 @@ mod native {
             live_holder_ancestor(pid)
         }
         fn terminate(&mut self, force: bool) -> (u8, bool) {
-            if !force && self.bootstrap.exchange(2).is_ok() {
-                return (0, false);
-            }
-            let terminated = self
-                .job
-                .as_ref()
-                .is_some_and(|job| job.terminate(0xc000013a).is_ok());
-            (u8::from(terminated) << 1, true)
+            crate::return_if!(!force && self.bootstrap.exchange(2).is_ok(), (0, false));
+            let job = self.job.as_ref();
+            let killed = job.is_some_and(|job| job.terminate(0xc000013a).is_ok());
+            (u8::from(killed) << 1, true)
         }
         fn exited(&mut self) -> Result<Option<NativeExit>> {
-            process_exit(self.process.raw()).map(|value| value.map(NativeExit::Code))
+            let exit = process_exit(self.process.raw())?;
+            if exit.is_some() {
+                // Closing HPCON can wait on older Windows, so the reader must
+                // keep draining concurrently while this detached close first
+                // releases the bootstrap and then the console ownership.
+                self.bootstrap.control = Pipe::default();
+                self.conpty.retire();
+            }
+            Ok(exit.map(NativeExit::Code))
+        }
+        fn abandon(&mut self) {
+            self.bootstrap.control = Pipe::default();
+            drop(self.job.take());
+            self.conpty.retire();
         }
     }
 
@@ -1699,6 +1944,54 @@ mod native {
         path_buffer("resolve absolute Windows path", |out, size| unsafe {
             GetFullPathNameW(wide(path.as_os_str()).as_ptr(), size, out, ptr::null_mut())
         })
+    }
+    fn caller_rejection(surface: &str, path: &Path, cause: &str) -> String {
+        format!(
+            "{surface} rejected: {} ({cause})",
+            name::render(path.as_os_str())
+        )
+    }
+    fn caller_open_cause(error: &io::Error) -> &'static str {
+        match error.raw_os_error().map(|value| value as u32) {
+            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => "missing",
+            Some(ERROR_DIRECTORY) => "wrong-type",
+            Some(ERROR_CANT_ACCESS_FILE) => "reparse-point",
+            _ => "io-error",
+        }
+    }
+    fn open_stderr_operand(
+        operand: &Path,
+        user: &str,
+        after_open: impl FnOnce(&File),
+    ) -> Result<Handle> {
+        let reject = |cause| caller_rejection("standard-error sink", operand, cause);
+        let path = absolute(operand).map_err(|_| reject("io-error"))?;
+        let file = OpenOptions::new()
+            .access_mode(OPEN_STDERR.0)
+            .share_mode(OPEN_STDERR.1)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|error| reject(caller_open_cause(&error)))?;
+        after_open(&file);
+        validate_stderr_handle(&file, user).map_err(reject)?;
+        Ok(Handle(Some(file)))
+    }
+    fn open_instrument_operand(
+        operand: &Path,
+        user: &str,
+        after_open: impl FnOnce(&File),
+    ) -> Result<File> {
+        let reject = |cause| caller_rejection("instrumentation", operand, cause);
+        crate::ensure!(operand.is_absolute(), reject("not-absolute"));
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(operand)
+            .map_err(|error| reject(caller_open_cause(&error)))?;
+        after_open(&file);
+        validate_instrument_handle(&file, user).map_err(reject)?;
+        Ok(file)
     }
     fn event_rejection(path: &Path, cause: &str) -> String {
         format!(
@@ -1713,14 +2006,6 @@ mod native {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
     }
-    fn event_component_cause(error: &io::Error) -> &'static str {
-        match error.raw_os_error().map(|code| code as u32) {
-            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => "missing",
-            Some(ERROR_DIRECTORY) => "not-directory",
-            Some(ERROR_ACCESS_DENIED) => "not-searchable",
-            _ => "io-error",
-        }
-    }
     fn event_attributes(handle: &File) -> Result<u32> {
         let info: FILE_ATTRIBUTE_TAG_INFO = unsafe {
             file_info(
@@ -1734,8 +2019,8 @@ mod native {
     fn event_target(operand: &Path, root: &Path) -> Result<EventTarget> {
         let reject = |cause| event_rejection(operand, cause);
         let event = absolute(operand).map_err(|_| reject("io-error"))?;
-        let root_handle =
-            event_component(root).map_err(|error| reject(event_component_cause(&error)))?;
+        let root_handle = event_component(root)
+            .map_err(|error| reject(CAUSES[directory_cause(&error) as usize]))?;
         let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
             .map_err(|_| reject("io-error"))?;
         let mut all = event.components();
@@ -1780,7 +2065,7 @@ mod native {
                     present = false;
                     break;
                 }
-                Err(error) => return Err(reject(event_component_cause(&error))),
+                Err(error) => return Err(reject(CAUSES[directory_cause(&error) as usize])),
             };
             let attributes = event_attributes(&handle).map_err(|_| reject("io-error"))?;
             crate::ensure!(
@@ -1796,6 +2081,7 @@ mod native {
         Ok(EventTarget {
             path: operand.to_owned(),
             present,
+            created: false,
             guards,
         })
     }
@@ -1830,60 +2116,26 @@ mod native {
     ) -> Result<()> {
         crate::return_if!(target.present, validate_event(target, user));
         let rejected = event_rejection(&target.path, "identity-changed");
-        let mut name = target
-            .path
-            .file_name()
-            .ok_or_else(|| rejected.clone())?
-            .encode_wide()
-            .collect::<Vec<_>>();
-        let length = u16::try_from(name.len().saturating_mul(2)).map_err(|_| rejected.clone())?;
-        let unicode = UNICODE_STRING {
-            Length: length,
-            MaximumLength: length,
-            Buffer: name.as_mut_ptr(),
-        };
-        let (descriptor, _) = descriptor(user, "FA").map_err(|_| rejected.clone())?;
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: target.guards.last().unwrap().as_raw_handle(),
-            ObjectName: &unicode,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: (&*descriptor as *const SecurityDescriptor).cast(),
-            SecurityQualityOfService: ptr::null(),
-        };
-        let (mut raw, mut status) = (INVALID_HANDLE_VALUE, IO_STATUS_BLOCK::default());
-        let result = unsafe {
-            NtCreateFile(
-                &mut raw,
-                FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
-                &attributes,
-                &mut status,
-                ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                FILE_CREATE,
-                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-                ptr::null(),
-                0,
-            )
-        };
-        let handle = unsafe { Handle::owned(raw) };
-        crate::ensure!(
-            result == STATUS_SUCCESS && !handle.is_null(),
-            rejected.clone()
-        );
+        let name = target.path.file_name().ok_or_else(|| rejected.clone())?;
+        let handle = relative_file(target.guards.last().unwrap(), name, user, CREATE_DIRECTORY)
+            .map_err(|_| rejected.clone())?;
         after_create(&target.path);
-        target.guards.push(handle.into_file());
-        let attributes =
-            event_attributes(target.guards.last().unwrap()).map_err(|_| rejected.clone())?;
-        crate::ensure!(
-            attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
-                == FILE_ATTRIBUTE_DIRECTORY,
-            rejected.clone()
-        );
-        target.present = true;
-        validate_event(target, user).map_err(|_| rejected)?;
-        Ok(())
+        target.guards.push(handle);
+        target.created = true;
+        let verified = (|| {
+            let attributes =
+                event_attributes(target.guards.last().unwrap()).map_err(|_| rejected.clone())?;
+            crate::ensure!(
+                attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+                    == FILE_ATTRIBUTE_DIRECTORY,
+                rejected.clone()
+            );
+            target.present = true;
+            validate_event(target, user).map_err(|_| rejected.clone())
+        })();
+        verified.inspect_err(|_| {
+            delete_file(target.guards.last().unwrap());
+        })
     }
     fn os_string(bytes: &[u8]) -> Result<OsString> {
         wtf8_decode(bytes).map(|wide| OsString::from_wide(&wide))
@@ -1937,9 +2189,6 @@ mod native {
     pub(crate) fn current_paths(invoked: &OsStr) -> Result<Vec<PathBuf>> {
         ancestry_paths(invoked, os_string)
     }
-    fn child_environment(invoked: &OsStr, path: &Path) -> Result<()> {
-        extend_ancestry(invoked, absolute(path)?, os_string, os_bytes)
-    }
     fn read_marker(path: &Path) -> Result<(Marker, [u8; 25])> {
         validate(path, sid()?, "FR", false)?;
         let mut file = read_reparse(path, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
@@ -1955,7 +2204,7 @@ mod native {
     fn pipe_name(marker: &Marker) -> [u16; 47] {
         std::array::from_fn(|at| marker.pipe.get(at).copied().map(u16::from).unwrap_or(0))
     }
-    fn controller(path: &Path, timeout: u32) -> Result<WireClient> {
+    fn controller(path: &Path, timeout: u32) -> Result<Client> {
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
         let (marker, identity) = read_marker(path)?;
         let pipe = pipe_name(&marker);
@@ -1968,14 +2217,14 @@ mod native {
             WaitNamedPipeW(pipe.as_ptr(), remaining),
             "wait for holder pipe"
         )?;
-        let stream = LocalStream::connect(local_name(&marker.pipe)?).map_err(string)?;
+        let stream = Stream::connect(local_name(&marker.pipe)?).map_err(string)?;
         require(
             read_marker(path)?.1 == identity,
             "marker identity changed during connection",
         )?;
-        WireClient::from_stream(stream, identity.to_vec(), deadline, cancel)
+        Client::from_stream(stream, identity.to_vec(), deadline, cancel)
     }
-    pub(crate) fn connect(path: &Path) -> Result<WireClient> {
+    pub(crate) fn connect(path: &Path) -> Result<Client> {
         controller(path, 2000)
     }
     fn inspect(path: &Path, status: bool, timeout: u32) -> SessionState {
@@ -2023,99 +2272,778 @@ mod native {
                 && validate(target, user, access, directory).is_ok()
         })
     }
-    pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
-        let (input, output) = unsafe {
-            (
-                GetStdHandle(STD_INPUT_HANDLE),
-                GetStdHandle(STD_OUTPUT_HANDLE),
-            )
-        };
-        let mut mode = 0;
-        crate::return_if!(
-            unsafe { GetConsoleMode(input, &mut mode) } == 0
-                || unsafe { GetConsoleMode(output, &mut mode) } == 0,
-            Err(CommandError::output("no controlling terminal"))
-        );
-        let mut client = controller(path, 2000).map_err(|_| missing(path))?;
+    const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
+    const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
+
+    fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
+        let raw =
+            ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
+        [
+            (input
+                | ENABLE_EXTENDED_FLAGS
+                | ENABLE_VIRTUAL_TERMINAL_INPUT
+                | ENABLE_WINDOW_INPUT
+                | ENABLE_MOUSE_INPUT)
+                & !raw,
+            output
+                | ENABLE_PROCESSED_OUTPUT
+                | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | DISABLE_NEWLINE_AUTO_RETURN,
+        ]
+    }
+    fn console_geometry(output: HANDLE) -> Result<(u16, u16)> {
         let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
-        let geometry = if unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0 {
-            (
-                (info.srWindow.Bottom - info.srWindow.Top + 1) as u16,
-                (info.srWindow.Right - info.srWindow.Left + 1) as u16,
+        let read = unsafe { GetConsoleScreenBufferInfo(output, &mut info) };
+        check(read != 0, "inspect viewer console geometry")?;
+        let invalid = "viewer console geometry is invalid";
+        let extent = |a, b| u16::try_from(i32::from(a) - i32::from(b) + 1).map_err(|_| invalid);
+        let window = info.srWindow;
+        let rows = extent(window.Bottom, window.Top)?;
+        let size = (rows, extent(window.Right, window.Left)?);
+        require(crate::wire::valid_size(size), invalid).map(|_| size)
+    }
+    struct ViewerConsole([HANDLE; 2], [u32; 2]);
+    struct ViewerInputMode(Option<HANDLE>);
+    impl ViewerInputMode {
+        fn write_handle(handle: HANDLE, bytes: &[u8]) -> Result<()> {
+            let mut written = 0;
+            win32!(
+                WriteFile(
+                    handle,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    ptr::null_mut(),
+                ),
+                "write viewer input-mode control"
+            )?;
+            require(
+                written == bytes.len() as u32,
+                "short viewer input-mode control write",
             )
-        } else {
-            (0, 0)
+        }
+        fn write(output: &mut dyn Write, bytes: &[u8]) -> Result<()> {
+            win(output.write_all(bytes), "write viewer input-mode control")?;
+            win(output.flush(), "flush viewer input-mode control")
+        }
+        fn enable(handle: HANDLE, output: &mut dyn Write) -> Result<Self> {
+            Self::write(output, WIN32_INPUT_ENABLE).map(|()| Self(Some(handle)))
+        }
+        fn disable(&mut self, output: &mut dyn Write) -> Result<()> {
+            if self.0.is_none() {
+                return Ok(());
+            }
+            Self::write(output, WIN32_INPUT_DISABLE)?;
+            self.0 = None;
+            Ok(())
+        }
+    }
+    impl Drop for ViewerInputMode {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0 {
+                Self::write_handle(handle, WIN32_INPUT_DISABLE).ok();
+            }
+        }
+    }
+    impl ViewerConsole {
+        fn detect() -> Option<Self> {
+            let handles =
+                [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE].map(|kind| unsafe { GetStdHandle(kind) });
+            let mut modes = [0; 2];
+            (0..2)
+                .all(|at| unsafe { GetConsoleMode(handles[at], &mut modes[at]) } != 0)
+                .then_some(Self(handles, modes))
+        }
+        fn set(&self, modes: [u32; 2]) -> Result<()> {
+            let set = |at| unsafe { SetConsoleMode(self.0[at], modes[at]) } != 0;
+            (0..2).try_for_each(|at| check(set(at), "configure viewer console"))
+        }
+    }
+    impl Drop for ViewerConsole {
+        fn drop(&mut self) {
+            self.set(self.1).ok();
+        }
+    }
+
+    fn console_wide_with_nul(key: KEY_EVENT_RECORD, nul: i16) -> Option<(u16, u16)> {
+        let unit = unsafe { key.uChar.UnicodeChar };
+        let null = unit == 0 && {
+            // Windows 10 1809 and Server 2019 predate conhost's reconstructed
+            // VkKeyScanW chord for a NUL emitted by its VT input engine. They
+            // enqueue one otherwise-empty key-down record instead.
+            let legacy =
+                key.wVirtualKeyCode == 0 && key.wVirtualScanCode == 0 && key.dwControlKeyState == 0;
+            let expected = nul as u16 & 0x7ff;
+            let chord = key.wVirtualKeyCode
+                | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
+                | u16::from(key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
+                    << 9
+                | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
+                    << 10;
+            legacy || chord == expected
         };
+        (key.bKeyDown != 0 && key.wRepeatCount != 0 && (unit != 0 || null))
+            .then_some((unit, key.wRepeatCount))
+    }
+
+    fn console_wide(key: KEY_EVENT_RECORD) -> Option<(u16, u16)> {
+        console_wide_with_nul(key, unsafe { VkKeyScanW(0) })
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Win32InputCarrier {
+        virtual_key: u16,
+        scan_code: u16,
+        unicode: u16,
+        key_down: bool,
+        control_state: u32,
+        repeat: u16,
+        c1: bool,
+    }
+
+    impl Win32InputCarrier {
+        fn key(self) -> KEY_EVENT_RECORD {
+            KEY_EVENT_RECORD {
+                bKeyDown: i32::from(self.key_down),
+                wRepeatCount: self.repeat,
+                wVirtualKeyCode: self.virtual_key,
+                wVirtualScanCode: self.scan_code,
+                uChar: KEY_EVENT_RECORD_0 {
+                    UnicodeChar: self.unicode,
+                },
+                dwControlKeyState: self.control_state,
+            }
+        }
+
+        fn modifier(self) -> bool {
+            matches!(
+                self.virtual_key,
+                VK_SHIFT
+                    | VK_CONTROL
+                    | VK_MENU
+                    | VK_LSHIFT
+                    | VK_RSHIFT
+                    | VK_LCONTROL
+                    | VK_RCONTROL
+                    | VK_LMENU
+                    | VK_RMENU
+                    | VK_LWIN
+                    | VK_RWIN
+            )
+        }
+
+        fn once(self) -> Vec<u8> {
+            let mut bytes = if self.c1 {
+                vec![0xc2, 0x9b]
+            } else {
+                b"\x1b[".to_vec()
+            };
+            bytes.extend_from_slice(
+                format!(
+                    "{};{};{};{};{};1_",
+                    self.virtual_key,
+                    self.scan_code,
+                    self.unicode,
+                    u8::from(self.key_down),
+                    self.control_state
+                )
+                .as_bytes(),
+            );
+            bytes
+        }
+
+        fn frame(self, bytes: Vec<u8>) -> InputFrame {
+            if !self.key_down || self.modifier() {
+                return InputFrame::Meta(bytes);
+            }
+            let semantic = console_wide(self.key()).and_then(|(unit, _)| u8::try_from(unit).ok());
+            InputFrame::Key(bytes, self.once(), semantic, self.repeat)
+        }
+    }
+
+    fn win32_input_carrier(bytes: &[u8]) -> Option<Win32InputCarrier> {
+        let (body, c1) = if let Some(body) = bytes.strip_prefix(b"\x1b[") {
+            (body, false)
+        } else {
+            (bytes.strip_prefix(b"\xc2\x9b")?, true)
+        };
+        let body = body.strip_suffix(b"_")?;
+        let values = body
+            .split(|byte| *byte == b';')
+            .map(|field| {
+                let text = std::str::from_utf8(field).ok()?;
+                crate::canonical_u64(text)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        crate::return_if!(values.len() != 6 || values[3] > 1, None);
+        let carrier = Win32InputCarrier {
+            virtual_key: values[0].try_into().ok()?,
+            scan_code: values[1].try_into().ok()?,
+            unicode: values[2].try_into().ok()?,
+            key_down: values[3] != 0,
+            control_state: values[4].try_into().ok()?,
+            repeat: values[5].try_into().ok()?,
+            c1,
+        };
+        (carrier.repeat != 0).then_some(carrier)
+    }
+
+    fn generated_carrier_unit(event: INPUT_RECORD) -> Option<(u16, u16)> {
+        crate::return_if!(event.EventType != KEY_EVENT as u16, None);
+        let key = unsafe { event.Event.KeyEvent };
+        let unit = unsafe { key.uChar.UnicodeChar };
+        (key.bKeyDown != 0
+            && key.wRepeatCount != 0
+            && key.wVirtualKeyCode == 0
+            && key.wVirtualScanCode == 0
+            && key.dwControlKeyState == 0)
+            .then_some((unit, key.wRepeatCount))
+    }
+
+    const CONSOLE_READ_RECORDS: usize = 256;
+    const CONSOLE_RECORD_BUDGET: usize = 16_384;
+    const CONSOLE_WIDE_TARGET: usize = 16 * 1024;
+    const CONSOLE_BYTE_TARGET: usize = 64 * 1024;
+    const WIN32_CARRIER_LIMIT: usize = 64;
+
+    enum ConsoleUnit {
+        Event(INPUT_RECORD),
+        Bytes(SmallVec<[u8; WIN32_CARRIER_LIMIT]>),
+        Framed(InputFrame),
+    }
+
+    struct ConsoleInput {
+        handle: HANDLE,
+        recognize_carriers: bool,
+        pending_high: Option<(u16, u32)>,
+        deferred: Option<InputState>,
+        closed: bool,
+        carrier: SmallVec<[u8; WIN32_CARRIER_LIMIT]>,
+        carrier_started: Option<Instant>,
+        units: VecDeque<u16>,
+        replay: VecDeque<ConsoleUnit>,
+        records: [INPUT_RECORD; CONSOLE_READ_RECORDS],
+        next: usize,
+        count: usize,
+    }
+
+    impl ConsoleInput {
+        #[cfg(test)]
+        fn new(handle: HANDLE) -> Self {
+            Self::with_detach(handle, None)
+        }
+
+        fn with_detach(handle: HANDLE, detach: Option<u8>) -> Self {
+            Self {
+                handle,
+                recognize_carriers: detach.is_some(),
+                pending_high: None,
+                deferred: None,
+                closed: false,
+                carrier: SmallVec::new(),
+                carrier_started: None,
+                units: VecDeque::new(),
+                replay: VecDeque::new(),
+                records: [INPUT_RECORD::default(); CONSOLE_READ_RECORDS],
+                next: 0,
+                count: 0,
+            }
+        }
+
+        fn raw_unit(unit: u16) -> SmallVec<[u8; WIN32_CARRIER_LIMIT]> {
+            if unit <= 0x7f {
+                SmallVec::from_slice(&[unit as u8])
+            } else {
+                debug_assert_eq!(unit, 0x9b);
+                SmallVec::from_slice(&[0xc2, 0x9b])
+            }
+        }
+
+        fn take_carrier(&mut self) -> SmallVec<[u8; WIN32_CARRIER_LIMIT]> {
+            self.carrier_started = None;
+            std::mem::take(&mut self.carrier)
+        }
+
+        fn carrier_wait(&self) -> u32 {
+            let elapsed = self
+                .carrier_started
+                .map_or(Duration::MAX, |at| at.elapsed());
+            let remaining = Duration::from_millis(50).saturating_sub(elapsed);
+            u32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap()
+        }
+
+        fn scan_unit(&mut self, unit: u16) -> Option<ConsoleUnit> {
+            if self.carrier.is_empty() {
+                match unit {
+                    0x1b => self.carrier.push(0x1b),
+                    0x9b => self.carrier.extend_from_slice(&[0xc2, 0x9b]),
+                    _ => return Some(ConsoleUnit::Bytes(Self::raw_unit(unit))),
+                }
+                self.carrier_started = Some(Instant::now());
+                return None;
+            }
+            if self.carrier.as_slice() == b"\x1b" {
+                if unit == u16::from(b'[') {
+                    self.carrier.push(b'[');
+                    return None;
+                }
+                let prior = self.take_carrier();
+                self.units.push_front(unit);
+                return Some(ConsoleUnit::Bytes(prior));
+            }
+            let byte = u8::try_from(unit).ok();
+            if byte.is_none_or(|byte| !byte.is_ascii_digit() && byte != b';' && byte != b'_') {
+                let bytes = self.take_carrier();
+                self.units.push_front(unit);
+                return Some(ConsoleUnit::Bytes(bytes));
+            }
+            let byte = byte.unwrap();
+            self.carrier.push(byte);
+            if self.carrier.len() > WIN32_CARRIER_LIMIT {
+                return Some(ConsoleUnit::Bytes(self.take_carrier()));
+            }
+            if byte == b'_' {
+                let bytes = self.take_carrier();
+                return match win32_input_carrier(&bytes) {
+                    Some(carrier) => Some(ConsoleUnit::Framed(carrier.frame(bytes.to_vec()))),
+                    None => Some(ConsoleUnit::Bytes(bytes)),
+                };
+            }
+            None
+        }
+
+        fn next_unit(&mut self) -> Option<ConsoleUnit> {
+            if let Some(unit) = self.replay.pop_front() {
+                return Some(unit);
+            }
+            loop {
+                if let Some(unit) = self.units.pop_front() {
+                    if let Some(unit) = self.scan_unit(unit) {
+                        return Some(unit);
+                    }
+                    continue;
+                }
+                crate::return_if!(self.next == self.count, None);
+                let event = self.records[self.next];
+                self.next += 1;
+                crate::return_if!(!self.recognize_carriers, Some(ConsoleUnit::Event(event)));
+                let Some((unit, repeat)) = generated_carrier_unit(event) else {
+                    if !self.carrier.is_empty() {
+                        self.replay.push_back(ConsoleUnit::Event(event));
+                        return Some(ConsoleUnit::Bytes(self.take_carrier()));
+                    }
+                    return Some(ConsoleUnit::Event(event));
+                };
+                if self.carrier.is_empty() && !matches!(unit, 0x1b | 0x9b) {
+                    return Some(ConsoleUnit::Event(event));
+                }
+                if unit > 0x7f && unit != 0x9b {
+                    self.replay.push_back(ConsoleUnit::Event(event));
+                    return Some(ConsoleUnit::Bytes(self.take_carrier()));
+                }
+                self.units.extend(std::iter::repeat_n(unit, repeat.into()));
+            }
+        }
+
+        fn finish(&mut self, output: Vec<u8>, next: InputState) -> InputState {
+            if output.is_empty() {
+                next
+            } else {
+                if next != InputState::Pending {
+                    self.deferred = Some(next);
+                }
+                InputState::Bytes(output)
+            }
+        }
+
+        fn record(
+            &mut self,
+            event: INPUT_RECORD,
+            codepage: u32,
+            wide: &mut Vec<u16>,
+        ) -> std::result::Result<Option<(u16, u16)>, ()> {
+            if self
+                .pending_high
+                .is_some_and(|(_, high_codepage)| high_codepage != codepage)
+            {
+                self.pending_high = None;
+            }
+            if event.EventType != KEY_EVENT as u16 {
+                if event.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
+                    self.pending_high = None;
+                    let size = unsafe { event.Event.WindowBufferSizeEvent.dwSize };
+                    let size = (size.Y as u16, size.X as u16);
+                    return Ok(crate::wire::valid_size(size).then_some(size));
+                }
+                return Ok(None);
+            }
+            let key = unsafe { event.Event.KeyEvent };
+            let Some((unit, repeat)) = console_wide(key) else {
+                return Ok(None);
+            };
+            if codepage == 0 {
+                return Err(());
+            }
+            if (0xd800..=0xdbff).contains(&unit) {
+                self.pending_high = (repeat == 1).then_some((unit, codepage));
+                return Ok(None);
+            }
+            let high = self.pending_high.take();
+            let low = (0xdc00..=0xdfff).contains(&unit);
+            let mut scalar = [unit; 2];
+            if low {
+                let Some((high, high_codepage)) = high else {
+                    return Ok(None);
+                };
+                if repeat != 1 || high_codepage != codepage {
+                    return Ok(None);
+                }
+                scalar[0] = high;
+                wide.extend_from_slice(&scalar);
+            } else {
+                wide.extend(std::iter::repeat_n(unit, repeat.into()));
+            }
+            Ok(None)
+        }
+
+        fn encode(
+            codepage: u32,
+            wide: &[u16],
+            output: &mut Vec<u8>,
+        ) -> std::result::Result<(), ()> {
+            if wide.is_empty() {
+                return Ok(());
+            }
+            let wide_length = i32::try_from(wide.len()).map_err(|_| ())?;
+            let (default, used) = (ptr::null(), ptr::null_mut());
+            let required = unsafe {
+                WideCharToMultiByte(
+                    codepage,
+                    0,
+                    wide.as_ptr(),
+                    wide_length,
+                    ptr::null_mut(),
+                    0,
+                    default,
+                    used,
+                )
+            };
+            if required <= 0 {
+                return Err(());
+            }
+            let mut bytes = SmallVec::<[u8; 8]>::new();
+            bytes.resize(required as usize, 0);
+            let length = unsafe {
+                WideCharToMultiByte(
+                    codepage,
+                    0,
+                    wide.as_ptr(),
+                    wide_length,
+                    bytes.as_mut_ptr(),
+                    required,
+                    default,
+                    used,
+                )
+            };
+            if length != required {
+                return Err(());
+            }
+            output.extend_from_slice(&bytes);
+            Ok(())
+        }
+
+        fn refill(&mut self, timeout: u32) -> std::result::Result<bool, ()> {
+            let wait = unsafe { WaitForSingleObject(self.handle, timeout) };
+            if wait == WAIT_TIMEOUT {
+                return Ok(false);
+            }
+            if wait != WAIT_OBJECT_0 {
+                return Err(());
+            }
+            let mut count = 0;
+            let read = unsafe {
+                ReadConsoleInputW(
+                    self.handle,
+                    self.records.as_mut_ptr(),
+                    self.records.len() as u32,
+                    &mut count,
+                )
+            };
+            if read == 0 || count == 0 || count as usize > self.records.len() {
+                return Err(());
+            }
+            self.next = 0;
+            self.count = count as usize;
+            Ok(true)
+        }
+
+        fn flush(
+            &mut self,
+            codepage: &mut Option<u32>,
+            wide: &mut Vec<u16>,
+            output: &mut Vec<u8>,
+        ) -> std::result::Result<(), ()> {
+            if let Some(codepage) = codepage.take() {
+                Self::encode(codepage, wide, output)?;
+                wide.clear();
+            }
+            Ok(())
+        }
+
+        fn state_with(
+            &mut self,
+            mut refill: impl FnMut(&mut Self, u32) -> std::result::Result<bool, ()>,
+        ) -> InputState {
+            if let Some(next) = self.deferred.take() {
+                return next;
+            }
+            let mut output = Vec::new();
+            let mut wide = Vec::new();
+            let mut codepage = None;
+            let mut frames = Vec::new();
+            let mut frame_bytes = 0;
+            // A larger processing budget coalesces ordinary paste input across
+            // many native reads. The fixed budget still yields periodically so
+            // ignored-event floods cannot starve keepalives or detach timing.
+            for _ in 0..CONSOLE_RECORD_BUDGET {
+                let unit = loop {
+                    if let Some(unit) = self.next_unit() {
+                        break unit;
+                    }
+                    if self.closed {
+                        if !frames.is_empty() {
+                            return InputState::Framed(frames);
+                        }
+                        self.flush(&mut codepage, &mut wide, &mut output).ok();
+                        output.extend_from_slice(&self.take_carrier());
+                        return self.finish(output, InputState::Closed);
+                    }
+                    if !frames.is_empty() {
+                        match refill(self, 0) {
+                            Ok(true) => continue,
+                            Ok(false) => return InputState::Framed(frames),
+                            Err(()) => {
+                                self.closed = true;
+                                return InputState::Framed(frames);
+                            }
+                        }
+                    }
+                    if !self.carrier.is_empty() && (!output.is_empty() || !wide.is_empty()) {
+                        let next = match self.flush(&mut codepage, &mut wide, &mut output) {
+                            Ok(()) => InputState::Pending,
+                            Err(()) => InputState::Closed,
+                        };
+                        return self.finish(output, next);
+                    }
+                    let wait = if self.carrier.is_empty() {
+                        u32::from(output.is_empty() && wide.is_empty()) * 50
+                    } else {
+                        self.carrier_wait()
+                    };
+                    if wait == 0 && !self.carrier.is_empty() {
+                        let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+                        output.extend_from_slice(&self.take_carrier());
+                        let next = if encoded.is_ok() {
+                            InputState::Pending
+                        } else {
+                            InputState::Closed
+                        };
+                        return self.finish(output, next);
+                    }
+                    match refill(self, wait) {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+                            output.extend_from_slice(&self.take_carrier());
+                            let next = if encoded.is_ok() {
+                                InputState::Pending
+                            } else {
+                                InputState::Closed
+                            };
+                            return self.finish(output, next);
+                        }
+                        Err(()) => {
+                            self.closed = true;
+                            continue;
+                        }
+                    }
+                };
+                if !frames.is_empty() && !matches!(unit, ConsoleUnit::Framed(_)) {
+                    self.replay.push_front(unit);
+                    return InputState::Framed(frames);
+                }
+                match unit {
+                    ConsoleUnit::Event(event) => {
+                        // The console VT engine exposes UTF-16 records, while
+                        // ConPTY's input boundary is always UTF-8. The viewer's
+                        // legacy input code page must not alter serialization.
+                        codepage = Some(CP_UTF8);
+                        match self.record(event, CP_UTF8, &mut wide) {
+                            Ok(Some((rows, columns))) => {
+                                if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                                    return self.finish(output, InputState::Closed);
+                                }
+                                return self.finish(output, InputState::Resize(rows, columns));
+                            }
+                            Ok(None) => {}
+                            Err(()) => {
+                                self.flush(&mut codepage, &mut wide, &mut output).ok();
+                                return self.finish(output, InputState::Closed);
+                            }
+                        }
+                    }
+                    ConsoleUnit::Bytes(bytes) => {
+                        if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                            return self.finish(output, InputState::Closed);
+                        }
+                        output.extend_from_slice(&bytes);
+                    }
+                    ConsoleUnit::Framed(frame) => {
+                        if !output.is_empty() || !wide.is_empty() {
+                            self.replay.push_front(ConsoleUnit::Framed(frame));
+                            let next = match self.flush(&mut codepage, &mut wide, &mut output) {
+                                Ok(()) => InputState::Pending,
+                                Err(()) => InputState::Closed,
+                            };
+                            return self.finish(output, next);
+                        }
+                        frame_bytes += match &frame {
+                            InputFrame::Meta(bytes) | InputFrame::Key(bytes, ..) => bytes.len(),
+                        };
+                        frames.push(frame);
+                        crate::return_if!(
+                            frame_bytes >= CONSOLE_BYTE_TARGET,
+                            InputState::Framed(frames)
+                        );
+                        continue;
+                    }
+                }
+                if wide.len() >= CONSOLE_WIDE_TARGET
+                    && self.flush(&mut codepage, &mut wide, &mut output).is_err()
+                {
+                    return self.finish(output, InputState::Closed);
+                }
+                crate::return_if!(
+                    output.len() >= CONSOLE_BYTE_TARGET,
+                    InputState::Bytes(output)
+                );
+            }
+            crate::return_if!(!frames.is_empty(), InputState::Framed(frames));
+            let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+            output.extend_from_slice(&self.take_carrier());
+            let next = if encoded.is_ok() {
+                InputState::Pending
+            } else {
+                InputState::Closed
+            };
+            self.finish(output, next)
+        }
+
+        fn state(&mut self) -> InputState {
+            self.state_with(|input, timeout| input.refill(timeout))
+        }
+    }
+
+    pub(crate) fn attach(path: &Path, options: Options) -> CommandResult<i32> {
+        let terminal = ViewerConsole::detect()
+            .ok_or_else(|| CommandError::output("no controlling terminal"))?;
+        terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
         let mut output = io::stdout();
-        Ok(attach_viewer_to(
+        let mut input_mode = ViewerInputMode::enable(terminal.0[1], &mut output)?;
+        let mut client = controller(path, 2000).map_err(|_| missing(path))?;
+        let geometry = console_geometry(terminal.0[1]).unwrap_or((0, 0));
+        let attached = attach_viewer_to(
             &mut client,
             &options,
             geometry,
             &mut output,
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
-            |sender| viewer_input(sender, options.detach),
-        )?)
+            |sender| viewer_input(sender, options.detach, geometry),
+        );
+        let disabled = input_mode.disable(&mut output);
+        let status = attached?;
+        disabled?;
+        Ok(status)
     }
-    fn viewer_input(sender: ViewerSender, detach: Option<u8>) {
+    fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
+            let mut input = ConsoleInput::with_detach(input as HANDLE, detach);
             run_viewer_input(
-                io::stdin(),
+                io::empty(),
                 sender,
                 InputConfig {
                     detach,
                     pass_suspend: true,
-                    last_size: None,
+                    last_size: crate::wire::valid_size(geometry).then_some(geometry),
                 },
-                move || match unsafe { WaitForSingleObject(input as HANDLE, 50) } {
-                    WAIT_OBJECT_0 => InputState::Ready,
-                    WAIT_TIMEOUT => InputState::Pending,
-                    _ => InputState::Closed,
-                },
+                move || input.state(),
                 || None,
                 || {},
                 Instant::now,
             );
         });
     }
-    fn detached() -> Result<i32> {
+    fn detached(geometry: (u16, u16)) -> Result<i32> {
         let mut command = SpawnCommand::new(std::env::current_exe().map_err(string)?);
         command
             .args(std::env::args_os().skip(1))
-            .env("MOOR_DETACHED_HOLDER", "1")
+            .env(DETACHED_HOLDER, "1")
+            .env(DETACHED_GEOMETRY, format!("{}:{}", geometry.0, geometry.1))
             .stdout(SpawnStdio::piped());
         let flags = CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP;
         let mut child = win(
             command.spawn_with(SpawnOptions::new().creation_flags(flags)),
             "start detached holder",
         )?;
-        Ok(i32::from(
-            await_launch(
-                child
-                    .stdout
-                    .take()
-                    .ok_or("launch result pipe is unavailable")?,
-            )?
-            .0,
-        ))
+        let output = child.stdout.take();
+        let output = output.ok_or("launch result pipe is unavailable")?;
+        Ok(i32::from(await_launch(output)?.0))
     }
-    fn holder(mut host: Native, listener: LocalListener) -> Result<i32> {
+    fn creation_size(required: bool, geometry: Option<(u16, u16)>) -> Result<(u16, u16)> {
+        crate::ensure!(geometry.is_some() || !required, "no controlling terminal");
+        Ok(geometry.unwrap_or((24, 80)))
+    }
+    fn parse_geometry(value: &OsStr) -> Option<(u16, u16)> {
+        let (rows, columns) = value.to_str()?.split_once(':')?;
+        let size = (rows.parse().ok()?, columns.parse().ok()?);
+        crate::wire::valid_size(size).then_some(size)
+    }
+    fn creation_geometry(required: bool, capture: bool, child: bool) -> Result<(u16, u16)> {
+        let inherited = std::env::var_os(DETACHED_GEOMETRY);
+        unsafe { std::env::remove_var(DETACHED_GEOMETRY) };
+        if child {
+            return inherited
+                .as_deref()
+                .and_then(parse_geometry)
+                .ok_or_else(|| "detached holder geometry is invalid".into());
+        }
+        let geometry = capture
+            .then(ViewerConsole::detect)
+            .flatten()
+            .map(|console| console_geometry(console.0[1]))
+            .transpose()?;
+        creation_size(required, geometry)
+    }
+    fn holder(mut host: Native, listener: Listener) -> Result<i32> {
+        let marker_path = std::mem::take(&mut host.marker);
+        let marker = host.stage.take().unwrap();
         let user = std::mem::take(&mut host.sid);
         let reader = std::mem::take(&mut host.output).into_file();
         let writer = std::mem::take(&mut host.input).into_file();
         let pty = Duplex::tracked(reader, writer, 1 << 20);
-        let marker_path = std::mem::take(&mut host.marker);
-        let identity = host.identity;
         let mut artifacts = host.artifacts.take().unwrap();
         let running = std::mem::take(&mut artifacts.running);
         let (authenticated, clients) = mpsc::channel::<(bool, Option<Authentication>)>();
-        let mut authenticating = 0;
-        let mut overflow_authenticating = false;
-        let synthetic = host.synthetic;
+        let (mut authenticating, mut overflow_authenticating) = (0, false);
+        let (synthetic, geometry) = (host.synthetic, host.geometry);
+        let (mut handled, mut ready) = (false, std::mem::take(&mut host.ready));
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
+        runtime.set_geometry(geometry.0, geometry.1);
         let Some(NativeExit::Code(code)) = runtime.drive(
             |pending, overflow| {
+                ready.notice(2, 0);
                 while let Ok((exhausted, client)) = clients.try_recv() {
                     if exhausted {
                         overflow_authenticating = false;
@@ -2146,7 +3074,10 @@ mod native {
                 }
                 None
             },
-            || None,
+            || {
+                let count = SHUTDOWN.swap(0, Ordering::AcqRel);
+                (count != 0).then(|| count > 1 || std::mem::replace(&mut handled, true))
+            },
         )?
         else {
             return Ok(125);
@@ -2154,11 +3085,75 @@ mod native {
         let termination = runtime.termination_method();
         let (exit, durable) = runtime.finish_exit(&running, NativeExit::Code(code), termination);
         let unlinked = durable
-            && read_marker(&marker_path).is_ok_and(|(_, final_id)| final_id == identity)
-            && fs::remove_file(&marker_path).is_ok();
+            && {
+                let deleted = delete_file(&marker.file);
+                drop(marker);
+                deleted
+                    && matches!(fs::symlink_metadata(marker_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+            };
         runtime.retired(unlinked, false);
         Ok(exit)
     }
+
+    fn observe_unpublished_exit(host: &mut Native) -> Result<Option<NativeExit>> {
+        if host.process.is_null() {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if let Some(code) = process_exit(host.process.raw())? {
+                return Ok(Some(NativeExit::Code(code)));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finalizable_unpublished_exit(host: &mut Native) -> Result<Option<NativeExit>> {
+        if !host.child_released {
+            return Ok(None);
+        }
+        host.early_exit
+            .map(NativeExit::Code)
+            .map_or_else(|| observe_unpublished_exit(host), |exit| Ok(Some(exit)))
+    }
+
+    fn finalize_unpublished_exit(
+        mut host: Native,
+        observed: NativeExit,
+        invoked: &OsStr,
+        report: bool,
+    ) -> Result<i32> {
+        require(
+            host.artifacts.is_some(),
+            "unpublished child artifacts are unavailable",
+        )?;
+        if let Some(stage) = host.stage.take() {
+            delete_file(&stage.file);
+        }
+        let reader = std::mem::take(&mut host.output).into_file();
+        let writer = std::mem::take(&mut host.input).into_file();
+        let pty = Duplex::tracked(reader, writer, 1 << 20);
+        let mut artifacts = host.artifacts.take().unwrap();
+        let running = std::mem::take(&mut artifacts.running);
+        let (synthetic, geometry) = (host.synthetic, host.geometry);
+        let mut ready = std::mem::take(&mut host.ready);
+        let mut runtime = artifacts.runtime(pty, (synthetic, host));
+        runtime.set_geometry(geometry.0, geometry.1);
+        let status = runtime.drive(|_, _| None, || None)?.unwrap_or(observed);
+        let (exit, durable) = runtime.finish_exit(&running, status, None);
+        require(durable, "prepublication child exit was not durable")?;
+        crate::return_if!(!report, Ok(exit));
+        eprintln!(
+            "{}: child exited before session publication",
+            name::program(invoked)
+        );
+        ready.notice(3, 1);
+        Ok(1)
+    }
+
     pub(crate) fn create(
         mode: CreateMode,
         path: &Path,
@@ -2167,9 +3162,31 @@ mod native {
         invoked: &OsStr,
     ) -> CommandResult<i32> {
         let foreground = matches!(mode, CreateMode::Run | CreateMode::LegacyRun);
-        let mut ready = launch_reporter();
+        let interactive = matches!(
+            mode,
+            CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
+        );
+        let selected = std::env::var_os(DETACHED_HOLDER).as_deref() == Some(OsStr::new("1"));
+        unsafe { std::env::remove_var(DETACHED_HOLDER) };
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let output =
+            (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
+                .then(|| unsafe { File::from_raw_handle(handle) });
+        let mut ready = LaunchReporter {
+            output,
+            generation: 1,
+        };
         let child = ready.output.is_some();
-        crate::return_if!(!foreground && !child, Ok(detached()?));
+        let geometry = creation_geometry(interactive, interactive || foreground, child)?;
+        crate::return_if!(!foreground && !child, Ok(detached(geometry)?));
+        SHUTDOWN.store(0, Ordering::Release);
+        check(
+            unsafe {
+                SetConsoleCtrlHandler(None, FALSE) != 0
+                    && SetConsoleCtrlHandler(Some(shutdown_handler), TRUE) != 0
+            },
+            "install console-control handler",
+        )?;
         if command.is_empty() {
             command.push(
                 std::env::var_os("SHELL")
@@ -2179,20 +3196,34 @@ mod native {
             );
         }
         let synthetic = terminal_environment(invoked);
-        child_environment(invoked, path)?;
+        extend_ancestry(invoked, absolute(path)?, os_string, os_bytes)?;
         let user = sid()?;
         let stage_root = root(invoked)?;
-        let event = options
-            .events
-            .as_deref()
-            .map(|operand| -> Result<EventTarget> {
-                let mut target = event_target(operand, &stage_root)?;
-                materialize_event(&mut target, user, |_| {})?;
-                Ok(target)
-            })
-            .transpose()?;
         let random = random_array::<64>()?;
-        let generation = launch_generation(invoked)?;
+        let generation = supervised_generation(
+            invoked,
+            false,
+            "supervised-launch acknowledgement was invalid",
+            |selector| {
+                let text = selector
+                    .to_str()
+                    .ok_or("invalid supervised-launch handle")?;
+                let raw = usize::from_str_radix(text, 16)
+                    .ok()
+                    .filter(|raw| {
+                        *raw != 0
+                            && text.len() <= 16
+                            && !text.starts_with('0')
+                            && lowercase_hex(text.as_bytes())
+                    })
+                    .ok_or("invalid supervised-launch handle")?;
+                let channel = unsafe { Handle::owned(raw as HANDLE) };
+                validate_pipe(channel.raw(), "supervised-launch channel")?;
+                decode_launch_record(&channel.record::<32>(true, "supervised-launch record")?)
+                    .ok_or_else(|| "supervised-launch acknowledgement was invalid".into())
+            },
+        )?
+        .0;
         ready.generation = generation;
         let marker = Marker::new(
             generation,
@@ -2204,6 +3235,15 @@ mod native {
         } else {
             Default::default()
         };
+        let event = options
+            .events
+            .as_deref()
+            .map(|operand| -> Result<EventTarget> {
+                let mut target = event_target(operand, &stage_root)?;
+                materialize_event(&mut target, user, |_| {})?;
+                Ok(target)
+            })
+            .transpose()?;
         let mut host = Native {
             marker: path.to_owned(),
             stage_root,
@@ -2213,6 +3253,7 @@ mod native {
             incarnation: marker.incarnation,
             semantic_token: semantic,
             synthetic,
+            geometry,
             ready,
             event,
             ..Native::default()
@@ -2220,18 +3261,23 @@ mod native {
         let listener = match host.launch(&marker, &command, random[32..48].try_into().unwrap()) {
             Ok(listener) => listener,
             Err(error) => {
-                if let Some(code) = host.early_exit {
-                    if child {
-                        host.ready.notice(
-                            if code == 0 { 1 } else { 3 },
-                            code.min(u16::MAX as u32) as u16,
-                        );
-                        if code == 0 {
-                            host.ready.notice(2, 0);
+                let observed = finalizable_unpublished_exit(&mut host)?;
+                if let Some(observed) = observed {
+                    if host.artifacts.is_none() {
+                        let marker_identity = host
+                            .stage
+                            .as_ref()
+                            .ok_or_else(|| "unpublished marker stage is unavailable".to_string())?
+                            .identity;
+                        if let Err(error) = host.prepare_storage(marker_identity) {
+                            host.rollback_unpublished();
+                            host.ready.notice(3, 1);
+                            return Err(error.into());
                         }
                     }
-                    return Ok(code as i32);
+                    return Ok(finalize_unpublished_exit(host, observed, invoked, child)?);
                 }
+                host.rollback_unpublished();
                 let result = if error.starts_with("could not execute ") {
                     127
                 } else {
@@ -2241,7 +3287,7 @@ mod native {
                 return if result == 127 {
                     // 127 returns Ok, bypassing the common run()->report()
                     // layer, so this path owns its single diagnostic.
-                    eprintln!("{}: {error}", name::program(invoked));
+                    let _ = write!(io::stderr(), "{}: {error}\r\n", name::program(invoked));
                     Ok(127)
                 } else {
                     // status 1 propagates as Err; the common report layer
@@ -2250,7 +3296,6 @@ mod native {
                 };
             }
         };
-        host.ready.notice(2, 0);
         Ok(holder(host, listener)?)
     }
     pub(crate) fn preflight_create(
@@ -2275,6 +3320,7 @@ mod native {
 pub use native::bootstrap;
 #[cfg(windows)]
 pub(crate) use native::{
-    attach, classify, cleanup, clock, connect, create, create_store_path, current_paths,
-    preflight_create, protected_store_path, resolve, sessions, valid_store_slots,
+    attach, classify, cleanup, clock, connect, create, create_store_directory, create_store_file,
+    create_store_path, current_paths, preflight_create, protected_store_path, resolve,
+    rollback_store, sessions, valid_store_directory, valid_store_slots,
 };

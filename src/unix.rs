@@ -156,8 +156,7 @@ macro_rules! syscall {
     };
 }
 
-crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: StoreTarget, log: Option<StoreTarget>, stage: Stage,
-    command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
+crate::schema!(struct Config<'a> fields; path: &'a Path, root: PathBuf, launch: LaunchSeed, event: Option<EventTarget>, lifecycle: StoreTarget, log: Option<StoreTarget>, stage: Stage, command: Vec<OsString>, options: &'a Options, invoked: &'a OsStr, terminal: (Option<libc::termios>, libc::winsize), stderr: Option<File>, instrument: Option<PreparedInstrument>);
 crate::schema!(struct UnixNative fields; control: File, group: i32, child: Child);
 crate::schema!(struct ViewerTerminal derive [Clone, Copy] fields; fd: i32, saved: libc::termios);
 crate::schema!(struct LaunchSeed fields; generation: u32, supervised: bool, incarnation: [u8; 16], semantic_token: [u8; 16], identity: Vec<u8>, start: (u64, u64, [u8; 16]));
@@ -660,7 +659,9 @@ fn abort_unpublished(
     error: String,
     diagnose: bool,
 ) -> Result<i32> {
-    let deadline = Instant::now() + Duration::from_millis(25);
+    // Give an already-triggered natural exit the same bounded scheduling
+    // allowance used by launch teardown before forcing the unpublished group.
+    let deadline = Instant::now() + Duration::from_millis(250);
     let observed = loop {
         if let Some(observed) = state.observe_exit()? {
             break Some(observed);
@@ -960,6 +961,7 @@ fn holder_setup(
             event_identity: event_manifest,
             instrument_identity: instrument_manifest,
             event_store: None,
+            event_directory: None,
             stores: Some(shared::ArtifactStores {
                 lifecycle: lifecycle_store,
                 event: event_store,
@@ -2309,69 +2311,8 @@ fn uid() -> u32 {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::*;
-    use std::sync::mpsc::sync_channel;
-
-    #[test]
-    fn descriptor_relative_socket_name_never_changes_process_cwd() {
-        let before = std::env::current_dir().unwrap();
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("moor-thread-cwd-{}-{nonce}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-        let parent = open_directory(&path).unwrap();
-        let (entered, wait) = sync_channel(0);
-        let (observed, receive) = sync_channel(0);
-        let observer = thread::spawn(move || {
-            wait.recv().unwrap();
-            observed.send(std::env::current_dir().unwrap()).unwrap();
-        });
-        let during = socket_name(&parent, OsStr::new("probe"), move |_| {
-            entered.send(()).unwrap();
-            Ok::<_, io::Error>(receive.recv().unwrap())
-        })
-        .unwrap();
-        observer.join().unwrap();
-        assert_eq!(during, before);
-        assert_eq!(std::env::current_dir().unwrap(), before);
-        fs::remove_dir(path).unwrap();
-    }
-
-    #[test]
-    fn accepted_socket_is_blocking_before_runtime_io_starts() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "moor-blocking-accept-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).unwrap();
-        let parent = open_directory(&path).unwrap();
-        let leaf = OsStr::new("probe");
-        let listener = socket_name(&parent, leaf, |name| {
-            ListenerOptions::new()
-                .name(name)
-                .reclaim_name(false)
-                .nonblocking(ListenerNonblockingMode::Accept)
-                .create_sync()
-        })
-        .unwrap();
-        let client = socket_name(&parent, leaf, LocalStream::connect).unwrap();
-        let accepted = accept_blocking(&listener).expect("pending local connection");
-        let LocalStream::UdSocket(accepted) = accepted;
-        let flags = fcntl(accepted.as_fd(), FcntlArg::F_GETFL).unwrap();
-        assert_eq!(flags & libc::O_NONBLOCK, 0);
-        drop(client);
-        drop(listener);
-        fs::remove_file(path.join(leaf)).unwrap();
-        fs::remove_dir(path).unwrap();
-    }
+    include!("../tests/unit/unix_macos.rs");
 }
 
 #[cfg(test)]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/unix.rs"));
+include!("../tests/unit/unix.rs");

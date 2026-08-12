@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
-schema!(enum pub InputState [Clone, Copy, Debug, Eq, PartialEq]; Ready, Pending, Closed);
+schema!(enum pub InputFrame [Clone, Debug, Eq, PartialEq]; Meta(Vec<u8>), Key(Vec<u8>, Vec<u8>, Option<u8>, u16));
+schema!(enum pub InputState [Clone, Debug, Eq, PartialEq]; Ready, Pending, Bytes(Vec<u8>), Framed(Vec<InputFrame>), Resize(u16, u16), Closed);
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
@@ -41,9 +42,9 @@ impl ViewerSender {
     }
 }
 
-schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write,
-    phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream,
-    lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
+schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write, phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream, lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
+
+const VIEWER_INPUT_CHUNK: usize = 65536;
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -344,10 +345,7 @@ fn reserve(used: Charge, charge: Charge, limit: Charge) -> Option<Charge> {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/runtime_io.rs"
-));
+include!("../../tests/unit/runtime_io.rs");
 
 pub fn attach_viewer_to(
     client: &mut Client,
@@ -359,10 +357,7 @@ pub fn attach_viewer_to(
     mut start: impl FnMut(ViewerSender),
 ) -> Result<i32, String> {
     let (sender, commands) = bounded(1);
-    let mut request = [0; 5];
-    request[..2].copy_from_slice(&geometry.1.to_le_bytes());
-    request[2..4].copy_from_slice(&geometry.0.to_le_bytes());
-    request[4] = 1 | u8::from(options.non_vt) << 1;
+    let mut request = crate::wire::attach_payload(geometry, 1 | u8::from(options.non_vt) << 1);
     let mut stream = Viewer {
         client,
         options,
@@ -430,11 +425,8 @@ pub fn attach_viewer_to(
             };
             let recovered: Result<(), String> = (|| {
                 lease.resume(stream.client, &mut reconnect)?;
-                if let Some((rows, columns)) = stream.size {
-                    request[..2].copy_from_slice(&columns.to_le_bytes());
-                    request[2..4].copy_from_slice(&rows.to_le_bytes());
-                }
-                request[4] &= !1;
+                request =
+                    crate::wire::attach_payload(stream.size.unwrap_or(geometry), request[4] & !1);
                 stream.client.send(3, &request)?;
                 stream.lease = Some(lease);
                 stream.phase = ViewerPhase::Reattaching;
@@ -457,13 +449,9 @@ pub fn run_viewer_input(
     mut suspend: impl FnMut(),
     mut now: impl FnMut() -> Instant,
 ) {
-    let InputConfig {
-        detach,
-        pass_suspend,
-        mut last_size,
-    } = config;
+    let mut last_size = config.last_size;
     let mut armed = None;
-    let mut bytes = vec![0; 65536];
+    let mut bytes = vec![0; VIEWER_INPUT_CHUNK];
     let mut output = Vec::with_capacity(bytes.len());
     let mut renewed = now();
     let graceful = 'input: loop {
@@ -474,41 +462,88 @@ pub fn run_viewer_input(
             }
             renewed = current;
         }
-        let next_size = size();
-        if next_size != last_size {
-            if let Some((rows, columns)) = next_size {
-                let _ = sender.0.send(Command::Resize(rows, columns));
-            }
-            last_size = next_size;
+        if let Some((rows, columns)) = size().filter(|size| Some(*size) != last_size) {
+            let _ = sender.0.send(Command::Resize(rows, columns));
+            last_size = Some((rows, columns));
         }
         if armed
             .is_some_and(|at| current.saturating_duration_since(at) >= Duration::from_millis(250))
         {
             break true;
         }
-        match ready() {
+        let mut native = None;
+        let count = match ready() {
             InputState::Pending => continue,
+            InputState::Bytes(value) => {
+                native = Some(value);
+                0
+            }
+            InputState::Framed(frames) => {
+                output.clear();
+                for frame in frames {
+                    match frame {
+                        InputFrame::Meta(bytes) => output.extend_from_slice(&bytes),
+                        InputFrame::Key(bytes, once, semantic, repeat) => {
+                            if armed.is_some() && semantic != config.detach {
+                                output.extend_from_slice(&bytes);
+                                break 'input sender.flush(&mut output);
+                            }
+                            if semantic == config.detach && config.detach.is_some() {
+                                for _ in 0..repeat {
+                                    if armed.take().is_some() {
+                                        output.extend_from_slice(&once);
+                                        if output.len() >= VIEWER_INPUT_CHUNK
+                                            && !sender.flush(&mut output)
+                                        {
+                                            break 'input false;
+                                        }
+                                    } else {
+                                        armed = Some(current);
+                                    }
+                                }
+                            } else {
+                                output.extend_from_slice(&bytes);
+                            }
+                        }
+                    }
+                    if output.len() >= VIEWER_INPUT_CHUNK && !sender.flush(&mut output) {
+                        break 'input false;
+                    }
+                }
+                if !sender.flush(&mut output) {
+                    break false;
+                }
+                continue;
+            }
+            InputState::Resize(rows, columns) => {
+                let next = Some((rows, columns));
+                if next != last_size && sender.0.send(Command::Resize(rows, columns)).is_err() {
+                    break false;
+                }
+                last_size = next;
+                continue;
+            }
             InputState::Closed => break true,
-            InputState::Ready => {}
-        }
-        let count = match input.read(&mut bytes) {
-            Ok(0) => break true,
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break false,
+            InputState::Ready => match input.read(&mut bytes) {
+                Ok(0) => break true,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break false,
+            },
         };
+        let input = native.as_deref().unwrap_or(&bytes[..count]);
         output.clear();
-        for byte in bytes[..count].iter().copied() {
+        for byte in input.iter().copied() {
             if armed.take().is_some() {
                 output.push(byte);
-                if Some(byte) != detach {
+                if Some(byte) != config.detach {
                     break 'input sender.flush(&mut output);
                 }
-            } else if Some(byte) == detach || byte == 0x1a && !pass_suspend {
+            } else if Some(byte) == config.detach || byte == 0x1a && !config.pass_suspend {
                 if !sender.flush(&mut output) {
                     break 'input false;
                 }
-                if Some(byte) == detach {
+                if Some(byte) == config.detach {
                     armed = Some(current);
                 } else {
                     suspend();
@@ -522,8 +557,7 @@ pub fn run_viewer_input(
             break false;
         }
     };
-    let released = graceful && sender.release();
-    if !released {
+    if !(graceful && sender.release()) {
         let _ = sender.0.send(Command::Abort);
     }
 }

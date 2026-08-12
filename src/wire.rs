@@ -61,9 +61,7 @@ macro_rules! length_field {
 }
 
 schema!(enum pub Profile [Clone, Copy, Debug, Eq, PartialEq]; Controller, Semantic);
-schema!(enum pub WireError [Clone, Debug, Eq, PartialEq]; UnknownVersion, UnknownType,
-    OversizedFrame, OversizedMessage, Malformed, BadSequence, ReassemblyAborted,
-    ReassemblyTimeout, ResourceExhausted, GenerationMismatch);
+schema!(enum pub WireError [Clone, Debug, Eq, PartialEq]; UnknownVersion, UnknownType, OversizedFrame, OversizedMessage, Malformed, BadSequence, ReassemblyAborted, ReassemblyTimeout, ResourceExhausted, GenerationMismatch);
 
 pub(crate) fn require(valid: bool, error: WireError) -> Result<(), WireError> {
     valid.then_some(()).ok_or(error)
@@ -184,11 +182,8 @@ fn message_size(profile: Profile, scope: u32, kind: u8) -> Result<Option<usize>,
         .map(|(_, size)| *size))
 }
 
-schema!(struct FrameHeader fields; magic: [u8; 4], version: u8, kind: u8, more: u8,
-    reserved: u8, scope: u32, sequence: u32, length: u32, checksum: u32);
-binary_record!(RawFrameHeader => FrameHeader[24] error WireError = WireError::Malformed; fixed {}
-    fields { magic: [u8; 4], version: u8, kind: u8, more: u8, reserved: u8, scope: U32<LE>,
-    sequence: U32<LE>, length: U32<LE>, checksum: U32<LE> });
+schema!(struct FrameHeader fields; magic: [u8; 4], version: u8, kind: u8, more: u8, reserved: u8, scope: u32, sequence: u32, length: u32, checksum: u32);
+binary_record!(RawFrameHeader => FrameHeader[24] error WireError = WireError::Malformed; fixed {} fields { magic: [u8; 4], version: u8, kind: u8, more: u8, reserved: u8, scope: U32<LE>, sequence: U32<LE>, length: U32<LE>, checksum: U32<LE> });
 
 fn frame_header(
     profile: Profile,
@@ -340,13 +335,11 @@ pub fn log_clear_payload(incarnation: [u8; 16], observed: u64) -> Result<[u8; 24
 
 wire_rules!(pure pub fn input_payload(epoch: u32, request: u64, bytes: &[u8]) -> Vec<u8> = wire_rules!(write epoch.to_le_bytes(); request.to_le_bytes(); [0]; bytes));
 wire_rules!(pure pub fn resize_payload(epoch: u32, rows: u16, columns: u16) -> [u8; 8] = fixed_payload::<8>(&[(0, &epoch.to_le_bytes()), (4, &columns.to_le_bytes()), (6, &rows.to_le_bytes())]).expect("fixed resize layout"));
+wire_rules!(pure pub(crate) fn attach_payload(size: (u16, u16), flags: u8) -> [u8; 5] = fixed_payload::<5>(&[(0, &size.1.to_le_bytes()), (2, &size.0.to_le_bytes()), (4, &[flags])]).expect("fixed attach layout"));
 wire_rules!(pure pub fn terminate_request_payload(identity: &[u8], generation: u32, incarnation: [u8; 16], force: bool) -> Result<Vec<u8>, WireError> = { let mut payload = Vec::with_capacity(identity.len() + 23); put_wide(&mut payload, identity)?; payload.extend_from_slice(&generation.to_le_bytes()); payload.extend_from_slice(&incarnation); payload.push(force.into()); Ok(payload) });
 
-schema!(struct LogClearResult fields; outcome: u8, reason: u8, reserved: [u8; 2], epoch: u32,
-    prior: u64, resulting: u64, cleared: u64);
-binary_record!(RawLogClearResult => LogClearResult[32] error WireError = WireError::Malformed;
-    fixed {} fields { outcome: u8, reason: u8, reserved: [u8; 2], epoch: U32<LE>,
-        prior: U64<LE>, resulting: U64<LE>, cleared: U64<LE> });
+schema!(struct LogClearResult fields; outcome: u8, reason: u8, reserved: [u8; 2], epoch: u32, prior: u64, resulting: u64, cleared: u64);
+binary_record!(RawLogClearResult => LogClearResult[32] error WireError = WireError::Malformed; fixed {} fields { outcome: u8, reason: u8, reserved: [u8; 2], epoch: U32<LE>, prior: U64<LE>, resulting: U64<LE>, cleared: U64<LE> });
 impl LogClearResult {
     wire_rules!(method fn valid(this: &Self) -> bool = this.reserved == [0; 2] && matches!((this.outcome, this.reason, this.epoch != 0), (0, 0, true) | (1, 0, _) | (2, 1..=3, _)));
 }
@@ -363,11 +356,8 @@ pub fn log_clear_result_payload(
     Ok(validated(value.valid(), value)?.encode_raw())
 }
 
-schema!(struct pub InputReceipt derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; epoch: u32, request: u64,
-    generation: u32, incarnation: [u8; 16], written: u64, status: u8, result: u16);
-binary_record!(RawInputReceipt => InputReceipt[43] error WireError = WireError::Malformed;
-    fixed {} fields { epoch: U32<LE>, request: U64<LE>, generation: U32<LE>, incarnation: [u8; 16], written: U64<LE>, status: u8,
-        result: U16<LE> });
+schema!(struct pub InputReceipt derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; epoch: u32, request: u64, generation: u32, incarnation: [u8; 16], written: u64, status: u8, result: u16);
+binary_record!(RawInputReceipt => InputReceipt[43] error WireError = WireError::Malformed; fixed {} fields { epoch: U32<LE>, request: U64<LE>, generation: U32<LE>, incarnation: [u8; 16], written: U64<LE>, status: u8, result: U16<LE> });
 
 impl InputReceipt {
     wire_rules!(method fn valid(this: &Self) -> bool = this.epoch != 0 && this.request != 0 && this.generation != 0 && nonzero(&this.incarnation) && matches!((this.status, this.result), (0, 0) | (1, 1..=20)));
@@ -422,8 +412,7 @@ wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], 
 
 pub use crc32c::crc32c;
 
-schema!(struct pub Query derive [Clone, Debug, Eq, PartialEq] pub fields;
-    correlation: u64, epoch: u32, class: u8, bytes: Vec<u8>);
+schema!(struct pub Query derive [Clone, Debug, Eq, PartialEq] pub fields; correlation: u64, epoch: u32, class: u8, bytes: Vec<u8>);
 
 impl Query {
     wire_rules!(method fn valid(this: &Self) -> bool = valid_query(this.correlation, this.epoch, this.class, &this.bytes));
@@ -442,11 +431,8 @@ fn read_query<'a>(input: &mut Reader<'a>) -> Result<(u64, u32, u8, &'a [u8]), Wi
 
 wire_rules!(pure pub fn decode_query(payload: &[u8]) -> Result<Query, WireError> = { let mut input = Reader(payload); let (correlation, epoch, class, bytes) = read_query(&mut input)?; input.finish(wire_rules!(value Query; correlation = correlation; epoch = epoch; class = class; bytes = bytes.to_vec())) });
 
-schema!(enum pub ViewerEvent<'a> [Debug, Eq, PartialEq]; Terminal(&'a [u8]), Output(u64, bool, &'a [u8]),
-    Receipt(InputReceipt), Lease(LeaseResult));
-schema!(struct pub ViewerStream derive [Default] pub fields; non_vt: bool, terminal: bool,
-    replay: Option<ReplayDescriptor>, next: Option<(u64, u64)>, received: Option<(u64, u64)>, lease_epoch: Option<u32>,
-    queries: SmallVec<[(Query, QueryShape); 4]>, probe: Vec<u8>);
+schema!(enum pub ViewerEvent<'a> [Debug, Eq, PartialEq]; Terminal(&'a [u8]), Output(u64, bool, &'a [u8]), Receipt(InputReceipt), Lease(LeaseResult));
+schema!(struct pub ViewerStream derive [Default] pub fields; non_vt: bool, terminal: bool, replay: Option<ReplayDescriptor>, next: Option<(u64, u64)>, received: Option<(u64, u64)>, lease_epoch: Option<u32>, queries: SmallVec<[(Query, QueryShape); 4]>, probe: Vec<u8>);
 
 pub fn decode_viewer<'a>(
     stream: &mut ViewerStream,
@@ -504,8 +490,7 @@ impl ViewerStream {
 
 wire_rules!(pure fn reply_state(bytes: &[u8]) -> i8 = match bytes { [0x1b] => 0, [0x1b, b'P', ..] | [0x90, ..] if bytes.ends_with(b"\x1b\\") || bytes.ends_with(&[0x9c]) => 1, [0x1b, b'P', ..] | [0x90, ..] if bytes.len() <= 256 => 0, [0x1b, b'P', ..] | [0x90, ..] => -1, [0x1b, b'[', body @ ..] | [0x9b, body @ ..] => match body.last() { Some(0x40..=0x7e) => 1, Some(0x20..=0x3f) | None if bytes.len() <= 256 => 0, _ => -1 }, _ => -1 });
 
-schema!(enum pub ControllerRequest<'a>; Hello(&'a [u8]), Policy(PolicyRequest<'a>), Status,
-    LogClear([u8; 16], u64));
+schema!(enum pub ControllerRequest<'a>; Hello(&'a [u8]), Policy(PolicyRequest<'a>), Status, LogClear([u8; 16], u64));
 
 pub fn decode_controller(
     kind: u8,
@@ -557,10 +542,8 @@ pub fn decode_semantic(
 
 wire_rules!(pure pub fn validate_status_flags(flags: u8) -> Result<(), WireError> = well_formed(flags & 0x0c == 0));
 
-schema!(struct pub StatusExtension derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; health: u8, log_epoch: u32,
-    log_index: u64, retained_start: u64, retained_end: u64);
-binary_record!(RawStatusExtension => StatusExtension[29] error WireError = WireError::Malformed;
-    fixed {} fields { health: u8, log_epoch: U32<LE>, log_index: U64<LE>, retained_start: U64<LE>, retained_end: U64<LE> });
+schema!(struct pub StatusExtension derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; health: u8, log_epoch: u32, log_index: u64, retained_start: u64, retained_end: u64);
+binary_record!(RawStatusExtension => StatusExtension[29] error WireError = WireError::Malformed; fixed {} fields { health: u8, log_epoch: U32<LE>, log_index: U64<LE>, retained_start: U64<LE>, retained_end: U64<LE> });
 
 impl StatusExtension {
     wire_rules!(method fn logging(this: &Self) -> bool = this.log_epoch != 0 || this.log_index != 0 || this.retained_start != 0 || this.retained_end != 0);
@@ -570,16 +553,10 @@ impl StatusExtension {
     }
 }
 
-schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields;
-    first: u64, last: u64, start: u64, end: u64, complete: bool, modes_exact: bool);
-schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; replay: ReplayDescriptor,
-    owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32,
-    semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
-schema!(struct TailRecord fields; first: u64, last: u64, start: u64, end: u64, flags: u8,
-    lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: [u8; 29]);
-binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malformed; fixed {}
-    fields { first: U64<LE>, last: U64<LE>, start: U64<LE>, end: U64<LE>, flags: u8,
-    lease_epoch: U32<LE>, semantic_flags: u8, semantic_pending: U16<LE>, extension: [u8; 29] });
+schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; first: u64, last: u64, start: u64, end: u64, complete: bool, modes_exact: bool);
+schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
+schema!(struct TailRecord fields; first: u64, last: u64, start: u64, end: u64, flags: u8, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: [u8; 29]);
+binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malformed; fixed {} fields { first: U64<LE>, last: U64<LE>, start: U64<LE>, end: U64<LE>, flags: u8, lease_epoch: U32<LE>, semantic_flags: u8, semantic_pending: U16<LE>, extension: [u8; 29] });
 
 impl StatusTail {
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
@@ -620,10 +597,11 @@ impl Heartbeat {
     }
 }
 
-schema!(struct pub QueryShape derive [Clone, Copy, Debug, Eq, PartialEq] pub fields;
-    class: u8, csi8: bool, mode: Option<u32>);
+schema!(struct pub QueryShape derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; class: u8, csi8: bool, mode: Option<u32>);
 
 wire_rules!(pure pub(crate) fn csi(bytes: &[u8]) -> Option<(bool, &[u8])> = bytes.strip_prefix(b"\x1b[").map(|tail| (false, tail)).or_else(|| bytes.strip_prefix(&[0x9b]).map(|tail| (true, tail))));
+#[cfg(windows)]
+wire_rules!(pure pub(crate) fn valid_size(size: (u16, u16)) -> bool = size.0 != 0 && size.1 != 0 && size.0 <= i16::MAX as u16 && size.1 <= i16::MAX as u16 && u32::from(size.0) * u32::from(size.1) <= 2_000_000);
 fn csi_body<'a>(bytes: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
     csi(bytes)?.1.strip_prefix(prefix)?.strip_suffix(suffix)
 }
@@ -634,4 +612,4 @@ wire_rules!(pure pub fn recognize_query(bytes: &[u8]) -> Option<QueryShape> = { 
 wire_rules!(pure pub fn validate_query_reply(query: &QueryShape, bytes: &[u8]) -> bool = match query.class { 1 => csi_body(bytes, b"?", b"c").is_some_and(|body| numbers(body, 1..=16, u16::MAX as u64, false)), 2 => csi_body(bytes, b">", b"c").is_some_and(|body| numbers(body, 3..=3, u32::MAX as u64, false)), 3 => [(b"\x1bP>|".as_slice(), b"\x1b\\".as_slice()), (&[0x90, b'>', b'|'], &[0x9c])].into_iter().find_map(|(head, tail)| bytes.strip_prefix(head)?.strip_suffix(tail)).is_some_and(|text| !text.is_empty() && text.len() <= 128 && text.iter().all(|b| (0x20..=0x7e).contains(b))), 4 => csi_body(bytes, b"?", b"$y").is_some_and(|body| { let Some(split) = body.iter().rposition(|byte| *byte == b';') else { return false }; decimal(&body[..split], u32::MAX as u64, true).map(|mode| mode as u32) == query.mode && matches!(&body[split + 1..], [b'0'..=b'4']) }), 5 => csi_body(bytes, b"", b"R").is_some_and(|body| numbers(body, 2..=2, u16::MAX as u64, true)), _ => false });
 
 #[cfg(test)]
-include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/unit/wire.rs"));
+include!("../tests/unit/wire.rs");
