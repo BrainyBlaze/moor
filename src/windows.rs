@@ -391,14 +391,14 @@ mod native {
         )?;
         Ok(Some(code))
     }
-    const BOOTSTRAP_SELECTOR: &str = "DESK_MOOR_BOOTSTRAP";
-    const BOOTSTRAP_CONTROL: &str = "DESK_MOOR_BOOTSTRAP_CONTROL";
-    const BOOTSTRAP_RESULT: &str = "DESK_MOOR_BOOTSTRAP_RESULT";
-    const BOOTSTRAP_STDERR: &str = "DESK_MOOR_BOOTSTRAP_STDERR";
-    const BOOTSTRAP_INSTRUMENT: &str = "DESK_MOOR_BOOTSTRAP_INSTRUMENT";
-    const BOOTSTRAP_DIRECTORY: &str = "DESK_MOOR_BOOTSTRAP_DIRECTORY";
-    const INSTRUMENT_CHANNEL: &str = "DESK_MOOR_INSTRUMENT_CHANNEL";
-    const INSTRUMENT_NONCE: &str = "DESK_MOOR_INSTRUMENT_NONCE";
+    const BOOTSTRAP_SELECTOR: &str = "MOOR_BOOTSTRAP";
+    const BOOTSTRAP_CONTROL: &str = "MOOR_BOOTSTRAP_CONTROL";
+    const BOOTSTRAP_RESULT: &str = "MOOR_BOOTSTRAP_RESULT";
+    const BOOTSTRAP_STDERR: &str = "MOOR_BOOTSTRAP_STDERR";
+    const BOOTSTRAP_INSTRUMENT: &str = "MOOR_BOOTSTRAP_INSTRUMENT";
+    const BOOTSTRAP_DIRECTORY: &str = "MOOR_BOOTSTRAP_DIRECTORY";
+    const INSTRUMENT_CHANNEL: &str = "MOOR_INSTRUMENT_CHANNEL";
+    const INSTRUMENT_NONCE: &str = "MOOR_INSTRUMENT_NONCE";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
         let size = fill(ptr::null_mut(), 0);
         check(size != 0, what)?;
@@ -590,9 +590,8 @@ mod native {
         Ok(info)
     }
     fn launch_reporter() -> LaunchReporter<File> {
-        let selected =
-            std::env::var_os("DESK_MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
-        unsafe { std::env::remove_var("DESK_MOOR_DETACHED_HOLDER") };
+        let selected = std::env::var_os("MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
+        unsafe { std::env::remove_var("MOOR_DETACHED_HOLDER") };
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
         let output =
             (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
@@ -2068,7 +2067,7 @@ mod native {
         let mut command = SpawnCommand::new(std::env::current_exe().map_err(string)?);
         command
             .args(std::env::args_os().skip(1))
-            .env("DESK_MOOR_DETACHED_HOLDER", "1")
+            .env("MOOR_DETACHED_HOLDER", "1")
             .stdout(SpawnStdio::piped());
         let flags = CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP;
         let mut child = win(
