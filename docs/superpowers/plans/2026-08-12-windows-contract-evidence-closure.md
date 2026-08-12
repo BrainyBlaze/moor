@@ -36,7 +36,7 @@
 
 - [ ] Inject `A`, application-cursor Up, `Z`, and the default detach record through one real `WriteConsoleInputW` call in the viewer's outer pseudoconsole.
 - [ ] Require the VT-native requested child to observe exactly `A ESC O A Z`, then require a 500 ms no-suffix interval so a delayed duplicate cannot pass.
-- [ ] Require the real viewer to detach with status 0; prove its writer emits and flushes exact `ESC[?9001l`, then query private mode 9001 through the native console and require the reset state. Leave the session live, restore the original console modes, and retire only after explicit child release.
+- [ ] Require the real viewer to detach with status 0 and prove restoration on every native host: query private mode 9001 and require reset where DECRQM supports that private mode; otherwise require the exact flushed `ESC[?9001l` control in the outer VT stream. A recognized enabled response always fails. Leave the session live, restore the original console modes, and retire only after explicit child release.
 - [ ] Keep geometry evidence separate: assert ordered `A -> ResizePseudoConsole(41,101) -> B`, then detach using the raw byte path.
 - [ ] Synchronize terminal-close timing at the actual `WM_CLOSE` post and prove graceful and ignoring-child durable retirement through shipped binaries.
 - [ ] Exercise publication races, post-rename identity validation, relative event operands, pinned event/stderr/instrument handles, semantic-token freshness, instrumentation rejection, and durable fast prepublication exit.
