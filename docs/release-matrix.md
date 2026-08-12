@@ -19,13 +19,17 @@ is no glibc asset and no libc dimension, so a consumer selects on
 | linux | arm64 | `aarch64-unknown-linux-musl` | fully static musl | `moor-<version>-linux-arm64` |
 | macos | x64 | `x86_64-apple-darwin` | system | `moor-<version>-macos-x64` |
 | macos | arm64 | `aarch64-apple-darwin` | system | `moor-<version>-macos-arm64` |
-| windows | x64 | `x86_64-pc-windows-msvc` | MSVC | `moor-<version>-windows-x64.exe` |
-| windows | arm64 | `aarch64-pc-windows-msvc` | MSVC | `moor-<version>-windows-arm64.exe` |
+| windows | x64 | `x86_64-pc-windows-msvc` | MSVC, static CRT | `moor-<version>-windows-x64.exe` |
+| windows | arm64 | `aarch64-pc-windows-msvc` | MSVC, static CRT | `moor-<version>-windows-arm64.exe` |
 
 `<version>` is the crate version from `Cargo.toml` (`0.1.0` for the first
 release). The manifest key is the target triple; the asset name above is the
 published filename. `x86_64-pc-windows-gnu` remains **compile-evidence only**
 and is never published — MSVC is the distributed Windows ABI.
+
+The MSVC assets statically link the VC++ runtime and therefore do not require a
+separately installed Visual C++ Redistributable. Native packaging records the PE
+dependency table and rejects any `VCRUNTIME*.dll` or `MSVCP*.dll` import.
 
 ### Why static musl for Linux, not glibc
 
@@ -71,6 +75,8 @@ none may be waived, and the release fails closed on any missing or red gate.
    dynamically linked Linux artifact is nonconforming.
 3. **Identity** — `moor --version` on the shipped asset reports exactly the
    release `<version>`.
+4. **Windows static-CRT proof** — the PE dependency table for each Windows asset
+   is archived and contains no `VCRUNTIME*.dll` or `MSVCP*.dll` import.
 
 ### Native-provenance per asset
 

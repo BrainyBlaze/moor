@@ -148,6 +148,7 @@ jobs:
         run: |
           $out = "ci-output/${{ matrix.lane }}"
           Copy-Item target/release/moor.exe "$out/moor.exe"
+          & ./ci/audit-windows-imports.ps1 -Executable "$out/moor.exe" -Output "$out/imports.txt"
           $hashes = foreach ($file in @("$out/moor.exe")) {
             $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))"

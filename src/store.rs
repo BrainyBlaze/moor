@@ -207,38 +207,61 @@ impl Store {
             if !owned {
                 validate_event_directory(path)?;
             }
-            let mut created = Vec::with_capacity(4);
-            if let Err((error, failed)) = NAMES.into_iter().try_for_each(|name| {
-                crate::windows::create_store_file(&directory, name).map(|file| created.push(file))
-            }) {
-                let identities = created
-                    .iter()
-                    .map(|(_, identity)| *identity)
-                    .chain(failed.as_ref().map(|(_, identity)| *identity))
-                    .collect::<Vec<_>>();
-                drop(created);
-                let guard = failed.map(|(guard, _)| guard);
-                crate::windows::rollback_store(directory, &identities, (guard, owned));
-                return Err(error.into());
-            }
-            let (slots, identities): (Vec<_>, Vec<_>) = created.into_iter().unzip();
-            let slots = slots.try_into().unwrap();
-            let mut store = Self::from_parts(slots, selected, hash);
-            store._rollback = Some((directory, identities, owned));
-            let rollback = store._rollback.as_ref().unwrap();
-            let initialized = (|| {
-                rollback.0.sync_all()?;
-                require(crate::windows::valid_store_directory(path, &rollback.0))?;
-                validate_slots(path, &store.slots, true)?;
-                durable(&store.slots[0], 0, initial)?;
-                durable(&store.slots[2], 0, &store.selected.encode())
-            })();
-            if let Err(error) = initialized {
-                store.rollback();
-                return Err(error);
-            }
-            Ok(store)
+            Self::create_windows(path, directory, owned, selected, hash, initial)
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn create_event_at(
+        path: &Path,
+        directory: &File,
+        generation: u32,
+        initial: &[u8],
+    ) -> Result<Self> {
+        let (selected, hash) = initial_commit(Kind::Event, generation, initial, 0..0)?;
+        Self::create_windows(path, directory.try_clone()?, false, selected, hash, initial)
+    }
+
+    #[cfg(windows)]
+    fn create_windows(
+        path: &Path,
+        directory: File,
+        owned: bool,
+        selected: Commit,
+        hash: Sha256,
+        initial: &[u8],
+    ) -> Result<Self> {
+        let mut created = Vec::with_capacity(4);
+        if let Err((error, failed)) = NAMES.into_iter().try_for_each(|name| {
+            crate::windows::create_store_file(&directory, name).map(|file| created.push(file))
+        }) {
+            let identities = created
+                .iter()
+                .map(|(_, identity)| *identity)
+                .chain(failed.as_ref().map(|(_, identity)| *identity))
+                .collect::<Vec<_>>();
+            drop(created);
+            let guard = failed.map(|(guard, _)| guard);
+            crate::windows::rollback_store(directory, &identities, (guard, owned));
+            return Err(error.into());
+        }
+        let (slots, identities): (Vec<_>, Vec<_>) = created.into_iter().unzip();
+        let slots = slots.try_into().unwrap();
+        let mut store = Self::from_parts(slots, selected, hash);
+        store._rollback = Some((directory, identities, owned));
+        let rollback = store._rollback.as_ref().unwrap();
+        let initialized = (|| {
+            rollback.0.sync_all()?;
+            require(crate::windows::valid_store_directory(path, &rollback.0))?;
+            validate_slots(path, &store.slots, true)?;
+            durable(&store.slots[0], 0, initial)?;
+            durable(&store.slots[2], 0, &store.selected.encode())
+        })();
+        if let Err(error) = initialized {
+            store.rollback();
+            return Err(error);
+        }
+        Ok(store)
     }
 
     #[cfg(unix)]

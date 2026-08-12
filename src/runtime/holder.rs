@@ -307,6 +307,7 @@ pub trait Native {
     }
     fn terminate(&mut self, force: bool) -> (u8, bool);
     fn exited(&mut self) -> Result<Option<NativeExit>>;
+    fn abandon(&mut self) {}
 }
 
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
@@ -539,6 +540,7 @@ impl<N: Native> Runtime<N> {
             }
             self.poll();
             if self.machine.termination_expired() {
+                self.native.abandon();
                 return Ok(None);
             }
             if let Some((status, drain_until)) = exited {

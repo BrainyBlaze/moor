@@ -4,27 +4,27 @@
 
 **Goal:** Make the shipped Windows viewer preserve ordered text, Unicode, resize, and detach input, then prove the change at merge time on hosted x64/ARM64 and at release time across the full frozen Windows/WSL matrix.
 
-**Architecture:** Keep the existing batched `ReadConsoleInputW` reader as the single input authority. While attached, configure the console for low-level record input by clearing `ENABLE_VIRTUAL_TERMINAL_INPUT`, retaining `ENABLE_WINDOW_INPUT` and `ENABLE_EXTENDED_FLAGS`, and clearing processed/line/echo/quick-edit modes; keep VT output enabled and restore both original modes on drop.
+**Architecture:** Keep the batched `ReadConsoleInputW` reader as the single input authority, but leave `ENABLE_VIRTUAL_TERMINAL_INPUT` enabled so Windows' own terminal input engine translates cursor, function, focus, and mouse input according to the active terminal modes. Force `ENABLE_WINDOW_INPUT`, `ENABLE_MOUSE_INPUT`, and `ENABLE_EXTENDED_FLAGS`; clear processed/line/echo/quick-edit modes. The console queues Windows' translated VT text as Unicode key records and resize as an independent `WINDOW_BUFFER_SIZE_EVENT`. Moor serializes the translated UTF-16 records as UTF-8 at the ConPTY boundary, never parses or consumes ambiguous CSI input, and restores both original modes on drop.
 
 **Tech Stack:** Rust, Win32 Console API, ConPTY, GitHub Actions native Windows runners.
 
 ---
 
-### Task 1: Specify low-level record mode in tests
+### Task 1: Specify VT-engine record mode in tests
 
 **Files:**
 - Modify: `tests/unit/windows_security.rs:59-83`
 - Modify: `tests/windows.rs:1020-1450`
 
-- [ ] **Step 1: Make the unit test require VT input to be cleared**
+- [ ] **Step 1: Make the unit test require the complete VT-engine mode**
 
-Include `ENABLE_VIRTUAL_TERMINAL_INPUT` in the input passed to `viewer_modes`, then replace the current nonzero assertion with:
+Include poisoned disabled mouse/window/VT state in the input passed to `viewer_modes`, then require:
 
 ```rust
-assert_eq!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
 assert_eq!(
-    input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
-    ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+    input & (ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS),
+    ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
 );
 ```
 
@@ -32,13 +32,13 @@ Retain the existing assertions that processed, line, echo, and quick-edit input 
 
 - [ ] **Step 2: Make the shipped-process test assert the same contract**
 
-Remove the `CSI ?9001h` wait because that sequence is specific to VT input mode and is absent on the Server 2022 console host. Change the live-mode assertion to require:
+The live-mode assertion must require:
 
 ```rust
-assert_eq!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
 assert_eq!(
-    input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
-    ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+    input & (ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS),
+    ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
 );
 ```
 
@@ -48,32 +48,36 @@ Replace the encoded win32-input-mode detach fixture with the user-visible raw de
 console.write(&[0x1c]).unwrap();
 ```
 
-Keep the existing real-process assertions for `A -> resize(41,101) -> B`, successful viewer detach, and exact restoration of the original console modes. This legacy Console API child proves record/resize ordering.
+Keep the existing real-process assertions for `A -> resize(41,101) -> B`, successful viewer detach, and exact restoration of the original console modes. This legacy Console API child proves record/resize ordering. Add a VT-native child that emits application-cursor mode (`CSI ?1h`) before readiness; inject an Up record in the outer console and require Windows' translated `ESC O A` bytes, not the normal-mode `ESC [ A` bytes.
 
-- [ ] **Step 3: Split exact-byte translation proof from shipped record-semantics proof**
+- [ ] **Step 3: Split the Moor boundary proof from the platform-boundary proof**
 
-Add a Windows unit test at Moor's `ConsoleInput::record` / `ConsoleInput::encode` boundary. Feed adjacent key-down, repeat-one input records for `A`, UTF-16 `D83D DE42` (🙂), `00E9` (é), semantic NUL, and `Z`, encode with CP65001, and require the complete vector, including length, to equal:
+Add a Windows unit test at Moor's `ConsoleInput::record` / `ConsoleInput::encode` boundary. Feed adjacent key-down, repeat-one input records for `A`, UTF-16 `D83D DE42` (🙂), `00E9` (é), semantic NUL, and `Z`, and require the complete UTF-8 vector, including length, to equal:
 
 ```rust
 b"A\xf0\x9f\x99\x82\xc3\xa9\0Z"
 ```
 
-This unit test is the exact-byte proof. Do not use ANSI `ReadFile` or `ReadConsoleA` in the real child: the console's ANSI input path obtains one UTF-16 unit through `GetChar` and converts each call separately, so a supplementary scalar split across `D83D DE42` cannot be required to survive that boundary as one UTF-8 sequence.
+This unit test proves Moor's record-to-UTF-8 boundary independently of the downstream
+ConPTY reconstruction that Windows owns. It must include both the modern
+`VkKeyScanW(0)` chord and Server 2019's exact legacy all-zero NUL record. Add a
+Windows-only VT-native helper in `tests/windows.rs` that runs as the real session
+child, enables application-cursor mode, and reads stdin with `ReadFile`. The shipped
+fixture proves the observable ASCII/application-cursor vector exactly; it does not
+misattribute older ConPTY's loss of non-BMP/NUL reconstruction to Moor.
 
-Add a separate Windows-only helper test in `tests/windows.rs` that runs as the real session child and:
+Add an outer-console sender helper that issues one `WriteConsoleInputW` batch containing `A`, a real Up record, and `Z`. It must set the outer code page to a legacy non-UTF-8 page, assert that every record was written, then create a sender-complete sentinel file whose path is passed by environment. Spawn it in the same outer pseudoconsole after the Moor viewer reports ready, and pump the outer ConPTY output while waiting for the bounded sender exit so sender panic diagnostics are retained.
 
-1. selects CP65001;
-2. configures its inner ConPTY input for low-level records by clearing `ENABLE_VIRTUAL_TERMINAL_INPUT`, processed, line, echo, and quick-edit input while preserving `ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS`;
-3. uses only bounded `WaitForSingleObject` plus `ReadConsoleInputW` calls;
-4. accepts exactly the ordered semantic UTF-16 sequence `0041 D83D DE42 00E9 0000 005A`, requiring every accepted record to be key-down with repeat one and rejecting wrong or extra semantic records. At the inner-console compatibility boundary only, normalize either the newer exact `VkKeyScanW(0)` NUL chord or the historical exact raw-zero record used by Windows 10 1809 and Server 2019 conhost.
+Do not parse or filter `CSI 8;<rows>;<columns>t`: it is indistinguishable from literal typed, pasted, or query-reply input. Resize must come only from `WINDOW_BUFFER_SIZE_EVENT` records.
 
-Add an outer-console sender helper that issues one `WriteConsoleInputW` batch containing those adjacent key-down records. It must assert that every record was written, then create a sender-complete sentinel file whose path is passed by environment. Spawn it in the same outer pseudoconsole after the Moor viewer reports ready, and pump the outer ConPTY output while waiting for the bounded sender exit so sender panic diagnostics are retained.
+After reading exactly the expected byte count, the child must wait for the
+sender-complete sentinel, compare the whole received byte vector exactly, and require
+the input handle to remain unsignaled for a bounded 500 ms quiet interval. The sentinel
+proves the sender did not merely pause mid-batch; whole-vector equality rejects
+duplication, reordering, and same-batch prefix/suffix leakage, while the quiet interval
+rejects a delayed duplicate or suffix.
 
-Construct the sender's semantic NUL exactly as `console_wide_with_nul` does: call `VkKeyScanW(0)`, use mapping bits 0..7 for `wVirtualKeyCode`, and normalize mapping bits 8/9/10 against shift/control/alt state. The sender sets `bKeyDown=TRUE`, `wRepeatCount=1`, and `uChar.UnicodeChar=0`. This includes the documented `-1` mapping bit-pattern case; do not substitute a raw zero record at the Moor input boundary. Microsoft Terminal commit `8747a39` added the chord reconstruction on 2023-11-27, so the real-child receiver must additionally accept the older conhost's exact raw-zero representation (`VK=0`, scan=0, controls=0) without weakening Moor's exact semantic-NUL unit proof.
-
-After accepting `Z`, the child must wait for the sender-complete sentinel, then continue bounded record reads until a fixed 500 ms quiet deadline. Drain and ignore non-character records, but fail on every additional semantic input record, including duplicates and reordered suffixes. The sentinel proves the sender did not merely pause mid-batch.
-
-The parent must assert sender and viewer success and the real session child's zero exit status. Together, the unit test and shipped-process fixture prove `ReadConsoleInputW -> UTF-16 scalar assembly -> exact CP65001 bytes -> Moor wire -> inner low-level semantic records` without making an invalid exact-byte claim across the lossy ANSI console input boundary.
+The parent must assert sender and viewer success and the real session child's zero exit status. Together, the unit test and shipped-process fixture prove Windows VT translation, `ReadConsoleInputW -> UTF-16 scalar assembly -> exact UTF-8 bytes`, resize ordering, and the real Moor wire path without claiming behavior beyond the frozen ConPTY boundary.
 
 - [ ] **Step 4: Run local formatting and cross-target compile checks**
 
@@ -100,21 +104,25 @@ git push origin codex/issue21-windows
 
 Inspect the exact-SHA `Hosted native evidence` run. Expected before the production change: Windows native tests fail because `viewer_modes` still leaves `ENABLE_VIRTUAL_TERMINAL_INPUT` set; all unrelated lanes remain green. Record the exact failing test names and SHA rather than treating a compile-only result as RED evidence.
 
-### Task 2: Configure the viewer for record input
+### Task 2: Configure the viewer for VT-engine record input
 
 **Files:**
 - Modify: `src/windows.rs:2027-2038`
 
-- [ ] **Step 1: Clear VT input in the mode transformation**
+- [ ] **Step 1: Force the complete VT-engine mode transformation**
 
 Change the input expression to:
 
 ```rust
-(input | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-    & !(raw | ENABLE_VIRTUAL_TERMINAL_INPUT)
+(input
+    | ENABLE_EXTENDED_FLAGS
+    | ENABLE_VIRTUAL_TERMINAL_INPUT
+    | ENABLE_WINDOW_INPUT
+    | ENABLE_MOUSE_INPUT)
+    & !raw
 ```
 
-Do not alter the output expression, `ConsoleInput`, `ViewerConsole::drop`, or the record batching/Unicode/resize logic.
+Keep output VT enabled and preserve `ViewerConsole::drop` restoration. Serialize accepted UTF-16 scalars with CP_UTF8 regardless of the outer console code page. Normalize only the exact Server 2019 legacy all-zero NUL record in addition to the modern NUL chord. Retain Windows' translated cursor/function/mouse/focus VT records and independent resize records in queue order.
 
 - [ ] **Step 2: Run local focused and full host checks**
 
@@ -140,7 +148,7 @@ git push origin codex/issue21-windows
 
 - [ ] **Step 4: Gate the merge candidate on exact hosted native evidence**
 
-Require both `Native hosted / windows-2022-x64` and `Native hosted / windows-11-arm64` to pass the full real-process suite at the exact production-fix SHA. The suite must include the legacy record/resize child, the inner record-mode semantic child, and the exact-byte translation-boundary unit test. Also require all six POSIX/musl/macOS lanes to remain green.
+Require both `Native hosted / windows-2022-x64` and `Native hosted / windows-11-arm64` to pass the full real-process suite at the exact production-fix SHA. The suite must include the legacy record/resize child, the VT-native exact-byte child, and the exact-byte translation-boundary unit test. Also require all six POSIX/musl/macOS lanes to remain green.
 
 This is merge-candidate regression evidence, not the full §12.8 release-conformance claim: Server 2022 is not a substitute for required Server 2019 or Windows 10 1809, and the hosted workflow supplies neither WSL1 nor WSL2.
 
@@ -202,9 +210,9 @@ Every dynamic result must name that same release-candidate commit and archive th
 Execute at the exact candidate SHA:
 
 ```text
-Windows 10 1809 x64       legacy + record-mode semantic child + exact-byte unit proof
-Windows Server 2019 x64   legacy + record-mode semantic child + exact-byte unit proof
-Windows 11 ARM64          legacy + record-mode semantic child + exact-byte unit proof
+Windows 10 1809 x64       legacy + VT-native child + exact-byte unit proof
+Windows Server 2019 x64   legacy + VT-native child + exact-byte unit proof
+Windows 11 ARM64          legacy + VT-native child + exact-byte unit proof
 WSL1 Ubuntu 22.04 x64     shipped-artifact real-process suite
 WSL2 Ubuntu 22.04 x64     shipped-artifact real-process suite
 ```

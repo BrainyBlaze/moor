@@ -156,6 +156,19 @@ pub fn accept_bootstrap_command(bytes: &[u8], nonce: [u8; 16], resumed: &mut boo
     Some(kind)
 }
 
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn console_control_kind(kind: u32) -> Option<bool> {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    match kind {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(false),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(true),
+        _ => None,
+    }
+}
+
 #[cfg(any(windows, test))]
 fn exact_descriptor_semantics(
     owner_matches: bool,
@@ -288,15 +301,17 @@ mod native {
         )?;
         Ok(Some(code))
     }
-    const BOOTSTRAP_SELECTOR: &str = "DESK_MOOR_BOOTSTRAP";
-    const BOOTSTRAP_CONTROL: &str = "DESK_MOOR_BOOTSTRAP_CONTROL";
-    const BOOTSTRAP_RESULT: &str = "DESK_MOOR_BOOTSTRAP_RESULT";
-    const BOOTSTRAP_STDERR: &str = "DESK_MOOR_BOOTSTRAP_STDERR";
-    const BOOTSTRAP_INSTRUMENT: &str = "DESK_MOOR_BOOTSTRAP_INSTRUMENT";
-    const BOOTSTRAP_DIRECTORY: &str = "DESK_MOOR_BOOTSTRAP_DIRECTORY";
-    const INSTRUMENT_CHANNEL: &str = "DESK_MOOR_INSTRUMENT_CHANNEL";
-    const INSTRUMENT_NONCE: &str = "DESK_MOOR_INSTRUMENT_NONCE";
-    const DETACHED_GEOMETRY: &str = "DESK_MOOR_DETACHED_GEOMETRY";
+    const BOOTSTRAP_SELECTOR: &str = "MOOR_BOOTSTRAP";
+    const BOOTSTRAP_CONTROL: &str = "MOOR_BOOTSTRAP_CONTROL";
+    const BOOTSTRAP_RESULT: &str = "MOOR_BOOTSTRAP_RESULT";
+    const BOOTSTRAP_STDERR: &str = "MOOR_BOOTSTRAP_STDERR";
+    const BOOTSTRAP_INSTRUMENT: &str = "MOOR_BOOTSTRAP_INSTRUMENT";
+    const BOOTSTRAP_DIRECTORY: &str = "MOOR_BOOTSTRAP_DIRECTORY";
+    const INSTRUMENT_CHANNEL: &str = "MOOR_INSTRUMENT_CHANNEL";
+    const INSTRUMENT_NONCE: &str = "MOOR_INSTRUMENT_NONCE";
+    const SEMANTIC_TOKEN: &str = "MOOR_SESSION_SEMANTIC_TOKEN";
+    const DETACHED_GEOMETRY: &str = "MOOR_DETACHED_GEOMETRY";
+    const DETACHED_HOLDER: &str = "MOOR_DETACHED_HOLDER";
     fn path_buffer(what: &str, mut fill: impl FnMut(*mut u16, u32) -> u32) -> Result<PathBuf> {
         let size = fill(ptr::null_mut(), 0);
         check(size != 0, what)?;
@@ -404,11 +419,22 @@ mod native {
     type Pipe = Handle;
     #[derive(Default)]
     struct Pseudo(HPCON);
+    fn retire_pseudo_with(handle: HPCON, close: impl FnOnce(HPCON) + Send + 'static) {
+        if handle != 0 {
+            let _ = thread::Builder::new()
+                .name("moor-conpty-close".into())
+                .spawn(move || close(handle));
+        }
+    }
+    impl Pseudo {
+        fn retire(&mut self) {
+            let handle = std::mem::replace(&mut self.0, 0);
+            retire_pseudo_with(handle, |handle| unsafe { ClosePseudoConsole(handle) });
+        }
+    }
     impl Drop for Pseudo {
         fn drop(&mut self) {
-            if self.0 != 0 {
-                unsafe { ClosePseudoConsole(self.0) };
-            }
+            self.retire();
         }
     }
     unsafe impl AsPseudoConsole for Pseudo {
@@ -424,7 +450,10 @@ mod native {
     const SHARE_ALL: u32 = SHARE_RW | FILE_SHARE_DELETE;
     const NO_FOLLOW: u32 = FILE_FLAG_OPEN_REPARSE_POINT;
     const OPEN_SLOT: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES, SHARE_ALL);
-    const OPEN_STDERR: OpenPolicy = OpenPolicy(FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ);
+    const OPEN_STDERR: OpenPolicy = OpenPolicy(
+        FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+        FILE_SHARE_READ,
+    );
     const CREATE_STAGE: OpenPolicy = OpenPolicy(
         GENERIC_READ | GENERIC_WRITE | DELETE,
         FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -636,6 +665,135 @@ mod native {
                 _ => false,
             },
         ))
+    }
+    fn instrument_descriptor_matches(
+        actual: &SecurityDescriptor,
+        expected: &SecurityDescriptor,
+    ) -> Result<bool> {
+        use windows_permissions::constants::AceType::{
+            ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        };
+        let protected = descriptor_control(actual)? & SE_DACL_PROTECTED != 0;
+        let (Some(actual_owner), Some(expected_owner), Some(dacl)) =
+            (actual.owner(), expected.owner(), actual.dacl())
+        else {
+            return Ok(false);
+        };
+        if !protected || actual_owner != expected_owner {
+            return Ok(false);
+        }
+        let system: LocalBox<windows_permissions::Sid> = "S-1-5-18"
+            .parse()
+            .map_err(|error: io::Error| format!("build system SID: {error}"))?;
+        let write = GENERIC_ALL
+            | GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER;
+        for at in 0..dacl.len() {
+            let Some(ace) = dacl.get_ace(at) else {
+                return Ok(false);
+            };
+            if !matches!(
+                ace.ace_type(),
+                ACCESS_ALLOWED_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+                    | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+            ) {
+                continue;
+            }
+            let trusted = ace
+                .sid()
+                .is_some_and(|sid| sid == actual_owner || sid == &*system);
+            if !trusted && ace.mask().bits() & write != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn handle_attributes(file: &File) -> std::result::Result<u32, &'static str> {
+        let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
+            file_info(
+                file.as_raw_handle(),
+                FileAttributeTagInfo,
+                "inspect protected Windows object",
+            )
+            .map_err(|_| "io-error")?
+        };
+        Ok(attributes.FileAttributes)
+    }
+    fn validate_stderr_handle(file: &File, user: &str) -> std::result::Result<(), &'static str> {
+        let attributes = handle_attributes(file).map_err(|_| "io-error")?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("reparse-point");
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err("wrong-type");
+        }
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|_| "io-error")?;
+        let (expected, _) = descriptor(user, "FA").map_err(|_| "io-error")?;
+        if actual
+            .owner()
+            .zip(expected.owner())
+            .is_none_or(|(actual, expected)| actual != expected)
+        {
+            return Err("wrong-owner");
+        }
+        if !descriptor_matches(&actual, &expected).map_err(|_| "io-error")? {
+            return Err("broad-dacl");
+        }
+        Ok(())
+    }
+    fn validate_instrument_handle(
+        file: &File,
+        user: &str,
+    ) -> std::result::Result<(), &'static str> {
+        let attributes = handle_attributes(file).map_err(|_| "io-error")?;
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err("reparse-point");
+        }
+        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err("wrong-type");
+        }
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|_| "io-error")?;
+        let (expected, _) = descriptor(user, "FA").map_err(|_| "io-error")?;
+        if actual
+            .owner()
+            .zip(expected.owner())
+            .is_none_or(|(actual, expected)| actual != expected)
+        {
+            return Err("wrong-owner");
+        }
+        if !instrument_descriptor_matches(&actual, &expected).map_err(|_| "io-error")? {
+            return Err("broad-dacl");
+        }
+        Ok(())
+    }
+    fn validate_exact_handle(file: &File, user: &str, access: &str, directory: bool) -> Result<()> {
+        let attributes = handle_attributes(file).map_err(str::to_owned)?;
+        require(
+            attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+                && (attributes & FILE_ATTRIBUTE_DIRECTORY != 0) == directory,
+            "reject Windows reparse point",
+        )?;
+        let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
+        let actual = wrappers::GetSecurityInfo(file, SeObjectType::SE_FILE_OBJECT, selector)
+            .map_err(|error| format!("read protected DACL: {error}"))?;
+        let (expected, _) = descriptor(user, access)?;
+        require(
+            descriptor_matches(&actual, &expected)?,
+            "unexpected Windows owner/DACL",
+        )
     }
     #[cfg(test)]
     mod security_descriptor_tests {
@@ -978,6 +1136,8 @@ mod native {
         let holder_pid =
             u32::try_from(selector_decimal(holder)?).map_err(|_| "invalid holder pid")?;
         let command = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let semantic_token = std::env::var_os(SEMANTIC_TOKEN);
+        unsafe { std::env::remove_var(SEMANTIC_TOKEN) };
         require(!command.is_empty(), "empty bootstrap command")?;
         unsafe {
             let required =
@@ -1012,15 +1172,25 @@ mod native {
             }
             let (program, args) = command.split_first().unwrap();
             let mut requested = SpawnCommand::new(program);
-            requested.args(args).env_remove(INSTRUMENT_NONCE);
-            transfer_handles!(requested;
-                INSTRUMENT_CHANNEL => instrument.as_ref(), "instrumentation channel"
-            );
+            requested
+                .args(args)
+                .env_remove(INSTRUMENT_NONCE)
+                .env_remove(SEMANTIC_TOKEN);
+            requested.env_remove(INSTRUMENT_CHANNEL);
+            if let Some(instrument) = instrument.as_ref() {
+                win(
+                    requested.env_handle_lower_hex(INSTRUMENT_CHANNEL, instrument),
+                    "transfer instrumentation channel",
+                )?;
+            }
             if instrument.is_some() {
                 requested.env(
                     INSTRUMENT_NONCE,
                     format!("{:032x}", u128::from_be_bytes(instrument_nonce)),
                 );
+            }
+            if let Some(token) = semantic_token {
+                requested.env(SEMANTIC_TOKEN, token);
             }
             if let Some(handle) = &stderr {
                 requested.stderr(win(
@@ -1275,20 +1445,32 @@ mod native {
     }
     static SHUTDOWN: AtomicU8 = AtomicU8::new(0);
     unsafe extern "system" fn shutdown_handler(kind: u32) -> i32 {
-        if kind <= CTRL_CLOSE_EVENT || matches!(kind, CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
-            let previous = SHUTDOWN.fetch_or(1, Ordering::Relaxed);
-            SHUTDOWN.fetch_or(u8::from(previous != 0) << 1, Ordering::Relaxed);
-            TRUE
-        } else {
-            FALSE
+        let Some(terminal) = super::console_control_kind(kind) else {
+            return FALSE;
+        };
+        let previous = SHUTDOWN.fetch_or(1, Ordering::Relaxed);
+        SHUTDOWN.fetch_or(u8::from(previous != 0) << 1, Ordering::Relaxed);
+        if terminal {
+            // Returning TRUE for CLOSE/LOGOFF/SHUTDOWN authorizes Windows to
+            // terminate the process immediately. This callback owns no
+            // cleanup; it gives the normal loop a short graceful interval,
+            // then requests force early enough for durable retirement before
+            // Windows' shorter terminal-control deadline. Ctrl-C/Break retain
+            // the ordinary five-/ten-second schedule in the state machine.
+            unsafe { Sleep(2_000) };
+            SHUTDOWN.fetch_or(2, Ordering::Release);
+            loop {
+                unsafe { Sleep(INFINITE) };
+            }
         }
+        TRUE
     }
 
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
     crate::schema!(struct Staged fields; path: PathBuf, file: File, identity: [u8; 24]);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
     crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, created: bool, guards: Vec<File>);
-    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
+    crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, child_released: bool, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
             self.control
@@ -1301,11 +1483,36 @@ mod native {
             )
         }
     }
+    fn publish_marker_stage(
+        stage: &Staged,
+        marker: &Path,
+        user: &str,
+        after_move: impl FnOnce(&Path),
+    ) -> Result<()> {
+        unsafe {
+            win32!(
+                MoveFileExW(
+                    wide(stage.path.as_os_str()).as_ptr(),
+                    wide(marker.as_os_str()).as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                ),
+                "publish protected marker"
+            )?;
+            after_move(marker);
+            let final_file = open_handle(marker, OPEN_MARKER, None, "reopen protected marker")?;
+            validate_exact_handle(final_file.0.as_ref().unwrap(), user, "FR", false)?;
+            require(
+                file_identity(final_file.raw())? == stage.identity,
+                "marker identity changed",
+            )
+        }
+    }
     impl Native {
         fn prepare_storage(&mut self, marker_identity: [u8; 24]) -> Result<()> {
             self.identity = session_identity(marker_identity);
             let start = (now(), unsafe { GetTickCount64() }, boot_identity());
             let event_path = self.event.as_ref().map(|target| target.path.as_path());
+            let event_directory = self.event.as_ref().and_then(|target| target.guards.last());
             let event_identity = event_path.map(|path| os_bytes(path.as_os_str()));
             let instrument_identity = self
                 .instrument
@@ -1327,6 +1534,7 @@ mod native {
                     event_identity: event_identity.as_deref(),
                     instrument_identity: instrument_identity.as_deref(),
                     event_store: None,
+                    event_directory,
                     stores: None,
                     event_layout: 2,
                     log_cap: self.options.log_cap,
@@ -1360,6 +1568,7 @@ mod native {
                 self.inject_and_ack(pid, nonce)?;
             }
             self.bootstrap.exchange(1)?;
+            self.child_released = true;
             self.prepublication_alive()?;
             self.publish_marker()?;
             Ok(listener)
@@ -1408,10 +1617,7 @@ mod native {
                 )?;
                 self.job = Some(job);
                 if let Some(path) = &self.options.stderr {
-                    let path = absolute(path)?;
-                    validate(&path, &self.sid, "FA", false)?;
-                    self.stderr =
-                        open_handle(&path, OPEN_STDERR, None, "open protected stderr sink")?;
+                    self.stderr = open_stderr_operand(path, &self.sid, |_| {})?;
                 }
                 let (command_read, bootstrap_control) =
                     Pipe::pair("create bootstrap control channel")?;
@@ -1438,7 +1644,14 @@ mod native {
                 bootstrap
                     .env_remove(BOOTSTRAP_SELECTOR)
                     .env_remove(INSTRUMENT_CHANNEL)
-                    .env_remove(INSTRUMENT_NONCE);
+                    .env_remove(INSTRUMENT_NONCE)
+                    .env_remove(SEMANTIC_TOKEN);
+                if self.semantic_token != [0; 16] {
+                    bootstrap.env(
+                        SEMANTIC_TOKEN,
+                        format!("{:032x}", u128::from_be_bytes(self.semantic_token)),
+                    );
+                }
                 bootstrap.env(
                     BOOTSTRAP_SELECTOR,
                     format!(
@@ -1519,21 +1732,7 @@ mod native {
             }
         }
         fn stage_instrument(&mut self, source: &Path, identity: &[u8]) -> Result<()> {
-            require(source.is_absolute(), "instrumentation path is not absolute")?;
-            let mut input = read_reparse(source, SHARE_ALL)?;
-            let attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe {
-                file_info(
-                    input.as_raw_handle(),
-                    FileAttributeTagInfo,
-                    "inspect instrumentation object",
-                )?
-            };
-            require(
-                attributes.FileAttributes
-                    & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-                    == 0,
-                "validate instrumentation object",
-            )?;
+            let mut input = open_instrument_operand(source, &self.sid, |_| {})?;
             let stage = instrument_stage(
                 &self.stage_root,
                 identity,
@@ -1649,29 +1848,16 @@ mod native {
             })
         }
         fn publish_marker(&mut self) -> Result<()> {
-            unsafe {
-                let staged_identity = self.stage.as_ref().unwrap().identity;
-                self.prepare_storage(staged_identity)?;
-                self.prepublication_alive()?;
-                self.ready.notice(1, 0);
-                let stage = &self.stage.as_ref().unwrap().path;
-                win32!(
-                    MoveFileExW(
-                        wide(stage.as_os_str()).as_ptr(),
-                        wide(self.marker.as_os_str()).as_ptr(),
-                        MOVEFILE_WRITE_THROUGH,
-                    ),
-                    "publish protected marker"
-                )?;
-                validate(&self.marker, &self.sid, "FR", false)?;
-                let final_file =
-                    open_handle(&self.marker, OPEN_MARKER, None, "reopen protected marker")?;
-                require(
-                    file_identity(final_file.raw())? == staged_identity,
-                    "marker identity changed",
-                )?;
-                Ok(())
-            }
+            let staged_identity = self.stage.as_ref().unwrap().identity;
+            self.prepare_storage(staged_identity)?;
+            self.prepublication_alive()?;
+            self.ready.notice(1, 0);
+            publish_marker_stage(
+                self.stage.as_ref().unwrap(),
+                &self.marker,
+                &self.sid,
+                |_| {},
+            )
         }
 
         fn rollback_unpublished(&mut self) {
@@ -1733,10 +1919,14 @@ mod native {
                 // keep draining concurrently while this detached close first
                 // releases the bootstrap and then the console ownership.
                 self.bootstrap.control = Pipe::default();
-                let conpty = std::mem::replace(&mut self.conpty.0, 0);
-                drop(thread::spawn(move || drop(Pseudo(conpty))));
+                self.conpty.retire();
             }
             Ok(exit.map(NativeExit::Code))
+        }
+        fn abandon(&mut self) {
+            self.bootstrap.control = Pipe::default();
+            drop(self.job.take());
+            self.conpty.retire();
         }
     }
 
@@ -1744,6 +1934,54 @@ mod native {
         path_buffer("resolve absolute Windows path", |out, size| unsafe {
             GetFullPathNameW(wide(path.as_os_str()).as_ptr(), size, out, ptr::null_mut())
         })
+    }
+    fn caller_rejection(surface: &str, path: &Path, cause: &str) -> String {
+        format!(
+            "{surface} rejected: {} ({cause})",
+            name::render(path.as_os_str())
+        )
+    }
+    fn caller_open_cause(error: &io::Error) -> &'static str {
+        match error.raw_os_error().map(|value| value as u32) {
+            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => "missing",
+            Some(ERROR_DIRECTORY) => "wrong-type",
+            Some(ERROR_CANT_ACCESS_FILE) => "reparse-point",
+            _ => "io-error",
+        }
+    }
+    fn open_stderr_operand(
+        operand: &Path,
+        user: &str,
+        after_open: impl FnOnce(&File),
+    ) -> Result<Handle> {
+        let reject = |cause| caller_rejection("standard-error sink", operand, cause);
+        let path = absolute(operand).map_err(|_| reject("io-error"))?;
+        let file = OpenOptions::new()
+            .access_mode(OPEN_STDERR.0)
+            .share_mode(OPEN_STDERR.1)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|error| reject(caller_open_cause(&error)))?;
+        after_open(&file);
+        validate_stderr_handle(&file, user).map_err(reject)?;
+        Ok(Handle(Some(file)))
+    }
+    fn open_instrument_operand(
+        operand: &Path,
+        user: &str,
+        after_open: impl FnOnce(&File),
+    ) -> Result<File> {
+        let reject = |cause| caller_rejection("instrumentation", operand, cause);
+        crate::ensure!(operand.is_absolute(), reject("not-absolute"));
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(operand)
+            .map_err(|error| reject(caller_open_cause(&error)))?;
+        after_open(&file);
+        validate_instrument_handle(&file, user).map_err(reject)?;
+        Ok(file)
     }
     fn event_rejection(path: &Path, cause: &str) -> String {
         format!(
@@ -2024,12 +2262,19 @@ mod native {
                 && validate(target, user, access, directory).is_ok()
         })
     }
+    const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
+    const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
+
     fn viewer_modes(input: u32, output: u32) -> [u32; 2] {
         let raw =
             ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
         [
-            (input | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-                & !(raw | ENABLE_VIRTUAL_TERMINAL_INPUT),
+            (input
+                | ENABLE_EXTENDED_FLAGS
+                | ENABLE_VIRTUAL_TERMINAL_INPUT
+                | ENABLE_WINDOW_INPUT
+                | ENABLE_MOUSE_INPUT)
+                & !raw,
             output
                 | ENABLE_PROCESSED_OUTPUT
                 | ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -2048,6 +2293,34 @@ mod native {
         require(crate::wire::valid_size(size), invalid).map(|_| size)
     }
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
+    struct ViewerInputMode(HANDLE);
+    impl ViewerInputMode {
+        fn write(handle: HANDLE, bytes: &[u8]) -> Result<()> {
+            let mut written = 0;
+            win32!(
+                WriteFile(
+                    handle,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    ptr::null_mut(),
+                ),
+                "write viewer input-mode control"
+            )?;
+            require(
+                written == bytes.len() as u32,
+                "short viewer input-mode control write",
+            )
+        }
+        fn enable(handle: HANDLE) -> Result<Self> {
+            Self::write(handle, WIN32_INPUT_ENABLE).map(|()| Self(handle))
+        }
+    }
+    impl Drop for ViewerInputMode {
+        fn drop(&mut self) {
+            Self::write(self.0, WIN32_INPUT_DISABLE).ok();
+        }
+    }
     impl ViewerConsole {
         fn detect() -> Option<Self> {
             let handles =
@@ -2071,6 +2344,11 @@ mod native {
     fn console_wide_with_nul(key: KEY_EVENT_RECORD, nul: i16) -> Option<(u16, u16)> {
         let unit = unsafe { key.uChar.UnicodeChar };
         let null = unit == 0 && {
+            // Windows 10 1809 and Server 2019 predate conhost's reconstructed
+            // VkKeyScanW chord for a NUL emitted by its VT input engine. They
+            // enqueue one otherwise-empty key-down record instead.
+            let legacy =
+                key.wVirtualKeyCode == 0 && key.wVirtualScanCode == 0 && key.dwControlKeyState == 0;
             let expected = nul as u16 & 0x7ff;
             let chord = key.wVirtualKeyCode
                 | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
@@ -2078,7 +2356,7 @@ mod native {
                     << 9
                 | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
                     << 10;
-            chord == expected
+            legacy || chord == expected
         };
         (key.bKeyDown != 0 && key.wRepeatCount != 0 && (unit != 0 || null))
             .then_some((unit, key.wRepeatCount))
@@ -2100,7 +2378,6 @@ mod native {
         records: [INPUT_RECORD; CONSOLE_READ_RECORDS],
         next: usize,
         count: usize,
-        codepage: u32,
     }
 
     impl ConsoleInput {
@@ -2112,7 +2389,6 @@ mod native {
                 records: [INPUT_RECORD::default(); CONSOLE_READ_RECORDS],
                 next: 0,
                 count: 0,
-                codepage: 0,
             }
         }
 
@@ -2231,10 +2507,6 @@ mod native {
             if wait != WAIT_OBJECT_0 {
                 return Err(());
             }
-            let codepage = unsafe { GetConsoleCP() };
-            if codepage == 0 {
-                return Err(());
-            }
             let mut count = 0;
             let read = unsafe {
                 ReadConsoleInputW(
@@ -2249,7 +2521,6 @@ mod native {
             }
             self.next = 0;
             self.count = count as usize;
-            self.codepage = codepage;
             Ok(true)
         }
 
@@ -2297,18 +2568,13 @@ mod native {
                         }
                     }
                 }
-                if codepage.is_some_and(|value| value != self.codepage) {
-                    if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
-                        return self.finish(output, InputState::Closed);
-                    }
-                    if output.len() >= CONSOLE_BYTE_TARGET {
-                        return InputState::Bytes(output);
-                    }
-                }
-                codepage = Some(self.codepage);
+                // The console VT engine exposes UTF-16 records, while ConPTY's
+                // input boundary is always UTF-8. The viewer's legacy input
+                // code page must not alter this serialization.
+                codepage = Some(CP_UTF8);
                 let event = self.records[self.next];
                 self.next += 1;
-                match self.record(event, self.codepage, &mut wide) {
+                match self.record(event, CP_UTF8, &mut wide) {
                     Ok(Some((rows, columns))) => {
                         if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
                             return self.finish(output, InputState::Closed);
@@ -2347,6 +2613,7 @@ mod native {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
+        let _input_mode = ViewerInputMode::enable(terminal.0[1])?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let geometry = console_geometry(terminal.0[1]).unwrap_or((0, 0));
         let mut output = io::stdout();
@@ -2383,7 +2650,7 @@ mod native {
         let mut command = SpawnCommand::new(std::env::current_exe().map_err(string)?);
         command
             .args(std::env::args_os().skip(1))
-            .env("DESK_MOOR_DETACHED_HOLDER", "1")
+            .env(DETACHED_HOLDER, "1")
             .env(DETACHED_GEOMETRY, format!("{}:{}", geometry.0, geometry.1))
             .stdout(SpawnStdio::piped());
         let flags = CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP;
@@ -2488,6 +2755,66 @@ mod native {
         runtime.retired(unlinked, false);
         Ok(exit)
     }
+
+    fn observe_unpublished_exit(host: &mut Native) -> Result<Option<NativeExit>> {
+        if host.process.is_null() {
+            return Ok(None);
+        }
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if let Some(code) = process_exit(host.process.raw())? {
+                return Ok(Some(NativeExit::Code(code)));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finalizable_unpublished_exit(host: &mut Native) -> Result<Option<NativeExit>> {
+        if !host.child_released {
+            return Ok(None);
+        }
+        host.early_exit
+            .map(NativeExit::Code)
+            .map_or_else(|| observe_unpublished_exit(host), |exit| Ok(Some(exit)))
+    }
+
+    fn finalize_unpublished_exit(
+        mut host: Native,
+        observed: NativeExit,
+        invoked: &OsStr,
+        report: bool,
+    ) -> Result<i32> {
+        require(
+            host.artifacts.is_some(),
+            "unpublished child artifacts are unavailable",
+        )?;
+        if let Some(stage) = host.stage.take() {
+            delete_file(&stage.file);
+        }
+        let reader = std::mem::take(&mut host.output).into_file();
+        let writer = std::mem::take(&mut host.input).into_file();
+        let pty = Duplex::tracked(reader, writer, 1 << 20);
+        let mut artifacts = host.artifacts.take().unwrap();
+        let running = std::mem::take(&mut artifacts.running);
+        let (synthetic, geometry) = (host.synthetic, host.geometry);
+        let mut ready = std::mem::take(&mut host.ready);
+        let mut runtime = artifacts.runtime(pty, (synthetic, host));
+        runtime.set_geometry(geometry.0, geometry.1);
+        let status = runtime.drive(|_, _| None, || None)?.unwrap_or(observed);
+        let (exit, durable) = runtime.finish_exit(&running, status, None);
+        require(durable, "prepublication child exit was not durable")?;
+        crate::return_if!(!report, Ok(exit));
+        eprintln!(
+            "{}: child exited before session publication",
+            name::program(invoked)
+        );
+        ready.notice(3, 1);
+        Ok(1)
+    }
+
     pub(crate) fn create(
         mode: CreateMode,
         path: &Path,
@@ -2500,9 +2827,8 @@ mod native {
             mode,
             CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
         );
-        let selected =
-            std::env::var_os("DESK_MOOR_DETACHED_HOLDER").as_deref() == Some(OsStr::new("1"));
-        unsafe { std::env::remove_var("DESK_MOOR_DETACHED_HOLDER") };
+        let selected = std::env::var_os(DETACHED_HOLDER).as_deref() == Some(OsStr::new("1"));
+        unsafe { std::env::remove_var(DETACHED_HOLDER) };
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
         let output =
             (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
@@ -2596,19 +2922,23 @@ mod native {
         let listener = match host.launch(&marker, &command, random[32..48].try_into().unwrap()) {
             Ok(listener) => listener,
             Err(error) => {
-                host.rollback_unpublished();
-                if let Some(code) = host.early_exit {
-                    if child {
-                        host.ready.notice(
-                            if code == 0 { 1 } else { 3 },
-                            code.min(u16::MAX as u32) as u16,
-                        );
-                        if code == 0 {
-                            host.ready.notice(2, 0);
+                let observed = finalizable_unpublished_exit(&mut host)?;
+                if let Some(observed) = observed {
+                    if host.artifacts.is_none() {
+                        let marker_identity = host
+                            .stage
+                            .as_ref()
+                            .ok_or_else(|| "unpublished marker stage is unavailable".to_string())?
+                            .identity;
+                        if let Err(error) = host.prepare_storage(marker_identity) {
+                            host.rollback_unpublished();
+                            host.ready.notice(3, 1);
+                            return Err(error.into());
                         }
                     }
-                    return Ok(code as i32);
+                    return Ok(finalize_unpublished_exit(host, observed, invoked, child)?);
                 }
+                host.rollback_unpublished();
                 let result = if error.starts_with("could not execute ") {
                     127
                 } else {

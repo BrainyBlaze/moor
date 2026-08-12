@@ -27,7 +27,7 @@ fn text_error(value: impl ToString) -> String {
 }
 
 crate::schema!(struct pub SessionEntry pub fields; name: OsString, path: PathBuf, state: SessionState);
-crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str, event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_store: Option<Store>, stores: Option<ArtifactStores>, event_layout: u8, log_cap: u64);
+crate::schema!(struct pub ArtifactConfig<'a> pub fields; marker: &'a Path, event_path: Option<&'a Path>, encoding: &'a str, event_identity: Option<&'a [u8]>, instrument_identity: Option<&'a [u8]>, event_store: Option<Store>, event_directory: Option<&'a fs::File>, stores: Option<ArtifactStores>, event_layout: u8, log_cap: u64);
 crate::schema!(struct pub ArtifactStores pub fields; lifecycle: Store, event: Option<Store>, log: Option<Store>);
 crate::schema!(struct pub PreparedStorage pub fields; log: Option<(Store, u64)>, events: Option<EventConfig>, lifecycle: Store);
 crate::schema!(struct pub PreparedArtifacts pub fields; core: CoreConfig, storage: PreparedStorage, status: Vec<u8>, commit_at: usize, running: String);
@@ -340,14 +340,15 @@ pub fn supervised_generation(
     read: impl FnOnce(&OsStr) -> Result<u32>,
 ) -> Result<(u32, bool)> {
     let key = environment_key(invoked, "_GENERATION");
-    let selector = std::env::var_os("DESK_MOOR_LAUNCH_CHANNEL");
+    let launch_channel_key = environment_key(invoked, "_LAUNCH_CHANNEL");
+    let selector = std::env::var_os(&launch_channel_key);
     let first = std::env::var_os(&key);
-    let second = std::env::var_os("DESK_SESSION_GENERATION");
+    let second = std::env::var_os("MOOR_SESSION_GENERATION");
     unsafe {
-        std::env::remove_var("DESK_MOOR_LAUNCH_CHANNEL");
+        std::env::remove_var(&launch_channel_key);
         if clear_supervised || selector.is_none() {
             std::env::remove_var(&key);
-            std::env::remove_var("DESK_SESSION_GENERATION");
+            std::env::remove_var("MOOR_SESSION_GENERATION");
         }
     }
     let Some(selector) = selector else {
@@ -639,12 +640,36 @@ pub fn holder_artifacts(
             .map(|path| {
                 config.event_store.take().map_or_else(
                     || {
+                        #[cfg(windows)]
+                        let created = config.event_directory.map_or_else(
+                            || create(path, Kind::Event, event_header().as_bytes()),
+                            |directory| {
+                                Store::create_event_at(
+                                    path,
+                                    directory,
+                                    generation.1,
+                                    event_header().as_bytes(),
+                                )
+                                .map_err(|error| format!("store initialization failed: {error:?}"))
+                            },
+                        );
+                        #[cfg(not(windows))]
+                        let created = create(path, Kind::Event, event_header().as_bytes());
                         // The event target is caller-supplied, so its creation
                         // failure reports the frozen closure §6.2 row rather
                         // than a generic store message.
-                        create(path, Kind::Event, event_header().as_bytes()).map_err(|_| {
+                        created.map_err(|_| {
+                            #[cfg(windows)]
+                            let cause = config
+                                .event_directory
+                                .filter(|directory| {
+                                    !crate::windows::valid_store_directory(path, directory)
+                                })
+                                .map_or("io-error", |_| "identity-changed");
+                            #[cfg(not(windows))]
+                            let cause = "io-error";
                             format!(
-                                "event store rejected: {} (io-error)",
+                                "event store rejected: {} ({cause})",
                                 crate::name::render(path.as_os_str())
                             )
                         })
