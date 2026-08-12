@@ -260,9 +260,14 @@ jobs:
           BARE: ${{ needs.validate.outputs.bare }}
           TARGET: ${{ matrix.target }}
         run: |
+          # §3 "Usage and version": --version writes exactly '<p> <v>' plus
+          # LF, where <p> is the OB-29 rendering of the invoked basename.
+          # Every release asset name stays in OB-29's unchanged class
+          # [A-Za-z0-9._/-], so the exact expected line is derivable.
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
-          "./exact/$ASSET" --version | tee identity.txt
-          grep -Fq "$BARE" identity.txt
+          OUT="$("./exact/$ASSET" --version)"
+          echo "$OUT"
+          test "$OUT" = "$ASSET $BARE"
 
       - name: 'Gate: static linkage'
         if: matrix.gate == 'static-linkage'
