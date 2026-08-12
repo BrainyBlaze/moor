@@ -49,29 +49,24 @@ ASSET_SUFFIX = {
 
 GATE_ORDER = ["native-conformance", "compatibility", "static-linkage", "identity"]
 
-# Canonical lane names. A record naming any other lane is refused.
-KNOWN_LANES = {
-    "ubuntu-22.04-x64",
-    "ubuntu-24.04-arm64",
-    "alpine-3.20-x64",
-    "alpine-3.20-arm64",
-    "wsl1-x64",
-    "wsl2-x64",
-    "macos-15-intel",
-    "macos-15-arm64",
-    "windows-2022-x64",
-    "windows-10-1809-x64",
-    "windows-2019-x64",
-    "windows-11-arm64",
-}
-
 # docs/release-matrix.md, table-driven: the exact required (gate -> lanes)
-# closure per target. windows-x64 compatibility includes the two
-# below-input-floor lanes; Server 2022 is the input-fidelity-floor lane.
+# closure per target. Lane names are the canonical enrollment labels used by
+# .github/workflows/native-self-hosted.yml so a record cannot cite a lane the
+# frozen matrix does not assign to that target/gate.
+#
+# Windows x64: Server 2022 is the input-fidelity floor; Windows 10 1809 and
+# Server 2019 are §12.8 native below-floor provenance (release-matrix.md), so
+# they are native-conformance lanes, not compatibility. Linux compatibility
+# spans Ubuntu/Alpine/WSL1/WSL2 on the exact bytes.
 REQUIRED = {
     "x86_64-unknown-linux-musl": {
         "native-conformance": {"ubuntu-22.04-x64", "alpine-3.20-x64"},
-        "compatibility": {"ubuntu-22.04-x64", "alpine-3.20-x64", "wsl1-x64", "wsl2-x64"},
+        "compatibility": {
+            "ubuntu-22.04-x64",
+            "alpine-3.20-x64",
+            "wsl1-ubuntu-22.04-x64",
+            "wsl2-ubuntu-22.04-x64",
+        },
         "static-linkage": {"ubuntu-22.04-x64"},
         "identity": {"ubuntu-22.04-x64"},
     },
@@ -92,8 +87,12 @@ REQUIRED = {
         "identity": {"macos-15-arm64"},
     },
     "x86_64-pc-windows-msvc": {
-        "native-conformance": {"windows-2022-x64"},
-        "compatibility": {"windows-2022-x64", "windows-10-1809-x64", "windows-2019-x64"},
+        "native-conformance": {
+            "windows-2022-x64",
+            "windows-10-1809-x64",
+            "windows-server-2019-x64",
+        },
+        "compatibility": {"windows-2022-x64"},
         "static-linkage": {"windows-2022-x64"},
         "identity": {"windows-2022-x64"},
     },
@@ -103,6 +102,15 @@ REQUIRED = {
         "static-linkage": {"windows-11-arm64"},
         "identity": {"windows-11-arm64"},
     },
+}
+
+# Every (target, gate, lane) the matrix permits — a record outside this exact
+# set is refused (no "any globally known lane on any gate").
+PERMITTED = {
+    (target, gate, lane)
+    for target, gates in REQUIRED.items()
+    for gate, lanes in gates.items()
+    for lane in lanes
 }
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -241,8 +249,8 @@ def main() -> None:
             if gate not in GATE_ORDER:
                 fail(f"{target}: unknown gate {gate!r} in {name}")
             lane = ascii_clean(verify.get("lane", ""), f"{target}.{gate}.lane")
-            if lane not in KNOWN_LANES:
-                fail(f"{target}: unknown lane {lane!r} in {name}")
+            if (target, gate, lane) not in PERMITTED:
+                fail(f"{target}: lane {lane!r} is not a matrix lane for gate {gate!r} in {name}")
             if (gate, lane) in seen:
                 fail(f"{target}: duplicate (gate, lane) ({gate}, {lane})")
             seen.add((gate, lane))

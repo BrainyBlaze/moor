@@ -3,16 +3,21 @@ name: Release candidate
 # Implements docs/release-manifest-v1.md and docs/release-matrix.md:
 # build each of the six targets exactly once, establish size/sha256 at the
 # build boundary, upload single-file artifacts with immutable IDs, verify
-# the exact downloaded bytes on native and compatibility lanes, ingest
-# externally produced lane records by immutable artifact ID, and only when
-# the full table-driven (gate, lane) closure holds emit the canonical
-# manifest and SHA256SUMS as the moor-release-candidate-v1 metadata
-# artifact, exposing its immutable ID as a machine-readable output.
+# the exact downloaded bytes on hosted, hosted-container, and self-hosted
+# native/compatibility lanes — every lane downloading the candidate by this
+# run's immutable artifact ID — and only when the full table-driven
+# (gate, lane) closure holds emit the canonical manifest and SHA256SUMS as
+# the moor-release-candidate-v1 metadata artifact, exposing its immutable ID
+# as a machine-readable output.
 #
 # Promotion is a separate, later workflow: nothing here creates a tag or a
-# release, and every gate fails closed. A hosted-only run cannot emit
-# metadata: the WSL and below-input-floor Windows compatibility lanes must
-# arrive as external records or the assembler refuses.
+# release, and every gate fails closed. Every required (gate, lane) is
+# proved inside this one run — hosted, hosted-container (Alpine), and
+# self-hosted (WSL1/WSL2, Windows 10 1809, Windows Server 2019) — and each
+# verifier downloads the candidate by THIS run's immutable artifact ID, so
+# provenance is bound to the run with no cross-run record ingestion. A
+# self-hosted lane whose enrollment-labelled runner is absent leaves its job
+# unstarted and the assembler refuses: metadata cannot be emitted without it.
 
 on:
   workflow_dispatch:
@@ -23,13 +28,6 @@ on:
       version:
         description: Proposed release version and tag name (vMAJOR.MINOR.PATCH)
         required: true
-      external_records:
-        description: >-
-          JSON array of GitHub Actions artifact IDs holding externally
-          produced verify-<target>-<gate>-<lane>.json records (WSL, Windows
-          10 1809, Windows Server 2019 lanes). Empty means none.
-        required: false
-        default: '[]'
 
 permissions:
   contents: read
@@ -394,10 +392,17 @@ jobs:
           while IFS= read -r exe; do
             grep -a -q -- "$BIN" "$exe" || grep -a -q -- "$(basename "$BIN")" "$exe"
           done < tests.txt
-          # Boundary proof 2 (negative): with a wrong program at that path
-          # the suite must fail, proving the fixtures execute those bytes.
+          # Boundary proof 2 (negative): with a wrong program at that path the
+          # suite must fail, proving the fixtures execute those exact bytes.
+          # The wrong program is a freshly written real regular file that
+          # always exits nonzero — not a shell builtin — so `cp` cannot fail
+          # to stat it (a Windows runner keeps the .exe suffix on $BIN, and a
+          # non-executable stand-in still fails the run, which is the point).
           cp "$BIN" moor.compiled
-          cp "$(command -v false)" "$BIN"
+          printf '#!/bin/sh\nexit 7\n' > wrong-program
+          chmod +x wrong-program
+          cp wrong-program "$BIN"
+          test "$(hash_of "$BIN")" != "$SHA_EXPECTED"
           NEGATIVE_FAILED=0
           while IFS= read -r exe; do
             if ! "$exe" > /dev/null 2>&1; then NEGATIVE_FAILED=1; break; fi
@@ -560,54 +565,212 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  ingest:
-    name: Ingest external lane records
+  compat-wsl:
+    name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
     needs: [validate, build]
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            lane: wsl1-ubuntu-22.04-x64
+            runner: [self-hosted, linux, x64, wsl1-ubuntu-22.04-x64]
+          - target: x86_64-unknown-linux-musl
+            lane: wsl2-ubuntu-22.04-x64
+            runner: [self-hosted, linux, x64, wsl2-ubuntu-22.04-x64]
     steps:
-      - name: Download, verify, and republish each external record set
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Download the build record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: record-build-${{ matrix.target }}
+          path: records
+
+      - name: Verify metadata, download by this run's ID, enforce shape/digest
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          EXTERNAL: ${{ inputs.external_records }}
-          COMMIT: ${{ inputs.commit }}
+          TARGET: ${{ matrix.target }}
         run: |
-          echo "$EXTERNAL" | jq -e 'type == "array" and all(.[]; type == "string" or type == "number")' > /dev/null
-          COUNT="$(echo "$EXTERNAL" | jq length)"
-          mkdir -p external
-          for i in $(seq 0 $((COUNT - 1))); do
-            ID="$(echo "$EXTERNAL" | jq -r ".[$i]")"
-            gh api "repos/${{ github.repository }}/actions/artifacts/$ID" > meta.json
-            NAME="$(jq -r .name meta.json)"
-            case "$NAME" in record-verify-*|record-external-*) ;; *) echo "unexpected artifact name $NAME" >&2; exit 1 ;; esac
-            test "$(jq -r .expired meta.json)" = "false"
-            RUN="$(jq -r .workflow_run.id meta.json)"
-            gh api "repos/${{ github.repository }}/actions/artifacts/$ID/zip" > ext.zip
-            mkdir -p "external/$i" && (cd "external/$i" && unzip -q ../../ext.zip)
-            for record in external/$i/*.json; do
-              test "$(jq -r .commit "$record")" = "$COMMIT"
-              JOB="$(jq -r .jobId "$record")"
-              gh api "repos/${{ github.repository }}/actions/jobs/$JOB" > job.json
-              test "$(jq -r .conclusion job.json)" = "success"
-              test "$(jq -r .run_id job.json)" = "$(jq -r .workflowRunId "$record")"
-              test "$(jq -r .name job.json)" = "$(jq -r .jobName "$record")"
-            done
-            rm ext.zip
-          done
-          find external -type f -name '*.json' -exec cp {} external/ \; || true
-          ls external
+          ARTIFACT_ID="$(jq -r .artifactId "records/build-$TARGET.json")"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID" > artifact.json
+          test "$(jq -r .name artifact.json)" = "moor-candidate-$TARGET"
+          test "$(jq -r .expired artifact.json)" = "false"
+          test "$(jq -r .workflow_run.id artifact.json)" = "${{ github.run_id }}"
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > candidate.zip
+          python3 scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
+          mkdir exact && (cd exact && unzip -q ../candidate.zip)
+          test "$(sha256sum "exact/$ASSET" | cut -d' ' -f1)" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+          chmod +x "exact/$ASSET"
 
-      - name: Republish verified external records into this run
+      - name: Exercise the exact bytes under WSL
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BARE: ${{ needs.validate.outputs.bare }}
+        run: |
+          rustup target add "$TARGET" || true
+          command -v musl-gcc >/dev/null || sudo apt-get update -q && sudo apt-get install -qy musl-tools
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
+          printf '%s %s\n' "$ASSET" "$BARE" > expected.bin
+          "./exact/$ASSET" --version > out.bin 2> err.bin
+          test ! -s err.bin
+          cmp expected.bin out.bin
+          cargo test --release --target "$TARGET" --no-run --message-format=json \
+            > build.json 2> build.log || { cat build.log >&2; exit 1; }
+          BIN="target/$TARGET/release/moor"
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+            build.json > tests.txt
+          test -s tests.txt
+          cp "exact/$ASSET" "$BIN"
+          test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+          while IFS= read -r exe; do echo "== $exe"; "$exe"; done < tests.txt
+          test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+
+      - name: Record the compatibility reference
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          LANE: ${{ matrix.lane }}
+          COMMIT: ${{ inputs.commit }}
+          JOB_NAME: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
+        run: |
+          JOB_ID="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+            --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")"
+          test -n "$JOB_ID"
+          SHA="$(jq -r .sha256 "records/build-$TARGET.json")"
+          mkdir -p records-out
+          jq -n \
+            --arg gate compatibility --arg lane "$LANE" --arg commit "$COMMIT" \
+            --arg sha256 "$SHA" \
+            --arg runId "${{ github.run_id }}" \
+            --argjson attempt "${{ github.run_attempt }}" \
+            --arg jobId "$JOB_ID" --arg jobName "$JOB_NAME" \
+            '{gate: $gate, lane: $lane, commit: $commit, sha256: $sha256,
+              workflowRunId: $runId, workflowRunAttempt: $attempt,
+              jobId: $jobId, jobName: $jobName}' \
+            > "records-out/verify-$TARGET-compatibility-$LANE.json"
+
+      - name: Upload the compatibility record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: record-external
-          path: external/*.json
-          if-no-files-found: ignore
+          name: record-wsl-${{ matrix.target }}-${{ matrix.lane }}
+          path: records-out/
+          if-no-files-found: error
+          retention-days: 30
+
+  native-below-floor:
+    name: Native below-floor ${{ matrix.lane }}
+    needs: [validate, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: windows-10-1809-x64
+            runner: [self-hosted, windows, x64, windows-10-1809-x64]
+          - lane: windows-server-2019-x64
+            runner: [self-hosted, windows, x64, windows-server-2019-x64]
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Download the build record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: record-build-x86_64-pc-windows-msvc
+          path: records
+
+      - name: Verify metadata, download by this run's ID, enforce shape/digest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACT_ID="$(jq -r .artifactId "records/build-$TARGET.json")"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID" > artifact.json
+          test "$(jq -r .name artifact.json)" = "moor-candidate-$TARGET"
+          test "$(jq -r .expired artifact.json)" = "false"
+          test "$(jq -r .workflow_run.id artifact.json)" = "${{ github.run_id }}"
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > candidate.zip
+          python scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
+          mkdir exact && (cd exact && unzip -q ../candidate.zip)
+          test "$(sha256sum "exact/$ASSET" | cut -d' ' -f1)" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+
+      - name: 'Static CRT proof on the exact bytes'
+        shell: bash
+        run: |
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          python scripts/candidate-verify.py pe-imports "exact/$ASSET"
+
+      - name: '§12.8 native conformance below the input floor'
+        shell: bash
+        run: |
+          rustup target add "$TARGET" || true
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
+          cargo test --release --target "$TARGET" --no-run --message-format=json \
+            > build.json 2> build.log || { cat build.log >&2; exit 1; }
+          BIN="target/$TARGET/release/moor.exe"
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
+            build.json > tests.txt
+          test -s tests.txt
+          cp "exact/$ASSET" "$BIN"
+          test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+          while IFS= read -r exe; do echo "== $exe"; "$exe"; done < tests.txt
+          test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+
+      - name: Record the native-conformance reference
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANE: ${{ matrix.lane }}
+          COMMIT: ${{ inputs.commit }}
+          JOB_NAME: Native below-floor ${{ matrix.lane }}
+        run: |
+          JOB_ID="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+            --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")"
+          test -n "$JOB_ID"
+          SHA="$(jq -r .sha256 "records/build-$TARGET.json")"
+          mkdir -p records-out
+          jq -n \
+            --arg gate native-conformance --arg lane "$LANE" --arg commit "$COMMIT" \
+            --arg sha256 "$SHA" \
+            --arg runId "${{ github.run_id }}" \
+            --argjson attempt "${{ github.run_attempt }}" \
+            --arg jobId "$JOB_ID" --arg jobName "$JOB_NAME" \
+            '{gate: $gate, lane: $lane, commit: $commit, sha256: $sha256,
+              workflowRunId: $runId, workflowRunAttempt: $attempt,
+              jobId: $jobId, jobName: $jobName}' \
+            > "records-out/verify-$TARGET-native-conformance-$LANE.json"
+
+      - name: Upload the native-conformance record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: record-belowfloor-${{ matrix.lane }}
+          path: records-out/
+          if-no-files-found: error
           retention-days: 30
 
   manifest:
     name: Emit the canonical candidate metadata
-    needs: [validate, build, verify, compat-alpine, ingest]
+    needs: [validate, build, verify, compat-alpine, compat-wsl, native-below-floor]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     outputs:

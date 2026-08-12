@@ -59,7 +59,7 @@ def write_valid(records: str) -> None:
                     "lane": lane,
                     "commit": COMMIT,
                     "sha256": sha,
-                    "workflowRunId": "500" if lane not in ("wsl1-x64", "wsl2-x64", "windows-10-1809-x64", "windows-2019-x64") else "777",
+                    "workflowRunId": "500",
                     "workflowRunAttempt": 1,
                     "jobId": str(job),
                     "jobName": f"Verify {target} / {gate} / {lane}",
@@ -138,6 +138,15 @@ def main() -> None:
     trial_with("wrong verified commit", lambda t: mutate_json(os.path.join(t, sample), commit="2" * 40))
     trial_with("unknown lane", lambda t: mutate_json(os.path.join(t, sample), lane="ubuntu-20.04-x64"))
     trial_with("unknown gate", lambda t: mutate_json(os.path.join(t, sample), gate="smoke"))
+    # A real lane, but for a target/gate the matrix does not assign it to:
+    # a Linux identity lane presented on the Windows x64 target.
+    trial_with(
+        "foreign-target lane on gate",
+        lambda t: mutate_json(
+            os.path.join(t, "verify-x86_64-pc-windows-msvc-identity-windows-2022-x64.json"),
+            lane="ubuntu-22.04-x64",
+        ),
+    )
     trial_with(
         "duplicate (gate, lane)",
         lambda t: shutil.copyfile(os.path.join(t, sample), os.path.join(t, f"verify-{target}-identity-{lane}.copy.json")),
