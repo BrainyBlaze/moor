@@ -1,0 +1,272 @@
+# Moor release manifest v1
+
+This document defines the machine-readable identity of a Moor release
+candidate and the only permitted path from that candidate to a GitHub Release.
+The supported platforms, native execution requirements, and compatibility
+lanes are defined by the [release matrix](release-matrix.md). A downstream
+consumer downloads Moor binaries; it never builds Moor from source.
+
+The normative metadata files are:
+
+- `moor-release-manifest-v1.json`, described below; and
+- `SHA256SUMS`, covering exactly the six binary assets.
+
+Both files are candidate artifacts first. Promotion publishes those same bytes
+after full manual QA; it does not regenerate either file.
+
+## Fixed release identity
+
+Every v1 manifest has these fixed values and relationships:
+
+- `schemaVersion` is the JSON number `1`.
+- `repository` is exactly the JSON string
+  `"https://github.com/BrainyBlaze/moor"`.
+- `version` is exactly `v` followed by a stable SemVer core
+  (`vMAJOR.MINOR.PATCH`, with no leading zero, prerelease, or build suffix).
+- `commit` is exactly 40 lowercase hexadecimal characters and resolves
+  to a commit in the repository. When a GitHub API requires an owner/repository
+  slug, it is the fixed derivation `BrainyBlaze/moor`, not another manifest
+  field.
+- All six binaries are built from that exact commit. A target entry cannot
+  override it.
+
+The first release uses the proposed `version: "v0.1.0"`. That value is both the
+release version and tag name. The tag does not exist until full manual QA
+authorizes promotion. Where an asset embeds the crate version, it uses the
+`version` value after removing its one leading `v`, so `v0.1.0` embeds `0.1.0`.
+
+## Exact targets and names
+
+`targets` is an object containing exactly these six keys, in this canonical
+order. No alias, glibc target, GNU Windows target, seventh key, or missing key
+is valid.
+
+| target key | v0.1.0 release asset | candidate artifact name |
+|---|---|---|
+| `x86_64-unknown-linux-musl` | `moor-0.1.0-linux-x64` | `moor-candidate-x86_64-unknown-linux-musl` |
+| `aarch64-unknown-linux-musl` | `moor-0.1.0-linux-arm64` | `moor-candidate-aarch64-unknown-linux-musl` |
+| `x86_64-apple-darwin` | `moor-0.1.0-macos-x64` | `moor-candidate-x86_64-apple-darwin` |
+| `aarch64-apple-darwin` | `moor-0.1.0-macos-arm64` | `moor-candidate-aarch64-apple-darwin` |
+| `x86_64-pc-windows-msvc` | `moor-0.1.0-windows-x64.exe` | `moor-candidate-x86_64-pc-windows-msvc` |
+| `aarch64-pc-windows-msvc` | `moor-0.1.0-windows-arm64.exe` | `moor-candidate-aarch64-pc-windows-msvc` |
+
+For a later v1 manifest, only the `0.1.0` component in the release asset name
+changes to the manifest's `version` with its leading `v` removed. Candidate
+artifact names remain the exact target-qualified strings above. Each candidate
+artifact contains exactly one regular file whose basename is the corresponding
+release asset name; directory entries, links, and additional files are invalid.
+
+## JSON data model
+
+Every object has an exact key set. Producers do not emit extension keys, and
+consumers reject unknown keys, missing keys, duplicate object keys, `null`, and
+values of the wrong JSON type.
+
+### Top level
+
+Keys occur in this order:
+
+1. `schemaVersion`: the number `1`.
+2. `repository`: the string `"https://github.com/BrainyBlaze/moor"`.
+3. `version`: the version/tag described above.
+4. `commit`: the exact source commit.
+5. `candidate`: the candidate-run object.
+6. `targets`: the exact six-key target object.
+
+The candidate-run object has these keys in order:
+
+1. `workflowRunId`: the GitHub Actions run ID as a nonzero decimal string.
+2. `workflowRunAttempt`: the positive JSON integer run attempt.
+3. `metadataArtifactName`: exactly `"moor-release-candidate-v1"`.
+
+GitHub assigns the metadata artifact ID only after upload, so it cannot be
+self-recorded without a circular mutation. The candidate job output records
+that assigned ID alongside the run ID and attempt. Full manual QA and promotion
+must receive that immutable metadata artifact ID as an explicit input, retrieve
+it from the recorded run, and verify its name is
+`moor-release-candidate-v1`. The metadata artifact contains exactly
+`moor-release-manifest-v1.json` and `SHA256SUMS`.
+
+### Target entry
+
+Each target value is an object with these keys in order:
+
+1. `asset`: the literal release filename from the table, adjusted only for the
+   manifest `version` without its leading `v`, as described above.
+2. `size`: the binary's positive byte length as a JSON integer no greater than
+   `9007199254740991`.
+3. `sha256`: 64 lowercase hexadecimal characters: SHA-256 of exactly `size`
+   binary bytes.
+4. `artifactId`: the immutable GitHub Actions artifact ID as a nonzero decimal
+   string.
+5. `artifactName`: the exact candidate artifact name from the table.
+6. `provenance`: the provenance object.
+
+The GitHub artifact identified by `(repository, candidate.workflowRunId,
+artifactId)` must belong to `candidate.workflowRunAttempt`, have exactly the
+declared `artifactName`, and contain exactly the declared `asset`. An artifact
+name alone is never an identity.
+
+### Provenance
+
+The provenance object has exactly two keys in order:
+
+1. `build`: one job reference for the job that produced and uploaded the
+   target artifact.
+2. `verification`: a nonempty array of verification-job references.
+
+The build job reference has these keys in order:
+
+1. `workflowRunId`
+2. `workflowRunAttempt`
+3. `jobId`
+4. `jobName`
+
+The two IDs are nonzero decimal strings, the attempt is a positive JSON
+integer, and the name is the exact nonempty GitHub Actions job name. The build
+reference's run and attempt must equal the top-level candidate run and attempt.
+The artifact metadata must identify this build job's run as its creator.
+
+Each verification-job reference has these keys in order:
+
+1. `gate`: one of `native-conformance`, `compatibility`, `static-linkage`, or
+   `identity`.
+2. `lane`: the stable ASCII lane name used by the release workflow.
+3. `workflowRunId`
+4. `workflowRunAttempt`
+5. `jobId`
+6. `jobName`
+
+IDs, attempts, and job names use the same representation as the build
+reference. Every referenced job must have concluded `success`, must identify
+the same `repository` and `commit`, and must have downloaded the target
+by its declared candidate artifact ID. The references must cover every gate
+and exact-byte lane required for that target by `release-matrix.md`; one green
+job may appear once for each gate it proves. Linux entries require explicit
+`static-linkage` evidence. Missing or non-native evidence cannot be represented
+as a weaker provenance value and blocks the entire release.
+
+Verification references are ordered by the gate order shown above, then by
+ASCII `lane`, then numerically by run ID, run attempt, and job ID. Duplicate
+`(gate, lane)` pairs are invalid.
+
+## Canonical JSON bytes
+
+The candidate producer emits one deterministic representation:
+
+1. UTF-8 without a byte-order mark.
+2. The object and field orders defined above. `targets` uses the six-row order
+   in the target table.
+3. Two ASCII spaces per indentation level, one space after `:`, and no trailing
+   whitespace.
+4. The layout is the result of serializing the ordered data with a two-space
+   pretty-print indent: each opening `{` or `[` follows its key or array
+   position; each member or array element starts on a new line; each closing
+   delimiter is on its own line at its parent's indentation; and every
+   nonfinal member or element has one trailing comma.
+5. All strings are printable ASCII and contain neither `"` nor `\`, so no
+   JSON escape has an alternative spelling.
+6. Integers use unsigned base-10 notation with no leading zero, sign, decimal
+   point, or exponent.
+7. Exactly one LF (`0a`) terminates the final `}`.
+
+Consumers validate the semantic schema even if their JSON parser does not
+preserve member order. Producers and any tool comparing candidate metadata to
+published metadata compare the canonical bytes, not a reserialized
+approximation.
+
+### Desk pin projection
+
+After validating a QA-approved complete manifest, Desk commits a mechanical
+projection with exactly the top-level keys `schemaVersion`, `repository`,
+`version`, `commit`, and `targets`. It retains all six exact target keys; each
+target contains exactly `asset`, `size`, and `sha256`. Values are copied without
+renaming or normalization. Candidate, artifact, and provenance fields are
+intentionally excluded from the consumer pin, but they must have been validated
+before the projection was made.
+
+Desk may exercise the pinned candidate bytes through an explicit candidate base
+URL during integration and manual QA. Its production default is enabled only
+after promotion and resolves an asset as
+`${repository}/releases/download/${version}/${asset}`. It never treats a
+candidate override as the production release location.
+
+## `SHA256SUMS`
+
+`SHA256SUMS` is UTF-8/ASCII with no byte-order mark. It contains exactly six
+lines in the target-table order. Each line is:
+
+```text
+<64 lowercase hexadecimal SHA-256><two ASCII spaces><literal asset filename><LF>
+```
+
+There is no leading path, `*` marker, carriage return, comment, blank line, or
+entry for the metadata files. Every digest and filename must equal the
+corresponding manifest fields. The final line also ends in LF.
+
+For v0.1.0 the filename column is, literally:
+
+```text
+moor-0.1.0-linux-x64
+moor-0.1.0-linux-arm64
+moor-0.1.0-macos-x64
+moor-0.1.0-macos-arm64
+moor-0.1.0-windows-x64.exe
+moor-0.1.0-windows-arm64.exe
+```
+
+## Candidate construction and QA
+
+A manually dispatched candidate workflow accepts an exact `commit` and
+proposed `version`. It checks out that commit and performs this sequence:
+
+1. Build each of the six targets exactly once. The output of that build becomes
+   the candidate binary; no later lane compiles a substitute.
+2. Establish the authoritative `size` and `sha256` once at the build boundary,
+   upload the single-file target artifact, and capture its immutable artifact
+   ID and name. Later digest calculations are verification of that identity,
+   not a new candidate hash.
+3. Every compatibility, native-conformance, static-linkage, and identity job
+   downloads the artifact by the captured run/attempt/artifact ID, verifies its
+   sole filename, size, and digest before execution, and records the job
+   reference.
+4. Only after all automatic gates are green, create the canonical manifest and
+   `SHA256SUMS`, upload the two-file metadata artifact, and record its immutable
+   artifact ID in the workflow output and manual-QA record.
+
+Full manual QA downloads the metadata artifact and all six binary artifacts by
+those exact IDs. The QA record identifies the repository, source commit,
+candidate run and attempt, metadata artifact ID, six binary artifact IDs,
+sizes, and hashes. Testing a locally rebuilt binary, a same-named artifact, or
+bytes copied from another run does not satisfy the gate.
+
+## Immutable promotion
+
+Promotion is allowed only after the operator records that full manual QA passed
+for the exact candidate identity above. Only then may the tag named by
+`manifest.version` be created. The promotion workflow performs no compilation,
+linking, packaging, or source-based reconstruction.
+
+Promotion must:
+
+1. Resolve the tag named by `manifest.version` to a commit and require exact
+   equality with `manifest.commit`.
+2. Require the repository, candidate run ID and attempt, and metadata artifact
+   ID/name to equal the approved manual-QA record.
+3. Download each target artifact by the manifest's immutable artifact ID and
+   require GitHub metadata to match repository, candidate run/attempt, and
+   artifact name.
+4. Require each artifact to contain only its declared regular file, then verify
+   the filename, byte length, and SHA-256 before upload.
+5. Require the candidate manifest and `SHA256SUMS` to be byte-for-byte equal to
+   the files approved by manual QA.
+6. Upload the six verified raw binaries plus those two unchanged metadata files
+   to the GitHub Release for the exact `manifest.version` tag.
+7. Download the published release assets again and verify their byte length and
+   SHA-256 before reporting promotion success.
+
+An expired or missing candidate artifact, an artifact ID/name/run mismatch, a
+changed byte, a non-green or missing provenance job, a tag/source mismatch, an
+already-populated conflicting release asset, or an unverifiable manual-QA
+record fails closed. The remedy is a new candidate run and a new full QA cycle;
+promotion never rebuilds or silently substitutes bytes.
