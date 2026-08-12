@@ -2028,8 +2028,8 @@ mod native {
         let raw =
             ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
         [
-            (input | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
-                & !raw,
+            (input | ENABLE_EXTENDED_FLAGS | ENABLE_WINDOW_INPUT)
+                & !(raw | ENABLE_VIRTUAL_TERMINAL_INPUT),
             output
                 | ENABLE_PROCESSED_OUTPUT
                 | ENABLE_VIRTUAL_TERMINAL_PROCESSING
