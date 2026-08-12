@@ -44,6 +44,32 @@ fn structural_validation_accepts_only_the_exact_protected_owner_and_aces() {
 }
 
 #[test]
+fn instrumentation_dacl_allows_outside_read_execute_but_never_outside_write() {
+    let (owner, _) = descriptor(USER, "FA").unwrap();
+    for valid in [
+        format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})"),
+        format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;FRFX;;;WD)"),
+    ] {
+        assert!(
+            instrument_descriptor_matches(&parsed(valid), &owner).unwrap(),
+            "rejected valid instrumentation DACL"
+        );
+    }
+    for invalid in [
+        format!("O:S-1-5-21-1-2-3-43D:P(A;;FA;;;SY)(A;;FA;;;{USER})"),
+        format!("O:{USER}D:(A;;FA;;;SY)(A;;FA;;;{USER})"),
+        format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;FW;;;WD)"),
+        format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;GA;;;WD)"),
+        format!("O:{USER}D:P(A;;FA;;;SY)(A;;FA;;;{USER})(A;;WD;;;WD)"),
+    ] {
+        assert!(
+            !instrument_descriptor_matches(&parsed(&invalid), &owner).unwrap(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
 fn file_descriptor_query_validates_a_created_store_directory() {
     let path = std::env::temp_dir().join(format!(
         "moor-windows-descriptor-{}-{}",
@@ -62,6 +88,7 @@ fn viewer_modes_are_raw_input_and_vt_output() {
             | ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
             | ENABLE_QUICK_EDIT_MODE
+            | ENABLE_MOUSE_INPUT
             | ENABLE_WINDOW_INPUT
             | ENABLE_VIRTUAL_TERMINAL_INPUT,
         0,
@@ -74,10 +101,10 @@ fn viewer_modes_are_raw_input_and_vt_output() {
                 | ENABLE_QUICK_EDIT_MODE),
         0
     );
-    assert_eq!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+    assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
     assert_eq!(
-        input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
-        ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+        input & (ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS),
+        ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
     );
     assert_ne!(output & ENABLE_PROCESSED_OUTPUT, 0);
     assert_ne!(output & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
@@ -85,7 +112,38 @@ fn viewer_modes_are_raw_input_and_vt_output() {
 }
 
 #[test]
-fn console_records_preserve_text_repeats_and_nul_but_reject_raw_zero_events() {
+fn pseudoconsole_retirement_never_joins_the_close_operation() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    retire_pseudo_with(1, move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "pseudoconsole retirement joined the close operation"
+    );
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    release_tx.send(()).unwrap();
+}
+
+#[test]
+fn prepublication_exit_is_finalizable_only_after_requested_child_release() {
+    let mut host = Native {
+        early_exit: Some(23),
+        ..Native::default()
+    };
+    assert!(finalizable_unpublished_exit(&mut host).unwrap().is_none());
+    host.child_released = true;
+    assert!(matches!(
+        finalizable_unpublished_exit(&mut host).unwrap(),
+        Some(NativeExit::Code(23))
+    ));
+}
+
+#[test]
+fn console_records_preserve_text_repeats_and_modern_or_legacy_nul() {
     let mut key = KEY_EVENT_RECORD {
         bKeyDown: 1,
         wRepeatCount: 1,
@@ -111,6 +169,12 @@ fn console_records_preserve_text_repeats_and_nul_but_reject_raw_zero_events() {
     key.wVirtualKeyCode = 0x26;
     key.wVirtualScanCode = 0x48;
     key.dwControlKeyState = 0;
+    assert_eq!(console_wide(key), None);
+
+    key.wVirtualKeyCode = 0;
+    key.wVirtualScanCode = 0;
+    assert_eq!(console_wide(key), Some((0, 1)));
+    key.wVirtualScanCode = 1;
     assert_eq!(console_wide(key), None);
 
     key.wVirtualKeyCode = zero & 0xff;
@@ -166,6 +230,16 @@ fn nul_record(repeat: u16) -> INPUT_RECORD {
     key_record(key)
 }
 
+fn legacy_nul_record(repeat: u16) -> INPUT_RECORD {
+    let mut key = KEY_EVENT_RECORD {
+        bKeyDown: 1,
+        wRepeatCount: repeat,
+        ..KEY_EVENT_RECORD::default()
+    };
+    key.uChar.UnicodeChar = 0;
+    key_record(key)
+}
+
 fn resize_record(rows: i16, columns: i16) -> INPUT_RECORD {
     INPUT_RECORD {
         EventType: WINDOW_BUFFER_SIZE_EVENT as u16,
@@ -189,7 +263,7 @@ fn console_record_translation_encodes_the_exact_cp65001_input_vector() {
         text_record(0xd83d, 1),
         text_record(0xde42, 1),
         text_record(0x00e9, 1),
-        nul_record(1),
+        legacy_nul_record(1),
         text_record(b'Z'.into(), 1),
     ] {
         assert_eq!(input.record(record, CP_UTF8, &mut wide), Ok(None));
@@ -314,7 +388,6 @@ fn console_batch_preserves_prefetched_text_resize_text_order() {
     input.records[1] = resize_record(41, 101);
     input.records[2] = text_record(b'B'.into(), 1);
     input.count = 3;
-    input.codepage = CP_UTF8;
 
     assert_eq!(
         input.state_with(|_, _| Ok(false)),
@@ -341,37 +414,16 @@ fn console_batch_preserves_prefetched_text_resize_text_order() {
 }
 
 #[test]
-fn console_batch_preserves_first_record_after_codepage_threshold() {
+fn console_batch_serializes_unicode_as_utf8_for_a_legacy_outer_codepage() {
     let mut input = ConsoleInput::new(ptr::null_mut());
-    input.records[0] = text_record(b'A'.into(), u16::MAX);
-    input.records[1] = text_record(b'A'.into(), 1);
-    input.count = 2;
-    input.codepage = CP_UTF8;
-    let mut loaded = false;
-
-    let first = input.state_with(|input, timeout| {
-        assert_eq!(timeout, 0, "buffered output incurred an input delay");
-        assert!(!loaded, "unexpected second native refill");
-        input.records[0] = text_record(b'B'.into(), 1);
-        input.next = 0;
-        input.count = 1;
-        input.codepage = 437;
-        loaded = true;
-        Ok(true)
-    });
-    let InputState::Bytes(first) = first else {
-        panic!("old-code-page bytes were not returned first");
-    };
-    assert_eq!(first.len(), CONSOLE_BYTE_TARGET);
-    assert!(first.iter().all(|byte| *byte == b'A'));
-    assert_eq!(input.next, 0, "first new-code-page record was consumed");
+    input.records[0] = text_record(0xd83d, 1);
+    input.records[1] = text_record(0xde42, 1);
+    input.records[2] = text_record(0x00e9, 1);
+    input.count = 3;
 
     assert_eq!(
-        input.state_with(|_, timeout| {
-            assert_eq!(timeout, 0, "buffered text incurred an input delay");
-            Ok(false)
-        }),
-        InputState::Bytes(b"B".to_vec())
+        input.state_with(|_, _| Ok(false)),
+        InputState::Bytes(b"\xf0\x9f\x99\x82\xc3\xa9".to_vec())
     );
 }
 

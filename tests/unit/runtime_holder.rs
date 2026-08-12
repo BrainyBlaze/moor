@@ -5,9 +5,11 @@ mod descriptor_deadline_tests {
     use crate::runtime::private::lifecycle_running;
     use crate::store::{Commit, Kind, Store, StoreError};
     use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
-    struct SlowNative(bool);
+    struct SlowNative(bool, Arc<AtomicBool>);
 
     impl Native for SlowNative {
         fn resize(&mut self, _: u16, _: u16) -> Result<()> {
@@ -20,11 +22,14 @@ mod descriptor_deadline_tests {
         fn exited(&mut self) -> Result<Option<NativeExit>> {
             Ok(None)
         }
+        fn abandon(&mut self) {
+            self.1.store(true, Ordering::Release);
+        }
     }
 
     #[test]
     fn native_redraw_defaults_to_the_platform_resize_contract() {
-        let mut native = SlowNative(false);
+        let mut native = SlowNative(false, Arc::new(AtomicBool::new(false)));
         native.redraw(24, 80).unwrap();
         assert!(native.0);
     }
@@ -62,7 +67,7 @@ mod descriptor_deadline_tests {
             status: Vec::new(),
             commit_at: 0,
             synthetic: 0,
-            native: SlowNative(false),
+            native: SlowNative(false, Arc::new(AtomicBool::new(false))),
         });
         (runtime, [root, log_path])
     }
@@ -96,6 +101,22 @@ mod descriptor_deadline_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn expired_termination_abandons_native_resources_before_drive_returns() {
+        let (mut runtime, paths) = fixture("termination-abandon");
+        let abandoned = runtime.native.1.clone();
+        runtime.shutdown_requested(0, true);
+        runtime.transition(Transition::Tick(10_000)).unwrap();
+
+        assert_eq!(runtime.drive(|_, _| None, || None).unwrap(), None);
+        assert!(
+            abandoned.load(Ordering::Acquire),
+            "uncertain native resources were dropped synchronously after the deadline"
+        );
+        drop(runtime);
+        cleanup(paths);
     }
 
     #[test]

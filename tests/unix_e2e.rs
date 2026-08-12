@@ -241,7 +241,7 @@ fn instrumentation(dir: &Path, exit: Option<u8>) -> PathBuf {
 #include <sys/stat.h>
 #include <unistd.h>
 __attribute__((constructor)) static void ack(void) {
-  char *f=getenv("DESK_MOOR_INSTRUMENT_CHANNEL"), *n=getenv("DESK_MOOR_INSTRUMENT_NONCE");
+  char *f=getenv("MOOR_INSTRUMENT_CHANNEL"), *n=getenv("MOOR_INSTRUMENT_NONCE");
   if(!f || !n) return; unsigned char b[36]={'M','O','O','R','I','N','S','3',1};
   int watch=-1;
 #ifdef __linux__
@@ -255,7 +255,7 @@ __attribute__((constructor)) static void ack(void) {
     if(out<0) _exit(122); write(out,"replacement",11); fchmod(out,0600); close(out); }
   b[12]=1; uint32_t p=(uint32_t)getpid(); for(int i=0;i<4;i++) b[16+i]=(p>>(8*i))&255;
   for(int i=0;i<16;i++) { char x[3]={n[i*2],n[i*2+1],0}; b[20+i]=(unsigned char)strtoul(x,0,16); }
-  int fd=atoi(f); unsetenv("DESK_MOOR_INSTRUMENT_CHANNEL"); unsetenv("DESK_MOOR_INSTRUMENT_NONCE"); write(fd,b,36);
+  int fd=atoi(f); unsetenv("MOOR_INSTRUMENT_CHANNEL"); unsetenv("MOOR_INSTRUMENT_NONCE"); write(fd,b,36);
 #ifdef __linux__
   if(watch>=0) { close(fd); char event[4096]; read(watch,event,sizeof(event)); _exit(23); }
 #endif
@@ -419,7 +419,7 @@ fn resource_exhausting_instrumentation(dir: &Path) -> PathBuf {
 #include <sys/resource.h>
 #include <unistd.h>
 __attribute__((constructor)) static void ack(void) {
-  char *p=getenv("MOOR_GUARD_PID_FILE"), *f=getenv("DESK_MOOR_INSTRUMENT_CHANNEL"), *n=getenv("DESK_MOOR_INSTRUMENT_NONCE");
+  char *p=getenv("MOOR_GUARD_PID_FILE"), *f=getenv("MOOR_INSTRUMENT_CHANNEL"), *n=getenv("MOOR_INSTRUMENT_NONCE");
   signal(SIGHUP,SIG_IGN); signal(SIGTERM,SIG_IGN);
   if(!p || !f || !n) return; int fd=atoi(f), ready[2]; pipe(ready); pid_t survivor=fork();
   if(survivor==0) { close(fd); close(ready[0]); int out=open(p,O_WRONLY|O_CREAT|O_TRUNC,0600); char text[32];
@@ -428,7 +428,7 @@ __attribute__((constructor)) static void ack(void) {
   unsigned char b[36]={'M','O','O','R','I','N','S','3',1}; b[12]=1; uint32_t pid=(uint32_t)getpid();
   for(int i=0;i<4;i++) b[16+i]=(pid>>(8*i))&255;
   for(int i=0;i<16;i++) { char x[3]={n[i*2],n[i*2+1],0}; b[20+i]=(unsigned char)strtoul(x,0,16); }
-  unsetenv("DESK_MOOR_INSTRUMENT_CHANNEL"); unsetenv("DESK_MOOR_INSTRUMENT_NONCE"); write(fd,b,36); close(fd);
+  unsetenv("MOOR_INSTRUMENT_CHANNEL"); unsetenv("MOOR_INSTRUMENT_NONCE"); write(fd,b,36); close(fd);
   struct rlimit limit; prlimit(getppid(),RLIMIT_NOFILE,0,&limit); limit.rlim_cur=0; prlimit(getppid(),RLIMIT_NOFILE,&limit,0);
   for(;;) pause();
 }"#,
@@ -2299,7 +2299,7 @@ fn supervised_launch_validates_private_record_and_propagates_generation() {
     let events = root.join("events");
     let generation_key = environment_key(std::ffi::OsStr::new(alias), "_GENERATION");
     let script = format!(
-        "printf '<%s><%s>\\n' \"${}\" \"$DESK_SESSION_GENERATION\"; sleep 30",
+        "printf '<%s><%s>\\n' \"${}\" \"$MOOR_SESSION_GENERATION\"; sleep 30",
         generation_key.to_str().unwrap()
     );
     let descriptor = launch_channel(42);
@@ -2313,9 +2313,12 @@ fn supervised_launch_validates_private_record_and_propagates_generation() {
             "-c",
             &script,
         ])
-        .env("DESK_MOOR_LAUNCH_CHANNEL", descriptor.to_string())
+        .env(
+            environment_key(std::ffi::OsStr::new(alias), "_LAUNCH_CHANNEL"),
+            descriptor.to_string(),
+        )
         .env(&generation_key, "42")
-        .env("DESK_SESSION_GENERATION", "42")
+        .env("MOOR_SESSION_GENERATION", "42")
         .output()
         .unwrap();
     unsafe { libc::close(descriptor) };
@@ -2347,10 +2350,10 @@ fn inherited_generation_without_launch_channel_is_stripped() {
             socket.to_str().unwrap(),
             "/bin/sh",
             "-c",
-            "printf '<%s><%s>\\n' \"$MOOR_GENERATION\" \"$DESK_SESSION_GENERATION\"; sleep 30",
+            "printf '<%s><%s>\\n' \"$MOOR_GENERATION\" \"$MOOR_SESSION_GENERATION\"; sleep 30",
         ])
         .env("MOOR_GENERATION", "91")
-        .env("DESK_SESSION_GENERATION", "91")
+        .env("MOOR_SESSION_GENERATION", "91")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
