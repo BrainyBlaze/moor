@@ -1,0 +1,401 @@
+name: Release candidate
+
+# Implements docs/release-manifest-v1.md: build each of the six targets
+# exactly once, establish size/sha256 at the build boundary, upload
+# single-file artifacts with immutable IDs, verify the exact downloaded
+# bytes on native lanes, and only then emit the canonical manifest and
+# SHA256SUMS as the moor-release-candidate-v1 metadata artifact.
+#
+# Promotion is a separate, later workflow: nothing here creates a tag or a
+# release, and every gate fails closed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-hex source commit all six assets are built from
+        required: true
+      version:
+        description: Proposed release version and tag name (vMAJOR.MINOR.PATCH)
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-candidate-${{ inputs.commit }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate candidate identity
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      bare: ${{ steps.check.outputs.bare }}
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Validate commit, version, and crate identity
+        id: check
+        env:
+          COMMIT: ${{ inputs.commit }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          echo "$VERSION" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          BARE="${VERSION#v}"
+          CRATE="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "moor") | .version')"
+          test "$CRATE" = "$BARE"
+          echo "bare=$BARE" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+            suffix: linux-x64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            suffix: linux-arm64
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            suffix: macos-x64
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            suffix: macos-arm64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            suffix: windows-x64.exe
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            suffix: windows-arm64.exe
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Install the toolchain and target
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+          if [ "${TARGET%-musl}" != "$TARGET" ]; then
+            sudo apt-get update -q
+            sudo apt-get install -qy musl-tools
+          fi
+
+      - name: Build the release binary once
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --bin moor --target "$TARGET"
+
+      - name: Name the asset and establish its identity
+        id: identity
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          SUFFIX: ${{ matrix.suffix }}
+          BARE: ${{ needs.validate.outputs.bare }}
+        run: |
+          SOURCE="target/$TARGET/release/moor"
+          [ -f "$SOURCE" ] || SOURCE="target/$TARGET/release/moor.exe"
+          ASSET="moor-$BARE-$SUFFIX"
+          mkdir candidate-out
+          cp "$SOURCE" "candidate-out/$ASSET"
+          if command -v sha256sum >/dev/null; then
+            SHA="$(sha256sum "candidate-out/$ASSET" | cut -d' ' -f1)"
+          else
+            SHA="$(shasum -a 256 "candidate-out/$ASSET" | cut -d' ' -f1)"
+          fi
+          SIZE="$(wc -c < "candidate-out/$ASSET" | tr -d ' ')"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the single-file candidate artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moor-candidate-${{ matrix.target }}
+          path: candidate-out/${{ steps.identity.outputs.asset }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Record the build reference
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ steps.identity.outputs.asset }}
+          SHA256: ${{ steps.identity.outputs.sha256 }}
+          SIZE: ${{ steps.identity.outputs.size }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          JOB_NAME: Build ${{ matrix.target }}
+        run: |
+          JOB_ID="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+            --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")"
+          test -n "$JOB_ID"
+          mkdir records
+          jq -n \
+            --arg asset "$ASSET" \
+            --arg sha256 "$SHA256" \
+            --argjson size "$SIZE" \
+            --arg artifactId "$ARTIFACT_ID" \
+            --arg artifactName "moor-candidate-$TARGET" \
+            --arg runId "${{ github.run_id }}" \
+            --argjson attempt "${{ github.run_attempt }}" \
+            --arg jobId "$JOB_ID" \
+            --arg jobName "$JOB_NAME" \
+            '{asset: $asset, sha256: $sha256, size: $size,
+              artifactId: $artifactId, artifactName: $artifactName,
+              workflowRunId: $runId, workflowRunAttempt: $attempt,
+              jobId: $jobId, jobName: $jobName}' \
+            > "records/build-$TARGET.json"
+
+      - name: Upload the build record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: record-build-${{ matrix.target }}
+          path: records/build-${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  verify:
+    name: Verify ${{ matrix.target }} / ${{ matrix.gate }}
+    needs: [validate, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # identity: the exact downloaded asset reports the release version.
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-22.04, gate: identity, lane: ubuntu-22.04-x64}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, gate: identity, lane: ubuntu-24.04-arm64}
+          - {target: x86_64-apple-darwin, runner: macos-15-intel, gate: identity, lane: macos-15-intel}
+          - {target: aarch64-apple-darwin, runner: macos-15, gate: identity, lane: macos-15-arm64}
+          - {target: x86_64-pc-windows-msvc, runner: windows-2022, gate: identity, lane: windows-2022-x64}
+          - {target: aarch64-pc-windows-msvc, runner: windows-11-arm, gate: identity, lane: windows-11-arm64}
+          # static-linkage: Linux assets prove no interpreter and no deps.
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-22.04, gate: static-linkage, lane: ubuntu-22.04-x64}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, gate: static-linkage, lane: ubuntu-24.04-arm64}
+          # native-conformance: §12.8 create/attach/detach/input against the
+          # exact shipped bytes, on the native platform.
+          - {target: x86_64-unknown-linux-musl, runner: ubuntu-22.04, gate: native-conformance, lane: ubuntu-22.04-x64}
+          - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, gate: native-conformance, lane: ubuntu-24.04-arm64}
+          - {target: x86_64-apple-darwin, runner: macos-15-intel, gate: native-conformance, lane: macos-15-intel}
+          - {target: aarch64-apple-darwin, runner: macos-15, gate: native-conformance, lane: macos-15-arm64}
+          - {target: x86_64-pc-windows-msvc, runner: windows-2022, gate: native-conformance, lane: windows-2022-x64}
+          - {target: aarch64-pc-windows-msvc, runner: windows-11-arm, gate: native-conformance, lane: windows-11-arm64}
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Download the build record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: record-build-${{ matrix.target }}
+          path: records
+
+      - name: Download the candidate by its immutable artifact ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ARTIFACT_ID="$(jq -r .artifactId "records/build-$TARGET.json")"
+          echo "$ARTIFACT_ID" | grep -Eq '^[1-9][0-9]*$'
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > candidate.zip
+          mkdir exact && cd exact && unzip -q ../candidate.zip
+
+      - name: Verify sole filename, size, and digest before execution
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
+          SIZE_EXPECTED="$(jq -r .size "records/build-$TARGET.json")"
+          test "$(ls exact | wc -l | tr -d ' ')" = 1
+          test -f "exact/$ASSET"
+          if command -v sha256sum >/dev/null; then
+            SHA="$(sha256sum "exact/$ASSET" | cut -d' ' -f1)"
+          else
+            SHA="$(shasum -a 256 "exact/$ASSET" | cut -d' ' -f1)"
+          fi
+          test "$SHA" = "$SHA_EXPECTED"
+          test "$(wc -c < "exact/$ASSET" | tr -d ' ')" = "$SIZE_EXPECTED"
+          chmod +x "exact/$ASSET" || true
+
+      - name: 'Gate: identity'
+        if: matrix.gate == 'identity'
+        shell: bash
+        env:
+          BARE: ${{ needs.validate.outputs.bare }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          "./exact/$ASSET" --version | tee identity.txt
+          grep -Fq "$BARE" identity.txt
+
+      - name: 'Gate: static linkage'
+        if: matrix.gate == 'static-linkage'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          file "exact/$ASSET" | tee file.txt
+          grep -Eq 'statically linked|static-pie linked' file.txt
+          if readelf -l "exact/$ASSET" | grep -q INTERP; then
+            echo 'dynamic interpreter present' >&2; exit 1
+          fi
+          if ldd "exact/$ASSET" 2>&1 | tee ldd.txt | grep -q '=>'; then
+            echo 'shared-library dependency present' >&2; exit 1
+          fi
+
+      - name: 'Gate: native conformance (§12.8) against the exact bytes'
+        if: matrix.gate == 'native-conformance'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          # Build the harness once at the same commit, then REPLACE the
+          # compiled bin with the exact downloaded bytes so every
+          # CARGO_BIN_EXE_moor invocation exercises the shipped asset, and
+          # run the prebuilt test executables directly (never through a
+          # cargo invocation that could rebuild and silently substitute).
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET" || true
+          if [ "${TARGET%-musl}" != "$TARGET" ]; then
+            sudo apt-get update -q && sudo apt-get install -qy musl-tools
+          fi
+          ASSET="$(jq -r .asset "records/build-$TARGET.json")"
+          cargo test --release --target "$TARGET" --no-run --message-format=json \
+            > build.json 2>build.log || { cat build.log >&2; exit 1; }
+          BIN="target/$TARGET/release/moor"
+          [ -f "$BIN" ] || BIN="target/$TARGET/release/moor.exe"
+          cp "exact/$ASSET" "$BIN"
+          if command -v sha256sum >/dev/null; then
+            SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          else
+            SHA="$(shasum -a 256 "$BIN" | cut -d' ' -f1)"
+          fi
+          test "$SHA" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+          jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' build.json > tests.txt
+          test -s tests.txt
+          while IFS= read -r exe; do
+            echo "== $exe"
+            "$exe" --test-threads=1
+          done < tests.txt
+
+      - name: Record the verification reference
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          GATE: ${{ matrix.gate }}
+          LANE: ${{ matrix.lane }}
+          JOB_NAME: Verify ${{ matrix.target }} / ${{ matrix.gate }}
+        run: |
+          JOB_ID="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}/jobs?per_page=100" \
+            --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")"
+          test -n "$JOB_ID"
+          mkdir -p records-out
+          jq -n \
+            --arg gate "$GATE" --arg lane "$LANE" \
+            --arg runId "${{ github.run_id }}" \
+            --argjson attempt "${{ github.run_attempt }}" \
+            --arg jobId "$JOB_ID" --arg jobName "$JOB_NAME" \
+            '{gate: $gate, lane: $lane, workflowRunId: $runId,
+              workflowRunAttempt: $attempt, jobId: $jobId, jobName: $jobName}' \
+            > "records-out/verify-$TARGET-$GATE.json"
+
+      - name: Upload the verification record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: record-verify-${{ matrix.target }}-${{ matrix.gate }}
+          path: records-out/verify-${{ matrix.target }}-${{ matrix.gate }}.json
+          if-no-files-found: error
+          retention-days: 30
+
+  manifest:
+    name: Emit the canonical candidate metadata
+    needs: [validate, build, verify]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - name: Download every build and verification record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: record-*
+          path: records-tree
+          merge-multiple: true
+
+      - name: Assemble canonical manifest and SHA256SUMS
+        env:
+          COMMIT: ${{ inputs.commit }}
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 scripts/candidate-manifest.py --records records-tree --out metadata
+          sha256sum metadata/moor-release-manifest-v1.json metadata/SHA256SUMS
+
+      - name: Upload the two-file metadata artifact
+        id: metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moor-release-candidate-v1
+          path: metadata/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Record the candidate identity for manual QA
+        env:
+          METADATA_ID: ${{ steps.metadata.outputs.artifact-id }}
+        run: |
+          {
+            echo '### Release candidate'
+            echo
+            echo "- commit: \`${{ inputs.commit }}\`"
+            echo "- version: \`${{ inputs.version }}\`"
+            echo "- run/attempt: \`${{ github.run_id }}\` / \`${{ github.run_attempt }}\`"
+            echo "- metadata artifact \`moor-release-candidate-v1\`: id \`$METADATA_ID\`"
+            echo
+            echo 'Full manual QA must retrieve the metadata artifact by this'
+            echo 'immutable ID and each binary by the artifact IDs it names.'
+          } >> "$GITHUB_STEP_SUMMARY"
