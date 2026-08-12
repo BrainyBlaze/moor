@@ -428,7 +428,7 @@ fn storage_reports_the_selected_log_commit() {
     use moor::runtime::storage::SessionStorage;
     use moor::store::{Kind, Store};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     let root = std::env::temp_dir().join(format!(
         "moor-log-status-test-{}-{}",
@@ -456,14 +456,23 @@ fn storage_reports_the_selected_log_commit() {
     }
     assert_eq!(selected(), (1, 2, 0, 3));
     drop(storage);
-    std::fs::remove_dir_all(root).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => break,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("store worker did not release cleanup handles: {error}"),
+        }
+    }
 }
 
 #[cfg(windows)]
 mod launch_paths {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Output, Stdio};
+    use std::sync::OnceLock;
 
     fn moor(args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_moor"))
@@ -478,27 +487,105 @@ mod launch_paths {
         value.into()
     }
 
-    fn invoked_root() -> PathBuf {
-        let output = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-            ])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let sid = String::from_utf8(output.stdout).unwrap();
+    fn current_sid() -> String {
+        windows_permissions::utilities::current_process_sid()
+            .unwrap()
+            .to_string()
+    }
+
+    fn invoked_root_for(executable: &Path) -> PathBuf {
+        let sid = current_sid();
         let mut leaf = OsString::from(".");
-        leaf.push(Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap());
+        leaf.push(executable.file_name().unwrap());
         leaf.push("-");
-        leaf.push(sid.trim());
+        leaf.push(sid);
         std::env::temp_dir().join(leaf)
     }
 
+    fn invoked_root() -> PathBuf {
+        invoked_root_for(Path::new(env!("CARGO_BIN_EXE_moor")))
+    }
+
+    fn protect_file(path: &Path) {
+        use windows_permissions::{LocalBox, SecurityDescriptor, constants::*, wrappers};
+
+        let sid = current_sid();
+        let descriptor: LocalBox<SecurityDescriptor> =
+            format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})")
+                .parse()
+                .unwrap();
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner
+                | SecurityInformation::Dacl
+                | SecurityInformation::ProtectedDacl,
+            descriptor.owner(),
+            None,
+            descriptor.dacl(),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("protect fixture {path:?}: {error}"));
+    }
+
+    fn own_file(path: &Path) {
+        use windows_permissions::{LocalBox, Sid, constants::*, wrappers};
+
+        let sid: LocalBox<Sid> = current_sid().parse().unwrap();
+        wrappers::SetNamedSecurityInfo(
+            path.as_os_str(),
+            SeObjectType::SE_FILE_OBJECT,
+            SecurityInformation::Owner,
+            Some(&sid),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("own fixture {path:?}: {error}"));
+    }
+
+    fn instrumentation_fixture() -> &'static Path {
+        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            let path = std::env::var_os("MOOR_TEST_WINDOWS_INSTRUMENT_DLL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let path = std::env::temp_dir().join(format!(
+                        "moor-instrument-{}-{}.dll",
+                        std::process::id(),
+                        moor::runtime::private::now()
+                    ));
+                    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/windows_instrument.rs");
+                    let mut command = Command::new("rustc");
+                    command.args(["--edition=2024", "--crate-type=cdylib"]);
+                    if cfg!(target_env = "msvc") {
+                        command.args(["-C", "target-feature=+crt-static"]);
+                    }
+                    let output = command.arg(source).arg("-o").arg(&path).output().unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                    path
+                });
+            protect_file(&path);
+            path
+        })
+    }
+
+    const PUBLICATION_RELEASE: &str = "MOOR_TEST_PUBLICATION_RELEASE";
     const SEMANTIC_TOKEN_PROBE: &str = "MOOR_TEST_SEMANTIC_TOKEN_PROBE";
+    const EARLY_EXIT_READY: &str = "MOOR_TEST_EARLY_EXIT_READY";
+    const EARLY_EXIT_RELEASE: &str = "MOOR_TEST_EARLY_EXIT_RELEASE";
+    const EARLY_EXIT_OUTPUT: &[u8] = b"MOOR-EARLY-OUTPUT";
+
+    #[test]
+    fn publication_waiter() {
+        let Some(release) = std::env::var_os(PUBLICATION_RELEASE) else {
+            return;
+        };
+        while !Path::new(&release).exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn semantic_token_probe() {
@@ -513,13 +600,36 @@ mod launch_paths {
     }
 
     #[test]
+    fn prepublication_exit_probe() {
+        let (Some(ready), Some(release)) = (
+            std::env::var_os(EARLY_EXIT_READY),
+            std::env::var_os(EARLY_EXIT_RELEASE),
+        ) else {
+            return;
+        };
+        print!("{}", String::from_utf8_lossy(EARLY_EXIT_OUTPUT));
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !Path::new(&release).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prepublication exit release timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::process::exit(23);
+    }
+
+    #[test]
     fn requested_child_semantic_token_is_fresh_iff_events_are_enabled() {
         let root = invoked_root();
         let _ = moor(&["list"]);
         let mut enabled_tokens = Vec::new();
         for (at, events) in [false, true, true].into_iter().enumerate() {
             let label = if events { "enabled" } else { "disabled" };
-            let session = format!("semantic-token-{label}-{}-{at}", std::process::id());
+            let session = format!("semantic-token-{label}-{}", std::process::id());
+            let session = format!("{session}-{at}");
             let event = root.join(format!("{session}-events"));
             let probe = root.join(format!("{session}-probe"));
             let _ = std::fs::remove_file(&probe);
@@ -561,6 +671,548 @@ mod launch_paths {
             std::fs::remove_file(probe).unwrap();
         }
         assert_ne!(enabled_tokens[0], enabled_tokens[1]);
+    }
+
+    #[test]
+    fn redirected_stderr_is_opened_once_and_requires_the_exact_protected_file() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        let sink = root.join(format!("stderr-sink-{}", std::process::id()));
+        std::fs::write(&sink, b"before\r\n").unwrap();
+        protect_file(&sink);
+        let session = format!("stderr-ok-{}", std::process::id());
+        let output = moor(&[
+            "run",
+            &session,
+            "-2",
+            sink.to_str().unwrap(),
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo after 1>&2",
+        ]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read(&sink).unwrap(), b"before\r\nafter \r\n");
+        assert!(moor(&["rm", "-q", &session]).status.success());
+
+        for (label, path, cause) in [
+            (
+                "missing",
+                root.join(format!("stderr-sink-missing-{}", std::process::id())),
+                "missing",
+            ),
+            (
+                "broad",
+                root.join(format!("stderr-sink-broad-{}", std::process::id())),
+                "broad-dacl",
+            ),
+        ] {
+            if label == "broad" {
+                std::fs::write(&path, b"").unwrap();
+                own_file(&path);
+            }
+            let session = format!("stderr-{label}-{}", std::process::id());
+            let output = moor(&[
+                "run",
+                &session,
+                "-2",
+                path.to_str().unwrap(),
+                "cmd.exe",
+                "/d",
+                "/c",
+                "exit 0",
+            ]);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "{program}: standard-error sink rejected: {} ({cause})\n",
+                    moor::name::render(path.as_os_str())
+                ),
+                "{output:?}"
+            );
+            assert!(!root.join(&session).exists());
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::remove_file(sink).unwrap();
+    }
+
+    #[test]
+    fn instrumentation_operand_rejections_use_the_frozen_row_and_original_spelling() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        let missing = root.join(format!("instrument-source-missing-{}", std::process::id()));
+        let broad = root.join(format!("instrument-source-broad-{}", std::process::id()));
+        std::fs::write(&broad, b"not a DLL").unwrap();
+        own_file(&broad);
+        let relative = PathBuf::from(format!("relative-instrument-{}", std::process::id()));
+        for (label, path, cause) in [
+            ("missing", missing, "missing"),
+            ("broad", broad.clone(), "broad-dacl"),
+            ("relative", relative, "not-absolute"),
+        ] {
+            let session = format!("instrument-{label}-{}", std::process::id());
+            let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["run", &session, "-S"])
+                .arg(&path)
+                .args(["cmd.exe", "/d", "/c", "exit 0"])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "{program}: instrumentation rejected: {} ({cause})\n",
+                    moor::name::render(path.as_os_str())
+                ),
+                "{output:?}"
+            );
+            assert!(!root.join(session).exists());
+        }
+        std::fs::remove_file(broad).unwrap();
+    }
+
+    #[test]
+    fn fast_prepublication_exit_is_durable_and_status_is_mode_specific() {
+        use moor::store::{Kind, Store};
+
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        for (mode, expected) in [("start", 1), ("run", 23)] {
+            let session = format!("early-{mode}-{}", std::process::id());
+            let marker = root.join(&session);
+            let event = root.join(format!("{session}-events"));
+            let ready = root.join(format!("{session}-child-ready"));
+            let release = root.join(format!("{session}-child-release"));
+            let _ = std::fs::remove_file(&ready);
+            let _ = std::fs::remove_file(&release);
+            let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args([mode, &session, "-T"])
+                .arg(&event)
+                .arg("-S")
+                .arg(instrumentation_fixture())
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::prepublication_exit_probe",
+                    "--nocapture",
+                ])
+                .env(EARLY_EXIT_READY, &ready)
+                .env(EARLY_EXIT_RELEASE, &release)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !event.is_dir() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    panic!("creator exited before event materialization: {status:?}: {output:?}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "event materialization timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, b"competing"))
+                .unwrap();
+            while !ready.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    let output = child.wait_with_output().unwrap();
+                    panic!("creator exited before child readiness: {status:?}: {output:?}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child readiness timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::fs::write(&release, b"release").unwrap();
+            let output = child.wait_with_output().unwrap();
+            let _ = std::fs::remove_file(&ready);
+            let _ = std::fs::remove_file(&release);
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            let diagnostic = (mode == "start")
+                .then(|| format!("{program}: child exited before session publication\n"));
+            assert_eq!(
+                output.stderr,
+                diagnostic.as_deref().unwrap_or_default().as_bytes(),
+                "{output:?}"
+            );
+            assert_eq!(std::fs::read(&marker).unwrap(), b"competing");
+            std::fs::remove_file(&marker).unwrap();
+
+            let (commit, lifecycle) =
+                Store::read_only(&companion(&marker, ".exit"), Kind::Exit, 1).unwrap();
+            let lifecycle = String::from_utf8(lifecycle).unwrap();
+            assert_eq!(commit.index, 2, "{lifecycle}");
+            assert!(lifecycle.contains("\"phase\":\"exited\""), "{lifecycle}");
+            assert!(lifecycle.contains("\"code\":23"), "{lifecycle}");
+            let lifecycle: serde_json::Value = serde_json::from_str(&lifecycle).unwrap();
+            let instrument = lifecycle["instrument_path"]
+                .as_str()
+                .and_then(|encoded| {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .ok()
+                })
+                .and_then(|bytes| moor::windows::wtf8_decode(&bytes).ok())
+                .map(|wide| OsString::from_wide(&wide))
+                .map(PathBuf::from)
+                .expect("durable exit omitted the instrumentation stage");
+            assert!(
+                instrument.is_file(),
+                "missing instrument stage: {instrument:?}"
+            );
+            let (_, events) = Store::read_only(&event, Kind::Event, 1).unwrap();
+            assert!(
+                String::from_utf8(events)
+                    .unwrap()
+                    .contains("\"type\":\"exit\"")
+            );
+            assert!(
+                Store::read_only(&companion(&marker, ".log"), Kind::Log, 1).is_ok(),
+                "log store was not retained"
+            );
+            let (_, log) = Store::read_only(&companion(&marker, ".log"), Kind::Log, 1).unwrap();
+            assert_eq!(
+                log.windows(EARLY_EXIT_OUTPUT.len())
+                    .filter(|bytes| *bytes == EARLY_EXIT_OUTPUT)
+                    .count(),
+                1,
+                "child output was not retained exactly once"
+            );
+            let listed = moor(&["list", "-a"]);
+            let listed = String::from_utf8(listed.stdout).unwrap();
+            assert!(
+                listed
+                    .lines()
+                    .any(|line| line.contains(&session) && line.contains("[exited]")),
+                "{listed:?}"
+            );
+            let removed = moor(&["rm", "-q", &session]);
+            assert!(removed.status.success(), "{removed:?}");
+            assert!(!event.exists(), "event store survived removal: {event:?}");
+            assert!(
+                std::fs::symlink_metadata(&instrument).is_err(),
+                "instrument stage survived removal: {instrument:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn instrumentation_exit_before_release_rolls_back_instead_of_becoming_exited() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("instrument-exit-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .env("MOOR_TEST_INSTRUMENT_EXIT", "1")
+            .arg("run")
+            .arg(&session)
+            .arg("-T")
+            .arg(&event)
+            .arg("-S")
+            .arg(instrumentation_fixture())
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr)
+                .contains("child exited before session publication"),
+            "pre-release failure was converted to a natural exit: {output:?}"
+        );
+        for path in [
+            marker.clone(),
+            companion(&marker, ".log"),
+            companion(&marker, ".exit"),
+            event,
+        ] {
+            assert!(std::fs::symlink_metadata(&path).is_err(), "leaked {path:?}");
+        }
+        assert!(
+            !String::from_utf8(moor(&["list", "-a"]).stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line.contains(&session)),
+            "pre-release instrumentation failure became discoverable residue"
+        );
+    }
+
+    fn published_run(session: &OsStr, event: Option<&Path>, marker: &Path) -> Output {
+        let release = companion(marker, ".release");
+        let _ = std::fs::remove_file(&release);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
+        command.arg("run").arg(session);
+        if let Some(event) = event {
+            command.arg("-T").arg(event);
+        }
+        let mut child = command
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!("child exited before publication: {status:?}: {output:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("marker publication timed out: {output:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(&release, b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_file(release);
+        output
+    }
+
+    #[test]
+    fn child_start_failure_is_127_crlf_and_rolls_back_unpublished_artifacts() {
+        let executable = std::env::temp_dir().join(format!(
+            "moor-exec-failure-{}-{}.exe",
+            std::process::id(),
+            moor::runtime::private::now()
+        ));
+        std::fs::copy(env!("CARGO_BIN_EXE_moor"), &executable).unwrap();
+        let root = invoked_root_for(&executable);
+        let _ = Command::new(&executable).arg("list").output().unwrap();
+        let instrument = instrumentation_fixture();
+        let missing = root.join(format!("missing-child-{}", std::process::id()));
+        let system = Command::new(&missing).spawn().unwrap_err().to_string();
+        let program = moor::name::program(executable.as_os_str());
+        let instruments = || {
+            let mut paths = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|value| value == "instrument"))
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        let prior_instruments = instruments();
+
+        for mode in ["run", "start"] {
+            let session = format!("exec-failure-{mode}-{}", std::process::id());
+            let marker = root.join(&session);
+            let event = root.join(format!("{session}-events"));
+            let out = Command::new(&executable)
+                .args([
+                    mode,
+                    &session,
+                    "-T",
+                    event.to_str().unwrap(),
+                    "-S",
+                    instrument.to_str().unwrap(),
+                    missing.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(127), "{out:?}");
+            assert!(out.stdout.is_empty(), "{out:?}");
+            assert_eq!(
+                out.stderr,
+                format!(
+                    "{program}: could not execute {}: {system}\r\n",
+                    moor::name::render(missing.as_os_str())
+                )
+                .as_bytes(),
+                "{out:?}"
+            );
+            for path in [
+                marker.clone(),
+                companion(&marker, ".log"),
+                companion(&marker, ".exit"),
+                event.clone(),
+            ] {
+                assert!(std::fs::symlink_metadata(&path).is_err(), "leaked {path:?}");
+            }
+            let stage = format!("{session}.stage-");
+            assert!(
+                std::fs::read_dir(&root).unwrap().all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&stage)
+                }),
+                "leaked marker stage for {session}"
+            );
+            assert_eq!(
+                instruments(),
+                prior_instruments,
+                "leaked instrumentation stage"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match std::fs::remove_file(&executable) {
+                Ok(()) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("detached launch retained test executable: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_supervised_generation_does_not_materialize_the_event_directory() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("generation-preflight-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let invoked = Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap();
+        let generation = moor::runtime::private::environment_key(invoked, "_GENERATION");
+        let launch = moor::runtime::private::environment_key(invoked, "_LAUNCH_CHANNEL");
+        let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .env(launch, "not-a-handle")
+            .env(&generation, "2")
+            .env("MOOR_SESSION_GENERATION", "2")
+            .args([
+                "start",
+                &session,
+                "-T",
+                event.to_str().unwrap(),
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "exit 0",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        for path in [marker, event] {
+            assert!(std::fs::symlink_metadata(&path).is_err(), "leaked {path:?}");
+        }
+    }
+
+    #[test]
+    fn normal_retirement_deletes_only_the_published_marker_identity() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("retirement-identity-{}", std::process::id());
+        let marker = root.join(&session);
+        let displaced = root.join(format!("{session}-displaced"));
+        let release = root.join(format!("{session}-release"));
+        let _ = std::fs::remove_file(&release);
+        let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["start", &session])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::rename(&marker, &displaced).unwrap();
+        std::fs::write(&marker, b"successor").unwrap();
+        std::fs::write(&release, b"go").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while displaced.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let successor = std::fs::read(&marker);
+        let original_survived = displaced.exists();
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&displaced);
+        let _ = std::fs::remove_file(&release);
+        for suffix in [".log", ".exit"] {
+            let _ = std::fs::remove_dir_all(companion(&marker, suffix));
+        }
+        assert_eq!(successor.unwrap(), b"successor");
+        assert!(
+            !original_survived,
+            "published marker identity survived retirement"
+        );
+    }
+
+    #[test]
+    fn publication_conflict_rolls_back_owned_artifacts_but_preserves_the_conflict() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let session = format!("publish-race-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let release = root.join(format!("{session}-child-release"));
+        let _ = std::fs::remove_file(&release);
+        let watched = event.clone();
+        let competing = marker.clone();
+        let racer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if watched.is_dir() {
+                    return std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(competing)
+                        .and_then(|mut file| std::io::Write::write_all(&mut file, b"competing"))
+                        .is_ok();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            false
+        });
+        let out = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["start", &session, "-T"])
+            .arg(&event)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .output()
+            .unwrap();
+        assert!(racer.join().unwrap(), "publication race was not installed");
+        let competing = std::fs::read(&marker);
+        let leaked = [
+            companion(&marker, ".log"),
+            companion(&marker, ".exit"),
+            event,
+        ]
+        .into_iter()
+        .filter(|path| std::fs::symlink_metadata(path).is_ok())
+        .collect::<Vec<_>>();
+        let stage = format!("{session}.stage-");
+        let staged = std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&stage)
+        });
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&release);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(competing.unwrap(), b"competing");
+        assert!(leaked.is_empty(), "leaked {leaked:?}");
+        assert!(!staged, "leaked marker stage");
     }
 
     #[test]
@@ -723,7 +1375,7 @@ mod launch_paths {
         std::fs::create_dir(&dir).unwrap();
         let session = dir.join("path-form-session");
         let event = dir.join("outside-events");
-        let initial = moor(&["run", session.to_str().unwrap(), "cmd", "/c", "exit"]);
+        let initial = published_run(session.as_os_str(), None, &session);
         assert_eq!(initial.status.code(), Some(0), "{initial:?}");
         let lifecycle = companion(&session, ".exit");
         assert!(lifecycle.is_dir(), "missing stale fixture {lifecycle:?}");
@@ -755,6 +1407,63 @@ mod launch_paths {
             "outside-root rejection mutated stale lifecycle state"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_absolute_event_operands_preserve_spelling_and_precede_cleanup_or_child_start() {
+        let root = invoked_root();
+        let _ = moor(&["list"]);
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        let relative = PathBuf::from(format!("relative-events-{}", std::process::id()));
+        let current = std::env::current_dir().unwrap();
+        let drive = current
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        let drive_relative = PathBuf::from(format!(
+            "{drive}drive-relative-events-{}",
+            std::process::id()
+        ));
+        let root_relative = PathBuf::from(format!("\\root-relative-events-{}", std::process::id()));
+        for (at, operand) in [relative, drive_relative, root_relative]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !operand.is_absolute(),
+                "fixture became absolute: {operand:?}"
+            );
+            let session = format!("relative-event-{at}-{}", std::process::id());
+            let stale = root.join(&session);
+            std::fs::write(&stale, b"foreign stale marker").unwrap();
+            let child_proof = root.join(format!("{session}-child-proof"));
+            let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["start", &session, "-T"])
+                .arg(&operand)
+                .args(["cmd.exe", "/d", "/c", "type nul >"])
+                .arg(&child_proof)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(output.stdout.is_empty(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "{program}: event store rejected: {} (not-absolute)\n",
+                    moor::name::render(operand.as_os_str())
+                ),
+                "{output:?}"
+            );
+            assert_eq!(std::fs::read(&stale).unwrap(), b"foreign stale marker");
+            assert!(
+                !child_proof.exists(),
+                "child started despite preflight refusal"
+            );
+            std::fs::remove_file(stale).unwrap();
+        }
     }
 
     #[test]
@@ -820,20 +1529,1198 @@ mod launch_paths {
         let _ = std::fs::remove_dir_all(&event);
         let session = format!("case-session-{}", std::process::id());
 
-        let out = moor(&[
-            "run",
-            &session,
-            "-T",
-            event.to_str().unwrap(),
-            "cmd",
-            "/c",
-            "exit",
-        ]);
+        let marker = root.join(&session);
+        let out = published_run(OsStr::new(&session), Some(&event), &marker);
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert!(event.is_dir(), "event store was not created at {event:?}");
 
         let removed = moor(&["rm", &session]);
         assert_eq!(removed.status.code(), Some(0), "{removed:?}");
         assert!(!event.exists(), "event store survived removal: {event:?}");
+    }
+
+    mod native_console {
+        use super::{companion, invoked_root, moor};
+        use moor::store::{Kind, Store};
+        use std::fs::File;
+        use std::io::{self, Read, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, ExitStatus, Stdio};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+        use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
+        use windows_sys::Win32::Foundation::{
+            FALSE, HANDLE, STATUS_CONTROL_C_EXIT, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::Globalization::CP_UTF8;
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, ClosePseudoConsole, CreatePseudoConsole,
+            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+            ENHANCED_KEY, FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent,
+            GetConsoleCP, GetConsoleMode, GetConsoleScreenBufferInfo, GetConsoleWindow,
+            GetStdHandle, HPCON, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
+            ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+            WriteConsoleInputW,
+        };
+        use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, WaitForSingleObject,
+        };
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_UP;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+        struct Console {
+            value: HPCON,
+            input: Option<File>,
+            output: Option<File>,
+            received: Vec<u8>,
+        }
+
+        impl Console {
+            fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
+                let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
+                if unsafe { CreatePipe(&mut read, &mut write, std::ptr::null(), 0) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(unsafe {
+                    (
+                        OwnedHandle::from_raw_handle(read as RawHandle),
+                        OwnedHandle::from_raw_handle(write as RawHandle),
+                    )
+                })
+            }
+
+            fn new(rows: i16, columns: i16) -> io::Result<Self> {
+                Self::new_with_flags(rows, columns, 0)
+            }
+
+            fn new_with_flags(rows: i16, columns: i16, flags: u32) -> io::Result<Self> {
+                let (input_reader, input_writer) = Self::pipe()?;
+                let (output_reader, output_writer) = Self::pipe()?;
+                let mut value = 0;
+                let result = unsafe {
+                    CreatePseudoConsole(
+                        COORD {
+                            X: columns,
+                            Y: rows,
+                        },
+                        input_reader.as_raw_handle() as HANDLE,
+                        output_writer.as_raw_handle() as HANDLE,
+                        flags,
+                        &mut value,
+                    )
+                };
+                if result < 0 {
+                    return Err(io::Error::other(format!(
+                        "CreatePseudoConsole failed with HRESULT {result:#x}"
+                    )));
+                }
+                drop((input_reader, output_writer));
+                Ok(Self {
+                    value,
+                    input: Some(input_writer.into()),
+                    output: Some(output_reader.into()),
+                    received: Vec::new(),
+                })
+            }
+
+            fn write(&self, bytes: &[u8]) -> io::Result<()> {
+                let mut input = self.input.as_ref().unwrap();
+                input.write_all(bytes)
+            }
+
+            fn resize(&self, rows: i16, columns: i16) -> io::Result<()> {
+                let result = unsafe {
+                    ResizePseudoConsole(
+                        self.value,
+                        COORD {
+                            X: columns,
+                            Y: rows,
+                        },
+                    )
+                };
+                (result >= 0)
+                    .then_some(())
+                    .ok_or_else(|| io::Error::other(format!("ResizePseudoConsole: {result:#x}")))
+            }
+
+            fn pump(&mut self) -> io::Result<()> {
+                let output = self.output.as_mut().unwrap();
+                let mut available = 0;
+                if unsafe {
+                    PeekNamedPipe(
+                        output.as_raw_handle() as HANDLE,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if available != 0 {
+                    let mut bytes = vec![0; available as usize];
+                    output.read_exact(&mut bytes)?;
+                    self.received.extend_from_slice(&bytes);
+                }
+                Ok(())
+            }
+
+            fn wait_for(&mut self, marker: &[u8], timeout: Duration) -> io::Result<()> {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    self.pump()?;
+                    if self
+                        .received
+                        .windows(marker.len())
+                        .any(|window| window == marker)
+                    {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "missing {:?} in {:?}",
+                        String::from_utf8_lossy(marker),
+                        String::from_utf8_lossy(&self.received)
+                    ),
+                ))
+            }
+
+            fn spawn(&self, mut command: SpawnCommand) -> io::Result<Child> {
+                command.spawn_with(SpawnOptions::new().pseudoconsole(self))
+            }
+        }
+
+        impl Drop for Console {
+            fn drop(&mut self) {
+                drop(self.input.take());
+                drop(self.output.take());
+                let value = self.value;
+                let _ = thread::spawn(move || unsafe { ClosePseudoConsole(value) });
+            }
+        }
+
+        unsafe impl AsPseudoConsole for Console {
+            fn raw_pseudoconsole(&self) -> isize {
+                self.value
+            }
+        }
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = moor(&["kill", "-f", "-q", &self.0]);
+                let _ = moor(&["rm", "-q", &self.0]);
+            }
+        }
+
+        fn wait_spawn(child: &mut Child, timeout: Duration) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(io::ErrorKind::TimedOut, "child timed out"))
+        }
+
+        fn wait_console_spawn(
+            console: &mut Console,
+            child: &mut Child,
+            timeout: Duration,
+        ) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                console.pump()?;
+                if let Some(status) = child.try_wait()? {
+                    console.pump()?;
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "child timed out; console output: {:?}",
+                    String::from_utf8_lossy(&console.received)
+                ),
+            ))
+        }
+
+        fn wait_std(child: &mut std::process::Child, timeout: Duration) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "moor run timed out",
+            ))
+        }
+
+        fn probe(console: &Console, label: &str) -> io::Result<Child> {
+            let mut command = SpawnCommand::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_mode_probe",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_MODE_PROBE", label);
+            console.spawn(command)
+        }
+
+        fn modes(bytes: &[u8], label: &str) -> (u32, u32) {
+            let text = String::from_utf8_lossy(bytes);
+            let prefix = format!("MOOR-MODE-{label}:");
+            let value = &text[text.rfind(&prefix).unwrap() + prefix.len()..];
+            let mut fields = value.split(':');
+            (
+                u32::from_str_radix(fields.next().unwrap(), 16).unwrap(),
+                u32::from_str_radix(fields.next().unwrap(), 16).unwrap(),
+            )
+        }
+
+        fn wait_modes(console: &mut Console, label: &str) -> (u32, u32) {
+            let end = format!("MOOR-MODE-{label}-END");
+            console
+                .wait_for(end.as_bytes(), Duration::from_secs(5))
+                .unwrap();
+            modes(&console.received, label)
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Win32InputModeState {
+            Reset,
+            Unsupported,
+        }
+
+        fn query_win32_input_mode() -> Win32InputModeState {
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            assert!(unsafe { FlushConsoleInputBuffer(input) } != 0);
+            let mut output = io::stdout();
+            output.write_all(b"\x1b[?9001$p").unwrap();
+            output.flush().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut response = Vec::new();
+            while !response.ends_with(&[u16::from(b'$'), u16::from(b'y')]) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    assert!(
+                        response.is_empty(),
+                        "incomplete win32 input-mode response: {:?}",
+                        String::from_utf16_lossy(&response)
+                    );
+                    return Win32InputModeState::Unsupported;
+                }
+                let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
+                match unsafe { WaitForSingleObject(input, timeout) } {
+                    WAIT_TIMEOUT => {
+                        assert!(
+                            response.is_empty(),
+                            "incomplete win32 input-mode response: {:?}",
+                            String::from_utf16_lossy(&response)
+                        );
+                        return Win32InputModeState::Unsupported;
+                    }
+                    WAIT_OBJECT_0 => {}
+                    wait => panic!("unexpected win32 input-mode wait result {wait:#x}"),
+                }
+                let mut records = [INPUT_RECORD::default(); 32];
+                let mut read = 0;
+                assert!(unsafe {
+                    ReadConsoleInputW(input, records.as_mut_ptr(), records.len() as u32, &mut read)
+                        != 0
+                });
+                for record in &records[..read as usize] {
+                    if record.EventType != KEY_EVENT as u16 {
+                        continue;
+                    }
+                    let key = unsafe { record.Event.KeyEvent };
+                    let unit = unsafe { key.uChar.UnicodeChar };
+                    if key.bKeyDown != 0 && unit != 0 {
+                        response.extend(std::iter::repeat_n(unit, usize::from(key.wRepeatCount)));
+                    }
+                }
+            }
+            match String::from_utf16(&response).unwrap().as_str() {
+                "\x1b[?9001;2$y" => Win32InputModeState::Reset,
+                "\x1b[?9001;0$y" => Win32InputModeState::Unsupported,
+                response => panic!("win32 input mode was not reset: {response:?}"),
+            }
+        }
+
+        fn win32_input_mode_state(bytes: &[u8], label: &str) -> String {
+            let text = String::from_utf8_lossy(bytes);
+            let prefix = format!("MOOR-W32IM-{label}:");
+            text[text.rfind(&prefix).unwrap() + prefix.len()..]
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+
+        fn assert_win32_input_mode_restored(console: &Console, restore_start: usize) {
+            match win32_input_mode_state(&console.received, "after").as_str() {
+                "reset" => {}
+                "unsupported" => assert!(
+                    console.received[restore_start..]
+                        .windows(WIN32_INPUT_DISABLE.len())
+                        .any(|bytes| bytes == WIN32_INPUT_DISABLE),
+                    "host cannot query mode 9001 and the exact reset control was not observed: {:?}",
+                    String::from_utf8_lossy(&console.received[restore_start..])
+                ),
+                state => panic!("unexpected win32 input-mode evidence {state:?}"),
+            }
+        }
+
+        #[test]
+        fn console_mode_probe() {
+            let Some(label) = std::env::var_os("MOOR_CONSOLE_MODE_PROBE") else {
+                return;
+            };
+            if label == "before" {
+                assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
+            }
+            assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
+            let (mut input, mut output) = (0, 0);
+            assert!(unsafe {
+                GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
+                    && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut output) != 0
+            });
+            if label == "after" {
+                let state = match query_win32_input_mode() {
+                    Win32InputModeState::Reset => "reset",
+                    Win32InputModeState::Unsupported => "unsupported",
+                };
+                println!("MOOR-W32IM-{}:{state}", label.to_string_lossy());
+            }
+            println!(
+                "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
+                label.to_string_lossy()
+            );
+            println!("MOOR-MODE-{}-END", label.to_string_lossy());
+        }
+
+        #[test]
+        fn console_geometry_probe() {
+            let Some(mode) = std::env::var_os("MOOR_CONSOLE_GEOMETRY_PROBE") else {
+                return;
+            };
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let output = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            assert!(unsafe { GetConsoleScreenBufferInfo(output, &mut info) } != 0);
+            let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+            let columns = info.srWindow.Right - info.srWindow.Left + 1;
+            println!("MOOR-GEOM-{}:{rows}:{columns}", mode.to_string_lossy());
+            io::stdout().flush().unwrap();
+            if mode.as_os_str() == "foreground" {
+                let release = std::env::var_os("MOOR_CONSOLE_GEOMETRY_RELEASE").unwrap();
+                while !std::path::Path::new(&release).exists() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                return;
+            }
+            let mut input_mode = 0;
+            assert!(unsafe { GetConsoleMode(input, &mut input_mode) } != 0);
+            assert!(unsafe {
+                SetConsoleMode(
+                    input,
+                    (input_mode | ENABLE_WINDOW_INPUT) & !ENABLE_VIRTUAL_TERMINAL_INPUT,
+                ) != 0
+            });
+            thread::sleep(Duration::from_millis(100));
+            assert!(unsafe { FlushConsoleInputBuffer(input) } != 0);
+            println!("MOOR-GEOM-READY");
+            let mut resized = 0;
+            loop {
+                let (mut record, mut read) = (INPUT_RECORD::default(), 0);
+                assert!(unsafe { ReadConsoleInputW(input, &mut record, 1, &mut read) } != 0);
+                if read == 0 {
+                    continue;
+                }
+                if record.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
+                    let size = unsafe { record.Event.WindowBufferSizeEvent.dwSize };
+                    resized += 1;
+                    println!("MOOR-RESIZE:{resized}:{}:{}", size.Y, size.X);
+                } else if record.EventType == KEY_EVENT as u16 {
+                    let key = unsafe { record.Event.KeyEvent };
+                    let character = unsafe { key.uChar.UnicodeChar };
+                    if key.bKeyDown != 0 {
+                        println!("MOOR-UNIT:{character:04X}:{resized}");
+                        if let Some(character) = char::from_u32(character as u32) {
+                            println!("MOOR-KEY:{character}:{resized}");
+                        }
+                    }
+                }
+                io::stdout().flush().unwrap();
+            }
+        }
+
+        #[test]
+        fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
+            let mut console = Console::new(37, 93).unwrap();
+            let mut before = probe(&console, "before").unwrap();
+            assert!(
+                wait_spawn(&mut before, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let before_modes = wait_modes(&mut console, "before");
+            let foreground_session = format!("console-run-e2e-{}", std::process::id());
+            let _foreground_cleanup = Cleanup(foreground_session.clone());
+            let foreground_release =
+                invoked_root().join(format!("console-run-release-{}", std::process::id()));
+            let _ = std::fs::remove_file(&foreground_release);
+            let executable = std::env::current_exe().unwrap();
+            let mut foreground = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            foreground
+                .args([
+                    "run".as_ref(),
+                    foreground_session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_geometry_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "foreground")
+                .env("MOOR_CONSOLE_GEOMETRY_RELEASE", &foreground_release);
+            let mut foreground = console.spawn(foreground).unwrap();
+            wait_log(
+                &invoked_root().join(&foreground_session),
+                b"MOOR-GEOM-foreground:37:93",
+            );
+            std::fs::write(&foreground_release, b"release").unwrap();
+            assert!(
+                wait_spawn(&mut foreground, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let _ = std::fs::remove_file(foreground_release);
+
+            let session = format!("console-e2e-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .args([
+                    "new".as_ref(),
+                    session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_geometry_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
+            let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
+                .unwrap();
+            console
+                .wait_for(b"MOOR-GEOM-READY", Duration::from_secs(10))
+                .unwrap();
+
+            let mut live = probe(&console, "live").unwrap();
+            assert!(
+                wait_spawn(&mut live, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let (input, output) = wait_modes(&mut console, "live");
+            assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+            assert_eq!(
+                input & (ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS),
+                ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
+            );
+            assert_eq!(
+                input
+                    & (ENABLE_LINE_INPUT
+                        | ENABLE_ECHO_INPUT
+                        | ENABLE_PROCESSED_INPUT
+                        | ENABLE_QUICK_EDIT_MODE),
+                0
+            );
+            assert_eq!(
+                output & (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING),
+                ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            );
+
+            console.resize(37, 93).unwrap();
+            thread::sleep(Duration::from_millis(500));
+            console.write(b"A").unwrap();
+            console
+                .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
+                .unwrap();
+            console.resize(41, 101).unwrap();
+            console
+                .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
+                .unwrap();
+            console.write(b"B").unwrap();
+            console
+                .wait_for(b"MOOR-KEY:B:1", Duration::from_secs(5))
+                .unwrap();
+            let trace = String::from_utf8_lossy(&console.received);
+            let mut after = 0;
+            for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
+                after += trace[after..].find(marker).expect("input/resize order") + marker.len();
+            }
+            let restore_start = console.received.len();
+            console.write(&[0x1c]).unwrap();
+            let detached = wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{error}; console output: {:?}",
+                        String::from_utf8_lossy(&console.received)
+                    )
+                });
+            assert!(detached.success(), "{detached:?}");
+            assert!(
+                marker.is_file(),
+                "detach retired the session marker: {marker:?}"
+            );
+            let listed = moor(&["list"]);
+            assert!(listed.status.success(), "{listed:?}");
+            let listed = String::from_utf8(listed.stdout).unwrap();
+            assert!(
+                listed.lines().any(|line| line.contains(&session)),
+                "detached session is not live: {listed:?}"
+            );
+
+            let mut after = probe(&console, "after").unwrap();
+            assert!(
+                wait_spawn(&mut after, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert_win32_input_mode_restored(&console, restore_start);
+            let killed = moor(&["kill", "-f", "-q", &session]);
+            assert!(killed.status.success(), "{killed:?}");
+        }
+
+        const VT_INPUT_SENTINEL: &str = "MOOR_CONSOLE_VT_INPUT_SENTINEL";
+        const CLOSE_READY: &str = "MOOR_CONSOLE_CLOSE_READY";
+        const CLOSE_RELEASE: &str = "MOOR_CONSOLE_CLOSE_RELEASE";
+        const VT_INPUT_READY: &[u8] = b"MOOR-VT-INPUT-READY";
+        const VT_INPUT_VERIFIED: &[u8] = b"MOOR-VT-INPUT-VERIFIED";
+        const VT_INPUT_EXPECTED: &[u8] = b"A\x1bOAZ";
+        const WIN32_INPUT_MODE: u32 = 4;
+        const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
+        const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
+        const WIN32_INPUT_VECTOR: &[u8] =
+            b"\x1b[65;30;65;1;0;1_\x1b[38;72;0;1;256;1_\x1b[90;44;90;1;0;1_";
+        const LEGACY_OUTER_CODEPAGE: u32 = 437;
+
+        fn wait_file(path: &std::path::Path, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if path.is_file() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {path:?}");
+        }
+
+        #[test]
+        fn console_vt_input_probe() {
+            let Some(sentinel) = std::env::var_os(VT_INPUT_SENTINEL) else {
+                return;
+            };
+            let sentinel = std::path::PathBuf::from(sentinel);
+            let release = companion(&sentinel, ".release");
+            let observed = companion(&sentinel, ".observed");
+            let verified = companion(&sentinel, ".verified");
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
+            assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
+
+            let raw = ENABLE_PROCESSED_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_QUICK_EDIT_MODE
+                | ENABLE_WINDOW_INPUT;
+            let mut mode = 0;
+            assert_ne!(unsafe { GetConsoleMode(input, &mut mode) }, 0);
+            assert_ne!(
+                unsafe {
+                    SetConsoleMode(
+                        input,
+                        (mode | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS) & !raw,
+                    )
+                },
+                0
+            );
+            assert_ne!(unsafe { GetConsoleMode(input, &mut mode) }, 0);
+            assert_ne!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+            assert_eq!(mode & raw, 0);
+            assert_ne!(mode & ENABLE_EXTENDED_FLAGS, 0);
+            assert_ne!(unsafe { FlushConsoleInputBuffer(input) }, 0);
+
+            println!("\x1b[?1h{}", String::from_utf8_lossy(VT_INPUT_READY));
+            io::stdout().flush().unwrap();
+
+            wait_file(&sentinel, Duration::from_secs(5));
+            let mut received = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while received.len() < VT_INPUT_EXPECTED.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "timed out waiting for VT input bytes: {received:?}"
+                );
+                let wait_ms = remaining.min(Duration::from_millis(100)).as_millis() as u32;
+                match unsafe { WaitForSingleObject(input, wait_ms.max(1)) } {
+                    WAIT_TIMEOUT => continue,
+                    WAIT_OBJECT_0 => {}
+                    wait => panic!("unexpected console input wait result {wait:#x}"),
+                }
+                let mut bytes = [0; 64];
+                let mut count = 0;
+                assert_ne!(
+                    unsafe {
+                        ReadFile(
+                            input,
+                            bytes.as_mut_ptr(),
+                            bytes.len() as u32,
+                            &mut count,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0,
+                    "ReadFile failed: {}",
+                    io::Error::last_os_error()
+                );
+                assert_ne!(count, 0, "VT input closed before the sentinel");
+                received.extend_from_slice(&bytes[..count as usize]);
+            }
+            std::fs::write(&observed, &received).unwrap();
+            assert_eq!(received, VT_INPUT_EXPECTED);
+            assert_eq!(
+                unsafe { WaitForSingleObject(input, 500) },
+                WAIT_TIMEOUT,
+                "unexpected delayed VT input after the exact vector"
+            );
+            std::fs::write(&verified, b"verified").unwrap();
+            println!("{}", String::from_utf8_lossy(VT_INPUT_VERIFIED));
+            io::stdout().flush().unwrap();
+            wait_file(&release, Duration::from_secs(10));
+        }
+
+        fn record_key(unit: u16) -> INPUT_RECORD {
+            let mut key = KEY_EVENT_RECORD {
+                bKeyDown: TRUE,
+                wRepeatCount: 1,
+                ..KEY_EVENT_RECORD::default()
+            };
+            key.uChar.UnicodeChar = unit;
+            INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: INPUT_RECORD_0 { KeyEvent: key },
+            }
+        }
+
+        fn record_up() -> INPUT_RECORD {
+            let key = KEY_EVENT_RECORD {
+                bKeyDown: TRUE,
+                wRepeatCount: 1,
+                wVirtualKeyCode: VK_UP,
+                wVirtualScanCode: 0x48,
+                dwControlKeyState: ENHANCED_KEY,
+                ..KEY_EVENT_RECORD::default()
+            };
+            INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: INPUT_RECORD_0 { KeyEvent: key },
+            }
+        }
+
+        #[test]
+        fn console_record_sender() {
+            let Some(sentinel) = std::env::var_os(VT_INPUT_SENTINEL) else {
+                return;
+            };
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let previous = unsafe { GetConsoleCP() };
+            assert_ne!(previous, 0);
+            assert_ne!(unsafe { SetConsoleCP(LEGACY_OUTER_CODEPAGE) }, 0);
+            assert_eq!(unsafe { GetConsoleCP() }, LEGACY_OUTER_CODEPAGE);
+            let records = [
+                record_key(u16::from(b'A')),
+                record_up(),
+                record_key(u16::from(b'Z')),
+                record_key(0x1c),
+            ];
+            let mut written = 0;
+            assert_ne!(
+                unsafe {
+                    WriteConsoleInputW(input, records.as_ptr(), records.len() as u32, &mut written)
+                },
+                0,
+                "WriteConsoleInputW failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(written as usize, records.len());
+            assert_ne!(unsafe { SetConsoleCP(previous) }, 0);
+            std::fs::write(sentinel, b"complete").unwrap();
+        }
+
+        struct FileCleanup(Vec<std::path::PathBuf>);
+
+        impl FileCleanup {
+            fn new(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Self {
+                let paths = paths.into_iter().collect::<Vec<_>>();
+                for path in &paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                Self(paths)
+            }
+        }
+
+        impl Drop for FileCleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        #[test]
+        fn platform_w32_input_mode_preserves_application_cursor_semantics() {
+            let mut console = Console::new_with_flags(37, 93, WIN32_INPUT_MODE).unwrap();
+            let sentinel = std::env::temp_dir()
+                .join(format!("moor-platform-w32-input-{}", std::process::id()));
+            let release = companion(&sentinel, ".release");
+            let observed = companion(&sentinel, ".observed");
+            let verified = companion(&sentinel, ".verified");
+            let _files = FileCleanup::new([
+                sentinel.clone(),
+                release.clone(),
+                observed.clone(),
+                verified.clone(),
+            ]);
+
+            let mut command = SpawnCommand::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    std::ffi::OsStr::new("--exact"),
+                    std::ffi::OsStr::new("launch_paths::native_console::console_vt_input_probe"),
+                    std::ffi::OsStr::new("--nocapture"),
+                ])
+                .env(VT_INPUT_SENTINEL, &sentinel);
+            let mut child = console.spawn(command).unwrap();
+            console
+                .wait_for(VT_INPUT_READY, Duration::from_secs(10))
+                .unwrap();
+
+            console.write(WIN32_INPUT_VECTOR).unwrap();
+            std::fs::write(&sentinel, b"complete").unwrap();
+            wait_file(&verified, Duration::from_secs(5));
+            assert_eq!(std::fs::read(&observed).unwrap(), VT_INPUT_EXPECTED);
+            std::fs::write(&release, b"release").unwrap();
+            let status = wait_spawn(&mut child, Duration::from_secs(5)).unwrap();
+            assert!(status.success(), "W32 input probe exited with {status:?}");
+        }
+
+        fn wait_lifecycle_exit(marker: &std::path::Path, timeout: Duration) -> String {
+            let exit = companion(marker, ".exit");
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Ok((_, body)) = Store::read_only(&exit, Kind::Exit, 1) {
+                    let body = String::from_utf8(body).unwrap();
+                    if body.contains("\"phase\":\"exited\"") {
+                        return body;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("child lifecycle did not exit at {exit:?}");
+        }
+
+        #[test]
+        fn shipped_viewer_preserves_exact_vt_input_bytes() {
+            let mut console = Console::new(37, 93).unwrap();
+            let mut before = probe(&console, "before").unwrap();
+            assert!(
+                wait_spawn(&mut before, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let before_modes = wait_modes(&mut console, "before");
+            let session = format!("console-vt-input-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let sentinel = std::env::temp_dir().join(format!(
+                "moor-console-vt-input-sender-{}",
+                std::process::id()
+            ));
+            let release = companion(&sentinel, ".release");
+            let observed = companion(&sentinel, ".observed");
+            let verified = companion(&sentinel, ".verified");
+            let _files = FileCleanup::new([
+                sentinel.clone(),
+                release.clone(),
+                observed.clone(),
+                verified.clone(),
+            ]);
+
+            let executable = std::env::current_exe().unwrap();
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .args([
+                    "new".as_ref(),
+                    session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_vt_input_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env(VT_INPUT_SENTINEL, &sentinel);
+            let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(VT_INPUT_READY, Duration::from_secs(10))
+                .unwrap();
+            console
+                .wait_for(WIN32_INPUT_ENABLE, Duration::from_secs(10))
+                .unwrap();
+            let restore_start = console.received.len();
+
+            let mut sender = SpawnCommand::new(&executable);
+            sender
+                .args([
+                    std::ffi::OsStr::new("--exact"),
+                    std::ffi::OsStr::new("launch_paths::native_console::console_record_sender"),
+                    std::ffi::OsStr::new("--nocapture"),
+                ])
+                .env(VT_INPUT_SENTINEL, &sentinel);
+            let mut sender = console.spawn(sender).unwrap();
+            let sender_status =
+                wait_console_spawn(&mut console, &mut sender, Duration::from_secs(5)).unwrap();
+            assert!(
+                sender_status.success(),
+                "record sender exited with {sender_status:?}; console output: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+            assert!(
+                sentinel.is_file(),
+                "record sender omitted completion sentinel"
+            );
+            wait_file(&verified, Duration::from_secs(5));
+            assert_eq!(
+                std::fs::read(&observed).unwrap(),
+                VT_INPUT_EXPECTED,
+                "outer console output: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+
+            let viewer_status =
+                wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5)).unwrap();
+            assert!(
+                viewer_status.success(),
+                "default detach failed: {viewer_status:?}; console output: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+            assert!(
+                marker.is_file(),
+                "detach retired the session marker: {marker:?}"
+            );
+            let listed = moor(&["list"]);
+            assert!(listed.status.success(), "{listed:?}");
+            let listed = String::from_utf8(listed.stdout).unwrap();
+            assert!(
+                listed.lines().any(|line| line.contains(&session)),
+                "detached session is not live: {listed:?}"
+            );
+            let mut after = probe(&console, "after").unwrap();
+            assert!(
+                wait_spawn(&mut after, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert_win32_input_mode_restored(&console, restore_start);
+
+            std::fs::write(&release, b"release").unwrap();
+            let lifecycle = wait_lifecycle_exit(&marker, Duration::from_secs(10));
+            let lifecycle: serde_json::Value = serde_json::from_str(&lifecycle).unwrap();
+            assert_eq!(lifecycle["phase"].as_str(), Some("exited"));
+            assert_eq!(lifecycle["ended"].as_str(), Some("exited"));
+            assert_eq!(lifecycle["code"].as_u64(), Some(0));
+        }
+
+        static CONTROL_BREAKS: AtomicU8 = AtomicU8::new(0);
+
+        unsafe extern "system" fn control_probe_handler(kind: u32) -> i32 {
+            if kind == CTRL_BREAK_EVENT {
+                CONTROL_BREAKS.fetch_add(1, Ordering::Relaxed);
+                TRUE
+            } else {
+                FALSE
+            }
+        }
+
+        unsafe extern "system" fn ignore_console_control(_: u32) -> i32 {
+            TRUE
+        }
+
+        #[test]
+        fn console_control_probe() {
+            let Some(mode) = std::env::var_os("MOOR_CONSOLE_CONTROL_PROBE") else {
+                return;
+            };
+            let graceful = mode.as_os_str() == "graceful";
+            assert!(graceful || mode.as_os_str() == "ignore");
+            CONTROL_BREAKS.store(0, Ordering::Relaxed);
+            assert!(unsafe { SetConsoleCtrlHandler(Some(control_probe_handler), TRUE) } != 0);
+            println!("MOOR-CONTROL-READY");
+            io::stdout().flush().unwrap();
+            while !graceful || CONTROL_BREAKS.load(Ordering::Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn console_signal_sender() {
+            let Some(target) = std::env::var_os("MOOR_CONSOLE_SIGNAL_TARGET") else {
+                return;
+            };
+            let target = target.to_string_lossy().parse::<u32>().unwrap();
+            unsafe {
+                FreeConsole();
+                assert!(AttachConsole(target) != 0);
+                assert!(SetConsoleCtrlHandler(None, TRUE) != 0);
+                assert!(GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, target) != 0);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        #[test]
+        fn console_close_sender() {
+            let Some(target) = std::env::var_os("MOOR_CONSOLE_CLOSE_TARGET") else {
+                return;
+            };
+            let ready = std::path::PathBuf::from(std::env::var_os(CLOSE_READY).unwrap());
+            let release = std::path::PathBuf::from(std::env::var_os(CLOSE_RELEASE).unwrap());
+            let target = target.to_string_lossy().parse::<u32>().unwrap();
+            unsafe {
+                FreeConsole();
+                assert!(AttachConsole(target) != 0);
+                assert!(SetConsoleCtrlHandler(Some(ignore_console_control), TRUE) != 0);
+                let window = GetConsoleWindow();
+                assert!(!window.is_null());
+                std::fs::write(&ready, b"ready").unwrap();
+                while !release.is_file() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(PostMessageW(window, WM_CLOSE, 0, 0) != 0);
+                assert!(FreeConsole() != 0);
+            }
+        }
+
+        fn signal(target: u32) {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_signal_sender",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_SIGNAL_TARGET", target.to_string())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "signal sender failed: {out:?}");
+        }
+
+        fn close_console(target: u32) -> Instant {
+            let ready = std::env::temp_dir().join(format!(
+                "moor-console-close-ready-{}-{target}",
+                std::process::id()
+            ));
+            let release = companion(&ready, ".release");
+            let _files = FileCleanup::new([ready.clone(), release.clone()]);
+            let mut sender = Command::new(std::env::current_exe().unwrap());
+            let mut sender = sender
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_close_sender",
+                    "--nocapture",
+                ])
+                .env("MOOR_CONSOLE_CLOSE_TARGET", target.to_string())
+                .env(CLOSE_READY, &ready)
+                .env(CLOSE_RELEASE, &release)
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .spawn()
+                .unwrap();
+            wait_file(&ready, Duration::from_secs(5));
+            let started = Instant::now();
+            std::fs::write(&release, b"release").unwrap();
+            let status = wait_std(&mut sender, Duration::from_secs(5)).unwrap();
+            assert!(
+                status.success() || status.code() == Some(STATUS_CONTROL_C_EXIT),
+                "close sender failed before posting WM_CLOSE: {status:?}"
+            );
+            started
+        }
+
+        fn wait_log(marker: &std::path::Path, needle: &[u8]) {
+            let log = companion(marker, ".log");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if Store::read_only(&log, Kind::Log, 1)
+                    .is_ok_and(|(_, body)| body.windows(needle.len()).any(|part| part == needle))
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("child readiness was not logged at {log:?}");
+        }
+
+        fn control_case(label: &str, ignore: bool, second: bool) -> (Duration, String) {
+            let session = format!("console-control-{label}-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["run", &session])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_control_probe",
+                    "--nocapture",
+                ])
+                .env(
+                    "MOOR_CONSOLE_CONTROL_PROBE",
+                    if ignore { "ignore" } else { "graceful" },
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+                .unwrap();
+            wait_log(&marker, b"MOOR-CONTROL-READY");
+            let started = Instant::now();
+            signal(child.id());
+            if second {
+                thread::sleep(Duration::from_millis(250));
+                signal(child.id());
+            }
+            let status = wait_std(&mut child, Duration::from_secs(10)).unwrap();
+            assert!(status.code().is_some(), "holder has no exit status");
+            let elapsed = started.elapsed();
+            let body = String::from_utf8(
+                Store::read_only(&companion(&marker, ".exit"), Kind::Exit, 1)
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            (elapsed, body)
+        }
+
+        fn close_case(label: &str, ignore: bool) -> (Duration, String) {
+            let session = format!("console-close-{label}-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let mut holder = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["run", &session])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_control_probe",
+                    "--nocapture",
+                ])
+                .env(
+                    "MOOR_CONSOLE_CONTROL_PROBE",
+                    if ignore { "ignore" } else { "graceful" },
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP)
+                .spawn()
+                .unwrap();
+            wait_log(&marker, b"MOOR-CONTROL-READY");
+            let started = close_console(holder.id());
+            let status = wait_std(&mut holder, Duration::from_secs(10)).unwrap();
+            assert!(status.code().is_some(), "holder has no close exit status");
+            let elapsed = started.elapsed();
+            let body = String::from_utf8(
+                Store::read_only(&companion(&marker, ".exit"), Kind::Exit, 1)
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            (elapsed, body)
+        }
+
+        #[test]
+        fn shipped_console_close_finishes_durable_graceful_retirement() {
+            let (elapsed, body) = close_case("graceful", false);
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+            assert!(body.contains("\"phase\":\"exited\""), "{body}");
+            assert!(body.contains("\"method\":\"graceful\""), "{body}");
+        }
+
+        #[test]
+        fn shipped_console_close_forces_ignoring_child_with_durable_retirement() {
+            let (elapsed, body) = close_case("ignore", true);
+            assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+            assert!(body.contains("\"phase\":\"exited\""), "{body}");
+            assert!(body.contains("\"method\":\"forced\""), "{body}");
+        }
+
+        #[test]
+        fn terminal_console_control_kinds_are_distinct_from_repeatable_signals() {
+            for kind in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+                assert_eq!(moor::windows::console_control_kind(kind), Some(true));
+            }
+            assert_eq!(
+                moor::windows::console_control_kind(CTRL_BREAK_EVENT),
+                Some(false)
+            );
+            assert_eq!(moor::windows::console_control_kind(u32::MAX), None);
+        }
+
+        #[test]
+        fn shipped_console_control_is_graceful_then_bounded_and_immediately_escalated() {
+            let (graceful, lifecycle) = control_case("graceful", false, false);
+            assert!(graceful < Duration::from_secs(5), "{graceful:?}");
+            assert!(lifecycle.contains("\"method\":\"graceful\""), "{lifecycle}");
+
+            let (bounded, lifecycle) = control_case("bounded", true, false);
+            assert!(bounded >= Duration::from_secs(4), "{bounded:?}");
+            assert!(bounded < Duration::from_secs(10), "{bounded:?}");
+            assert!(lifecycle.contains("\"method\":\"forced\""), "{lifecycle}");
+
+            let (immediate, lifecycle) = control_case("immediate", true, true);
+            assert!(immediate < Duration::from_secs(5), "{immediate:?}");
+            assert!(lifecycle.contains("\"method\":\"forced\""), "{lifecycle}");
+        }
     }
 }

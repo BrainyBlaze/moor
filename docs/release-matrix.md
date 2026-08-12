@@ -19,13 +19,17 @@ is no glibc asset and no libc dimension, so a consumer selects on
 | linux | arm64 | `aarch64-unknown-linux-musl` | fully static musl | `moor-<version>-linux-arm64` |
 | macos | x64 | `x86_64-apple-darwin` | system | `moor-<version>-macos-x64` |
 | macos | arm64 | `aarch64-apple-darwin` | system | `moor-<version>-macos-arm64` |
-| windows | x64 | `x86_64-pc-windows-msvc` | MSVC | `moor-<version>-windows-x64.exe` |
-| windows | arm64 | `aarch64-pc-windows-msvc` | MSVC | `moor-<version>-windows-arm64.exe` |
+| windows | x64 | `x86_64-pc-windows-msvc` | MSVC, static CRT | `moor-<version>-windows-x64.exe` |
+| windows | arm64 | `aarch64-pc-windows-msvc` | MSVC, static CRT | `moor-<version>-windows-arm64.exe` |
 
 `<version>` is the crate version from `Cargo.toml` (`0.1.0` for the first
 release). The manifest key is the target triple; the asset name above is the
 published filename. `x86_64-pc-windows-gnu` remains **compile-evidence only**
 and is never published — MSVC is the distributed Windows ABI.
+
+The MSVC assets statically link the VC++ runtime and therefore do not require a
+separately installed Visual C++ Redistributable. Native packaging records the PE
+dependency table and rejects any `VCRUNTIME*.dll` or `MSVCP*.dll` import.
 
 ### Why static musl for Linux, not glibc
 
@@ -53,8 +57,8 @@ about the shipped bytes, not a lane-local rebuild.
 | linux-arm64 (musl) | Ubuntu 24.04 ARM64, Alpine 3.20 ARM64 (both native ARM64 execution) |
 | macos-x64 | macOS 13+ on Intel |
 | macos-arm64 | macOS 13+ on Apple silicon |
-| windows-x64 | Windows 10 1809, Windows Server 2019 (Server 2022 additional) |
-| windows-arm64 | Windows 11 ARM64 |
+| windows-x64 | Windows Server 2022 (input-fidelity floor, win32 input carrier); Windows 10 1809 and Windows Server 2019 as below-input-floor lanes (§12.8 — input-carrier cases expected-absent, everything else exercised) |
+| windows-arm64 | Windows 11 ARM64 (input-fidelity floor) |
 
 macOS assets are built with deployment target 13.0 on each arch.
 
@@ -71,6 +75,8 @@ none may be waived, and the release fails closed on any missing or red gate.
    dynamically linked Linux artifact is nonconforming.
 3. **Identity** — `moor --version` on the shipped asset reports exactly the
    release `<version>`.
+4. **Windows static-CRT proof** — the PE dependency table for each Windows asset
+   is archived and contains no `VCRUNTIME*.dll` or `MSVCP*.dll` import.
 
 ### Native-provenance per asset
 
@@ -83,7 +89,7 @@ green native lane that satisfied gate 1. Provenance is labelled honestly:
 | `aarch64-unknown-linux-musl` | Ubuntu 24.04 ARM64 + Alpine 3.20 ARM64, native execution | native (required) |
 | `x86_64-apple-darwin` | macOS x64 | native |
 | `aarch64-apple-darwin` | macOS arm64 | native |
-| `x86_64-pc-windows-msvc` | Windows 10 1809 + Server 2019 | native |
+| `x86_64-pc-windows-msvc` | Windows Server 2022 (input-fidelity floor) + 1809/Server 2019 below-floor lanes | native |
 | `aarch64-pc-windows-msvc` | Windows 11 ARM64 | native |
 
 Native execution is mandatory for every asset, aarch64 Linux included: §12.8

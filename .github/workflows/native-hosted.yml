@@ -148,6 +148,7 @@ jobs:
         run: |
           $out = "ci-output/${{ matrix.lane }}"
           Copy-Item target/release/moor.exe "$out/moor.exe"
+          & ./ci/audit-windows-imports.ps1 -Executable "$out/moor.exe" -Output "$out/imports.txt"
           $hashes = foreach ($file in @("$out/moor.exe")) {
             $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))"
@@ -172,7 +173,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-${{ matrix.lane }}-${{ github.sha }}
-          path: ci-output/${{ matrix.lane }}
+          path: ci-output
           if-no-files-found: error
           retention-days: 14
 

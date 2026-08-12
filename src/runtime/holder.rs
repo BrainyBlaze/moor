@@ -15,8 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::thread;
 use std::time::Duration;
 
-schema!(struct pub CoreConfig derive [Debug] pub fields; generation: u32, identity: Vec<u8>, incarnation: [u8; 16],
-    semantic_token: [u8; 16], replay_limit: usize);
+schema!(struct pub CoreConfig derive [Debug] pub fields; generation: u32, identity: Vec<u8>, incarnation: [u8; 16], semantic_token: [u8; 16], replay_limit: usize);
 type DecodeResult = std::result::Result<(), wire::WireError>;
 type ClearResult = (u8, u8, Option<(u32, u64, u64)>);
 type Refusal = (u16, u16, &'static [u8]);
@@ -308,13 +307,12 @@ pub trait Native {
     }
     fn terminate(&mut self, force: bool) -> (u8, bool);
     fn exited(&mut self) -> Result<Option<NativeExit>>;
+    fn abandon(&mut self) {}
 }
 
-schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage,
-    status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
+schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
 schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
-schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64,
-    pid: Option<u32>, refusal: Option<Refusal>);
+schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64, pid: Option<u32>, refusal: Option<Refusal>);
 
 impl Peer {
     fn profile(&self) -> Option<Profile> {
@@ -326,10 +324,7 @@ impl Peer {
     }
 }
 
-schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool,
-    peers: HashMap<u64, Peer>, recipients: Vec<u64>,
-    frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N,
-    heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
+schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool, peers: HashMap<u64, Peer>, recipients: Vec<u64>, frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N, heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
     pub fn output(&mut self, bytes: Vec<u8>) {
@@ -545,6 +540,7 @@ impl<N: Native> Runtime<N> {
             }
             self.poll();
             if self.machine.termination_expired() {
+                self.native.abandon();
                 return Ok(None);
             }
             if let Some((status, drain_until)) = exited {
@@ -1104,7 +1100,4 @@ impl PreparedArtifacts {
 }
 
 #[cfg(test)]
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/unit/runtime_holder.rs"
-));
+include!("../../tests/unit/runtime_holder.rs");
