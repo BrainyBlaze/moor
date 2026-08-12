@@ -57,8 +57,8 @@ about the shipped bytes, not a lane-local rebuild.
 | linux-arm64 (musl) | Ubuntu 24.04 ARM64, Alpine 3.20 ARM64 (both native ARM64 execution) |
 | macos-x64 | macOS 13+ on Intel |
 | macos-arm64 | macOS 13+ on Apple silicon |
-| windows-x64 | Windows 10 1809, Windows Server 2019 (Server 2022 additional) |
-| windows-arm64 | Windows 11 ARM64 |
+| windows-x64 | Windows Server 2022 (input-fidelity floor, win32 input carrier); Windows 10 1809 and Windows Server 2019 as below-input-floor lanes (§12.8 — input-carrier cases expected-absent, everything else exercised) |
+| windows-arm64 | Windows 11 ARM64 (input-fidelity floor) |
 
 macOS assets are built with deployment target 13.0 on each arch.
 
@@ -89,7 +89,7 @@ green native lane that satisfied gate 1. Provenance is labelled honestly:
 | `aarch64-unknown-linux-musl` | Ubuntu 24.04 ARM64 + Alpine 3.20 ARM64, native execution | native (required) |
 | `x86_64-apple-darwin` | macOS x64 | native |
 | `aarch64-apple-darwin` | macOS arm64 | native |
-| `x86_64-pc-windows-msvc` | Windows 10 1809 + Server 2019 | native |
+| `x86_64-pc-windows-msvc` | Windows Server 2022 (input-fidelity floor) + 1809/Server 2019 below-floor lanes | native |
 | `aarch64-pc-windows-msvc` | Windows 11 ARM64 | native |
 
 Native execution is mandatory for every asset, aarch64 Linux included: §12.8
