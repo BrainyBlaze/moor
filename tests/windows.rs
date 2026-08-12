@@ -1565,14 +1565,15 @@ mod launch_paths {
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT,
             CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, ClosePseudoConsole, CreatePseudoConsole,
-            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-            ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, ENHANCED_KEY,
-            FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
-            GetConsoleMode, GetConsoleScreenBufferInfo, GetConsoleWindow, GetStdHandle, HPCON,
-            INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, ReadConsoleInputW,
-            ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP,
-            SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
+            ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_QUICK_EDIT_MODE,
+            ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+            ENHANCED_KEY, FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent,
+            GetConsoleCP, GetConsoleMode, GetConsoleScreenBufferInfo, GetConsoleWindow,
+            GetStdHandle, HPCON, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
+            ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+            WriteConsoleInputW,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
         use windows_sys::Win32::System::Threading::{
@@ -1747,6 +1748,31 @@ mod launch_paths {
             Err(io::Error::new(io::ErrorKind::TimedOut, "child timed out"))
         }
 
+        fn wait_console_spawn(
+            console: &mut Console,
+            child: &mut Child,
+            timeout: Duration,
+        ) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                console.pump()?;
+                if let Some(status) = child.try_wait()? {
+                    console.pump()?;
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "child timed out; console output: {:?}",
+                    String::from_utf8_lossy(&console.received)
+                ),
+            ))
+        }
+
         fn wait_std(child: &mut std::process::Child, timeout: Duration) -> io::Result<ExitStatus> {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
@@ -1914,6 +1940,7 @@ mod launch_paths {
 
             let session = format!("console-e2e-{}", std::process::id());
             let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
             let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
             command
                 .args([
@@ -1942,8 +1969,8 @@ mod launch_paths {
             let (input, output) = wait_modes(&mut console, "live");
             assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
             assert_eq!(
-                input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
-                ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+                input & (ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS),
+                ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS
             );
             assert_eq!(
                 input
@@ -1977,19 +2004,30 @@ mod launch_paths {
             for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
-            let killed = moor(&["kill", "-f", "-q", &session]);
-            assert!(killed.status.success(), "{killed:?}");
-            let detached =
-                wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
+            console.write(&[0x1c]).unwrap();
+            let detached = wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5))
+                .unwrap_or_else(|error| {
                     panic!(
                         "{error}; console output: {:?}",
                         String::from_utf8_lossy(&console.received)
                     )
                 });
-            assert_eq!(detached.code(), Some(1), "{detached:?}");
+            assert!(detached.success(), "{detached:?}");
             console
                 .wait_for(WIN32_INPUT_DISABLE, Duration::from_secs(5))
                 .unwrap();
+            let disabled_at = last_marker(&console.received, WIN32_INPUT_DISABLE);
+            assert!(
+                marker.is_file(),
+                "detach retired the session marker: {marker:?}"
+            );
+            let listed = moor(&["list"]);
+            assert!(listed.status.success(), "{listed:?}");
+            let listed = String::from_utf8(listed.stdout).unwrap();
+            assert!(
+                listed.lines().any(|line| line.contains(&session)),
+                "detached session is not live: {listed:?}"
+            );
 
             let mut after = probe(&console, "after").unwrap();
             assert!(
@@ -1998,9 +2036,17 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert!(
+                disabled_at < last_marker(&console.received, b"MOOR-MODE-after:"),
+                "input-mode disable did not precede console restoration evidence"
+            );
+            let killed = moor(&["kill", "-f", "-q", &session]);
+            assert!(killed.status.success(), "{killed:?}");
         }
 
         const VT_INPUT_SENTINEL: &str = "MOOR_CONSOLE_VT_INPUT_SENTINEL";
+        const CLOSE_READY: &str = "MOOR_CONSOLE_CLOSE_READY";
+        const CLOSE_RELEASE: &str = "MOOR_CONSOLE_CLOSE_RELEASE";
         const VT_INPUT_READY: &[u8] = b"MOOR-VT-INPUT-READY";
         const VT_INPUT_VERIFIED: &[u8] = b"MOOR-VT-INPUT-VERIFIED";
         const VT_INPUT_EXPECTED: &[u8] = b"A\x1bOAZ";
@@ -2020,6 +2066,19 @@ mod launch_paths {
                 thread::sleep(Duration::from_millis(10));
             }
             panic!("timed out waiting for {path:?}");
+        }
+
+        fn last_marker(bytes: &[u8], marker: &[u8]) -> usize {
+            bytes
+                .windows(marker.len())
+                .rposition(|window| window == marker)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing {:?} in {:?}",
+                        String::from_utf8_lossy(marker),
+                        String::from_utf8_lossy(bytes)
+                    )
+                })
         }
 
         #[test]
@@ -2062,9 +2121,16 @@ mod launch_paths {
 
             wait_file(&sentinel, Duration::from_secs(5));
             let mut received = Vec::new();
-            loop {
-                match unsafe { WaitForSingleObject(input, 500) } {
-                    WAIT_TIMEOUT => break,
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while received.len() < VT_INPUT_EXPECTED.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "timed out waiting for VT input bytes: {received:?}"
+                );
+                let wait_ms = remaining.min(Duration::from_millis(100)).as_millis() as u32;
+                match unsafe { WaitForSingleObject(input, wait_ms.max(1)) } {
+                    WAIT_TIMEOUT => continue,
                     WAIT_OBJECT_0 => {}
                     wait => panic!("unexpected console input wait result {wait:#x}"),
                 }
@@ -2089,6 +2155,11 @@ mod launch_paths {
             }
             std::fs::write(&observed, &received).unwrap();
             assert_eq!(received, VT_INPUT_EXPECTED);
+            assert_eq!(
+                unsafe { WaitForSingleObject(input, 500) },
+                WAIT_TIMEOUT,
+                "unexpected delayed VT input after the exact vector"
+            );
             std::fs::write(&verified, b"verified").unwrap();
             println!("{}", String::from_utf8_lossy(VT_INPUT_VERIFIED));
             io::stdout().flush().unwrap();
@@ -2129,12 +2200,15 @@ mod launch_paths {
                 return;
             };
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let previous = unsafe { GetConsoleCP() };
+            assert_ne!(previous, 0);
             assert_ne!(unsafe { SetConsoleCP(LEGACY_OUTER_CODEPAGE) }, 0);
             assert_eq!(unsafe { GetConsoleCP() }, LEGACY_OUTER_CODEPAGE);
             let records = [
                 record_key(u16::from(b'A')),
                 record_up(),
                 record_key(u16::from(b'Z')),
+                record_key(0x1c),
             ];
             let mut written = 0;
             assert_ne!(
@@ -2146,6 +2220,7 @@ mod launch_paths {
                 io::Error::last_os_error()
             );
             assert_eq!(written as usize, records.len());
+            assert_ne!(unsafe { SetConsoleCP(previous) }, 0);
             std::fs::write(sentinel, b"complete").unwrap();
         }
 
@@ -2225,6 +2300,13 @@ mod launch_paths {
         #[test]
         fn shipped_viewer_preserves_exact_vt_input_bytes() {
             let mut console = Console::new(37, 93).unwrap();
+            let mut before = probe(&console, "before").unwrap();
+            assert!(
+                wait_spawn(&mut before, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            let before_modes = wait_modes(&mut console, "before");
             let session = format!("console-vt-input-{}", std::process::id());
             let _cleanup = Cleanup(session.clone());
             let marker = invoked_root().join(&session);
@@ -2262,8 +2344,26 @@ mod launch_paths {
                 .wait_for(WIN32_INPUT_ENABLE, Duration::from_secs(10))
                 .unwrap();
 
-            console.write(WIN32_INPUT_VECTOR).unwrap();
-            std::fs::write(&sentinel, b"complete").unwrap();
+            let mut sender = SpawnCommand::new(&executable);
+            sender
+                .args([
+                    std::ffi::OsStr::new("--exact"),
+                    std::ffi::OsStr::new("launch_paths::native_console::console_record_sender"),
+                    std::ffi::OsStr::new("--nocapture"),
+                ])
+                .env(VT_INPUT_SENTINEL, &sentinel);
+            let mut sender = console.spawn(sender).unwrap();
+            let sender_status =
+                wait_console_spawn(&mut console, &mut sender, Duration::from_secs(5)).unwrap();
+            assert!(
+                sender_status.success(),
+                "record sender exited with {sender_status:?}; console output: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+            assert!(
+                sentinel.is_file(),
+                "record sender omitted completion sentinel"
+            );
             wait_file(&observed, Duration::from_secs(5));
             assert_eq!(
                 std::fs::read(&observed).unwrap(),
@@ -2273,11 +2373,38 @@ mod launch_paths {
             );
             wait_file(&verified, Duration::from_secs(5));
 
-            viewer.kill().unwrap();
-            let viewer_status = viewer.wait().unwrap();
+            let viewer_status =
+                wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5)).unwrap();
             assert!(
-                !viewer_status.success(),
-                "terminated viewer unexpectedly reported success"
+                viewer_status.success(),
+                "default detach failed: {viewer_status:?}; console output: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+            console
+                .wait_for(WIN32_INPUT_DISABLE, Duration::from_secs(5))
+                .unwrap();
+            let disabled_at = last_marker(&console.received, WIN32_INPUT_DISABLE);
+            assert!(
+                marker.is_file(),
+                "detach retired the session marker: {marker:?}"
+            );
+            let listed = moor(&["list"]);
+            assert!(listed.status.success(), "{listed:?}");
+            let listed = String::from_utf8(listed.stdout).unwrap();
+            assert!(
+                listed.lines().any(|line| line.contains(&session)),
+                "detached session is not live: {listed:?}"
+            );
+            let mut after = probe(&console, "after").unwrap();
+            assert!(
+                wait_spawn(&mut after, Duration::from_secs(5))
+                    .unwrap()
+                    .success()
+            );
+            assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert!(
+                disabled_at < last_marker(&console.received, b"MOOR-MODE-after:"),
+                "input-mode disable did not precede console restoration evidence"
             );
 
             std::fs::write(&release, b"release").unwrap();
@@ -2339,6 +2466,8 @@ mod launch_paths {
             let Some(target) = std::env::var_os("MOOR_CONSOLE_CLOSE_TARGET") else {
                 return;
             };
+            let ready = std::path::PathBuf::from(std::env::var_os(CLOSE_READY).unwrap());
+            let release = std::path::PathBuf::from(std::env::var_os(CLOSE_RELEASE).unwrap());
             let target = target.to_string_lossy().parse::<u32>().unwrap();
             unsafe {
                 FreeConsole();
@@ -2346,6 +2475,10 @@ mod launch_paths {
                 assert!(SetConsoleCtrlHandler(Some(ignore_console_control), TRUE) != 0);
                 let window = GetConsoleWindow();
                 assert!(!window.is_null());
+                std::fs::write(&ready, b"ready").unwrap();
+                while !release.is_file() {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 assert!(PostMessageW(window, WM_CLOSE, 0, 0) != 0);
                 assert!(FreeConsole() != 0);
             }
@@ -2364,21 +2497,35 @@ mod launch_paths {
             assert!(out.status.success(), "signal sender failed: {out:?}");
         }
 
-        fn close_console(target: u32) {
-            let out = Command::new(std::env::current_exe().unwrap())
+        fn close_console(target: u32) -> Instant {
+            let ready = std::env::temp_dir().join(format!(
+                "moor-console-close-ready-{}-{target}",
+                std::process::id()
+            ));
+            let release = companion(&ready, ".release");
+            let _files = FileCleanup::new([ready.clone(), release.clone()]);
+            let mut sender = Command::new(std::env::current_exe().unwrap());
+            let mut sender = sender
                 .args([
                     "--exact",
                     "launch_paths::native_console::console_close_sender",
                     "--nocapture",
                 ])
                 .env("MOOR_CONSOLE_CLOSE_TARGET", target.to_string())
+                .env(CLOSE_READY, &ready)
+                .env(CLOSE_RELEASE, &release)
                 .creation_flags(CREATE_NEW_CONSOLE)
-                .output()
+                .spawn()
                 .unwrap();
+            wait_file(&ready, Duration::from_secs(5));
+            let started = Instant::now();
+            std::fs::write(&release, b"release").unwrap();
+            let status = wait_std(&mut sender, Duration::from_secs(5)).unwrap();
             assert!(
-                out.status.success() || out.status.code() == Some(STATUS_CONTROL_C_EXIT),
-                "close sender failed before posting WM_CLOSE: {out:?}"
+                status.success() || status.code() == Some(STATUS_CONTROL_C_EXIT),
+                "close sender failed before posting WM_CLOSE: {status:?}"
             );
+            started
         }
 
         fn wait_log(marker: &std::path::Path, needle: &[u8]) {
@@ -2459,8 +2606,7 @@ mod launch_paths {
                 .spawn()
                 .unwrap();
             wait_log(&marker, b"MOOR-CONTROL-READY");
-            let started = Instant::now();
-            close_console(holder.id());
+            let started = close_console(holder.id());
             let status = wait_std(&mut holder, Duration::from_secs(10)).unwrap();
             assert!(status.code().is_some(), "holder has no close exit status");
             let elapsed = started.elapsed();

@@ -216,6 +216,7 @@ mod native {
     use interprocess::os::windows::local_socket::ListenerOptionsExt;
     use interprocess::os::windows::security_descriptor::*;
     use smallvec::SmallVec;
+    use std::collections::VecDeque;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::windows::{ffi::*, fs::*, io::*};
@@ -241,7 +242,10 @@ mod native {
             SystemInformation::*,
             Threading::*,
         },
-        UI::Input::KeyboardAndMouse::VkKeyScanW,
+        UI::Input::KeyboardAndMouse::{
+            VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU,
+            VK_RSHIFT, VK_RWIN, VK_SHIFT, VkKeyScanW,
+        },
     };
 
     fn check(ok: bool, what: &str) -> Result<()> {
@@ -1006,7 +1010,13 @@ mod native {
         }
         drop(state.0);
         if state.1 {
-            delete_file(&directory);
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !delete_file(&directory) && Instant::now() < deadline {
+                // Slot dispositions become visible asynchronously under
+                // filesystem load. Keep the exact owned-directory handle
+                // pinned while waiting for its namespace to become empty.
+                thread::sleep(Duration::from_millis(1));
+            }
         }
     }
     pub(crate) fn delete_file(file: &File) -> bool {
@@ -2366,29 +2376,258 @@ mod native {
         console_wide_with_nul(key, unsafe { VkKeyScanW(0) })
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Win32InputCarrier {
+        virtual_key: u16,
+        scan_code: u16,
+        unicode: u16,
+        key_down: bool,
+        control_state: u32,
+        repeat: u16,
+        c1: bool,
+    }
+
+    impl Win32InputCarrier {
+        fn key(self) -> KEY_EVENT_RECORD {
+            KEY_EVENT_RECORD {
+                bKeyDown: i32::from(self.key_down),
+                wRepeatCount: self.repeat,
+                wVirtualKeyCode: self.virtual_key,
+                wVirtualScanCode: self.scan_code,
+                uChar: KEY_EVENT_RECORD_0 {
+                    UnicodeChar: self.unicode,
+                },
+                dwControlKeyState: self.control_state,
+            }
+        }
+
+        fn modifier(self) -> bool {
+            matches!(
+                self.virtual_key,
+                VK_SHIFT
+                    | VK_CONTROL
+                    | VK_MENU
+                    | VK_LSHIFT
+                    | VK_RSHIFT
+                    | VK_LCONTROL
+                    | VK_RCONTROL
+                    | VK_LMENU
+                    | VK_RMENU
+                    | VK_LWIN
+                    | VK_RWIN
+            )
+        }
+
+        fn once(self) -> Vec<u8> {
+            let mut bytes = if self.c1 {
+                vec![0xc2, 0x9b]
+            } else {
+                b"\x1b[".to_vec()
+            };
+            bytes.extend_from_slice(
+                format!(
+                    "{};{};{};{};{};1_",
+                    self.virtual_key,
+                    self.scan_code,
+                    self.unicode,
+                    u8::from(self.key_down),
+                    self.control_state
+                )
+                .as_bytes(),
+            );
+            bytes
+        }
+
+        fn frame(self, bytes: Vec<u8>) -> InputFrame {
+            if !self.key_down || self.modifier() {
+                return InputFrame::Meta(bytes);
+            }
+            let semantic = console_wide(self.key()).and_then(|(unit, _)| u8::try_from(unit).ok());
+            InputFrame::Key(bytes, self.once(), semantic, self.repeat)
+        }
+    }
+
+    fn win32_input_carrier(bytes: &[u8]) -> Option<Win32InputCarrier> {
+        let (body, c1) = if let Some(body) = bytes.strip_prefix(b"\x1b[") {
+            (body, false)
+        } else {
+            (bytes.strip_prefix(b"\xc2\x9b")?, true)
+        };
+        let body = body.strip_suffix(b"_")?;
+        let values = body
+            .split(|byte| *byte == b';')
+            .map(|field| {
+                let text = std::str::from_utf8(field).ok()?;
+                crate::canonical_u64(text)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        crate::return_if!(values.len() != 6 || values[3] > 1, None);
+        let carrier = Win32InputCarrier {
+            virtual_key: values[0].try_into().ok()?,
+            scan_code: values[1].try_into().ok()?,
+            unicode: values[2].try_into().ok()?,
+            key_down: values[3] != 0,
+            control_state: values[4].try_into().ok()?,
+            repeat: values[5].try_into().ok()?,
+            c1,
+        };
+        (carrier.repeat != 0).then_some(carrier)
+    }
+
+    fn generated_carrier_unit(event: INPUT_RECORD) -> Option<(u16, u16)> {
+        crate::return_if!(event.EventType != KEY_EVENT as u16, None);
+        let key = unsafe { event.Event.KeyEvent };
+        let unit = unsafe { key.uChar.UnicodeChar };
+        (key.bKeyDown != 0
+            && key.wRepeatCount != 0
+            && key.wVirtualKeyCode == 0
+            && key.wVirtualScanCode == 0
+            && key.dwControlKeyState == 0)
+            .then_some((unit, key.wRepeatCount))
+    }
+
     const CONSOLE_READ_RECORDS: usize = 256;
     const CONSOLE_RECORD_BUDGET: usize = 16_384;
     const CONSOLE_WIDE_TARGET: usize = 16 * 1024;
     const CONSOLE_BYTE_TARGET: usize = 64 * 1024;
+    const WIN32_CARRIER_LIMIT: usize = 64;
+
+    enum ConsoleUnit {
+        Event(INPUT_RECORD),
+        Bytes(SmallVec<[u8; WIN32_CARRIER_LIMIT]>),
+        Framed(InputFrame),
+    }
 
     struct ConsoleInput {
         handle: HANDLE,
+        recognize_carriers: bool,
         pending_high: Option<(u16, u32)>,
         deferred: Option<InputState>,
+        closed: bool,
+        carrier: SmallVec<[u8; WIN32_CARRIER_LIMIT]>,
+        carrier_started: Option<Instant>,
+        units: VecDeque<u16>,
+        replay: VecDeque<ConsoleUnit>,
         records: [INPUT_RECORD; CONSOLE_READ_RECORDS],
         next: usize,
         count: usize,
     }
 
     impl ConsoleInput {
+        #[cfg(test)]
         fn new(handle: HANDLE) -> Self {
+            Self::with_detach(handle, None)
+        }
+
+        fn with_detach(handle: HANDLE, detach: Option<u8>) -> Self {
             Self {
                 handle,
+                recognize_carriers: detach.is_some(),
                 pending_high: None,
                 deferred: None,
+                closed: false,
+                carrier: SmallVec::new(),
+                carrier_started: None,
+                units: VecDeque::new(),
+                replay: VecDeque::new(),
                 records: [INPUT_RECORD::default(); CONSOLE_READ_RECORDS],
                 next: 0,
                 count: 0,
+            }
+        }
+
+        fn raw_unit(unit: u16) -> SmallVec<[u8; WIN32_CARRIER_LIMIT]> {
+            if unit <= 0x7f {
+                SmallVec::from_slice(&[unit as u8])
+            } else {
+                debug_assert_eq!(unit, 0x9b);
+                SmallVec::from_slice(&[0xc2, 0x9b])
+            }
+        }
+
+        fn take_carrier(&mut self) -> SmallVec<[u8; WIN32_CARRIER_LIMIT]> {
+            self.carrier_started = None;
+            std::mem::take(&mut self.carrier)
+        }
+
+        fn carrier_wait(&self) -> u32 {
+            let elapsed = self
+                .carrier_started
+                .map_or(Duration::MAX, |at| at.elapsed());
+            let remaining = Duration::from_millis(50).saturating_sub(elapsed);
+            u32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap()
+        }
+
+        fn scan_unit(&mut self, unit: u16) -> Option<ConsoleUnit> {
+            if self.carrier.is_empty() {
+                match unit {
+                    0x1b => self.carrier.push(0x1b),
+                    0x9b => self.carrier.extend_from_slice(&[0xc2, 0x9b]),
+                    _ => return Some(ConsoleUnit::Bytes(Self::raw_unit(unit))),
+                }
+                self.carrier_started = Some(Instant::now());
+                return None;
+            }
+            if self.carrier.as_slice() == b"\x1b" {
+                if unit == u16::from(b'[') {
+                    self.carrier.push(b'[');
+                    return None;
+                }
+                let prior = self.take_carrier();
+                self.units.push_front(unit);
+                return Some(ConsoleUnit::Bytes(prior));
+            }
+            let byte = u8::try_from(unit).ok();
+            if byte.is_none_or(|byte| !byte.is_ascii_digit() && byte != b';' && byte != b'_') {
+                let bytes = self.take_carrier();
+                self.units.push_front(unit);
+                return Some(ConsoleUnit::Bytes(bytes));
+            }
+            let byte = byte.unwrap();
+            self.carrier.push(byte);
+            if self.carrier.len() > WIN32_CARRIER_LIMIT {
+                return Some(ConsoleUnit::Bytes(self.take_carrier()));
+            }
+            if byte == b'_' {
+                let bytes = self.take_carrier();
+                return match win32_input_carrier(&bytes) {
+                    Some(carrier) => Some(ConsoleUnit::Framed(carrier.frame(bytes.to_vec()))),
+                    None => Some(ConsoleUnit::Bytes(bytes)),
+                };
+            }
+            None
+        }
+
+        fn next_unit(&mut self) -> Option<ConsoleUnit> {
+            if let Some(unit) = self.replay.pop_front() {
+                return Some(unit);
+            }
+            loop {
+                if let Some(unit) = self.units.pop_front() {
+                    if let Some(unit) = self.scan_unit(unit) {
+                        return Some(unit);
+                    }
+                    continue;
+                }
+                crate::return_if!(self.next == self.count, None);
+                let event = self.records[self.next];
+                self.next += 1;
+                crate::return_if!(!self.recognize_carriers, Some(ConsoleUnit::Event(event)));
+                let Some((unit, repeat)) = generated_carrier_unit(event) else {
+                    if !self.carrier.is_empty() {
+                        self.replay.push_back(ConsoleUnit::Event(event));
+                        return Some(ConsoleUnit::Bytes(self.take_carrier()));
+                    }
+                    return Some(ConsoleUnit::Event(event));
+                };
+                if self.carrier.is_empty() && !matches!(unit, 0x1b | 0x9b) {
+                    return Some(ConsoleUnit::Event(event));
+                }
+                if unit > 0x7f && unit != 0x9b {
+                    self.replay.push_back(ConsoleUnit::Event(event));
+                    return Some(ConsoleUnit::Bytes(self.take_carrier()));
+                }
+                self.units.extend(std::iter::repeat_n(unit, repeat.into()));
             }
         }
 
@@ -2547,44 +2786,122 @@ mod native {
             let mut output = Vec::new();
             let mut wide = Vec::new();
             let mut codepage = None;
+            let mut frames = Vec::new();
+            let mut frame_bytes = 0;
             // A larger processing budget coalesces ordinary paste input across
             // many native reads. The fixed budget still yields periodically so
             // ignored-event floods cannot starve keepalives or detach timing.
             for _ in 0..CONSOLE_RECORD_BUDGET {
-                if self.next == self.count {
-                    let wait = u32::from(output.is_empty() && wide.is_empty()) * 50;
+                let unit = loop {
+                    if let Some(unit) = self.next_unit() {
+                        break unit;
+                    }
+                    if self.closed {
+                        if !frames.is_empty() {
+                            return InputState::Framed(frames);
+                        }
+                        self.flush(&mut codepage, &mut wide, &mut output).ok();
+                        output.extend_from_slice(&self.take_carrier());
+                        return self.finish(output, InputState::Closed);
+                    }
+                    if !frames.is_empty() {
+                        match refill(self, 0) {
+                            Ok(true) => continue,
+                            Ok(false) => return InputState::Framed(frames),
+                            Err(()) => {
+                                self.closed = true;
+                                return InputState::Framed(frames);
+                            }
+                        }
+                    }
+                    if !self.carrier.is_empty() && (!output.is_empty() || !wide.is_empty()) {
+                        let next = match self.flush(&mut codepage, &mut wide, &mut output) {
+                            Ok(()) => InputState::Pending,
+                            Err(()) => InputState::Closed,
+                        };
+                        return self.finish(output, next);
+                    }
+                    let wait = if self.carrier.is_empty() {
+                        u32::from(output.is_empty() && wide.is_empty()) * 50
+                    } else {
+                        self.carrier_wait()
+                    };
+                    if wait == 0 && !self.carrier.is_empty() {
+                        let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+                        output.extend_from_slice(&self.take_carrier());
+                        let next = if encoded.is_ok() {
+                            InputState::Pending
+                        } else {
+                            InputState::Closed
+                        };
+                        return self.finish(output, next);
+                    }
                     match refill(self, wait) {
-                        Ok(true) => {}
+                        Ok(true) => continue,
                         Ok(false) => {
+                            let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+                            output.extend_from_slice(&self.take_carrier());
+                            let next = if encoded.is_ok() {
+                                InputState::Pending
+                            } else {
+                                InputState::Closed
+                            };
+                            return self.finish(output, next);
+                        }
+                        Err(()) => {
+                            self.closed = true;
+                            continue;
+                        }
+                    }
+                };
+                if !frames.is_empty() && !matches!(unit, ConsoleUnit::Framed(_)) {
+                    self.replay.push_front(unit);
+                    return InputState::Framed(frames);
+                }
+                match unit {
+                    ConsoleUnit::Event(event) => {
+                        // The console VT engine exposes UTF-16 records, while
+                        // ConPTY's input boundary is always UTF-8. The viewer's
+                        // legacy input code page must not alter serialization.
+                        codepage = Some(CP_UTF8);
+                        match self.record(event, CP_UTF8, &mut wide) {
+                            Ok(Some((rows, columns))) => {
+                                if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                                    return self.finish(output, InputState::Closed);
+                                }
+                                return self.finish(output, InputState::Resize(rows, columns));
+                            }
+                            Ok(None) => {}
+                            Err(()) => {
+                                self.flush(&mut codepage, &mut wide, &mut output).ok();
+                                return self.finish(output, InputState::Closed);
+                            }
+                        }
+                    }
+                    ConsoleUnit::Bytes(bytes) => {
+                        if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
+                            return self.finish(output, InputState::Closed);
+                        }
+                        output.extend_from_slice(&bytes);
+                    }
+                    ConsoleUnit::Framed(frame) => {
+                        if !output.is_empty() || !wide.is_empty() {
+                            self.replay.push_front(ConsoleUnit::Framed(frame));
                             let next = match self.flush(&mut codepage, &mut wide, &mut output) {
                                 Ok(()) => InputState::Pending,
                                 Err(()) => InputState::Closed,
                             };
                             return self.finish(output, next);
                         }
-                        Err(()) => {
-                            self.flush(&mut codepage, &mut wide, &mut output).ok();
-                            return self.finish(output, InputState::Closed);
-                        }
-                    }
-                }
-                // The console VT engine exposes UTF-16 records, while ConPTY's
-                // input boundary is always UTF-8. The viewer's legacy input
-                // code page must not alter this serialization.
-                codepage = Some(CP_UTF8);
-                let event = self.records[self.next];
-                self.next += 1;
-                match self.record(event, CP_UTF8, &mut wide) {
-                    Ok(Some((rows, columns))) => {
-                        if self.flush(&mut codepage, &mut wide, &mut output).is_err() {
-                            return self.finish(output, InputState::Closed);
-                        }
-                        return self.finish(output, InputState::Resize(rows, columns));
-                    }
-                    Ok(None) => {}
-                    Err(()) => {
-                        self.flush(&mut codepage, &mut wide, &mut output).ok();
-                        return self.finish(output, InputState::Closed);
+                        frame_bytes += match &frame {
+                            InputFrame::Meta(bytes) | InputFrame::Key(bytes, ..) => bytes.len(),
+                        };
+                        frames.push(frame);
+                        crate::return_if!(
+                            frame_bytes >= CONSOLE_BYTE_TARGET,
+                            InputState::Framed(frames)
+                        );
+                        continue;
                     }
                 }
                 if wide.len() >= CONSOLE_WIDE_TARGET
@@ -2597,9 +2914,13 @@ mod native {
                     InputState::Bytes(output)
                 );
             }
-            let next = match self.flush(&mut codepage, &mut wide, &mut output) {
-                Ok(()) => InputState::Pending,
-                Err(()) => InputState::Closed,
+            crate::return_if!(!frames.is_empty(), InputState::Framed(frames));
+            let encoded = self.flush(&mut codepage, &mut wide, &mut output);
+            output.extend_from_slice(&self.take_carrier());
+            let next = if encoded.is_ok() {
+                InputState::Pending
+            } else {
+                InputState::Closed
             };
             self.finish(output, next)
         }
@@ -2630,7 +2951,7 @@ mod native {
     fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) } as usize;
-            let mut input = ConsoleInput::new(input as HANDLE);
+            let mut input = ConsoleInput::with_detach(input as HANDLE, detach);
             run_viewer_input(
                 io::empty(),
                 sender,
