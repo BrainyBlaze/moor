@@ -1,8 +1,13 @@
-use moor::cli::{Options, Redraw};
+use moor::cli::Options;
+#[cfg(unix)]
+use moor::cli::Redraw;
 use moor::runtime::client::Client;
 use moor::runtime::io::{self, Duplex, Event, SendError, ViewerSender};
+#[cfg(unix)]
 use moor::session::{LeaseResult, LeaseRole, ResultOutcome, ResultReason};
+#[cfg(unix)]
 use moor::wire::{self, Profile};
+#[cfg(unix)]
 use std::collections::VecDeque;
 use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
@@ -22,6 +27,7 @@ fn duplex<R: Read + Send + 'static, W: Write + Send + 'static>(
     Duplex::closing(reader, writer, limit, || {})
 }
 
+#[cfg(unix)]
 fn handshake<R: Read + Send + 'static, W: Write + Send + 'static>(
     reader: R,
     writer: W,
@@ -63,8 +69,10 @@ impl Read for BlockingReader {
 
 struct BurstReader(Arc<AtomicUsize>);
 
+#[cfg(unix)]
 struct Chunks(VecDeque<Vec<u8>>);
 
+#[cfg(unix)]
 impl Read for Chunks {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         let Some(next) = self.0.pop_front() else {
@@ -75,8 +83,10 @@ impl Read for Chunks {
     }
 }
 
+#[cfg(unix)]
 struct GatedReader(Arc<Gate>, VecDeque<Vec<u8>>);
 
+#[cfg(unix)]
 impl Read for GatedReader {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         let mut open = self.0.open.lock().unwrap();
@@ -91,8 +101,10 @@ impl Read for GatedReader {
     }
 }
 
+#[cfg(unix)]
 struct SignalWriter(Arc<Mutex<Vec<u8>>>, Arc<Gate>);
 
+#[cfg(unix)]
 impl Write for SignalWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(bytes);
@@ -185,6 +197,7 @@ impl Peer {
     }
 }
 
+#[cfg(unix)]
 fn status(first: u64, last: u64, start: u64, end: u64, flags: u8) -> Vec<u8> {
     let mut out = Vec::new();
     wire::put_wide(&mut out, b"\x01/session").unwrap();
