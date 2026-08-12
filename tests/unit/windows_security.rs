@@ -106,6 +106,34 @@ fn viewer_modes_are_raw_input_and_vt_output() {
 }
 
 #[test]
+fn viewer_input_mode_controls_are_flushed_through_the_attach_writer() {
+    #[derive(Default)]
+    struct Output {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    let mut output = Output::default();
+    ViewerInputMode::write(&mut output, WIN32_INPUT_ENABLE).unwrap();
+    ViewerInputMode::write(&mut output, WIN32_INPUT_DISABLE).unwrap();
+    assert_eq!(
+        output.bytes,
+        [WIN32_INPUT_ENABLE, WIN32_INPUT_DISABLE].concat()
+    );
+    assert_eq!(output.flushes, 2);
+}
+
+#[test]
 fn pseudoconsole_retirement_never_joins_the_close_operation() {
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
