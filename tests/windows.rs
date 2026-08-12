@@ -1814,7 +1814,13 @@ mod launch_paths {
             modes(&console.received, label)
         }
 
-        fn query_win32_input_mode() -> String {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Win32InputModeState {
+            Reset,
+            Unsupported,
+        }
+
+        fn query_win32_input_mode() -> Win32InputModeState {
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
             assert!(unsafe { FlushConsoleInputBuffer(input) } != 0);
             let mut output = io::stdout();
@@ -1824,13 +1830,27 @@ mod launch_paths {
             let mut response = Vec::new();
             while !response.ends_with(&[u16::from(b'$'), u16::from(b'y')]) {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                assert!(!remaining.is_zero(), "win32 input-mode query timed out");
+                if remaining.is_zero() {
+                    assert!(
+                        response.is_empty(),
+                        "incomplete win32 input-mode response: {:?}",
+                        String::from_utf16_lossy(&response)
+                    );
+                    return Win32InputModeState::Unsupported;
+                }
                 let timeout = remaining.as_millis().min(u128::from(u32::MAX)) as u32;
-                assert_eq!(
-                    unsafe { WaitForSingleObject(input, timeout) },
-                    WAIT_OBJECT_0,
-                    "win32 input-mode query was not answered"
-                );
+                match unsafe { WaitForSingleObject(input, timeout) } {
+                    WAIT_TIMEOUT => {
+                        assert!(
+                            response.is_empty(),
+                            "incomplete win32 input-mode response: {:?}",
+                            String::from_utf16_lossy(&response)
+                        );
+                        return Win32InputModeState::Unsupported;
+                    }
+                    WAIT_OBJECT_0 => {}
+                    wait => panic!("unexpected win32 input-mode wait result {wait:#x}"),
+                }
                 let mut records = [INPUT_RECORD::default(); 32];
                 let mut read = 0;
                 assert!(unsafe {
@@ -1848,7 +1868,35 @@ mod launch_paths {
                     }
                 }
             }
-            String::from_utf16(&response).unwrap()
+            match String::from_utf16(&response).unwrap().as_str() {
+                "\x1b[?9001;2$y" => Win32InputModeState::Reset,
+                "\x1b[?9001;0$y" => Win32InputModeState::Unsupported,
+                response => panic!("win32 input mode was not reset: {response:?}"),
+            }
+        }
+
+        fn win32_input_mode_state(bytes: &[u8], label: &str) -> String {
+            let text = String::from_utf8_lossy(bytes);
+            let prefix = format!("MOOR-W32IM-{label}:");
+            text[text.rfind(&prefix).unwrap() + prefix.len()..]
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        }
+
+        fn assert_win32_input_mode_restored(console: &Console, restore_start: usize) {
+            match win32_input_mode_state(&console.received, "after").as_str() {
+                "reset" => {}
+                "unsupported" => assert!(
+                    console.received[restore_start..]
+                        .windows(WIN32_INPUT_DISABLE.len())
+                        .any(|bytes| bytes == WIN32_INPUT_DISABLE),
+                    "host cannot query mode 9001 and the exact reset control was not observed: {:?}",
+                    String::from_utf8_lossy(&console.received[restore_start..])
+                ),
+                state => panic!("unexpected win32 input-mode evidence {state:?}"),
+            }
         }
 
         #[test]
@@ -1865,9 +1913,12 @@ mod launch_paths {
                 GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut input) != 0
                     && GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut output) != 0
             });
-            if label != "live" {
-                assert_eq!(query_win32_input_mode(), "\x1b[?9001;2$y");
-                println!("MOOR-W32IM-{}:reset", label.to_string_lossy());
+            if label == "after" {
+                let state = match query_win32_input_mode() {
+                    Win32InputModeState::Reset => "reset",
+                    Win32InputModeState::Unsupported => "unsupported",
+                };
+                println!("MOOR-W32IM-{}:{state}", label.to_string_lossy());
             }
             println!(
                 "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
@@ -2039,6 +2090,7 @@ mod launch_paths {
             for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
+            let restore_start = console.received.len();
             console.write(&[0x1c]).unwrap();
             let detached = wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5))
                 .unwrap_or_else(|error| {
@@ -2067,6 +2119,7 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert_win32_input_mode_restored(&console, restore_start);
             let killed = moor(&["kill", "-f", "-q", &session]);
             assert!(killed.status.success(), "{killed:?}");
         }
@@ -2079,6 +2132,7 @@ mod launch_paths {
         const VT_INPUT_EXPECTED: &[u8] = b"A\x1bOAZ";
         const WIN32_INPUT_MODE: u32 = 4;
         const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
+        const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
         const WIN32_INPUT_VECTOR: &[u8] =
             b"\x1b[65;30;65;1;0;1_\x1b[38;72;0;1;256;1_\x1b[90;44;90;1;0;1_";
         const LEGACY_OUTER_CODEPAGE: u32 = 437;
@@ -2355,6 +2409,7 @@ mod launch_paths {
             console
                 .wait_for(WIN32_INPUT_ENABLE, Duration::from_secs(10))
                 .unwrap();
+            let restore_start = console.received.len();
 
             let mut sender = SpawnCommand::new(&executable);
             sender
@@ -2409,6 +2464,7 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
+            assert_win32_input_mode_restored(&console, restore_start);
 
             std::fs::write(&release, b"release").unwrap();
             let lifecycle = wait_lifecycle_exit(&marker, Duration::from_secs(10));
