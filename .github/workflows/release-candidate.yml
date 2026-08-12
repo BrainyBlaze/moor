@@ -731,9 +731,17 @@ jobs:
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
           python scripts/candidate-verify.py pe-imports "exact/$ASSET"
 
-      - name: '§12.8 native conformance below the input floor (input-carrier expected-absent)'
+      - name: '§12.8 native conformance below the input floor'
         shell: bash
         run: |
+          # The three carrier cases are floor-aware in the suite itself: they
+          # classify the host build with RtlGetVersion and positively assert
+          # the frozen below-floor outcome (empty win32 carrier, degraded
+          # input, three-record resize) as a PASS on 1809 / Server 2019, and
+          # the strict full-carrier outcome as a PASS at or above the floor.
+          # So this lane runs the WHOLE suite with zero skip and zero swallowed
+          # exit — every test, including the carrier cases, must pass — exactly
+          # like the hosted native-conformance gate.
           rustup target add "$TARGET" || true
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
           SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
@@ -745,38 +753,7 @@ jobs:
           test -s tests.txt
           cp "exact/$ASSET" "$BIN"
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
-          # release-matrix.md below-floor rule: the three input-carrier rows
-          # are expected-absent on 1809 / Server 2019 (their ConPTY predates
-          # the win32-input-mode request), while everything else is exercised
-          # and MUST pass. The three carrier tests are skipped by exact name
-          # here and verified separately as expected-failures below.
-          ABSENT="platform_w32_input_mode_preserves_application_cursor_semantics \
-                  shipped_viewer_preserves_exact_vt_input_bytes \
-                  shipped_viewer_uses_real_geometry_resize_and_restores_console_modes"
-          SKIP=""
-          for t in $ABSENT; do SKIP="$SKIP --skip $t"; done
-          # Exercised set: everything except the three carrier rows must pass.
-          while IFS= read -r exe; do echo "== exercised: $exe"; "$exe" $SKIP; done < tests.txt
-          # Expected-absent proof: each carrier row is run by its exact name
-          # in the one executable that owns it, and MUST NOT report a pass on
-          # this below-floor host — the platform drops the carrier. "0 tests
-          # run" (an executable that does not contain the name) is ignored;
-          # only a genuine pass — "test result: ok. N passed" with N>=1 —
-          # fails the job, because it would contradict the frozen floor.
-          for t in $ABSENT; do
-            found=0
-            while IFS= read -r exe; do
-              out="$("$exe" --exact "$t" 2>&1 || true)"
-              if echo "$out" | grep -qE 'running [1-9][0-9]* test'; then
-                found=1
-                if echo "$out" | grep -qE 'test result: ok\. [1-9]'; then
-                  echo "carrier test $t unexpectedly passed below floor" >&2
-                  exit 1
-                fi
-              fi
-            done < tests.txt
-            test "$found" -eq 1 || { echo "carrier test $t not found in any executable" >&2; exit 1; }
-          done
+          while IFS= read -r exe; do echo "== $exe"; "$exe"; done < tests.txt
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
 
       - name: Record the compatibility and native-conformance references
