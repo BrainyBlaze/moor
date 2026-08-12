@@ -2305,7 +2305,7 @@ mod native {
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
     struct ViewerInputMode(Option<HANDLE>);
     impl ViewerInputMode {
-        fn write(handle: HANDLE, bytes: &[u8]) -> Result<()> {
+        fn write_handle(handle: HANDLE, bytes: &[u8]) -> Result<()> {
             let mut written = 0;
             win32!(
                 WriteFile(
@@ -2322,14 +2322,18 @@ mod native {
                 "short viewer input-mode control write",
             )
         }
-        fn enable(handle: HANDLE) -> Result<Self> {
-            Self::write(handle, WIN32_INPUT_ENABLE).map(|()| Self(Some(handle)))
+        fn write(output: &mut dyn Write, bytes: &[u8]) -> Result<()> {
+            win(output.write_all(bytes), "write viewer input-mode control")?;
+            win(output.flush(), "flush viewer input-mode control")
         }
-        fn disable(&mut self) -> Result<()> {
-            let Some(handle) = self.0 else {
+        fn enable(handle: HANDLE, output: &mut dyn Write) -> Result<Self> {
+            Self::write(output, WIN32_INPUT_ENABLE).map(|()| Self(Some(handle)))
+        }
+        fn disable(&mut self, output: &mut dyn Write) -> Result<()> {
+            if self.0.is_none() {
                 return Ok(());
-            };
-            Self::write(handle, WIN32_INPUT_DISABLE)?;
+            }
+            Self::write(output, WIN32_INPUT_DISABLE)?;
             self.0 = None;
             Ok(())
         }
@@ -2337,7 +2341,7 @@ mod native {
     impl Drop for ViewerInputMode {
         fn drop(&mut self) {
             if let Some(handle) = self.0 {
-                Self::write(handle, WIN32_INPUT_DISABLE).ok();
+                Self::write_handle(handle, WIN32_INPUT_DISABLE).ok();
             }
         }
     }
@@ -2944,10 +2948,10 @@ mod native {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
-        let mut input_mode = ViewerInputMode::enable(terminal.0[1])?;
+        let mut output = io::stdout();
+        let mut input_mode = ViewerInputMode::enable(terminal.0[1], &mut output)?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let geometry = console_geometry(terminal.0[1]).unwrap_or((0, 0));
-        let mut output = io::stdout();
         let attached = attach_viewer_to(
             &mut client,
             &options,
@@ -2957,7 +2961,7 @@ mod native {
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
             |sender| viewer_input(sender, options.detach, geometry),
         );
-        let disabled = input_mode.disable();
+        let disabled = input_mode.disable(&mut output);
         let status = attached?;
         disabled?;
         Ok(status)
