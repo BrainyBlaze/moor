@@ -48,10 +48,15 @@ def zip_inventory(path: str, names: list) -> None:
                 fail(f"{path}: directory member {name!r}")
             if "/" in name or "\\" in name or name.startswith("."):
                 fail(f"{path}: unsafe member name {name!r}")
-            # Upper 16 bits of external_attr carry POSIX mode; reject links.
+            # Upper 16 bits of external_attr carry the POSIX mode. Require a
+            # regular file: a set type field that is anything else — symlink,
+            # FIFO, socket, block/char device, directory — is rejected. A zero
+            # mode (archives that record no POSIX type) is allowed and treated
+            # as a regular file; the directory guard above already caught dirs.
             mode = info.external_attr >> 16
-            if mode & 0o170000 == 0o120000:
-                fail(f"{path}: symlink member {name!r}")
+            file_type = mode & 0o170000
+            if file_type not in (0, 0o100000):
+                fail(f"{path}: non-regular member {name!r} (type {file_type:o})")
             seen.append(name)
         if sorted(seen) != sorted(names):
             fail(f"{path}: members {sorted(seen)} != expected {sorted(names)}")
@@ -134,15 +139,23 @@ def macho_min_version(data: bytes) -> str:
         cmd, cmdsize = struct.unpack_from("<II", data, offset)
         if cmd == LC_BUILD_VERSION:
             (minos,) = struct.unpack_from("<I", data, offset + 12)
-            return f"{minos >> 16}.{(minos >> 8) & 0xFF}"
+            return f"{minos >> 16}.{(minos >> 8) & 0xFF}.{minos & 0xFF}"
         if cmd == LC_VERSION_MIN_MACOSX:
             (version,) = struct.unpack_from("<I", data, offset + 8)
-            return f"{version >> 16}.{(version >> 8) & 0xFF}"
+            return f"{version >> 16}.{(version >> 8) & 0xFF}.{version & 0xFF}"
         offset += cmdsize
     fail("no LC_BUILD_VERSION or LC_VERSION_MIN_MACOSX load command")
 
 
 def macho_minos(path: str, expected: str) -> None:
+    # Compare the full X.Y.Z minimum: a crafted 13.0.1 must not pass a 13.0.0
+    # gate, so the patch byte is significant. A two-component expected is
+    # normalised to X.Y.0.
+    parts = expected.split(".")
+    if len(parts) == 2:
+        expected = f"{expected}.0"
+    elif len(parts) != 3:
+        fail(f"expected minimum must be X.Y or X.Y.Z, got {expected!r}")
     with open(path, "rb") as handle:
         data = handle.read()
     found = macho_min_version(data)
@@ -193,8 +206,10 @@ def self_test() -> None:
     banned = [d for d in pe_imported_dlls(dirty) if d.lower().startswith(BANNED_IMPORT_PREFIXES)]
     assert banned == ["VCRUNTIME140.dll"], banned
 
-    assert macho_min_version(craft_macho(0x000D0000)) == "13.0"
-    assert macho_min_version(craft_macho(0x000C0000)) == "12.0"
+    assert macho_min_version(craft_macho(0x000D0000)) == "13.0.0"
+    assert macho_min_version(craft_macho(0x000C0000)) == "12.0.0"
+    # The patch byte is significant: 13.0.1 must not satisfy a 13.0(.0) gate.
+    assert macho_min_version(craft_macho(0x000D0001)) == "13.0.1"
 
     import subprocess
     import tempfile
@@ -210,10 +225,28 @@ def self_test() -> None:
             archive.writestr("moor-0.1.0-linux-x64", b"bytes")
             archive.writestr(".hidden", b"extra")
 
-        for args in (
+        # A ZIP whose sole expected member is a FIFO (not a regular file).
+        fifo_zip = f"{scratch}/fifo.zip"
+        with zipfile.ZipFile(fifo_zip, "w") as archive:
+            info = zipfile.ZipInfo("moor-0.1.0-linux-x64")
+            info.external_attr = (0o010000 | 0o644) << 16  # S_IFIFO
+            archive.writestr(info, b"")
+        macho_ok = f"{scratch}/ok.macho"
+        macho_patch = f"{scratch}/patch.macho"
+        with open(macho_ok, "wb") as handle:
+            handle.write(craft_macho(0x000D0000))
+        with open(macho_patch, "wb") as handle:
+            handle.write(craft_macho(0x000D0001))
+        # Positive control: the exact 13.0.0 binary passes the 13.0 gate.
+        macho_minos(macho_ok, "13.0")
+
+        must_reject = [
             ["zip-inventory", bad_zip, "moor-0.1.0-linux-x64"],
             ["zip-inventory", ok_zip, "other-name"],
-        ):
+            ["zip-inventory", fifo_zip, "moor-0.1.0-linux-x64"],
+            ["macho-minos", macho_patch, "13.0"],
+        ]
+        for args in must_reject:
             result = subprocess.run([sys.executable, __file__, *args], capture_output=True)
             assert result.returncode != 0, args
     print("candidate-verify self-test: OK")
