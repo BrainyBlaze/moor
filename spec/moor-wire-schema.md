@@ -616,7 +616,7 @@ Every unassigned semantic payload flag bit or enum value is `SEM_MALFORMED`. It 
 
 | width | field |
 |---|---|
-| 16 | holder-fresh token decoded from `DESK_SESSION_SEMANTIC_TOKEN` |
+| 16 | holder-fresh token decoded from `MOOR_SESSION_SEMANTIC_TOKEN` |
 | 16 | producer instance |
 | 4 | producer-carried generation; exact current generation, or zero for an unsupervised session |
 | 1 | mode |
@@ -720,7 +720,7 @@ These records are carried on distinct inherited byte streams. They are not contr
 
 ### 15.1 Supervised-launch discriminator
 
-The launcher writes exactly one 32-byte record to the private one-way channel selected by `DESK_MOOR_LAUNCH_CHANNEL`, closes its write end, and the holder requires EOF after byte 32. This record is a freshness discriminator, not authorisation; same-user trust remains §11.1 of the specification.
+The launcher writes exactly one 32-byte record to the private one-way channel selected by `<BASENAME>_LAUNCH_CHANNEL`, closes its write end, and the holder requires EOF after byte 32. This record is a freshness discriminator, not authorisation; same-user trust remains §11.1 of the specification.
 
 | offset | width | field |
 |---|---|---|
@@ -735,7 +735,7 @@ The whole read including EOF has a 2-second deadline. A selector that is present
 
 ### 15.2 Instrumentation-load acknowledgement
 
-With `-S`, the holder creates a different one-way byte stream and inherits only its write end into the requested initial child. `DESK_MOOR_INSTRUMENT_CHANNEL` selects that end using canonical unsigned decimal descriptor text on POSIX or 1–16 lowercase hexadecimal digits without `0x` for a nonzero 64-bit Windows handle. `DESK_MOOR_INSTRUMENT_NONCE` is exactly 32 lowercase hexadecimal digits encoding the holder's fresh 16-byte challenge. The module initializer consumes and removes both variables before any application instruction, writes exactly this 36-byte record, and closes the write end.
+With `-S`, the holder creates a different one-way byte stream and inherits only its write end into the requested initial child. `MOOR_INSTRUMENT_CHANNEL` selects that end using canonical unsigned decimal descriptor text on POSIX or 1–16 lowercase hexadecimal digits without `0x` for a nonzero 64-bit Windows handle. `MOOR_INSTRUMENT_NONCE` is exactly 32 lowercase hexadecimal digits encoding the holder's fresh 16-byte challenge. The module initializer consumes and removes both variables before any application instruction, writes exactly this 36-byte record, and closes the write end.
 
 | offset | width | field |
 |---|---|---|
@@ -745,7 +745,7 @@ With `-S`, the holder creates a different one-way byte stream and inherits only 
 | 10 | 2 | reserved, zero |
 | 12 | 4 | session wire generation: `1` unsupervised or the exact supervised generation |
 | 16 | 4 | nonzero operating-system PID of the requested initial child |
-| 20 | 16 | exact nonce decoded from `DESK_MOOR_INSTRUMENT_NONCE` |
+| 20 | 16 | exact nonce decoded from `MOOR_INSTRUMENT_NONCE` |
 
 The holder requires the expected generation, requested-child PID and nonce, followed by EOF, within 2 seconds. A selector/nonce with any other grammar, a handle outside the requested child's explicit inheritance set, a non-byte-stream handle, a short or long record, missing EOF, inherited duplicate writer, bad magic/format/reserved field, zero/wrong PID, wrong generation/nonce, or timeout fails the unpublished launch. On POSIX the writer is the module's load constructor. On Windows the injected DLL exports and runs `MoorInstrumentationInitV1` inside the still-suspended requested process as specified in §4.7; its unsigned return value must also be zero. This acknowledgement is separate from §15.1 and cannot establish supervision.
 
