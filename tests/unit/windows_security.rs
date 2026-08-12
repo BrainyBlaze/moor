@@ -84,13 +84,7 @@ fn file_descriptor_query_validates_a_created_store_directory() {
 #[test]
 fn viewer_modes_are_raw_input_and_vt_output() {
     let [input, output] = viewer_modes(
-        ENABLE_PROCESSED_INPUT
-            | ENABLE_LINE_INPUT
-            | ENABLE_ECHO_INPUT
-            | ENABLE_QUICK_EDIT_MODE
-            | ENABLE_MOUSE_INPUT
-            | ENABLE_WINDOW_INPUT
-            | ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE,
         0,
     );
     assert_eq!(
@@ -187,8 +181,7 @@ fn console_records_preserve_text_repeats_and_modern_or_legacy_nul() {
         | SCROLLLOCK_ON;
     assert_eq!(console_wide(key), Some((0, 1)));
     key.wRepeatCount = 3;
-    key.dwControlKeyState = (key.dwControlKeyState
-        & !(LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED))
+    key.dwControlKeyState = (key.dwControlKeyState & !(LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED))
         | (u32::from(zero & 0x200 != 0) * RIGHT_CTRL_PRESSED)
         | (u32::from(zero & 0x400 != 0) * RIGHT_ALT_PRESSED);
     assert_eq!(console_wide(key), Some((0, 3)));
@@ -283,10 +276,7 @@ fn console_record_translation_preserves_scalars_repeats_nul_and_event_boundaries
         input.record(text_record(b'A'.into(), 3), CP_UTF8, &mut wide),
         Ok(None)
     );
-    assert_eq!(
-        input.record(nul_record(2), CP_UTF8, &mut wide),
-        Ok(None)
-    );
+    assert_eq!(input.record(nul_record(2), CP_UTF8, &mut wide), Ok(None));
     assert_eq!(
         input.record(text_record(0xd83d, 1), CP_UTF8, &mut wide),
         Ok(None)
@@ -427,12 +417,321 @@ fn console_batch_serializes_unicode_as_utf8_for_a_legacy_outer_codepage() {
     );
 }
 
+fn carrier_records(bytes: &[u8]) -> Vec<INPUT_RECORD> {
+    let (prefix, rest): (Vec<_>, _) = if let Some(rest) = bytes.strip_prefix(b"\xc2\x9b") {
+        (vec![text_record(0x009b, 1)], rest)
+    } else {
+        (Vec::new(), bytes)
+    };
+    prefix
+        .into_iter()
+        .chain(rest.iter().copied().map(|byte| text_record(byte.into(), 1)))
+        .collect()
+}
+
+#[test]
+fn win32_carrier_decoder_accepts_only_canonical_complete_key_records() {
+    let decoded = win32_input_carrier(b"\x1b[220;43;28;1;8;3_").unwrap();
+    assert_eq!(
+        (
+            decoded.virtual_key,
+            decoded.scan_code,
+            decoded.unicode,
+            decoded.key_down,
+            decoded.control_state,
+            decoded.repeat,
+            decoded.c1,
+        ),
+        (220, 43, 28, true, 8, 3, false)
+    );
+    let decoded = win32_input_carrier(b"\xc2\x9b220;43;28;0;8;3_").unwrap();
+    assert_eq!(
+        (
+            decoded.unicode,
+            decoded.key_down,
+            decoded.repeat,
+            decoded.c1
+        ),
+        (28, false, 3, true)
+    );
+    for malformed in [
+        b"\x1b[220;43;28;1;8;3".as_slice(),
+        b"\x1b[0220;43;28;1;8;3_",
+        b"\x1b[220;43;65536;1;8;3_",
+        b"\x1b[220;43;28;2;8;3_",
+        b"\x1b[220;43;28;1;8;0_",
+        b"\x1b[220;43;28;1;8;3;0_",
+        b"\x1b[220;43;28;1;8;x_",
+    ] {
+        assert_eq!(win32_input_carrier(malformed), None, "{malformed:?}");
+    }
+}
+
+#[test]
+fn console_batch_exposes_carrier_detach_and_one_following_record_atomically() {
+    const A: &[u8] = b"\x1b[65;30;65;1;0;1_";
+    const DETACH: &[u8] = b"\x1b[220;43;28;1;8;1_";
+    const Z: &[u8] = b"\x1b[90;44;90;1;0;1_";
+    let records = [A, DETACH, Z]
+        .into_iter()
+        .flat_map(carrier_records)
+        .collect::<Vec<_>>();
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Framed(vec![
+            InputFrame::Key(A.to_vec(), A.to_vec(), Some(b'A'), 1),
+            InputFrame::Key(DETACH.to_vec(), DETACH.to_vec(), Some(0x1c), 1),
+            InputFrame::Key(Z.to_vec(), Z.to_vec(), Some(b'Z'), 1),
+        ])
+    );
+    assert_eq!(
+        input.state_with(|_, timeout| {
+            assert_eq!(timeout, 50);
+            Ok(false)
+        }),
+        InputState::Pending
+    );
+}
+
+#[test]
+fn carrier_syntax_never_matches_a_printable_detach_byte() {
+    const A: &[u8] = b"\x1b[65;30;65;1;0;1_";
+    let records = carrier_records(A);
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(b';'));
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Framed(vec![
+            InputFrame::Key(A.to_vec(), A.to_vec(), Some(b'A'), 1,)
+        ])
+    );
+}
+
+#[test]
+fn carrier_recognizer_is_fragment_safe_at_every_native_read_boundary() {
+    for carrier in [
+        b"\x1b[65;30;65;1;0;1_".as_slice(),
+        b"\xc2\x9b65;30;65;1;0;1_",
+    ] {
+        let records = carrier_records(carrier);
+        for split in 0..=records.len() {
+            let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+            input.records[..split].copy_from_slice(&records[..split]);
+            input.count = split;
+            let mut refilled = false;
+            let state = input.state_with(|input, timeout| {
+                if refilled || split == records.len() {
+                    assert_eq!(timeout, 0, "completed carrier incurred an input delay");
+                    return Ok(false);
+                }
+                assert_eq!(timeout, 50, "partial carrier was not bounded");
+                refilled = true;
+                input.records[..records.len() - split].copy_from_slice(&records[split..]);
+                input.next = 0;
+                input.count = records.len() - split;
+                Ok(true)
+            });
+            let decoded = win32_input_carrier(carrier).unwrap();
+            assert_eq!(
+                state,
+                InputState::Framed(vec![decoded.frame(carrier.to_vec())]),
+                "split {split} of {carrier:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn carrier_candidate_deadline_does_not_reset_on_slow_fragments() {
+    let initial = carrier_records(b"\x1b[65;");
+    let continuation = carrier_records(b"30");
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+    input.records[..initial.len()].copy_from_slice(&initial);
+    input.count = initial.len();
+    let mut refilled = false;
+
+    assert_eq!(
+        input.state_with(|input, timeout| {
+            assert!(!refilled, "expired candidate requested another native read");
+            assert_eq!(timeout, 50);
+            refilled = true;
+            input.carrier_started = Some(Instant::now() - Duration::from_millis(51));
+            input.records[..continuation.len()].copy_from_slice(&continuation);
+            input.next = 0;
+            input.count = continuation.len();
+            Ok(true)
+        }),
+        InputState::Bytes(b"\x1b[65;30".to_vec())
+    );
+}
+
+#[test]
+fn malformed_incomplete_and_overlong_carriers_replay_exactly() {
+    let mut overlong = b"\x1b[".to_vec();
+    overlong.extend(std::iter::repeat_n(b'1', WIN32_CARRIER_LIMIT + 4));
+    overlong.push(b'_');
+    for bytes in [
+        b"\x1b[1;2;x".as_slice(),
+        b"\x1b[65;30;65;1;0".as_slice(),
+        overlong.as_slice(),
+    ] {
+        let records = carrier_records(bytes);
+        let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+        input.records[..records.len()].copy_from_slice(&records);
+        input.count = records.len();
+        assert_eq!(
+            input.state_with(|_, timeout| {
+                assert!(matches!(timeout, 0 | 50));
+                Ok(false)
+            }),
+            InputState::Bytes(bytes.to_vec()),
+            "{bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn incomplete_carrier_replays_before_a_native_resize() {
+    let partial = b"\x1b[65;30";
+    let mut records = carrier_records(partial);
+    records.push(resize_record(41, 101));
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Bytes(partial.to_vec())
+    );
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Resize(41, 101)
+    );
+}
+
+#[test]
+fn incomplete_carrier_replays_before_a_native_read_failure() {
+    let partial = b"\xc2\x9b65;30";
+    let records = carrier_records(partial);
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+    assert_eq!(
+        input.state_with(|_, timeout| {
+            assert_eq!(timeout, 50);
+            Err(())
+        }),
+        InputState::Bytes(partial.to_vec())
+    );
+    assert_eq!(
+        input.state_with(|_, _| panic!("closed input attempted another native read")),
+        InputState::Closed
+    );
+}
+
+#[test]
+fn disabled_detach_bypasses_carrier_recognition() {
+    const CARRIER: &[u8] = b"\x1b[220;43;28;1;8;3_";
+    let records = carrier_records(CARRIER);
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), None);
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Bytes(CARRIER.to_vec())
+    );
+}
+
+#[test]
+fn carrier_semantics_distinguish_nul_navigation_release_and_modifiers() {
+    let up = win32_input_carrier(b"\x1b[38;72;0;1;0;1_").unwrap();
+    assert_eq!(
+        up.frame(b"\x1b[38;72;0;1;0;1_".to_vec()),
+        InputFrame::Key(
+            b"\x1b[38;72;0;1;0;1_".to_vec(),
+            b"\x1b[38;72;0;1;0;1_".to_vec(),
+            None,
+            1,
+        )
+    );
+
+    let mapping = unsafe { VkKeyScanW(0) } as u16;
+    let control = (u32::from(mapping & 0x100 != 0) * SHIFT_PRESSED)
+        | (u32::from(mapping & 0x200 != 0) * LEFT_CTRL_PRESSED)
+        | (u32::from(mapping & 0x400 != 0) * LEFT_ALT_PRESSED);
+    let modern = format!("\x1b[{};0;0;1;{};1_", mapping & 0xff, control).into_bytes();
+    let modern_frame = win32_input_carrier(&modern).unwrap().frame(modern.clone());
+    assert!(matches!(modern_frame, InputFrame::Key(_, _, Some(0), 1)));
+    let legacy = b"\x1b[0;0;0;1;0;1_".to_vec();
+    assert!(matches!(
+        win32_input_carrier(&legacy).unwrap().frame(legacy),
+        InputFrame::Key(_, _, Some(0), 1)
+    ));
+
+    let release = b"\x1b[220;43;28;0;8;1_".to_vec();
+    assert!(matches!(
+        win32_input_carrier(&release).unwrap().frame(release),
+        InputFrame::Meta(_)
+    ));
+    let modifier = b"\x1b[17;29;0;1;0;1_".to_vec();
+    assert!(matches!(
+        win32_input_carrier(&modifier).unwrap().frame(modifier),
+        InputFrame::Meta(_)
+    ));
+}
+
+#[test]
+fn carrier_repeat_rewrite_preserves_all_fields_and_introducer() {
+    for bytes in [
+        b"\x1b[220;43;28;1;8;3_".as_slice(),
+        b"\xc2\x9b220;43;28;1;8;3_",
+    ] {
+        let carrier = win32_input_carrier(bytes).unwrap();
+        let InputFrame::Key(original, once, Some(0x1c), 3) = carrier.frame(bytes.to_vec()) else {
+            panic!("detach carrier was not classified as a key")
+        };
+        assert_eq!(original, bytes);
+        let expected = if carrier.c1 {
+            b"\xc2\x9b220;43;28;1;8;1_".as_slice()
+        } else {
+            b"\x1b[220;43;28;1;8;1_"
+        };
+        assert_eq!(once, expected);
+    }
+}
+
+#[test]
+fn generated_character_repeat_counts_are_expanded_inside_a_carrier() {
+    const CARRIER: &[u8] = b"\x1b[11;30;65;1;0;1_";
+    let mut records = vec![text_record(0x1b, 1), text_record(b'['.into(), 1)];
+    records.push(text_record(b'1'.into(), 2));
+    records.extend(carrier_records(b";30;65;1;0;1_"));
+    let mut input = ConsoleInput::with_detach(ptr::null_mut(), Some(0x1c));
+    input.records[..records.len()].copy_from_slice(&records);
+    input.count = records.len();
+    assert_eq!(
+        input.state_with(|_, _| Ok(false)),
+        InputState::Framed(vec![
+            win32_input_carrier(CARRIER)
+                .unwrap()
+                .frame(CARRIER.to_vec()),
+        ])
+    );
+}
+
 #[test]
 fn creation_size_requires_attaching_viewers_but_defaults_headless_callers() {
     assert_eq!(creation_size(false, None).unwrap(), (24, 80));
     assert_eq!(creation_size(true, Some((33, 101))).unwrap(), (33, 101));
     assert_eq!(creation_size(false, Some((41, 132))).unwrap(), (41, 132));
-    assert_eq!(creation_size(true, None).unwrap_err(), "no controlling terminal");
+    assert_eq!(
+        creation_size(true, None).unwrap_err(),
+        "no controlling terminal"
+    );
 }
 
 include!(concat!(

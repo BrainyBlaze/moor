@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 schema!(enum pub Event [Debug, Eq, PartialEq]; Bytes(Vec<u8>), Closed);
 schema!(enum pub SendError [Clone, Copy, Debug, Eq, PartialEq]; Full, Closed);
-schema!(enum pub InputState [Clone, Debug, Eq, PartialEq]; Ready, Pending, Bytes(Vec<u8>), Resize(u16, u16), Closed);
+schema!(enum pub InputFrame [Clone, Debug, Eq, PartialEq]; Meta(Vec<u8>), Key(Vec<u8>, Vec<u8>, Option<u8>, u16));
+schema!(enum pub InputState [Clone, Debug, Eq, PartialEq]; Ready, Pending, Bytes(Vec<u8>), Framed(Vec<InputFrame>), Resize(u16, u16), Closed);
 
 schema!(struct pub InputConfig pub fields; detach: Option<u8>, pass_suspend: bool, last_size: Option<(u16, u16)>);
 
@@ -42,6 +43,8 @@ impl ViewerSender {
 }
 
 schema!(struct Viewer<'a> fields; client: &'a mut Client, options: &'a Options, output: &'a mut dyn Write, phase: ViewerPhase<'a>, commands: Receiver<Command>, sender: Sender<Command>, wire: ViewerStream, lease: Option<InputLease>, size: Option<(u16, u16)>, release: Option<SyncSender<bool>>);
+
+const VIEWER_INPUT_CHUNK: usize = 65536;
 
 impl Viewer<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -448,7 +451,7 @@ pub fn run_viewer_input(
 ) {
     let mut last_size = config.last_size;
     let mut armed = None;
-    let mut bytes = vec![0; 65536];
+    let mut bytes = vec![0; VIEWER_INPUT_CHUNK];
     let mut output = Vec::with_capacity(bytes.len());
     let mut renewed = now();
     let graceful = 'input: loop {
@@ -474,6 +477,43 @@ pub fn run_viewer_input(
             InputState::Bytes(value) => {
                 native = Some(value);
                 0
+            }
+            InputState::Framed(frames) => {
+                output.clear();
+                for frame in frames {
+                    match frame {
+                        InputFrame::Meta(bytes) => output.extend_from_slice(&bytes),
+                        InputFrame::Key(bytes, once, semantic, repeat) => {
+                            if armed.is_some() && semantic != config.detach {
+                                output.extend_from_slice(&bytes);
+                                break 'input sender.flush(&mut output);
+                            }
+                            if semantic == config.detach && config.detach.is_some() {
+                                for _ in 0..repeat {
+                                    if armed.take().is_some() {
+                                        output.extend_from_slice(&once);
+                                        if output.len() >= VIEWER_INPUT_CHUNK
+                                            && !sender.flush(&mut output)
+                                        {
+                                            break 'input false;
+                                        }
+                                    } else {
+                                        armed = Some(current);
+                                    }
+                                }
+                            } else {
+                                output.extend_from_slice(&bytes);
+                            }
+                        }
+                    }
+                    if output.len() >= VIEWER_INPUT_CHUNK && !sender.flush(&mut output) {
+                        break 'input false;
+                    }
+                }
+                if !sender.flush(&mut output) {
+                    break false;
+                }
+                continue;
             }
             InputState::Resize(rows, columns) => {
                 let next = Some((rows, columns));
