@@ -62,7 +62,8 @@ fn viewer_modes_are_raw_input_and_vt_output() {
             | ENABLE_LINE_INPUT
             | ENABLE_ECHO_INPUT
             | ENABLE_QUICK_EDIT_MODE
-            | ENABLE_WINDOW_INPUT,
+            | ENABLE_WINDOW_INPUT
+            | ENABLE_VIRTUAL_TERMINAL_INPUT,
         0,
     );
     assert_eq!(
@@ -73,9 +74,11 @@ fn viewer_modes_are_raw_input_and_vt_output() {
                 | ENABLE_QUICK_EDIT_MODE),
         0
     );
-    assert_ne!(input & ENABLE_WINDOW_INPUT, 0);
-    assert_ne!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
-    assert_ne!(input & ENABLE_EXTENDED_FLAGS, 0);
+    assert_eq!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+    assert_eq!(
+        input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
+        ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+    );
     assert_ne!(output & ENABLE_PROCESSED_OUTPUT, 0);
     assert_ne!(output & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
     assert_ne!(output & DISABLE_NEWLINE_AUTO_RETURN, 0);
@@ -148,6 +151,21 @@ fn text_record(unit: u16, repeat: u16) -> INPUT_RECORD {
     key_record(key)
 }
 
+fn nul_record(repeat: u16) -> INPUT_RECORD {
+    let mapping = unsafe { VkKeyScanW(0) } as u16;
+    let mut key = KEY_EVENT_RECORD {
+        bKeyDown: 1,
+        wRepeatCount: repeat,
+        wVirtualKeyCode: mapping & 0xff,
+        dwControlKeyState: (u32::from(mapping & 0x100 != 0) * SHIFT_PRESSED)
+            | (u32::from(mapping & 0x200 != 0) * LEFT_CTRL_PRESSED)
+            | (u32::from(mapping & 0x400 != 0) * LEFT_ALT_PRESSED),
+        ..KEY_EVENT_RECORD::default()
+    };
+    key.uChar.UnicodeChar = 0;
+    key_record(key)
+}
+
 fn resize_record(rows: i16, columns: i16) -> INPUT_RECORD {
     INPUT_RECORD {
         EventType: WINDOW_BUFFER_SIZE_EVENT as u16,
@@ -163,8 +181,26 @@ fn resize_record(rows: i16, columns: i16) -> INPUT_RECORD {
 }
 
 #[test]
+fn console_record_translation_encodes_the_exact_cp65001_input_vector() {
+    let mut input = ConsoleInput::new(ptr::null_mut());
+    let mut wide = Vec::new();
+    for record in [
+        text_record(b'A'.into(), 1),
+        text_record(0xd83d, 1),
+        text_record(0xde42, 1),
+        text_record(0x00e9, 1),
+        nul_record(1),
+        text_record(b'Z'.into(), 1),
+    ] {
+        assert_eq!(input.record(record, CP_UTF8, &mut wide), Ok(None));
+    }
+    let mut output = Vec::new();
+    ConsoleInput::encode(CP_UTF8, &wide, &mut output).unwrap();
+    assert_eq!(output, b"A\xf0\x9f\x99\x82\xc3\xa9\0Z");
+}
+
+#[test]
 fn console_record_translation_preserves_scalars_repeats_nul_and_event_boundaries() {
-    let zero = unsafe { VkKeyScanW(0) } as u16;
     let mut input = ConsoleInput::new(ptr::null_mut());
     let mut wide = Vec::new();
     let mut output = Vec::new();
@@ -173,18 +209,8 @@ fn console_record_translation_preserves_scalars_repeats_nul_and_event_boundaries
         input.record(text_record(b'A'.into(), 3), CP_UTF8, &mut wide),
         Ok(None)
     );
-    let mut nul = KEY_EVENT_RECORD {
-        bKeyDown: 1,
-        wRepeatCount: 2,
-        wVirtualKeyCode: zero & 0xff,
-        dwControlKeyState: (u32::from(zero & 0x100 != 0) * SHIFT_PRESSED)
-            | (u32::from(zero & 0x200 != 0) * LEFT_CTRL_PRESSED)
-            | (u32::from(zero & 0x400 != 0) * LEFT_ALT_PRESSED),
-        ..KEY_EVENT_RECORD::default()
-    };
-    nul.uChar.UnicodeChar = 0;
     assert_eq!(
-        input.record(key_record(nul), CP_UTF8, &mut wide),
+        input.record(nul_record(2), CP_UTF8, &mut wide),
         Ok(None)
     );
     assert_eq!(

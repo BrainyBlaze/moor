@@ -1027,7 +1027,7 @@ mod launch_paths {
         use std::thread;
         use std::time::{Duration, Instant};
         use windows_spawn::{AsPseudoConsole, Child, Command as SpawnCommand, SpawnOptions};
-        use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE};
+        use windows_sys::Win32::Foundation::{FALSE, HANDLE, TRUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::Globalization::CP_UTF8;
         use windows_sys::Win32::System::Console::{
             AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, CTRL_BREAK_EVENT, ClosePseudoConsole,
@@ -1036,11 +1036,16 @@ mod launch_paths {
             ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
             FlushConsoleInputBuffer, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleCP,
             GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, INPUT_RECORD,
-            KEY_EVENT, ReadConsoleInputW, ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-            SetConsoleCP, SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+            INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED,
+            RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, ReadConsoleInputW, ResizePseudoConsole,
+            SHIFT_PRESSED, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP,
+            SetConsoleCtrlHandler, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT, WriteConsoleInputW,
         };
         use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
-        use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, WaitForSingleObject,
+        };
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VkKeyScanW;
 
         struct Console {
             value: HPCON,
@@ -1113,9 +1118,34 @@ mod launch_paths {
                     .ok_or_else(|| io::Error::other(format!("ResizePseudoConsole: {result:#x}")))
             }
 
+            fn pump(&mut self) -> io::Result<()> {
+                let output = self.output.as_mut().unwrap();
+                let mut available = 0;
+                if unsafe {
+                    PeekNamedPipe(
+                        output.as_raw_handle() as HANDLE,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if available != 0 {
+                    let mut bytes = vec![0; available as usize];
+                    output.read_exact(&mut bytes)?;
+                    self.received.extend_from_slice(&bytes);
+                }
+                Ok(())
+            }
+
             fn wait_for(&mut self, marker: &[u8], timeout: Duration) -> io::Result<()> {
                 let deadline = Instant::now() + timeout;
                 loop {
+                    self.pump()?;
                     if self
                         .received
                         .windows(marker.len())
@@ -1125,27 +1155,6 @@ mod launch_paths {
                     }
                     if Instant::now() >= deadline {
                         break;
-                    }
-                    let output = self.output.as_mut().unwrap();
-                    let mut available = 0;
-                    if unsafe {
-                        PeekNamedPipe(
-                            output.as_raw_handle() as HANDLE,
-                            std::ptr::null_mut(),
-                            0,
-                            std::ptr::null_mut(),
-                            &mut available,
-                            std::ptr::null_mut(),
-                        )
-                    } == 0
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if available != 0 {
-                        let mut bytes = vec![0; available as usize];
-                        output.read_exact(&mut bytes)?;
-                        self.received.extend_from_slice(&bytes);
-                        continue;
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -1197,6 +1206,37 @@ mod launch_paths {
             }
             let _ = child.kill();
             let _ = child.wait();
+            Err(io::Error::new(io::ErrorKind::TimedOut, "child timed out"))
+        }
+
+        fn wait_spawn_pumping(
+            console: &mut Console,
+            child: &mut Child,
+            timeout: Duration,
+        ) -> io::Result<ExitStatus> {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                console.pump()?;
+                if let Some(status) = child.try_wait()? {
+                    let drain_deadline = Instant::now() + Duration::from_millis(500);
+                    while Instant::now() < drain_deadline {
+                        console.pump()?;
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    console.pump()?;
+                    return Ok(status);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let _ = child.kill();
+            let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < cleanup_deadline {
+                console.pump()?;
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(io::Error::new(io::ErrorKind::TimedOut, "child timed out"))
         }
 
@@ -1380,9 +1420,6 @@ mod launch_paths {
                 .env("MOOR_CONSOLE_GEOMETRY_PROBE", "detached");
             let mut viewer = console.spawn(command).unwrap();
             console
-                .wait_for(b"\x1b[?9001h", Duration::from_secs(1))
-                .unwrap();
-            console
                 .wait_for(b"MOOR-GEOM-detached:37:93", Duration::from_secs(10))
                 .unwrap();
             console
@@ -1396,9 +1433,10 @@ mod launch_paths {
                     .success()
             );
             let (input, output) = wait_modes(&mut console, "live");
+            assert_eq!(input & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
             assert_eq!(
-                input & (ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS),
-                ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_EXTENDED_FLAGS
+                input & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
+                ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
             );
             assert_eq!(
                 input
@@ -1408,7 +1446,6 @@ mod launch_paths {
                         | ENABLE_QUICK_EDIT_MODE),
                 0
             );
-            assert_ne!(input & ENABLE_WINDOW_INPUT, 0);
             assert_eq!(
                 output & (ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING),
                 ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -1433,9 +1470,7 @@ mod launch_paths {
             for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
                 after += trace[after..].find(marker).expect("input/resize order") + marker.len();
             }
-            // ConPTY requested win32-input-mode with CSI ?9001h. Act as its
-            // terminal and encode a key-down U+001C INPUT_RECORD on that wire.
-            console.write(b"\x1b[0;0;28;1;0;1_").unwrap();
+            console.write(&[0x1c]).unwrap();
             let detached =
                 wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
                     panic!(
@@ -1452,6 +1487,371 @@ mod launch_paths {
                     .success()
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
+        }
+
+        const RECORD_INPUT_SENTINEL: &str = "MOOR_CONSOLE_RECORD_INPUT_SENTINEL";
+        const RECORD_INPUT_READY: &[u8] = b"MOOR-RECORD-INPUT-READY";
+        const RECORD_INPUT_VERIFIED: &[u8] = b"MOOR-RECORD-INPUT-VERIFIED";
+        const RECORD_INPUT_EXPECTED: &[u16] = &[0x0041, 0xd83d, 0xde42, 0x00e9, 0, 0x005a];
+
+        fn wait_file(path: &std::path::Path, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if path.is_file() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {path:?}");
+        }
+
+        #[test]
+        fn console_record_input_probe() {
+            let Some(sentinel) = std::env::var_os(RECORD_INPUT_SENTINEL) else {
+                return;
+            };
+            let sentinel = std::path::PathBuf::from(sentinel);
+            let release = companion(&sentinel, ".release");
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
+            assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
+
+            let raw = ENABLE_PROCESSED_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_QUICK_EDIT_MODE;
+            let mut mode = 0;
+            assert_ne!(unsafe { GetConsoleMode(input, &mut mode) }, 0);
+            assert_ne!(
+                unsafe {
+                    SetConsoleMode(
+                        input,
+                        (mode | ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS)
+                            & !(raw | ENABLE_VIRTUAL_TERMINAL_INPUT),
+                    )
+                },
+                0
+            );
+            assert_ne!(unsafe { GetConsoleMode(input, &mut mode) }, 0);
+            assert_eq!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+            assert_eq!(mode & raw, 0);
+            assert_eq!(
+                mode & (ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS),
+                ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS
+            );
+            assert_ne!(unsafe { FlushConsoleInputBuffer(input) }, 0);
+
+            println!("{}", String::from_utf8_lossy(RECORD_INPUT_READY));
+            io::stdout().flush().unwrap();
+
+            let nul = unsafe { VkKeyScanW(0) } as u16;
+            let mut records = [INPUT_RECORD::default(); 64];
+            let mut seen = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while seen < RECORD_INPUT_EXPECTED.len() {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_else(|| panic!("timed out after {seen} semantic input records"));
+                let count = read_console_records(input, remaining, &mut records)
+                    .unwrap_or_else(|| panic!("timed out after {seen} semantic input records"));
+                for record in records[..count].iter().copied() {
+                    accept_semantic_record(record, nul, &mut seen);
+                }
+            }
+
+            wait_file(&sentinel, Duration::from_secs(5));
+            let quiet = Instant::now() + Duration::from_millis(500);
+            while let Some(remaining) = quiet.checked_duration_since(Instant::now()) {
+                let Some(count) = read_console_records(input, remaining, &mut records) else {
+                    break;
+                };
+                for record in records[..count].iter().copied() {
+                    accept_semantic_record(record, nul, &mut seen);
+                }
+            }
+
+            assert_eq!(seen, RECORD_INPUT_EXPECTED.len());
+            println!("{}", String::from_utf8_lossy(RECORD_INPUT_VERIFIED));
+            io::stdout().flush().unwrap();
+            wait_file(&release, Duration::from_secs(10));
+        }
+
+        fn nul_control_state(mapping: u16) -> u32 {
+            (u32::from(mapping & 0x100 != 0) * SHIFT_PRESSED)
+                | (u32::from(mapping & 0x200 != 0) * LEFT_CTRL_PRESSED)
+                | (u32::from(mapping & 0x400 != 0) * LEFT_ALT_PRESSED)
+        }
+
+        fn semantic_nul(key: KEY_EVENT_RECORD, mapping: u16) -> bool {
+            let unit = unsafe { key.uChar.UnicodeChar };
+            if unit != 0 || key.wVirtualScanCode != 0 {
+                return false;
+            }
+            // Windows 10 1809 and Server 2019 predate the conhost change that
+            // represents an inbound NUL as its VkKeyScanW chord. Normalize the
+            // exact historical raw-zero record at this inner-console boundary.
+            let legacy = key.wVirtualKeyCode == 0 && key.dwControlKeyState == 0;
+            let chord = key.wVirtualKeyCode
+                | u16::from(key.dwControlKeyState & SHIFT_PRESSED != 0) << 8
+                | u16::from(key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0)
+                    << 9
+                | u16::from(key.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0)
+                    << 10;
+            legacy || chord == mapping & 0x7ff
+        }
+
+        fn semantic_key(record: INPUT_RECORD, nul: u16) -> Option<(KEY_EVENT_RECORD, u16)> {
+            if record.EventType != KEY_EVENT as u16 {
+                return None;
+            }
+            let key = unsafe { record.Event.KeyEvent };
+            if key.bKeyDown == FALSE {
+                return None;
+            }
+            let unit = unsafe { key.uChar.UnicodeChar };
+            (unit != 0 || semantic_nul(key, nul)).then_some((key, unit))
+        }
+
+        fn accept_semantic_record(record: INPUT_RECORD, nul: u16, seen: &mut usize) {
+            let Some((key, unit)) = semantic_key(record, nul) else {
+                return;
+            };
+            assert_eq!(key.bKeyDown, TRUE, "semantic input was not key-down");
+            assert_eq!(key.wRepeatCount, 1, "semantic input repeated");
+            let expected = RECORD_INPUT_EXPECTED
+                .get(*seen)
+                .unwrap_or_else(|| panic!("unexpected extra semantic input record U+{unit:04X}"));
+            assert_eq!(unit, *expected, "semantic input record {}", *seen);
+            *seen += 1;
+        }
+
+        fn read_console_records(
+            input: HANDLE,
+            timeout: Duration,
+            records: &mut [INPUT_RECORD],
+        ) -> Option<usize> {
+            let timeout = timeout
+                .as_millis()
+                .saturating_add(1)
+                .min(u128::from(u32::MAX)) as u32;
+            match unsafe { WaitForSingleObject(input, timeout) } {
+                WAIT_TIMEOUT => return None,
+                WAIT_OBJECT_0 => {}
+                wait => panic!("unexpected console input wait result {wait:#x}"),
+            }
+            let mut count = 0;
+            assert_ne!(
+                unsafe {
+                    ReadConsoleInputW(
+                        input,
+                        records.as_mut_ptr(),
+                        records.len() as u32,
+                        &mut count,
+                    )
+                },
+                0,
+                "ReadConsoleInputW failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_ne!(count, 0, "ReadConsoleInputW returned no records");
+            assert!(count as usize <= records.len());
+            Some(count as usize)
+        }
+
+        fn record_key(unit: u16) -> INPUT_RECORD {
+            let mut key = KEY_EVENT_RECORD {
+                bKeyDown: TRUE,
+                wRepeatCount: 1,
+                ..KEY_EVENT_RECORD::default()
+            };
+            key.uChar.UnicodeChar = unit;
+            INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: INPUT_RECORD_0 { KeyEvent: key },
+            }
+        }
+
+        fn record_nul() -> INPUT_RECORD {
+            let mapping = unsafe { VkKeyScanW(0) } as u16;
+            let mut key = KEY_EVENT_RECORD {
+                bKeyDown: TRUE,
+                wRepeatCount: 1,
+                wVirtualKeyCode: mapping & 0xff,
+                dwControlKeyState: nul_control_state(mapping),
+                ..KEY_EVENT_RECORD::default()
+            };
+            key.uChar.UnicodeChar = 0;
+            INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: INPUT_RECORD_0 { KeyEvent: key },
+            }
+        }
+
+        #[test]
+        fn record_input_normalizes_legacy_and_modern_nul_records() {
+            let mapping = unsafe { VkKeyScanW(0) } as u16;
+            assert_eq!(
+                semantic_key(record_nul(), mapping).map(|(_, unit)| unit),
+                Some(0)
+            );
+            assert_eq!(
+                semantic_key(record_key(0), mapping).map(|(_, unit)| unit),
+                Some(0)
+            );
+
+            let mut invalid = unsafe { record_key(0).Event.KeyEvent };
+            invalid.wVirtualScanCode = 1;
+            assert_eq!(
+                semantic_key(
+                    INPUT_RECORD {
+                        EventType: KEY_EVENT as u16,
+                        Event: INPUT_RECORD_0 { KeyEvent: invalid },
+                    },
+                    mapping,
+                )
+                .map(|(_, unit)| unit),
+                None
+            );
+        }
+
+        #[test]
+        fn console_record_sender() {
+            let Some(sentinel) = std::env::var_os(RECORD_INPUT_SENTINEL) else {
+                return;
+            };
+            let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
+            assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
+            let records = [
+                record_key(u16::from(b'A')),
+                record_key(0xd83d),
+                record_key(0xde42),
+                record_key(0x00e9),
+                record_nul(),
+                record_key(u16::from(b'Z')),
+            ];
+            let mut written = 0;
+            assert_ne!(
+                unsafe {
+                    WriteConsoleInputW(input, records.as_ptr(), records.len() as u32, &mut written)
+                },
+                0,
+                "WriteConsoleInputW failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(written as usize, records.len());
+            std::fs::write(sentinel, b"complete").unwrap();
+        }
+
+        struct FileCleanup([std::path::PathBuf; 2]);
+
+        impl FileCleanup {
+            fn new(paths: [std::path::PathBuf; 2]) -> Self {
+                for path in &paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                Self(paths)
+            }
+        }
+
+        impl Drop for FileCleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
+        fn wait_lifecycle_exit(marker: &std::path::Path, timeout: Duration) -> String {
+            let exit = companion(marker, ".exit");
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if let Ok((_, body)) = Store::read_only(&exit, Kind::Exit, 1) {
+                    let body = String::from_utf8(body).unwrap();
+                    if body.contains("\"phase\":\"exited\"") {
+                        return body;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("child lifecycle did not exit at {exit:?}");
+        }
+
+        #[test]
+        fn shipped_viewer_preserves_exact_record_input_semantics() {
+            let mut console = Console::new(37, 93).unwrap();
+            let session = format!("console-record-input-{}", std::process::id());
+            let _cleanup = Cleanup(session.clone());
+            let marker = invoked_root().join(&session);
+            let sentinel = std::env::temp_dir().join(format!(
+                "moor-console-record-input-sender-{}",
+                std::process::id()
+            ));
+            let release = companion(&sentinel, ".release");
+            let _files = FileCleanup::new([sentinel.clone(), release.clone()]);
+
+            let executable = std::env::current_exe().unwrap();
+            let mut command = SpawnCommand::new(env!("CARGO_BIN_EXE_moor"));
+            command
+                .args([
+                    "new".as_ref(),
+                    session.as_ref(),
+                    executable.as_os_str(),
+                    "--exact".as_ref(),
+                    "launch_paths::native_console::console_record_input_probe".as_ref(),
+                    "--nocapture".as_ref(),
+                ])
+                .env(RECORD_INPUT_SENTINEL, &sentinel);
+            let mut viewer = console.spawn(command).unwrap();
+            console
+                .wait_for(RECORD_INPUT_READY, Duration::from_secs(10))
+                .unwrap();
+
+            let mut sender = SpawnCommand::new(&executable);
+            sender
+                .args([
+                    "--exact",
+                    "launch_paths::native_console::console_record_sender",
+                    "--nocapture",
+                ])
+                .env(RECORD_INPUT_SENTINEL, &sentinel);
+            let mut sender = console.spawn(sender).unwrap();
+            let sender_status =
+                wait_spawn_pumping(&mut console, &mut sender, Duration::from_secs(5))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{error}; console output: {:?}",
+                            String::from_utf8_lossy(&console.received)
+                        )
+                    });
+            assert!(
+                sender_status.success(),
+                "record sender exited with {sender_status:?}: {:?}",
+                String::from_utf8_lossy(&console.received)
+            );
+            console
+                .wait_for(RECORD_INPUT_VERIFIED, Duration::from_secs(10))
+                .unwrap();
+
+            console.write(&[0x1c]).unwrap();
+            let viewer_status =
+                wait_spawn(&mut viewer, Duration::from_secs(5)).unwrap_or_else(|error| {
+                    panic!(
+                        "{error}; console output: {:?}",
+                        String::from_utf8_lossy(&console.received)
+                    )
+                });
+            assert!(
+                viewer_status.success(),
+                "viewer exited with {viewer_status:?}"
+            );
+
+            std::fs::write(&release, b"release").unwrap();
+            let lifecycle = wait_lifecycle_exit(&marker, Duration::from_secs(10));
+            let lifecycle: serde_json::Value = serde_json::from_str(&lifecycle).unwrap();
+            assert_eq!(lifecycle["phase"].as_str(), Some("exited"));
+            assert_eq!(lifecycle["ended"].as_str(), Some("exited"));
+            assert_eq!(lifecycle["code"].as_u64(), Some(0));
         }
 
         static CONTROL_BREAKS: AtomicU8 = AtomicU8::new(0);
