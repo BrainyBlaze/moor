@@ -848,19 +848,20 @@ fn holder_setup(
         .transpose()?;
     let directory_fd = directory_guard.as_ref().map(|fd| fd.as_raw_fd());
     let generation_key = shared::environment_key(invoked, "_GENERATION");
+    let launch_channel_key = shared::environment_key(invoked, "_LAUNCH_CHANNEL");
     process
         .env_remove(&generation_key)
-        .env_remove("DESK_SESSION_GENERATION")
-        .env_remove("DESK_SESSION_SEMANTIC_TOKEN")
-        .env_remove("DESK_MOOR_LAUNCH_CHANNEL");
+        .env_remove("MOOR_SESSION_GENERATION")
+        .env_remove("MOOR_SESSION_SEMANTIC_TOKEN")
+        .env_remove(&launch_channel_key);
     if supervised {
         let value = generation.to_string();
         process
             .env(&generation_key, &value)
-            .env("DESK_SESSION_GENERATION", value);
+            .env("MOOR_SESSION_GENERATION", value);
     }
     if semantic_token != [0; 16] {
-        process.env("DESK_SESSION_SEMANTIC_TOKEN", hex(semantic_token));
+        process.env("MOOR_SESSION_SEMANTIC_TOKEN", hex(semantic_token));
     }
     let (start_wall, start_mono, boot) = config.launch.start;
     let event_path = options.events.as_deref();
@@ -1636,11 +1637,8 @@ impl PreparedInstrument {
         );
         let (read, write) = nix::unistd::pipe().map_err(|_| reject("io-error"))?;
         let nonce = shared::random_array::<16>().map_err(|_| reject("io-error"))?;
-        process.env(
-            "DESK_MOOR_INSTRUMENT_CHANNEL",
-            write.as_raw_fd().to_string(),
-        );
-        process.env("DESK_MOOR_INSTRUMENT_NONCE", hex(nonce));
+        process.env("MOOR_INSTRUMENT_CHANNEL", write.as_raw_fd().to_string());
+        process.env("MOOR_INSTRUMENT_NONCE", hex(nonce));
         #[cfg(target_os = "macos")]
         let (loader, separator) = ("DYLD_INSERT_LIBRARIES", ":");
         #[cfg(not(target_os = "macos"))]

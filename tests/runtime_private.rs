@@ -231,10 +231,11 @@ fn discovery_applies_one_deadline_to_the_complete_listing() {
 fn supervised_generation_validates_and_sanitizes_environment_carriers() {
     let invoked = std::ffi::OsStr::new("moor-private-generation-test");
     let key = environment_key(invoked, "_GENERATION");
+    let launch = environment_key(invoked, "_LAUNCH_CHANNEL");
     unsafe {
-        std::env::set_var("DESK_MOOR_LAUNCH_CHANNEL", "channel");
+        std::env::set_var(&launch, "channel");
         std::env::set_var(&key, "42");
-        std::env::set_var("DESK_SESSION_GENERATION", "42");
+        std::env::set_var("MOOR_SESSION_GENERATION", "42");
     }
     let result = supervised_generation(invoked, true, "invalid launch", |selector| {
         assert_eq!(selector, "channel");
@@ -246,9 +247,9 @@ fn supervised_generation_validates_and_sanitizes_environment_carriers() {
         decode_launch_record(&bytes).ok_or_else(|| "decode failed".to_string())
     });
     assert_eq!(result.unwrap(), (42, true));
-    assert!(std::env::var_os("DESK_MOOR_LAUNCH_CHANNEL").is_none());
+    assert!(std::env::var_os(launch).is_none());
     assert!(std::env::var_os(key).is_none());
-    assert!(std::env::var_os("DESK_SESSION_GENERATION").is_none());
+    assert!(std::env::var_os("MOOR_SESSION_GENERATION").is_none());
 }
 
 #[test]
