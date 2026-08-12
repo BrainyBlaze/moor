@@ -2274,9 +2274,8 @@ mod launch_paths {
 
             console.write(WIN32_INPUT_VECTOR).unwrap();
             std::fs::write(&sentinel, b"complete").unwrap();
-            wait_file(&observed, Duration::from_secs(5));
-            assert_eq!(std::fs::read(&observed).unwrap(), VT_INPUT_EXPECTED);
             wait_file(&verified, Duration::from_secs(5));
+            assert_eq!(std::fs::read(&observed).unwrap(), VT_INPUT_EXPECTED);
             std::fs::write(&release, b"release").unwrap();
             let status = wait_spawn(&mut child, Duration::from_secs(5)).unwrap();
             assert!(status.success(), "W32 input probe exited with {status:?}");
@@ -2364,14 +2363,13 @@ mod launch_paths {
                 sentinel.is_file(),
                 "record sender omitted completion sentinel"
             );
-            wait_file(&observed, Duration::from_secs(5));
+            wait_file(&verified, Duration::from_secs(5));
             assert_eq!(
                 std::fs::read(&observed).unwrap(),
                 VT_INPUT_EXPECTED,
                 "outer console output: {:?}",
                 String::from_utf8_lossy(&console.received)
             );
-            wait_file(&verified, Duration::from_secs(5));
 
             let viewer_status =
                 wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5)).unwrap();
