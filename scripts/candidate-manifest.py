@@ -87,12 +87,19 @@ REQUIRED = {
         "identity": {"macos-15-arm64"},
     },
     "x86_64-pc-windows-msvc": {
+        # Server 2022 is the input-fidelity floor; 1809 and Server 2019 are
+        # exact-byte compatibility lanes AND §12.8 native below-floor
+        # provenance (release-matrix.md), so both gates require all three.
         "native-conformance": {
             "windows-2022-x64",
             "windows-10-1809-x64",
             "windows-server-2019-x64",
         },
-        "compatibility": {"windows-2022-x64"},
+        "compatibility": {
+            "windows-2022-x64",
+            "windows-10-1809-x64",
+            "windows-server-2019-x64",
+        },
         "static-linkage": {"windows-2022-x64"},
         "identity": {"windows-2022-x64"},
     },
