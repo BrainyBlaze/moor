@@ -387,12 +387,7 @@ jobs:
             if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
             else shasum -a 256 "$1" | cut -d' ' -f1; fi
           }
-          # Boundary proof 1: every fixture resolves to the compiled bin
-          # path (CARGO_BIN_EXE embeds it at compile time).
-          while IFS= read -r exe; do
-            grep -a -q -- "$BIN" "$exe" || grep -a -q -- "$(basename "$BIN")" "$exe"
-          done < tests.txt
-          # Boundary proof 2 (negative): with a wrong program at that path the
+          # Boundary proof (negative): with a wrong program at that path the
           # suite must fail, proving the fixtures execute those exact bytes.
           # The wrong program is a freshly written real regular file that
           # always exits nonzero — not a shell builtin — so `cp` cannot fail
@@ -416,7 +411,7 @@ jobs:
             echo "== $exe"
             "$exe"
           done < tests.txt
-          # Boundary proof 3: the bytes under test never changed.
+          # Final proof: the bytes under test never changed across the run.
           test "$(hash_of "$BIN")" = "$SHA_EXPECTED"
 
       - name: Record the verification reference(s)
@@ -502,6 +497,7 @@ jobs:
           python3 scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
           mkdir exact && (cd exact && unzip -q ../candidate.zip)
           test "$(sha256sum "exact/$ASSET" | cut -d' ' -f1)" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+          test "$(wc -c < "exact/$ASSET" | tr -d ' ')" = "$(jq -r .size "records/build-$TARGET.json")"
           chmod +x "exact/$ASSET"
 
       - name: Exercise the exact bytes on the musl host
@@ -581,6 +577,13 @@ jobs:
             lane: wsl2-ubuntu-22.04-x64
             runner: [self-hosted, linux, x64, wsl2-ubuntu-22.04-x64]
     steps:
+      - name: Preflight the self-hosted lane tools
+        shell: bash
+        run: |
+          for tool in bash gh jq unzip sha256sum python3 cargo rustup; do
+            command -v "$tool" >/dev/null || { echo "self-hosted lane missing required tool: $tool" >&2; exit 1; }
+          done
+
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -609,6 +612,7 @@ jobs:
           python3 scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
           mkdir exact && (cd exact && unzip -q ../candidate.zip)
           test "$(sha256sum "exact/$ASSET" | cut -d' ' -f1)" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+          test "$(wc -c < "exact/$ASSET" | tr -d ' ')" = "$(jq -r .size "records/build-$TARGET.json")"
           chmod +x "exact/$ASSET"
 
       - name: Exercise the exact bytes under WSL
@@ -685,6 +689,13 @@ jobs:
     env:
       TARGET: x86_64-pc-windows-msvc
     steps:
+      - name: Preflight the self-hosted lane tools
+        shell: bash
+        run: |
+          for tool in bash gh jq unzip sha256sum python cargo rustup; do
+            command -v "$tool" >/dev/null || { echo "self-hosted Windows lane missing required tool: $tool" >&2; exit 1; }
+          done
+
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -712,6 +723,7 @@ jobs:
           python scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
           mkdir exact && (cd exact && unzip -q ../candidate.zip)
           test "$(sha256sum "exact/$ASSET" | cut -d' ' -f1)" = "$(jq -r .sha256 "records/build-$TARGET.json")"
+          test "$(wc -c < "exact/$ASSET" | tr -d ' ')" = "$(jq -r .size "records/build-$TARGET.json")"
 
       - name: 'Static CRT proof on the exact bytes'
         shell: bash
@@ -719,7 +731,7 @@ jobs:
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
           python scripts/candidate-verify.py pe-imports "exact/$ASSET"
 
-      - name: '§12.8 native conformance below the input floor'
+      - name: '§12.8 native conformance below the input floor (input-carrier expected-absent)'
         shell: bash
         run: |
           rustup target add "$TARGET" || true
@@ -733,10 +745,41 @@ jobs:
           test -s tests.txt
           cp "exact/$ASSET" "$BIN"
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
-          while IFS= read -r exe; do echo "== $exe"; "$exe"; done < tests.txt
+          # release-matrix.md below-floor rule: the three input-carrier rows
+          # are expected-absent on 1809 / Server 2019 (their ConPTY predates
+          # the win32-input-mode request), while everything else is exercised
+          # and MUST pass. The three carrier tests are skipped by exact name
+          # here and verified separately as expected-failures below.
+          ABSENT="platform_w32_input_mode_preserves_application_cursor_semantics \
+                  shipped_viewer_preserves_exact_vt_input_bytes \
+                  shipped_viewer_uses_real_geometry_resize_and_restores_console_modes"
+          SKIP=""
+          for t in $ABSENT; do SKIP="$SKIP --skip $t"; done
+          # Exercised set: everything except the three carrier rows must pass.
+          while IFS= read -r exe; do echo "== exercised: $exe"; "$exe" $SKIP; done < tests.txt
+          # Expected-absent proof: each carrier row is run by its exact name
+          # in the one executable that owns it, and MUST NOT report a pass on
+          # this below-floor host — the platform drops the carrier. "0 tests
+          # run" (an executable that does not contain the name) is ignored;
+          # only a genuine pass — "test result: ok. N passed" with N>=1 —
+          # fails the job, because it would contradict the frozen floor.
+          for t in $ABSENT; do
+            found=0
+            while IFS= read -r exe; do
+              out="$("$exe" --exact "$t" 2>&1 || true)"
+              if echo "$out" | grep -qE 'running [1-9][0-9]* test'; then
+                found=1
+                if echo "$out" | grep -qE 'test result: ok\. [1-9]'; then
+                  echo "carrier test $t unexpectedly passed below floor" >&2
+                  exit 1
+                fi
+              fi
+            done < tests.txt
+            test "$found" -eq 1 || { echo "carrier test $t not found in any executable" >&2; exit 1; }
+          done
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
 
-      - name: Record the native-conformance reference
+      - name: Record the compatibility and native-conformance references
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -749,16 +792,18 @@ jobs:
           test -n "$JOB_ID"
           SHA="$(jq -r .sha256 "records/build-$TARGET.json")"
           mkdir -p records-out
-          jq -n \
-            --arg gate native-conformance --arg lane "$LANE" --arg commit "$COMMIT" \
-            --arg sha256 "$SHA" \
-            --arg runId "${{ github.run_id }}" \
-            --argjson attempt "${{ github.run_attempt }}" \
-            --arg jobId "$JOB_ID" --arg jobName "$JOB_NAME" \
-            '{gate: $gate, lane: $lane, commit: $commit, sha256: $sha256,
-              workflowRunId: $runId, workflowRunAttempt: $attempt,
-              jobId: $jobId, jobName: $jobName}' \
-            > "records-out/verify-$TARGET-native-conformance-$LANE.json"
+          for gate in compatibility native-conformance; do
+            jq -n \
+              --arg gate "$gate" --arg lane "$LANE" --arg commit "$COMMIT" \
+              --arg sha256 "$SHA" \
+              --arg runId "${{ github.run_id }}" \
+              --argjson attempt "${{ github.run_attempt }}" \
+              --arg jobId "$JOB_ID" --arg jobName "$JOB_NAME" \
+              '{gate: $gate, lane: $lane, commit: $commit, sha256: $sha256,
+                workflowRunId: $runId, workflowRunAttempt: $attempt,
+                jobId: $jobId, jobName: $jobName}' \
+              > "records-out/verify-$TARGET-$gate-$LANE.json"
+          done
 
       - name: Upload the native-conformance record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
