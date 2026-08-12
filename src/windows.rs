@@ -819,7 +819,7 @@ mod native {
     fn pipe_descriptor(
         sid: &str,
     ) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
-        let (descriptor, _) = descriptor(sid, "0x12019b")?;
+        let (descriptor, _) = descriptor(sid, "0x12019f")?;
         unsafe {
             BorrowedSecurityDescriptor::from_ptr((&*descriptor as *const SecurityDescriptor).cast())
         }
