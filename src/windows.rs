@@ -2303,7 +2303,7 @@ mod native {
         require(crate::wire::valid_size(size), invalid).map(|_| size)
     }
     struct ViewerConsole([HANDLE; 2], [u32; 2]);
-    struct ViewerInputMode(HANDLE);
+    struct ViewerInputMode(Option<HANDLE>);
     impl ViewerInputMode {
         fn write(handle: HANDLE, bytes: &[u8]) -> Result<()> {
             let mut written = 0;
@@ -2323,12 +2323,22 @@ mod native {
             )
         }
         fn enable(handle: HANDLE) -> Result<Self> {
-            Self::write(handle, WIN32_INPUT_ENABLE).map(|()| Self(handle))
+            Self::write(handle, WIN32_INPUT_ENABLE).map(|()| Self(Some(handle)))
+        }
+        fn disable(&mut self) -> Result<()> {
+            let Some(handle) = self.0 else {
+                return Ok(());
+            };
+            Self::write(handle, WIN32_INPUT_DISABLE)?;
+            self.0 = None;
+            Ok(())
         }
     }
     impl Drop for ViewerInputMode {
         fn drop(&mut self) {
-            Self::write(self.0, WIN32_INPUT_DISABLE).ok();
+            if let Some(handle) = self.0 {
+                Self::write(handle, WIN32_INPUT_DISABLE).ok();
+            }
         }
     }
     impl ViewerConsole {
@@ -2934,11 +2944,11 @@ mod native {
         let terminal = ViewerConsole::detect()
             .ok_or_else(|| CommandError::output("no controlling terminal"))?;
         terminal.set(viewer_modes(terminal.1[0], terminal.1[1]))?;
-        let _input_mode = ViewerInputMode::enable(terminal.0[1])?;
+        let mut input_mode = ViewerInputMode::enable(terminal.0[1])?;
         let mut client = controller(path, 2000).map_err(|_| missing(path))?;
         let geometry = console_geometry(terminal.0[1]).unwrap_or((0, 0));
         let mut output = io::stdout();
-        Ok(attach_viewer_to(
+        let attached = attach_viewer_to(
             &mut client,
             &options,
             geometry,
@@ -2946,7 +2956,11 @@ mod native {
             Duration::from_secs(15),
             |remaining| controller(path, remaining.as_millis().min(u128::from(u32::MAX)) as u32),
             |sender| viewer_input(sender, options.detach, geometry),
-        )?)
+        );
+        let disabled = input_mode.disable();
+        let status = attached?;
+        disabled?;
+        Ok(status)
     }
     fn viewer_input(sender: ViewerSender, detach: Option<u8>, geometry: (u16, u16)) {
         thread::spawn(move || {
