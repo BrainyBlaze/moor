@@ -6,14 +6,20 @@ canonical JSON bytes (two-space indent, one space after ':', LF ending),
 printable-ASCII-only strings without '"' or '\\', unsigned base-10 integers,
 and the six-line SHA256SUMS in target-table order.
 
+Closure is table-driven per docs/release-matrix.md: every required
+(gate, lane) pair must be present as a green verification record whose
+verified digest equals the build digest; a missing lane, an unknown lane,
+a gate satisfied by the wrong lane, or a different-byte verification
+refuses the whole manifest. Extra honest lanes are recorded but never
+substitute for a required one.
+
 Input: a directory of JSON records —
   build-<target>.json          one per target, written at the build boundary
-  verify-<target>-<gate>.json  one per green verification job reference
+  verify-<target>-<gate>-<lane>.json  one per green verification reference,
+    carrying gate, lane, run/attempt/job identity, the verified sha256, and
+    the exact source commit the verifying job checked out.
 Environment: COMMIT, VERSION (with leading v), RUN_ID, RUN_ATTEMPT.
 Output: moor-release-manifest-v1.json and SHA256SUMS in --out directory.
-
-The script fails closed: a missing target, missing required gate, malformed
-field, or non-canonical value is an error, never a weaker manifest.
 """
 
 import json
@@ -23,7 +29,6 @@ import sys
 
 REPOSITORY = "https://github.com/BrainyBlaze/moor"
 
-# The exact six targets in canonical (table) order.
 TARGETS = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
@@ -44,15 +49,61 @@ ASSET_SUFFIX = {
 
 GATE_ORDER = ["native-conformance", "compatibility", "static-linkage", "identity"]
 
-# release-matrix.md: gates that must be present per target. Linux requires
-# explicit static-linkage evidence; every target requires native §12.8
-# conformance and identity.
-def required_gates(target: str) -> set:
-    gates = {"native-conformance", "identity"}
-    if "linux" in target:
-        gates.add("static-linkage")
-    return gates
+# Canonical lane names. A record naming any other lane is refused.
+KNOWN_LANES = {
+    "ubuntu-22.04-x64",
+    "ubuntu-24.04-arm64",
+    "alpine-3.20-x64",
+    "alpine-3.20-arm64",
+    "wsl1-x64",
+    "wsl2-x64",
+    "macos-15-intel",
+    "macos-15-arm64",
+    "windows-2022-x64",
+    "windows-10-1809-x64",
+    "windows-2019-x64",
+    "windows-11-arm64",
+}
 
+# docs/release-matrix.md, table-driven: the exact required (gate -> lanes)
+# closure per target. windows-x64 compatibility includes the two
+# below-input-floor lanes; Server 2022 is the input-fidelity-floor lane.
+REQUIRED = {
+    "x86_64-unknown-linux-musl": {
+        "native-conformance": {"ubuntu-22.04-x64", "alpine-3.20-x64"},
+        "compatibility": {"ubuntu-22.04-x64", "alpine-3.20-x64", "wsl1-x64", "wsl2-x64"},
+        "static-linkage": {"ubuntu-22.04-x64"},
+        "identity": {"ubuntu-22.04-x64"},
+    },
+    "aarch64-unknown-linux-musl": {
+        "native-conformance": {"ubuntu-24.04-arm64", "alpine-3.20-arm64"},
+        "compatibility": {"ubuntu-24.04-arm64", "alpine-3.20-arm64"},
+        "static-linkage": {"ubuntu-24.04-arm64"},
+        "identity": {"ubuntu-24.04-arm64"},
+    },
+    "x86_64-apple-darwin": {
+        "native-conformance": {"macos-15-intel"},
+        "compatibility": {"macos-15-intel"},
+        "identity": {"macos-15-intel"},
+    },
+    "aarch64-apple-darwin": {
+        "native-conformance": {"macos-15-arm64"},
+        "compatibility": {"macos-15-arm64"},
+        "identity": {"macos-15-arm64"},
+    },
+    "x86_64-pc-windows-msvc": {
+        "native-conformance": {"windows-2022-x64"},
+        "compatibility": {"windows-2022-x64", "windows-10-1809-x64", "windows-2019-x64"},
+        "static-linkage": {"windows-2022-x64"},
+        "identity": {"windows-2022-x64"},
+    },
+    "aarch64-pc-windows-msvc": {
+        "native-conformance": {"windows-11-arm64"},
+        "compatibility": {"windows-11-arm64"},
+        "static-linkage": {"windows-11-arm64"},
+        "identity": {"windows-11-arm64"},
+    },
+}
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 DECIMAL = re.compile(r"^[1-9][0-9]*$")
@@ -65,7 +116,9 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
-def ascii_clean(value: str, what: str) -> str:
+def ascii_clean(value, what: str) -> str:
+    if not isinstance(value, str):
+        fail(f"{what} is not a string: {value!r}")
     if not all(0x20 <= ord(ch) <= 0x7E for ch in value):
         fail(f"{what} is not printable ASCII: {value!r}")
     if '"' in value or "\\" in value:
@@ -87,7 +140,7 @@ def positive_int(value, what: str) -> int:
     return value
 
 
-def job_reference(record: dict, what: str, run_id: str, run_attempt: int) -> dict:
+def job_reference(record: dict, what: str) -> dict:
     reference = {
         "workflowRunId": decimal_string(record.get("workflowRunId"), f"{what}.workflowRunId"),
         "workflowRunAttempt": positive_int(record.get("workflowRunAttempt"), f"{what}.workflowRunAttempt"),
@@ -123,6 +176,19 @@ def serialize(value, indent: int) -> str:
     fail(f"unrepresentable value: {value!r}")
 
 
+def load_json(path: str, what: str) -> dict:
+    try:
+        with open(path, encoding="ascii") as handle:
+            value = json.load(handle)
+    except OSError:
+        fail(f"missing {what}: {path}")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"unreadable {what}: {error}")
+    if not isinstance(value, dict):
+        fail(f"{what} is not an object")
+    return value
+
+
 def main() -> None:
     if len(sys.argv) != 5 or sys.argv[1] != "--records" or sys.argv[3] != "--out":
         fail("usage: candidate-manifest.py --records <dir> --out <dir>")
@@ -132,7 +198,6 @@ def main() -> None:
     version = os.environ.get("VERSION", "")
     run_id = os.environ.get("RUN_ID", "")
     run_attempt_text = os.environ.get("RUN_ATTEMPT", "")
-    metadata_name = "moor-release-candidate-v1"
 
     if not COMMIT_RE.fullmatch(commit):
         fail(f"COMMIT is not 40 lowercase hex: {commit!r}")
@@ -147,14 +212,7 @@ def main() -> None:
     targets_object = {}
     sums_lines = []
     for target in TARGETS:
-        build_path = os.path.join(records_dir, f"build-{target}.json")
-        try:
-            with open(build_path, encoding="ascii") as handle:
-                build = json.load(handle)
-        except OSError:
-            fail(f"missing build record for {target}")
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            fail(f"unreadable build record for {target}: {error}")
+        build = load_json(os.path.join(records_dir, f"build-{target}.json"), f"build record for {target}")
 
         asset = f"moor-{bare}-{ASSET_SUFFIX[target]}"
         if build.get("asset") != asset:
@@ -168,35 +226,38 @@ def main() -> None:
             fail(f"{target}: sha256 is not 64 lowercase hex")
         artifact_id = decimal_string(build.get("artifactId"), f"{target}.artifactId")
 
-        build_reference = job_reference(build, f"{target}.build", run_id, run_attempt)
+        build_reference = job_reference(build, f"{target}.build")
         if build_reference["workflowRunId"] != run_id or build_reference["workflowRunAttempt"] != run_attempt:
             fail(f"{target}: build reference run/attempt differs from candidate run")
 
         references = []
         seen = set()
+        prefix = f"verify-{target}-"
         for name in sorted(os.listdir(records_dir)):
-            prefix = f"verify-{target}-"
             if not (name.startswith(prefix) and name.endswith(".json")):
                 continue
-            with open(os.path.join(records_dir, name), encoding="ascii") as handle:
-                verify = json.load(handle)
+            verify = load_json(os.path.join(records_dir, name), f"verification record {name}")
             gate = verify.get("gate")
             if gate not in GATE_ORDER:
                 fail(f"{target}: unknown gate {gate!r} in {name}")
             lane = ascii_clean(verify.get("lane", ""), f"{target}.{gate}.lane")
-            if not lane:
-                fail(f"{target}: {gate} lane is empty")
+            if lane not in KNOWN_LANES:
+                fail(f"{target}: unknown lane {lane!r} in {name}")
             if (gate, lane) in seen:
                 fail(f"{target}: duplicate (gate, lane) ({gate}, {lane})")
             seen.add((gate, lane))
+            if verify.get("commit") != commit:
+                fail(f"{target}: {name} verified commit {verify.get('commit')!r} != {commit!r}")
+            if verify.get("sha256") != sha256:
+                fail(f"{target}: {name} verified different bytes ({verify.get('sha256')!r})")
             reference = {"gate": gate, "lane": lane}
-            reference.update(job_reference(verify, f"{target}.{gate}", run_id, run_attempt))
+            reference.update(job_reference(verify, f"{target}.{gate}.{lane}"))
             references.append(reference)
 
-        present = {reference["gate"] for reference in references}
-        missing = required_gates(target) - present
-        if missing:
-            fail(f"{target}: missing required gates {sorted(missing)}")
+        for gate, lanes in REQUIRED[target].items():
+            missing = lanes - {ref["lane"] for ref in references if ref["gate"] == gate}
+            if missing:
+                fail(f"{target}: gate {gate} is missing required lanes {sorted(missing)}")
 
         references.sort(
             key=lambda ref: (
@@ -226,21 +287,28 @@ def main() -> None:
         "candidate": {
             "workflowRunId": run_id,
             "workflowRunAttempt": run_attempt,
-            "metadataArtifactName": metadata_name,
+            "metadataArtifactName": "moor-release-candidate-v1",
         },
         "targets": targets_object,
     }
 
     body = serialize(manifest, 0) + "\n"
+    sums = "".join(sums_lines)
+    for text, what in ((body, "manifest"), (sums, "SHA256SUMS")):
+        if "\r" in text:
+            fail(f"{what} contains a carriage return")
+        if not text.endswith("\n") or text.endswith("\n\n"):
+            fail(f"{what} does not end in exactly one LF")
+
     os.makedirs(out_dir, exist_ok=True)
     manifest_path = os.path.join(out_dir, "moor-release-manifest-v1.json")
     with open(manifest_path, "w", encoding="ascii", newline="") as handle:
         handle.write(body)
     sums_path = os.path.join(out_dir, "SHA256SUMS")
     with open(sums_path, "w", encoding="ascii", newline="") as handle:
-        handle.write("".join(sums_lines))
+        handle.write(sums)
 
-    print(f"wrote {manifest_path} ({len(body)} bytes) and {sums_path}")
+    print(f"wrote {manifest_path} ({len(body)} bytes) and {sums_path} ({len(sums)} bytes)")
 
 
 if __name__ == "__main__":
