@@ -211,19 +211,39 @@ approximation.
 
 ### Desk pin projection
 
-After validating a QA-approved complete manifest, Desk commits a mechanical
-projection with exactly the top-level keys `schemaVersion`, `repository`,
-`version`, `commit`, and `targets`. It retains all six exact target keys; each
+After validating a QA-approved manifest, Desk commits a mechanical projection
+with exactly the top-level keys `schemaVersion`, `repository`, `version`,
+`commit`, `coverage`, and `targets`. It retains all six exact target keys; each
 target contains exactly `asset`, `size`, and `sha256`. Values are copied without
-renaming or normalization. Candidate, coverage, artifact, and provenance fields
-are intentionally excluded from the consumer pin, but they must have been
-validated before the projection was made.
+renaming or normalization. Candidate, artifact, and provenance fields are
+intentionally excluded from the consumer pin, but they must have been validated
+before the projection was made.
 
-Because the pin carries an exact five-key top level, the projection is a
-whitelist: it copies the five keys it names. An exclusion list would leak the
+`coverage` is copied **verbatim**, with the same three branches defined above.
+It is the one manifest field whose absence would mislead: the consumer installs
+from the pin, not from the manifest, so a pin without coverage makes a narrowed
+candidate byte-identical to a complete one and the consumer would embed
+unverified coverage believing it verified. Copying rather than translating also
+means the pin and the manifest can be compared literally, so the two documents
+cannot drift.
+
+Because the pin carries an exact six-key top level, the projection is a
+whitelist: it copies the six keys it names. An exclusion list would leak the
 next field added here into the pin, and the consumer rejects unknown keys, so
 the leak would surface as a fail-closed refusal at install time rather than at
 build time.
+
+The consumer's pin schema version is `2`. A pin at version `1` predates
+`coverage` and is refused with a diagnostic that says so, rather than being
+read as fully covered — the whole point of carrying the field is defeated if a
+document that lacks it is treated as if it claimed completeness. A narrowed
+closure that names no lane is refused for the same reason: an assertion that
+cannot be checked is worse than none.
+
+Installing a narrowed candidate is then an explicit operator decision rather
+than a default. The consumer refuses a pin whose closure is not `"full-matrix"`
+unless the operator opts in, and the refusal names each unverified lane, so the
+decision is made against the facts instead of the label.
 
 Desk may exercise the pinned candidate bytes through an explicit candidate base
 URL during integration and manual QA. Its production default is enabled only

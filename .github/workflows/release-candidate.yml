@@ -3,12 +3,14 @@ name: Release candidate
 # Implements docs/release-manifest-v1.md and docs/release-matrix.md:
 # build each of the six targets exactly once, establish size/sha256 at the
 # build boundary, upload single-file artifacts with immutable IDs, verify
-# the exact downloaded bytes on hosted, hosted-container, and self-hosted
+# the exact downloaded bytes on hosted and hosted-container
 # native/compatibility lanes — every lane downloading the candidate by this
-# run's immutable artifact ID — and only when the full table-driven
+# run's immutable artifact ID — and only when the matrix's required
 # (gate, lane) closure holds emit the canonical manifest and SHA256SUMS as
 # the moor-release-candidate-v1 metadata artifact, exposing its immutable ID
-# as a machine-readable output.
+# as a machine-readable output. The deferred (gate, lane) pairs are optional
+# evidence, and whatever they did not cover is named in the manifest's own
+# coverage object, so a narrowed candidate never reads as a complete one.
 #
 # Promotion is a separate, later workflow: nothing here creates a tag or a
 # release, and every gate fails closed. Every required (gate, lane) is proved
