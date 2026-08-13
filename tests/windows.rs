@@ -466,6 +466,69 @@ fn storage_reports_the_selected_log_commit() {
     }
 }
 
+const WIN32_INPUT_CARRIER_BUILD_FLOOR: u32 = 19_041;
+const WIN32_INPUT_CARRIER_BYTES: &[u8] = b"A\x1bOAZ";
+
+// §12.3 freezes the public win32-input-mode carrier floor at Windows 10
+// version 2004 (build 19041). Server 2022 is build 20348; Windows 10 1809
+// and Server 2019 are both build 17763 and are required below-floor lanes.
+fn win32_input_carrier_expected(build: u32) -> bool {
+    build >= WIN32_INPUT_CARRIER_BUILD_FLOOR
+}
+
+fn expected_platform_win32_input_bytes(build: u32) -> &'static [u8] {
+    if win32_input_carrier_expected(build) {
+        WIN32_INPUT_CARRIER_BYTES
+    } else {
+        b""
+    }
+}
+
+fn expected_shipped_win32_input_bytes(build: u32) -> &'static [u8] {
+    if win32_input_carrier_expected(build) {
+        WIN32_INPUT_CARRIER_BYTES
+    } else {
+        b"AZ"
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn RtlGetVersion(
+        version: *mut windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn windows_build_number() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..OSVERSIONINFOW::default()
+    };
+    let status = unsafe { RtlGetVersion(&mut version) };
+    assert!(
+        status >= 0,
+        "RtlGetVersion failed with NTSTATUS {status:#x}"
+    );
+    version.dwBuildNumber
+}
+
+#[test]
+fn input_fidelity_floor_tracks_frozen_windows_builds() {
+    assert!(!win32_input_carrier_expected(17_763));
+    assert!(!win32_input_carrier_expected(19_040));
+    assert!(win32_input_carrier_expected(19_041));
+    assert!(win32_input_carrier_expected(20_348));
+    assert!(win32_input_carrier_expected(22_000));
+    assert_eq!(expected_platform_win32_input_bytes(17_763), b"");
+    assert_eq!(expected_platform_win32_input_bytes(20_348), b"A\x1bOAZ");
+    assert_eq!(expected_shipped_win32_input_bytes(17_763), b"AZ");
+    assert_eq!(expected_shipped_win32_input_bytes(20_348), b"A\x1bOAZ");
+}
+
 #[cfg(windows)]
 mod launch_paths {
     use std::ffi::{OsStr, OsString};
@@ -1878,11 +1941,11 @@ mod launch_paths {
         fn win32_input_mode_state(bytes: &[u8], label: &str) -> String {
             let text = String::from_utf8_lossy(bytes);
             let prefix = format!("MOOR-W32IM-{label}:");
-            text[text.rfind(&prefix).unwrap() + prefix.len()..]
-                .lines()
-                .next()
-                .unwrap()
-                .to_owned()
+            let state = &text[text.rfind(&prefix).unwrap() + prefix.len()..];
+            let end = state
+                .find(":END")
+                .unwrap_or_else(|| panic!("incomplete win32 input-mode evidence: {text:?}"));
+            state[..end].to_owned()
         }
 
         fn assert_win32_input_mode_restored(console: &Console, restore_start: usize) {
@@ -1895,8 +1958,73 @@ mod launch_paths {
                     "host cannot query mode 9001 and the exact reset control was not observed: {:?}",
                     String::from_utf8_lossy(&console.received[restore_start..])
                 ),
-                state => panic!("unexpected win32 input-mode evidence {state:?}"),
+                state => panic!(
+                    "unexpected win32 input-mode evidence {state:?}; console output: {:?}",
+                    String::from_utf8_lossy(&console.received)
+                ),
             }
+        }
+
+        fn below_floor_resize_evidence(trace: &str) -> usize {
+            let a = trace.find("MOOR-KEY:A:0:END").unwrap_or_else(|| {
+                panic!("ordinary input was not delivered before resize: {trace:?}")
+            });
+            let first_resize = trace[a..]
+                .find("MOOR-RESIZE:1:41:101:END")
+                .map(|offset| a + offset)
+                .unwrap_or_else(|| panic!("target resize was not delivered after A: {trace:?}"));
+            assert!(
+                !trace.contains("MOOR-KEY:B:1:END") && !trace.contains("MOOR-UNIT:0042:1:END"),
+                "below-floor host unexpectedly produced the lossless resize/input result: {trace:?}"
+            );
+
+            let b = trace
+                .find("MOOR-KEY:B:")
+                .unwrap_or_else(|| panic!("below-floor B outcome was not observed: {trace:?}"));
+            assert!(
+                b > first_resize,
+                "B arrived before the target resize: {trace:?}"
+            );
+            let suffix = &trace[b + "MOOR-KEY:B:".len()..];
+            let digits = suffix
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            assert!(
+                suffix[digits.len()..].starts_with(":END"),
+                "incomplete B key marker in trace: {trace:?}"
+            );
+            let count: usize = digits
+                .parse()
+                .unwrap_or_else(|_| panic!("invalid B resize count in trace: {trace:?}"));
+            assert_eq!(
+                count, 3,
+                "below-floor B did not carry the demonstrated build-17763 resize count: {trace:?}"
+            );
+            let second_resize = "MOOR-RESIZE:2:41:101:END";
+            let third_resize = "MOOR-RESIZE:3:41:101:END";
+            let unit = format!("MOOR-UNIT:0042:{count}:END");
+            let second_resize = trace[..b]
+                .find(second_resize)
+                .unwrap_or_else(|| panic!("B is missing the second target resize: {trace:?}"));
+            let third_resize = trace[..b]
+                .find(third_resize)
+                .unwrap_or_else(|| panic!("B is missing the third target resize: {trace:?}"));
+            let unit = trace[..b]
+                .rfind(&unit)
+                .unwrap_or_else(|| panic!("B has no matching console unit: {trace:?}"));
+            assert!(
+                first_resize < second_resize
+                    && second_resize < third_resize
+                    && third_resize < unit
+                    && unit < b,
+                "degraded resize/input markers are out of order: {trace:?}"
+            );
+            assert!(
+                !trace[..b].contains("MOOR-RESIZE:4:41:101:END"),
+                "below-floor B followed more than the demonstrated three target resizes: {trace:?}"
+            );
+            count
         }
 
         #[test]
@@ -1918,7 +2046,7 @@ mod launch_paths {
                     Win32InputModeState::Reset => "reset",
                     Win32InputModeState::Unsupported => "unsupported",
                 };
-                println!("MOOR-W32IM-{}:{state}", label.to_string_lossy());
+                println!("MOOR-W32IM-{}:{state}:END", label.to_string_lossy());
             }
             println!(
                 "MOOR-MODE-{}:{input:08x}:{output:08x}:END",
@@ -1968,14 +2096,14 @@ mod launch_paths {
                 if record.EventType == WINDOW_BUFFER_SIZE_EVENT as u16 {
                     let size = unsafe { record.Event.WindowBufferSizeEvent.dwSize };
                     resized += 1;
-                    println!("MOOR-RESIZE:{resized}:{}:{}", size.Y, size.X);
+                    println!("MOOR-RESIZE:{resized}:{}:{}:END", size.Y, size.X);
                 } else if record.EventType == KEY_EVENT as u16 {
                     let key = unsafe { record.Event.KeyEvent };
                     let character = unsafe { key.uChar.UnicodeChar };
                     if key.bKeyDown != 0 {
-                        println!("MOOR-UNIT:{character:04X}:{resized}");
+                        println!("MOOR-UNIT:{character:04X}:{resized}:END");
                         if let Some(character) = char::from_u32(character as u32) {
-                            println!("MOOR-KEY:{character}:{resized}");
+                            println!("MOOR-KEY:{character}:{resized}:END");
                         }
                     }
                 }
@@ -1985,6 +2113,8 @@ mod launch_paths {
 
         #[test]
         fn shipped_viewer_uses_real_geometry_resize_and_restores_console_modes() {
+            let carrier_expected =
+                crate::win32_input_carrier_expected(crate::windows_build_number());
             let mut console = Console::new(37, 93).unwrap();
             let mut before = probe(&console, "before").unwrap();
             assert!(
@@ -2075,21 +2205,67 @@ mod launch_paths {
             thread::sleep(Duration::from_millis(500));
             console.write(b"A").unwrap();
             console
-                .wait_for(b"MOOR-KEY:A:0", Duration::from_secs(5))
+                .wait_for(b"MOOR-KEY:A:0:END", Duration::from_secs(5))
                 .unwrap();
             console.resize(41, 101).unwrap();
             console
-                .wait_for(b"MOOR-RESIZE:1:41:101", Duration::from_secs(5))
+                .wait_for(b"MOOR-RESIZE:1:41:101:END", Duration::from_secs(5))
                 .unwrap();
             console.write(b"B").unwrap();
-            console
-                .wait_for(b"MOOR-KEY:B:1", Duration::from_secs(5))
-                .unwrap();
-            let trace = String::from_utf8_lossy(&console.received);
-            let mut after = 0;
-            for marker in ["MOOR-KEY:A:0", "MOOR-RESIZE:1:41:101", "MOOR-KEY:B:1"] {
-                after += trace[after..].find(marker).expect("input/resize order") + marker.len();
+            if carrier_expected {
+                console
+                    .wait_for(b"MOOR-KEY:B:1:END", Duration::from_secs(5))
+                    .unwrap();
+            } else {
+                let b_start = console.received.len();
+                if let Err(error) = console.wait_for(b"MOOR-KEY:B:", Duration::from_secs(5)) {
+                    assert_eq!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut,
+                        "below-floor resize-adjacent input failed for an unrelated reason: {error}"
+                    );
+                } else {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        console.pump().unwrap();
+                        let trace = String::from_utf8_lossy(&console.received[b_start..]);
+                        if trace.find("MOOR-KEY:B:").is_some_and(|b| {
+                            let suffix = &trace[b + "MOOR-KEY:B:".len()..];
+                            let digits = suffix.chars().take_while(char::is_ascii_digit).count();
+                            suffix[digits..].starts_with(":END")
+                        }) {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "incomplete B evidence: {:?}",
+                            String::from_utf8_lossy(&console.received[b_start..])
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
             }
+            let trace = String::from_utf8_lossy(&console.received);
+            let below_floor_outcome = if carrier_expected {
+                let mut after = 0;
+                for marker in [
+                    "MOOR-KEY:A:0:END",
+                    "MOOR-RESIZE:1:41:101:END",
+                    "MOOR-KEY:B:1:END",
+                ] {
+                    after +=
+                        trace[after..].find(marker).expect("input/resize order") + marker.len();
+                }
+                None
+            } else {
+                let outcome = below_floor_resize_evidence(&trace);
+                println!("MOOR-BELOW-FLOOR-RESIZE:{outcome}");
+                Some(outcome)
+            };
+            assert!(
+                viewer.try_wait().unwrap().is_none(),
+                "viewer exited before the explicit detach; console output: {trace:?}"
+            );
             let restore_start = console.received.len();
             console.write(&[0x1c]).unwrap();
             let detached = wait_console_spawn(&mut console, &mut viewer, Duration::from_secs(5))
@@ -2120,6 +2296,10 @@ mod launch_paths {
             );
             assert_eq!(wait_modes(&mut console, "after"), before_modes);
             assert_win32_input_mode_restored(&console, restore_start);
+            if let Some(expected) = below_floor_outcome {
+                let trace = String::from_utf8_lossy(&console.received);
+                assert_eq!(below_floor_resize_evidence(&trace), expected);
+            }
             let killed = moor(&["kill", "-f", "-q", &session]);
             assert!(killed.status.success(), "{killed:?}");
         }
@@ -2129,7 +2309,7 @@ mod launch_paths {
         const CLOSE_RELEASE: &str = "MOOR_CONSOLE_CLOSE_RELEASE";
         const VT_INPUT_READY: &[u8] = b"MOOR-VT-INPUT-READY";
         const VT_INPUT_VERIFIED: &[u8] = b"MOOR-VT-INPUT-VERIFIED";
-        const VT_INPUT_EXPECTED: &[u8] = b"A\x1bOAZ";
+        const VT_INPUT_SCENARIO: &str = "MOOR_CONSOLE_VT_INPUT_SCENARIO";
         const WIN32_INPUT_MODE: u32 = 4;
         const WIN32_INPUT_ENABLE: &[u8] = b"\x1b[?9001h";
         const WIN32_INPUT_DISABLE: &[u8] = b"\x1b[?9001l";
@@ -2137,15 +2317,22 @@ mod launch_paths {
             b"\x1b[65;30;65;1;0;1_\x1b[38;72;0;1;256;1_\x1b[90;44;90;1;0;1_";
         const LEGACY_OUTER_CODEPAGE: u32 = 437;
 
-        fn wait_file(path: &std::path::Path, timeout: Duration) {
+        fn file_appears(path: &std::path::Path, timeout: Duration) -> bool {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
                 if path.is_file() {
-                    return;
+                    return true;
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            panic!("timed out waiting for {path:?}");
+            false
+        }
+
+        fn wait_file(path: &std::path::Path, timeout: Duration) {
+            assert!(
+                file_appears(path, timeout),
+                "timed out waiting for {path:?}"
+            );
         }
 
         #[test]
@@ -2157,6 +2344,7 @@ mod launch_paths {
             let release = companion(&sentinel, ".release");
             let observed = companion(&sentinel, ".observed");
             let verified = companion(&sentinel, ".verified");
+            let control_ready = companion(&sentinel, ".control-ready");
             let input = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
             assert_ne!(unsafe { SetConsoleCP(CP_UTF8) }, 0);
             assert_eq!(unsafe { GetConsoleCP() }, CP_UTF8);
@@ -2187,9 +2375,16 @@ mod launch_paths {
             io::stdout().flush().unwrap();
 
             wait_file(&sentinel, Duration::from_secs(5));
+            let build = crate::windows_build_number();
+            let scenario = std::env::var(VT_INPUT_SCENARIO).unwrap();
+            let expected = match scenario.as_str() {
+                "platform" => crate::expected_platform_win32_input_bytes(build),
+                "shipped-viewer" => crate::expected_shipped_win32_input_bytes(build),
+                _ => panic!("unknown VT-input scenario {scenario:?}"),
+            };
             let mut received = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while received.len() < VT_INPUT_EXPECTED.len() {
+            while received.len() < expected.len() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 assert!(
                     !remaining.is_zero(),
@@ -2217,16 +2412,93 @@ mod launch_paths {
                     "ReadFile failed: {}",
                     io::Error::last_os_error()
                 );
-                assert_ne!(count, 0, "VT input closed before the sentinel");
+                if count == 0 {
+                    continue;
+                }
                 received.extend_from_slice(&bytes[..count as usize]);
             }
-            std::fs::write(&observed, &received).unwrap();
-            assert_eq!(received, VT_INPUT_EXPECTED);
-            assert_eq!(
-                unsafe { WaitForSingleObject(input, 500) },
-                WAIT_TIMEOUT,
-                "unexpected delayed VT input after the exact vector"
+            let quiet = if crate::win32_input_carrier_expected(build) {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(5)
+            };
+            let quiet_deadline = Instant::now() + quiet;
+            while Instant::now() < quiet_deadline {
+                let remaining = quiet_deadline.saturating_duration_since(Instant::now());
+                let wait_ms = remaining.min(Duration::from_millis(100)).as_millis() as u32;
+                match unsafe { WaitForSingleObject(input, wait_ms.max(1)) } {
+                    WAIT_TIMEOUT => continue,
+                    WAIT_OBJECT_0 => {}
+                    wait => panic!("unexpected console input wait result {wait:#x}"),
+                }
+                let mut bytes = [0; 64];
+                let mut count = 0;
+                assert_ne!(
+                    unsafe {
+                        ReadFile(
+                            input,
+                            bytes.as_mut_ptr(),
+                            bytes.len() as u32,
+                            &mut count,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0,
+                    "ReadFile failed during quiet proof: {}",
+                    io::Error::last_os_error()
+                );
+                received.extend_from_slice(&bytes[..count as usize]);
+            }
+            assert_ne!(
+                unsafe { GetConsoleMode(input, &mut mode) },
+                0,
+                "console input became invalid while observing build {build}: {}",
+                io::Error::last_os_error()
             );
+            std::fs::write(&observed, &received).unwrap();
+            assert_eq!(
+                received, expected,
+                "win32 input-carrier outcome disagrees with Windows build {build}"
+            );
+            if scenario == "platform" && !crate::win32_input_carrier_expected(build) {
+                std::fs::write(&control_ready, b"ready").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut control = Vec::new();
+                while control.is_empty() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(
+                        !remaining.is_zero(),
+                        "timed out waiting for the ordinary-input control"
+                    );
+                    let wait_ms = remaining.min(Duration::from_millis(100)).as_millis() as u32;
+                    match unsafe { WaitForSingleObject(input, wait_ms.max(1)) } {
+                        WAIT_TIMEOUT => continue,
+                        WAIT_OBJECT_0 => {}
+                        wait => panic!("unexpected ordinary-input wait result {wait:#x}"),
+                    }
+                    let mut bytes = [0; 64];
+                    let mut count = 0;
+                    assert_ne!(
+                        unsafe {
+                            ReadFile(
+                                input,
+                                bytes.as_mut_ptr(),
+                                bytes.len() as u32,
+                                &mut count,
+                                std::ptr::null_mut(),
+                            )
+                        },
+                        0,
+                        "ReadFile failed for ordinary-input control: {}",
+                        io::Error::last_os_error()
+                    );
+                    control.extend_from_slice(&bytes[..count as usize]);
+                }
+                assert_eq!(
+                    control, b"Q",
+                    "same-console ordinary input control disagrees with Windows build {build}"
+                );
+            }
             std::fs::write(&verified, b"verified").unwrap();
             println!("{}", String::from_utf8_lossy(VT_INPUT_VERIFIED));
             io::stdout().flush().unwrap();
@@ -2313,17 +2585,20 @@ mod launch_paths {
 
         #[test]
         fn platform_w32_input_mode_preserves_application_cursor_semantics() {
+            let build = crate::windows_build_number();
             let mut console = Console::new_with_flags(37, 93, WIN32_INPUT_MODE).unwrap();
             let sentinel = std::env::temp_dir()
                 .join(format!("moor-platform-w32-input-{}", std::process::id()));
             let release = companion(&sentinel, ".release");
             let observed = companion(&sentinel, ".observed");
             let verified = companion(&sentinel, ".verified");
+            let control_ready = companion(&sentinel, ".control-ready");
             let _files = FileCleanup::new([
                 sentinel.clone(),
                 release.clone(),
                 observed.clone(),
                 verified.clone(),
+                control_ready.clone(),
             ]);
 
             let mut command = SpawnCommand::new(std::env::current_exe().unwrap());
@@ -2333,7 +2608,8 @@ mod launch_paths {
                     std::ffi::OsStr::new("launch_paths::native_console::console_vt_input_probe"),
                     std::ffi::OsStr::new("--nocapture"),
                 ])
-                .env(VT_INPUT_SENTINEL, &sentinel);
+                .env(VT_INPUT_SENTINEL, &sentinel)
+                .env(VT_INPUT_SCENARIO, "platform");
             let mut child = console.spawn(command).unwrap();
             console
                 .wait_for(VT_INPUT_READY, Duration::from_secs(10))
@@ -2341,8 +2617,28 @@ mod launch_paths {
 
             console.write(WIN32_INPUT_VECTOR).unwrap();
             std::fs::write(&sentinel, b"complete").unwrap();
-            wait_file(&verified, Duration::from_secs(5));
-            assert_eq!(std::fs::read(&observed).unwrap(), VT_INPUT_EXPECTED);
+            if !crate::win32_input_carrier_expected(build) {
+                if !file_appears(&control_ready, Duration::from_secs(15)) {
+                    console.pump().unwrap();
+                    panic!(
+                        "timed out waiting for {control_ready:?}; outer console output: {:?}",
+                        String::from_utf8_lossy(&console.received)
+                    );
+                }
+                console.write(b"Q").unwrap();
+            }
+            if !file_appears(&verified, Duration::from_secs(15)) {
+                console.pump().unwrap();
+                panic!(
+                    "timed out waiting for {verified:?}; outer console output: {:?}",
+                    String::from_utf8_lossy(&console.received)
+                );
+            }
+            assert_eq!(
+                std::fs::read(&observed).unwrap(),
+                crate::expected_platform_win32_input_bytes(build),
+                "platform carrier outcome disagrees with Windows build {build}"
+            );
             std::fs::write(&release, b"release").unwrap();
             let status = wait_spawn(&mut child, Duration::from_secs(5)).unwrap();
             assert!(status.success(), "W32 input probe exited with {status:?}");
@@ -2365,6 +2661,7 @@ mod launch_paths {
 
         #[test]
         fn shipped_viewer_preserves_exact_vt_input_bytes() {
+            let build = crate::windows_build_number();
             let mut console = Console::new(37, 93).unwrap();
             let mut before = probe(&console, "before").unwrap();
             assert!(
@@ -2401,7 +2698,8 @@ mod launch_paths {
                     "launch_paths::native_console::console_vt_input_probe".as_ref(),
                     "--nocapture".as_ref(),
                 ])
-                .env(VT_INPUT_SENTINEL, &sentinel);
+                .env(VT_INPUT_SENTINEL, &sentinel)
+                .env(VT_INPUT_SCENARIO, "shipped-viewer");
             let mut viewer = console.spawn(command).unwrap();
             console
                 .wait_for(VT_INPUT_READY, Duration::from_secs(10))
@@ -2431,10 +2729,16 @@ mod launch_paths {
                 sentinel.is_file(),
                 "record sender omitted completion sentinel"
             );
-            wait_file(&verified, Duration::from_secs(5));
+            if !file_appears(&verified, Duration::from_secs(15)) {
+                console.pump().unwrap();
+                panic!(
+                    "timed out waiting for {verified:?}; outer console output: {:?}",
+                    String::from_utf8_lossy(&console.received)
+                );
+            }
             assert_eq!(
                 std::fs::read(&observed).unwrap(),
-                VT_INPUT_EXPECTED,
+                crate::expected_shipped_win32_input_bytes(build),
                 "outer console output: {:?}",
                 String::from_utf8_lossy(&console.received)
             );
