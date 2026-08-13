@@ -214,10 +214,17 @@ approximation.
 After validating a QA-approved manifest, Desk commits a mechanical projection
 with exactly the top-level keys `schemaVersion`, `repository`, `version`,
 `commit`, `coverage`, and `targets`. It retains all six exact target keys; each
-target contains exactly `asset`, `size`, and `sha256`. Values are copied without
-renaming or normalization. Candidate, artifact, and provenance fields are
-intentionally excluded from the consumer pin, but they must have been validated
-before the projection was made.
+target contains exactly `asset`, `size`, and `sha256`. Candidate, artifact, and
+provenance fields are intentionally excluded from the consumer pin, but they
+must have been validated before the projection was made.
+
+`schemaVersion` is the one key the projection **sets** rather than copies: the
+manifest states `1`, its own schema, and the pin states `2`, the consumer
+schema described below. The two documents version independently, so copying
+that number would claim the pin is something it is not. Every other projected
+value — `repository`, `version`, `commit`, `coverage`, and each target's
+`asset`, `size`, and `sha256` — is copied verbatim, without renaming or
+normalization.
 
 `coverage` is copied **verbatim**, with the same three branches defined above.
 It is the one manifest field whose absence would mislead: the consumer installs
