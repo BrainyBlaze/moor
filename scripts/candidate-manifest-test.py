@@ -119,6 +119,30 @@ def main() -> None:
         for gate, lanes in gates.items()
         for lane in lanes
     )
+    # The emitted shape is pinned to docs/release-manifest-v1.md key-for-key, so
+    # the producer cannot drift from the contract it claims to implement. A v1
+    # object has an exact key set in an exact order, and a consumer rejects any
+    # extension — so an added key has to change the document first.
+    assert list(manifest) == [
+        "schemaVersion",
+        "repository",
+        "version",
+        "commit",
+        "candidate",
+        "coverage",
+        "targets",
+    ], list(manifest)
+    assert manifest["schemaVersion"] == 1
+    assert list(manifest["coverage"]) == ["requiredClosure", "unverified"], list(
+        manifest["coverage"]
+    )
+    for entry in manifest["coverage"]["unverified"]:
+        assert list(entry) == ["target", "gate", "lane"], list(entry)
+    assert manifest["coverage"]["unverified"] == sorted(
+        manifest["coverage"]["unverified"],
+        key=lambda entry: (entry["target"], entry["gate"], entry["lane"]),
+    ), "unverified is not in the documented ascending order"
+
     assert manifest["coverage"]["requiredClosure"] == "hosted-only", manifest["coverage"]
     assert [
         (entry["target"], entry["gate"], entry["lane"])
@@ -179,6 +203,8 @@ def main() -> None:
     with open(os.path.join(base, "out-deferred-all", "moor-release-manifest-v1.json")) as handle:
         full = json.load(handle)
     assert full["coverage"] == {"requiredClosure": "full-matrix"}, full["coverage"]
+    assert list(full["coverage"]) == ["requiredClosure"], list(full["coverage"])
+    assert list(full) == list(manifest), "the full-matrix top level drifted from the narrowed one"
 
     cases = 0
 

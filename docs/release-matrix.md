@@ -66,6 +66,10 @@ macOS assets are built with deployment target 13.0 on each arch.
 
 An asset is published only when all of the following pass on its native lane;
 none may be waived, and the release fails closed on any missing or red gate.
+"Waived" means accepted without evidence and without saying so — that remains
+forbidden. The deferred set defined below is the opposite of a waiver: it is
+declared in the candidate's own bytes, and a candidate that omits a deferred
+lane says which one it omitted.
 
 1. **§12.8 native conformance** — `create`, `attach`, `detach`, and `input`
    exercised against the shipped binary on the native platform. Compilation and
@@ -77,6 +81,47 @@ none may be waived, and the release fails closed on any missing or red gate.
    release `<version>`.
 4. **Windows static-CRT proof** — the PE dependency table for each Windows asset
    is archived and contains no `VCRUNTIME*.dll` or `MSVCP*.dll` import.
+
+### Required closure and the deferred set
+
+The `(target, gate, lane)` pairs above split into two disjoint sets.
+
+The **required closure** is every pair reachable on a GitHub-hosted runner —
+26 pairs, covering both Windows lanes at the input-fidelity floor
+(`windows-2022-x64`, `windows-11-arm64`), both macOS lanes, both Alpine musl
+lanes, and the Ubuntu lanes. A candidate that omits any of these is refused.
+
+The **deferred set** is the six pairs that require a self-hosted runner:
+
+| target | gate | lane |
+|---|---|---|
+| `x86_64-unknown-linux-musl` | compatibility | `wsl1-ubuntu-22.04-x64` |
+| `x86_64-unknown-linux-musl` | compatibility | `wsl2-ubuntu-22.04-x64` |
+| `x86_64-pc-windows-msvc` | compatibility | `windows-10-1809-x64` |
+| `x86_64-pc-windows-msvc` | compatibility | `windows-server-2019-x64` |
+| `x86_64-pc-windows-msvc` | native-conformance | `windows-10-1809-x64` |
+| `x86_64-pc-windows-msvc` | native-conformance | `windows-server-2019-x64` |
+
+No runner is enrolled for these lanes, so requiring them made every candidate
+unbuildable. For `v0.1.0` the operator therefore narrowed the mandatory closure
+to the required set, with the deferred set restored once the runners exist.
+Three properties keep that from becoming a silent waiver:
+
+1. The deferred pairs remain **permitted**. A record from one of these lanes is
+   accepted the moment its runner is enrolled, with no change to the matrix or
+   the producer — restoring the full matrix is enrolment, not a code edit.
+2. The candidate **names what it lacks**: its `coverage` object declares
+   `"hosted-only"` and lists each deferred pair it did not verify
+   (`docs/release-manifest-v1.md`). A candidate that verified all of them
+   declares `"full-matrix"` instead.
+3. A deferred lane that runs is held to the same standard as any other: its
+   record must cite the exact candidate commit and the exact asset digest, and
+   a deferred lane that runs and **fails** still refuses the candidate. Only
+   absence is tolerated, never failure.
+
+These lanes carry the §12.8 below-input-floor evidence (Windows 10 1809 and
+Server 2019) and the WSL1/WSL2 compatibility evidence. Until they are restored,
+`v0.1.0` is not evidenced on those environments, and the candidate says so.
 
 ### Native-provenance per asset
 
