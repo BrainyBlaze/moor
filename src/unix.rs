@@ -1087,9 +1087,8 @@ impl Drop for RawTerminal {
     }
 }
 
-fn connected(path: &Path, timeout: Duration, stream: LocalStream) -> Result<WireClient> {
+fn connected(path: &Path, deadline: Instant, stream: LocalStream) -> Result<WireClient> {
     crate::ensure!(peer_owned(&stream), "holder peer identity mismatch");
-    let deadline = Instant::now() + timeout;
     stream
         .set_send_timeout(Some(Duration::from_millis(250)))
         .text()?;
@@ -1097,8 +1096,35 @@ fn connected(path: &Path, timeout: Duration, stream: LocalStream) -> Result<Wire
 }
 
 fn bounded(path: &Path, timeout: Duration) -> Result<WireClient> {
-    let (_parent, stream) = socket_stream(path).map_err(|(error, _)| error)?;
-    connected(path, timeout, stream)
+    // ONE absolute deadline, taken before the first connect and then shared:
+    // the same value admits each retry and bounds the protocol phase, so the
+    // retries cannot hand the identity exchange a fresh budget of its own.
+    bounded_at(path, Instant::now() + timeout)
+}
+
+/// Run the two phases of one probe against a single deadline.
+///
+/// The connect phase and the protocol phase that follows it are handed the
+/// SAME value — not two windows computed independently, which is how the
+/// identity exchange used to open a fresh budget after the connect had already
+/// spent wall clock the caller granted. Threading it through one seam makes
+/// that an observable property rather than a discipline each call site must
+/// remember to keep.
+fn within_deadline<S, T, E>(
+    deadline: Instant,
+    dial: impl FnOnce(Instant) -> std::result::Result<S, E>,
+    speak: impl FnOnce(Instant, S) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let carried = dial(deadline)?;
+    speak(deadline, carried)
+}
+
+fn bounded_at(path: &Path, deadline: Instant) -> Result<WireClient> {
+    within_deadline(
+        deadline,
+        |deadline| socket_stream(path, deadline).map_err(|(error, _)| error),
+        |deadline, (_parent, stream)| connected(path, deadline, stream),
+    )
 }
 
 pub(crate) fn connect(path: &Path) -> Result<WireClient> {
@@ -1161,8 +1187,13 @@ fn inspect(path: &Path, status: bool, timeout: Duration) -> shared::SessionState
                 .is_ok_and(|meta| meta.file_type().is_socket() && owned(&meta))
         },
         || {
-            let (_parent, stream) = socket_stream(path).map_err(|(_, refused)| refused)?;
-            connected(path, timeout, stream).map_err(|_| false)
+            // The same absolute deadline covers the connect retries and the
+            // identity exchange that follows them.
+            within_deadline(
+                Instant::now() + timeout,
+                |deadline| socket_stream(path, deadline).map_err(|(_, refused)| refused),
+                |deadline, (_parent, stream)| connected(path, deadline, stream).map_err(|_| false),
+            )
         },
     )
 }
@@ -1865,15 +1896,76 @@ fn publish_exclusive(parent: &File, stage: &OsStr, destination: &OsStr) -> Resul
     parent.sync_all().text()
 }
 
-fn socket_stream(path: &Path) -> std::result::Result<(File, LocalStream), (String, bool)> {
+/// The most connect calls one probe may make, counting the first. The budget
+/// is stated in calls rather than retries so the storm witness can pin the
+/// exact number instead of a tolerant range.
+const MAX_CONNECT_ATTEMPTS: usize = 16;
+
+/// Retry an operation the kernel interrupted, within a call budget and the
+/// caller's absolute deadline.
+///
+/// EINTR is not an answer: it reports that a signal arrived while the call was
+/// in flight, and says nothing about the peer. Every other kind is returned
+/// untouched on the first call — a refusal, a permission denial and a timeout
+/// are real answers, and retrying them would either spin or invite treating one
+/// as another. Exhausting the budget or the deadline yields the last
+/// interruption, which stays indeterminate: fail closed, never a claim about
+/// liveness.
+///
+/// The bound governs when a retry may BEGIN. It makes no claim about a call
+/// already in flight: nothing here can shorten a `connect` the kernel is
+/// running, so the guarantee is that attempt N+1 never starts once the budget
+/// is spent or the deadline is reached.
+fn retry_interrupted<T>(
+    deadline: Instant,
+    now: impl Fn() -> Instant,
+    mut open: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut attempts = 0;
+    loop {
+        let outcome = open();
+        attempts += 1;
+        let interrupted = outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted);
+        if !interrupted || attempts == MAX_CONNECT_ATTEMPTS || now() >= deadline {
+            return outcome;
+        }
+    }
+}
+
+/// Does this connect failure positively prove nothing is listening?
+///
+/// Only a refusal does. The kernel answers ECONNREFUSED when the path is bound
+/// but no listener stands behind it, which is exactly the stale-residue shape.
+/// Every other failure — permission, timeout, an interruption that outlived its
+/// budget, anything unknown — leaves the question open, and the caller must
+/// keep treating it as indeterminate. Widening this predicate would convert a
+/// question into a liveness claim, so it is named and tested per kind rather
+/// than written inline.
+fn connect_refused(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ConnectionRefused
+}
+
+fn socket_stream(
+    path: &Path,
+    deadline: Instant,
+) -> std::result::Result<(File, LocalStream), (String, bool)> {
     let parent = socket_parent(path).map_err(|error| (error, false))?;
     let leaf = path
         .file_name()
         .ok_or_else(|| ("rendezvous has no name".into(), false))?;
     let mut refused = false;
     let stream = socket_name(&parent, leaf, |name| {
-        LocalStream::connect(name).inspect_err(|error| {
-            refused = error.kind() == io::ErrorKind::ConnectionRefused;
+        // The io::Error survives here, where the refusal decision is made; the
+        // caller's boundary stays the same bool, so no production output,
+        // shared type, or platform beyond this function sees any change.
+        retry_interrupted(deadline, Instant::now, || {
+            LocalStream::connect(name.clone())
+        })
+        .inspect_err(|error| {
+            refused = connect_refused(error);
         })
     })
     .map_err(|error| (error, refused))?;
