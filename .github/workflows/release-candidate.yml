@@ -11,13 +11,19 @@ name: Release candidate
 # as a machine-readable output.
 #
 # Promotion is a separate, later workflow: nothing here creates a tag or a
-# release, and every gate fails closed. Every required (gate, lane) is
-# proved inside this one run — hosted, hosted-container (Alpine), and
-# self-hosted (WSL1/WSL2, Windows 10 1809, Windows Server 2019) — and each
+# release, and every gate fails closed. Every required (gate, lane) is proved
+# inside this one run — hosted and hosted-container (Alpine) — and each
 # verifier downloads the candidate by THIS run's immutable artifact ID, so
-# provenance is bound to the run with no cross-run record ingestion. A
-# self-hosted lane whose enrollment-labelled runner is absent leaves its job
-# unstarted and the assembler refuses: metadata cannot be emitted without it.
+# provenance is bound to the run with no cross-run record ingestion. The
+# assembler refuses a candidate missing any required lane.
+#
+# The six deferred (gate, lane) pairs of release-matrix.md — WSL1/WSL2 and the
+# Windows 10 1809 / Server 2019 below-floor lanes — need self-hosted runners
+# that are not enrolled, so they run only when self_hosted_lanes is true. They
+# may be SKIPPED but never FAILED: a deferred lane that runs and loses still
+# refuses the candidate, and whatever a run could not verify is named in the
+# manifest's own coverage object, so a narrowed candidate cannot pass for a
+# complete one.
 
 on:
   workflow_dispatch:

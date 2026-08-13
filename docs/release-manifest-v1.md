@@ -71,7 +71,8 @@ Keys occur in this order:
 3. `version`: the version/tag described above.
 4. `commit`: the exact source commit.
 5. `candidate`: the candidate-run object.
-6. `targets`: the exact six-key target object.
+6. `coverage`: the coverage object.
+7. `targets`: the exact six-key target object.
 
 The candidate-run object has these keys in order:
 
@@ -86,6 +87,35 @@ must receive that immutable metadata artifact ID as an explicit input, retrieve
 it from the recorded run, and verify its name is
 `moor-release-candidate-v1`. The metadata artifact contains exactly
 `moor-release-manifest-v1.json` and `SHA256SUMS`.
+
+### Coverage
+
+`docs/release-matrix.md` defines two disjoint sets of `(target, gate, lane)`
+pairs: the **required closure**, which no candidate may omit, and the
+**deferred set**, which a candidate may omit while its self-hosted runners are
+not enrolled. The coverage object states, in the manifest's own bytes, which of
+the two situations produced this candidate, so a narrowed candidate can never
+be mistaken for a complete one by reading the document alone.
+
+Like the exit branches in `spec/moor-wire-schema.md`, its exact key set depends
+on the branch it declares:
+
+- Full matrix — exactly one key:
+  1. `requiredClosure`: the string `"full-matrix"`.
+- Narrowed — exactly two keys in this order:
+  1. `requiredClosure`: the string `"hosted-only"`.
+  2. `unverified`: a non-empty array of the deferred pairs this candidate did
+     not verify, ascending by `(target, gate, lane)`. Each element has exactly
+     `target`, `gate`, and `lane` in that order, each a string drawn from the
+     matrix.
+
+`"full-matrix"` asserts that every deferred pair was also verified, so the
+array would be empty and is therefore absent: this format never encodes an
+empty array. A deferred pair that *was* verified is an ordinary verification —
+it appears in the target's `provenance.verification` like any other and is
+absent from `unverified`. Deferral never weakens a record: a deferred lane's
+verification must still cite this exact `commit` and the same `sha256` as every
+other lane for that target.
 
 ### Target entry
 
@@ -181,9 +211,15 @@ After validating a QA-approved complete manifest, Desk commits a mechanical
 projection with exactly the top-level keys `schemaVersion`, `repository`,
 `version`, `commit`, and `targets`. It retains all six exact target keys; each
 target contains exactly `asset`, `size`, and `sha256`. Values are copied without
-renaming or normalization. Candidate, artifact, and provenance fields are
-intentionally excluded from the consumer pin, but they must have been validated
-before the projection was made.
+renaming or normalization. Candidate, coverage, artifact, and provenance fields
+are intentionally excluded from the consumer pin, but they must have been
+validated before the projection was made.
+
+Because the pin carries an exact five-key top level, the projection is a
+whitelist: it copies the five keys it names. An exclusion list would leak the
+next field added here into the pin, and the consumer rejects unknown keys, so
+the leak would surface as a fail-closed refusal at install time rather than at
+build time.
 
 Desk may exercise the pinned candidate bytes through an explicit candidate base
 URL during integration and manual QA. Its production default is enabled only
