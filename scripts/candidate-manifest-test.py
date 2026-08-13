@@ -110,7 +110,101 @@ def main() -> None:
         sums = handle.read()
     assert b"\r" not in sums and sums.count(b"\n") == 6 and sums.endswith(b"\n")
 
+    # The narrowed closure must be honest, not silent: a run with no deferred
+    # record is accepted, and the manifest names every lane it could not cover.
+    manifest = json.loads(first)
+    deferred_pairs = sorted(
+        (target, gate, lane)
+        for target, gates in assembler.DEFERRED.items()
+        for gate, lanes in gates.items()
+        for lane in lanes
+    )
+    assert manifest["coverage"]["requiredClosure"] == "hosted-only", manifest["coverage"]
+    assert [
+        (entry["target"], entry["gate"], entry["lane"])
+        for entry in manifest["coverage"]["unverified"]
+    ] == deferred_pairs, "manifest does not name exactly the uncovered deferred lanes"
+
+    # A deferred lane is optional, not unchecked: a real record for one is
+    # accepted, and that lane then disappears from the unverified list.
+    covered_one = os.path.join(base, "deferred-one")
+    shutil.copytree(good, covered_one)
+    target, gate, lane = deferred_pairs[0]
+    sha = hashlib.sha256(target.encode()).hexdigest()
+    with open(os.path.join(covered_one, f"verify-{target}-{gate}-{lane}.json"), "w") as handle:
+        json.dump(
+            {
+                "gate": gate,
+                "lane": lane,
+                "commit": COMMIT,
+                "sha256": sha,
+                "workflowRunId": "500",
+                "workflowRunAttempt": 1,
+                "jobId": "901",
+                "jobName": f"Verify {target} / {gate} / {lane}",
+            },
+            handle,
+        )
+    result = run(covered_one, os.path.join(base, "out-deferred-one"))
+    assert result.returncode == 0, f"covered deferred lane rejected: {result.stderr}"
+    with open(os.path.join(base, "out-deferred-one", "moor-release-manifest-v1.json")) as handle:
+        partial = json.load(handle)
+    assert [
+        (entry["target"], entry["gate"], entry["lane"])
+        for entry in partial["coverage"]["unverified"]
+    ] == deferred_pairs[1:], "covering a deferred lane did not clear it"
+
+    # Covering every deferred lane (the restored full matrix) must not emit an
+    # empty array — the serializer refuses one, so the key is dropped instead.
+    covered_all = os.path.join(base, "deferred-all")
+    shutil.copytree(good, covered_all)
+    for index, (target, gate, lane) in enumerate(deferred_pairs):
+        sha = hashlib.sha256(target.encode()).hexdigest()
+        with open(os.path.join(covered_all, f"verify-{target}-{gate}-{lane}.json"), "w") as handle:
+            json.dump(
+                {
+                    "gate": gate,
+                    "lane": lane,
+                    "commit": COMMIT,
+                    "sha256": sha,
+                    "workflowRunId": "500",
+                    "workflowRunAttempt": 1,
+                    "jobId": str(910 + index),
+                    "jobName": f"Verify {target} / {gate} / {lane}",
+                },
+                handle,
+            )
+    result = run(covered_all, os.path.join(base, "out-deferred-all"))
+    assert result.returncode == 0, f"full matrix rejected: {result.stderr}"
+    with open(os.path.join(base, "out-deferred-all", "moor-release-manifest-v1.json")) as handle:
+        full = json.load(handle)
+    assert full["coverage"] == {"requiredClosure": "full-matrix"}, full["coverage"]
+
     cases = 0
+
+    # A deferred lane still has to be a real verification of these exact bytes.
+    for label, mutation in (
+        ("deferred lane with a different digest", {"sha256": "f" * 64}),
+        ("deferred lane with a wrong commit", {"commit": "2" * 40}),
+    ):
+        trial = os.path.join(base, f"deferred-bad-{cases}")
+        shutil.copytree(good, trial)
+        target, gate, lane = deferred_pairs[0]
+        record = {
+            "gate": gate,
+            "lane": lane,
+            "commit": COMMIT,
+            "sha256": hashlib.sha256(target.encode()).hexdigest(),
+            "workflowRunId": "500",
+            "workflowRunAttempt": 1,
+            "jobId": "902",
+            "jobName": f"Verify {target} / {gate} / {lane}",
+        }
+        record.update(mutation)
+        with open(os.path.join(trial, f"verify-{target}-{gate}-{lane}.json"), "w") as handle:
+            json.dump(record, handle)
+        expect_reject(trial, label)
+        cases += 1
 
     # Every individually missing required (gate, lane) must refuse.
     for target in assembler.TARGETS:
