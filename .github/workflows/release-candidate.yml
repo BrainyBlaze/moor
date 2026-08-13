@@ -388,7 +388,21 @@ jobs:
           BIN="target/$TARGET/release/moor"
           [ -f "$BIN" ] || BIN="target/$TARGET/release/moor.exe"
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            build.json > tests.txt
+            build.json > tests.raw
+          # Cargo reports native paths, so on Windows this step (a bash step)
+          # receives D:\a\...\deps\moor-<hash>.exe. bash reads the backslashes
+          # as escapes and refuses to execute it — exit 127, "No such file or
+          # directory" — and any trailing CR makes it worse. Normalise once,
+          # here, so every consumer below runs an executable path verbatim.
+          : > tests.txt
+          while IFS= read -r exe; do
+            exe="$(printf '%s' "$exe" | tr -d '\r')"
+            [ -n "$exe" ] || continue
+            if command -v cygpath >/dev/null 2>&1; then
+              exe="$(cygpath -u "$exe")"
+            fi
+            printf '%s\n' "$exe" >> tests.txt
+          done < tests.raw
           test -s tests.txt
           hash_of() {
             if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
@@ -771,7 +785,19 @@ jobs:
             > build.json 2> build.log || { cat build.log >&2; exit 1; }
           BIN="target/$TARGET/release/moor.exe"
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            build.json > tests.txt
+            build.json > tests.raw
+          # Same normalisation as the hosted verify lane: Cargo reports native
+          # Windows paths, which bash cannot execute with their backslashes (and
+          # a trailing CR) intact.
+          : > tests.txt
+          while IFS= read -r exe; do
+            exe="$(printf '%s' "$exe" | tr -d '\r')"
+            [ -n "$exe" ] || continue
+            if command -v cygpath >/dev/null 2>&1; then
+              exe="$(cygpath -u "$exe")"
+            fi
+            printf '%s\n' "$exe" >> tests.txt
+          done < tests.raw
           test -s tests.txt
           cp "exact/$ASSET" "$BIN"
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
