@@ -153,6 +153,43 @@ fn append_replace_and_read_or_clear_are_fifo_barriers() {
     let _ = fs::remove_dir_all(path);
 }
 
+// #28 regression: dropping a `Lane` must not return until its worker thread has
+// terminated and released the `Store` it owns. On Windows a still-open event-
+// store handle intermittently blocked the caller's directory delete with OS
+// error 32; the platform-independent, Linux-observable half of that guarantee
+// is that `Lane::drop` JOINS the worker before returning. We capture the
+// worker's exit witness (set on the worker's own stack, after it drops the
+// store, immediately before the thread returns), drop the lane, and then read
+// the witness with a plain assertion — NO sleep, NO poll. If the drop returned
+// while the detached worker was still alive, the flag would still be false.
+#[test]
+fn dropping_a_lane_joins_its_worker_before_returning() {
+    let path = temp("join-on-drop");
+    let store = Store::create(&path, Kind::Log, 1, b"", 0, 0).unwrap();
+    let mut lane = Lane::new(store, 8, 1024);
+    // Exercise the worker so it has run real store I/O and is parked on recv at
+    // drop time — the exact teardown state that used to detach.
+    capped(&mut lane, Purpose::Test(1), b"abc".to_vec(), 1024, 3).unwrap();
+    assert_eq!(selected(next(&mut lane)), (1, 2, 1, 3, 0, 3));
+    let exited = lane.worker_exit_flag();
+    assert!(
+        !exited.load(Ordering::Acquire),
+        "worker must still be alive while the lane is held"
+    );
+
+    drop(lane);
+
+    // Immediately, with no sleep/poll: the join inside Lane::drop guarantees the
+    // worker has already returned (and thus dropped the Store) by this point.
+    assert!(
+        exited.load(Ordering::Acquire),
+        "Lane::drop must join the worker before returning"
+    );
+    // And with the store handle provably released, the directory delete that
+    // panicked with OS error 32 on Windows now succeeds outright.
+    fs::remove_dir_all(&path).unwrap();
+}
+
 #[test]
 fn capped_output_rotates_to_the_exact_newest_suffix() {
     let path = temp("capped");

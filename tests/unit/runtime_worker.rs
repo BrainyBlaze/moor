@@ -231,4 +231,12 @@ impl Lane {
     pub(crate) fn publication_claimed(&self) -> bool {
         self.state.bits.load(Ordering::Acquire) & PUBLISHING != 0
     }
+
+    // Cloneable witness the worker flips true right before its thread returns
+    // (after dropping the `Store`). Captured before `drop(lane)` so a test can
+    // read it afterwards and prove `Lane::drop` joined the worker (#28).
+    #[allow(dead_code)]
+    pub(crate) fn worker_exit_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.state.exited)
+    }
 }
