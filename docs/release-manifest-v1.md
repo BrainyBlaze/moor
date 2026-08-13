@@ -103,15 +103,19 @@ on the branch it declares:
 - Full matrix — exactly one key:
   1. `requiredClosure`: the string `"full-matrix"`.
 - Narrowed — exactly two keys in this order:
-  1. `requiredClosure`: the string `"hosted-only"`.
+  1. `requiredClosure`: `"hosted-only"` when no deferred pair was verified, or
+     `"partial"` when some were and some were not.
   2. `unverified`: a non-empty array of the deferred pairs this candidate did
      not verify, ascending by `(target, gate, lane)`. Each element has exactly
      `target`, `gate`, and `lane` in that order, each a string drawn from the
      matrix.
 
-`"full-matrix"` asserts that every deferred pair was also verified, so the
-array would be empty and is therefore absent: this format never encodes an
-empty array. A deferred pair that *was* verified is an ordinary verification —
+The label is determined by which deferred pairs are missing, never by whether
+any are: a candidate that verified some deferred lanes and not others is
+`"partial"`, because it is no longer hosted-only and the label is the part of
+this object a reader trusts at a glance. `"full-matrix"` asserts that every
+deferred pair was also verified, so the array would be empty and is therefore
+absent: this format never encodes an empty array. A deferred pair that *was* verified is an ordinary verification —
 it appears in the target's `provenance.verification` like any other and is
 absent from `unverified`. Deferral never weakens a record: a deferred lane's
 verification must still cite this exact `commit` and the same `sha256` as every

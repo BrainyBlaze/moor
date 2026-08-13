@@ -309,8 +309,21 @@ def main() -> None:
 
     # Deterministic order, and never an empty array (serialize refuses one):
     # a full matrix states "full-matrix" and carries no unverified list at all.
+    #
+    # The label is derived from WHICH deferred pairs are missing, not merely
+    # from whether any are: once a runner is enrolled for some deferred lanes
+    # but not others, the candidate is no longer hosted-only, and a label that
+    # still said so would be the one part of this object a reader trusts at a
+    # glance while it was wrong.
     unverified.sort(key=lambda entry: (entry["target"], entry["gate"], entry["lane"]))
-    coverage = {"requiredClosure": "hosted-only" if unverified else "full-matrix"}
+    deferred_total = sum(len(lanes) for gates in DEFERRED.values() for lanes in gates.values())
+    if not unverified:
+        closure = "full-matrix"
+    elif len(unverified) == deferred_total:
+        closure = "hosted-only"
+    else:
+        closure = "partial"
+    coverage = {"requiredClosure": closure}
     if unverified:
         coverage["unverified"] = unverified
 

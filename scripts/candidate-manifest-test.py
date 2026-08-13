@@ -177,6 +177,13 @@ def main() -> None:
         (entry["target"], entry["gate"], entry["lane"])
         for entry in partial["coverage"]["unverified"]
     ] == deferred_pairs[1:], "covering a deferred lane did not clear it"
+    # The label follows which pairs are missing, not merely that some are: a
+    # candidate holding evidence for part of the deferred set is no longer
+    # hosted-only, and must not keep claiming to be.
+    assert partial["coverage"]["requiredClosure"] == "partial", partial["coverage"]
+    assert list(partial["coverage"]) == ["requiredClosure", "unverified"], list(
+        partial["coverage"]
+    )
 
     # Covering every deferred lane (the restored full matrix) must not emit an
     # empty array — the serializer refuses one, so the key is dropped instead.
