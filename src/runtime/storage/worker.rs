@@ -25,6 +25,13 @@ struct State {
     bits: AtomicU8,
     frontier: Mutex<Option<Commit>>,
     completed: Mutex<VecDeque<Outcome>>,
+    // Test-only exit witness. The worker flips this immediately before its
+    // thread returns (after the `Store` — and thus every event-store file
+    // handle — has been dropped), letting a test observe deterministically
+    // that `Lane::drop` joined the worker before returning. Gated out of
+    // production builds so it adds no field, no store, and no atomic traffic.
+    #[cfg(test)]
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl State {
@@ -138,7 +145,7 @@ impl Work {
     }
 }
 
-schema!(struct pub(crate) Lane fields; submit: Sender<Submitted>, limits: (usize, usize), pending: VecDeque<Job>, bytes: usize, failure: Option<ErrorKind>, state: Arc<State>);
+schema!(struct pub(crate) Lane fields; submit: Option<Sender<Submitted>>, handle: Option<std::thread::JoinHandle<()>>, limits: (usize, usize), pending: VecDeque<Job>, bytes: usize, failure: Option<ErrorKind>, state: Arc<State>);
 
 impl Lane {
     pub(crate) fn new(mut store: Store, jobs: usize, bytes: usize) -> Self {
@@ -152,9 +159,11 @@ impl Lane {
             bits: AtomicU8::new(0),
             frontier: Mutex::new(Some(*store.selected())),
             completed: Mutex::new(VecDeque::new()),
+            #[cfg(test)]
+            exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         let worker_state = Arc::clone(&state);
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             for (operation, deadline) in work {
                 if worker_state.closed() {
                     break;
@@ -194,9 +203,20 @@ impl Lane {
                     break;
                 }
             }
+            // Release the event-store OS file handles here, on the worker's own
+            // stack, before signalling exit — the detached-thread race in #28
+            // was `Lane::drop` returning while this `store` (and its handles)
+            // outlived the drop. `Lane::drop` now joins this thread, so by the
+            // time the join returns the handles are provably gone.
+            drop(store);
+            #[cfg(test)]
+            worker_state
+                .exited
+                .store(true, std::sync::atomic::Ordering::Release);
         });
         Self {
-            submit,
+            submit: Some(submit),
+            handle: Some(handle),
             limits: (jobs, bytes),
             pending: VecDeque::new(),
             bytes: 0,
@@ -226,7 +246,11 @@ impl Lane {
             return Err(StorageError::Busy);
         };
         let deadline = Instant::now() + Duration::from_secs(2);
-        if self.submit.send((operation, deadline)).is_err() {
+        let delivered = match self.submit.as_ref() {
+            Some(sender) => sender.send((operation, deadline)).is_ok(),
+            None => false,
+        };
+        if !delivered {
             self.fail(ErrorKind::BrokenPipe);
             return Err(StorageError::Disabled);
         }
@@ -293,6 +317,31 @@ impl Lane {
         self.failure.get_or_insert(kind);
         self.state.close();
         failure(kind)
+    }
+}
+
+impl Drop for Lane {
+    // Deterministically stop and JOIN the worker so the `Store` it owns (and
+    // every event-store OS file handle) is fully released before this returns.
+    // #28: the worker used to be a detached thread whose `JoinHandle` was
+    // discarded, so `Lane::drop` could return while the worker still held the
+    // event-store handles open — harmless on Unix, but on Windows the live
+    // handle blocked the caller's `remove_dir_all` with OS error 32.
+    //
+    // Order matters and avoids a teardown deadlock: at drop time the worker is
+    // typically parked on `recv` with no pending work. `state.close()` alone
+    // will NOT wake it — only dropping the `Sender` closes the channel and ends
+    // the `for … in work` loop. Manual `Drop` runs before fields are dropped,
+    // so we must drop the `Sender` (`self.submit = None`) BEFORE `join()`;
+    // joining while the `Sender` field is still alive would park the worker
+    // forever. `join` is never unwrapped — a poisoned worker still unblocks the
+    // delete, which is the whole point.
+    fn drop(&mut self) {
+        self.state.close();
+        self.submit = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
