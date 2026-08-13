@@ -28,6 +28,13 @@ on:
       version:
         description: Proposed release version and tag name (vMAJOR.MINOR.PATCH)
         required: true
+      self_hosted_lanes:
+        description: >-
+          Run the self-hosted deferred lanes (WSL1/WSL2, Windows 10 1809,
+          Windows Server 2019). Leave false until those runners are enrolled;
+          the assembler then names every lane it could not verify.
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -577,6 +584,7 @@ jobs:
   compat-wsl:
     name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
     needs: [validate, build]
+    if: inputs.self_hosted_lanes == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -689,6 +697,7 @@ jobs:
   native-below-floor:
     name: Native below-floor ${{ matrix.lane }}
     needs: [validate, build]
+    if: inputs.self_hosted_lanes == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -806,6 +815,17 @@ jobs:
   manifest:
     name: Emit the canonical candidate metadata
     needs: [validate, build, verify, compat-alpine, compat-wsl, native-below-floor]
+    # The deferred self-hosted lanes may be skipped, but never failed: a lane
+    # that ran and lost still blocks the candidate. Everything mandatory must
+    # have succeeded outright.
+    if: >-
+      always()
+      && needs.validate.result == 'success'
+      && needs.build.result == 'success'
+      && needs.verify.result == 'success'
+      && needs['compat-alpine'].result == 'success'
+      && (needs['compat-wsl'].result == 'success' || needs['compat-wsl'].result == 'skipped')
+      && (needs['native-below-floor'].result == 'success' || needs['native-below-floor'].result == 'skipped')
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     outputs:
