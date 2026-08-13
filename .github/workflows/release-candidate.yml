@@ -3,21 +3,29 @@ name: Release candidate
 # Implements docs/release-manifest-v1.md and docs/release-matrix.md:
 # build each of the six targets exactly once, establish size/sha256 at the
 # build boundary, upload single-file artifacts with immutable IDs, verify
-# the exact downloaded bytes on hosted, hosted-container, and self-hosted
+# the exact downloaded bytes on hosted and hosted-container
 # native/compatibility lanes — every lane downloading the candidate by this
-# run's immutable artifact ID — and only when the full table-driven
+# run's immutable artifact ID — and only when the matrix's required
 # (gate, lane) closure holds emit the canonical manifest and SHA256SUMS as
 # the moor-release-candidate-v1 metadata artifact, exposing its immutable ID
-# as a machine-readable output.
+# as a machine-readable output. The deferred (gate, lane) pairs are optional
+# evidence, and whatever they did not cover is named in the manifest's own
+# coverage object, so a narrowed candidate never reads as a complete one.
 #
 # Promotion is a separate, later workflow: nothing here creates a tag or a
-# release, and every gate fails closed. Every required (gate, lane) is
-# proved inside this one run — hosted, hosted-container (Alpine), and
-# self-hosted (WSL1/WSL2, Windows 10 1809, Windows Server 2019) — and each
+# release, and every gate fails closed. Every required (gate, lane) is proved
+# inside this one run — hosted and hosted-container (Alpine) — and each
 # verifier downloads the candidate by THIS run's immutable artifact ID, so
-# provenance is bound to the run with no cross-run record ingestion. A
-# self-hosted lane whose enrollment-labelled runner is absent leaves its job
-# unstarted and the assembler refuses: metadata cannot be emitted without it.
+# provenance is bound to the run with no cross-run record ingestion. The
+# assembler refuses a candidate missing any required lane.
+#
+# The six deferred (gate, lane) pairs of release-matrix.md — WSL1/WSL2 and the
+# Windows 10 1809 / Server 2019 below-floor lanes — need self-hosted runners
+# that are not enrolled, so they run only when self_hosted_lanes is true. They
+# may be SKIPPED but never FAILED: a deferred lane that runs and loses still
+# refuses the candidate, and whatever a run could not verify is named in the
+# manifest's own coverage object, so a narrowed candidate cannot pass for a
+# complete one.
 
 on:
   workflow_dispatch:
@@ -28,6 +36,13 @@ on:
       version:
         description: Proposed release version and tag name (vMAJOR.MINOR.PATCH)
         required: true
+      self_hosted_lanes:
+        description: >-
+          Run the self-hosted deferred lanes (WSL1/WSL2, Windows 10 1809,
+          Windows Server 2019). Leave false until those runners are enrolled;
+          the assembler then names every lane it could not verify.
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -381,7 +396,21 @@ jobs:
           BIN="target/$TARGET/release/moor"
           [ -f "$BIN" ] || BIN="target/$TARGET/release/moor.exe"
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            build.json > tests.txt
+            build.json > tests.raw
+          # Cargo reports native paths, so on Windows this step (a bash step)
+          # receives D:\a\...\deps\moor-<hash>.exe. bash reads the backslashes
+          # as escapes and refuses to execute it — exit 127, "No such file or
+          # directory" — and any trailing CR makes it worse. Normalise once,
+          # here, so every consumer below runs an executable path verbatim.
+          : > tests.txt
+          while IFS= read -r exe; do
+            exe="$(printf '%s' "$exe" | tr -d '\r')"
+            [ -n "$exe" ] || continue
+            if command -v cygpath >/dev/null 2>&1; then
+              exe="$(cygpath -u "$exe")"
+            fi
+            printf '%s\n' "$exe" >> tests.txt
+          done < tests.raw
           test -s tests.txt
           hash_of() {
             if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1
@@ -457,7 +486,6 @@ jobs:
     name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
     needs: [validate, build]
     runs-on: ${{ matrix.runner }}
-    container: rust:1-alpine3.20
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -466,9 +494,6 @@ jobs:
           - {target: x86_64-unknown-linux-musl, runner: ubuntu-22.04, lane: alpine-3.20-x64}
           - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, lane: alpine-3.20-arm64}
     steps:
-      - name: Install lane prerequisites
-        run: apk add --no-cache bash curl jq python3 unzip musl-dev github-cli file git
-
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -506,6 +531,16 @@ jobs:
           TARGET: ${{ matrix.target }}
           BARE: ${{ needs.validate.outputs.bare }}
         run: |
+          # A job-level `container:` cannot carry this lane: GitHub supports
+          # JavaScript actions in Alpine containers on x64 runners only, so the
+          # arm64 lane died during initialisation with "JavaScript Actions in
+          # Alpine containers are only supported on x64 Linux runners". The musl
+          # work therefore runs through `docker run` from the host — the same
+          # mechanism native-hosted.yml already proves on both alpine lanes —
+          # which keeps checkout/download/upload executing on the host runner.
+          cat > musl-lane.sh <<'LANE'
+          set -eu
+          apk add --no-cache bash jq musl-dev >/dev/null
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
           SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
           printf '%s %s\n' "$ASSET" "$BARE" > expected.bin
@@ -525,6 +560,13 @@ jobs:
             "$exe"
           done < tests.txt
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+          LANE
+          docker run --rm \
+            -e TARGET \
+            -e BARE \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            rust:1-alpine3.20 /bin/sh -e musl-lane.sh
 
       - name: Record the compatibility reference
         shell: bash
@@ -564,6 +606,7 @@ jobs:
   compat-wsl:
     name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
     needs: [validate, build]
+    if: inputs.self_hosted_lanes == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -676,6 +719,7 @@ jobs:
   native-below-floor:
     name: Native below-floor ${{ matrix.lane }}
     needs: [validate, build]
+    if: inputs.self_hosted_lanes == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -749,7 +793,19 @@ jobs:
             > build.json 2> build.log || { cat build.log >&2; exit 1; }
           BIN="target/$TARGET/release/moor.exe"
           jq -r 'select(.reason == "compiler-artifact" and .profile.test == true) | .executable // empty' \
-            build.json > tests.txt
+            build.json > tests.raw
+          # Same normalisation as the hosted verify lane: Cargo reports native
+          # Windows paths, which bash cannot execute with their backslashes (and
+          # a trailing CR) intact.
+          : > tests.txt
+          while IFS= read -r exe; do
+            exe="$(printf '%s' "$exe" | tr -d '\r')"
+            [ -n "$exe" ] || continue
+            if command -v cygpath >/dev/null 2>&1; then
+              exe="$(cygpath -u "$exe")"
+            fi
+            printf '%s\n' "$exe" >> tests.txt
+          done < tests.raw
           test -s tests.txt
           cp "exact/$ASSET" "$BIN"
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
@@ -793,6 +849,17 @@ jobs:
   manifest:
     name: Emit the canonical candidate metadata
     needs: [validate, build, verify, compat-alpine, compat-wsl, native-below-floor]
+    # The deferred self-hosted lanes may be skipped, but never failed: a lane
+    # that ran and lost still blocks the candidate. Everything mandatory must
+    # have succeeded outright.
+    if: >-
+      always()
+      && needs.validate.result == 'success'
+      && needs.build.result == 'success'
+      && needs.verify.result == 'success'
+      && needs['compat-alpine'].result == 'success'
+      && (needs['compat-wsl'].result == 'success' || needs['compat-wsl'].result == 'skipped')
+      && (needs['native-below-floor'].result == 'success' || needs['native-below-floor'].result == 'skipped')
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     outputs:

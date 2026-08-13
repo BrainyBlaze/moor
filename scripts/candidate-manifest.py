@@ -61,12 +61,7 @@ GATE_ORDER = ["native-conformance", "compatibility", "static-linkage", "identity
 REQUIRED = {
     "x86_64-unknown-linux-musl": {
         "native-conformance": {"ubuntu-22.04-x64", "alpine-3.20-x64"},
-        "compatibility": {
-            "ubuntu-22.04-x64",
-            "alpine-3.20-x64",
-            "wsl1-ubuntu-22.04-x64",
-            "wsl2-ubuntu-22.04-x64",
-        },
+        "compatibility": {"ubuntu-22.04-x64", "alpine-3.20-x64"},
         "static-linkage": {"ubuntu-22.04-x64"},
         "identity": {"ubuntu-22.04-x64"},
     },
@@ -87,19 +82,11 @@ REQUIRED = {
         "identity": {"macos-15-arm64"},
     },
     "x86_64-pc-windows-msvc": {
-        # Server 2022 is the input-fidelity floor; 1809 and Server 2019 are
-        # exact-byte compatibility lanes AND §12.8 native below-floor
-        # provenance (release-matrix.md), so both gates require all three.
-        "native-conformance": {
-            "windows-2022-x64",
-            "windows-10-1809-x64",
-            "windows-server-2019-x64",
-        },
-        "compatibility": {
-            "windows-2022-x64",
-            "windows-10-1809-x64",
-            "windows-server-2019-x64",
-        },
+        # Server 2022 is the input-fidelity floor. 1809 and Server 2019 are
+        # §12.8 native below-floor provenance (release-matrix.md) and sit in
+        # DEFERRED below until their self-hosted runners exist.
+        "native-conformance": {"windows-2022-x64"},
+        "compatibility": {"windows-2022-x64"},
         "static-linkage": {"windows-2022-x64"},
         "identity": {"windows-2022-x64"},
     },
@@ -111,11 +98,29 @@ REQUIRED = {
     },
 }
 
+# Lanes the frozen matrix assigns but that a v0.1.0 candidate does not have to
+# carry, because no self-hosted runner is enrolled for them yet (operator
+# decision of 2026-08-13: narrow the mandatory closure now, restore it once the
+# runners exist). They stay PERMITTED, so the moment such a runner appears its
+# record is accepted here with no code change — and every deferred lane a run
+# could NOT verify is named in the manifest's own bytes, so a narrowed closure
+# can never be mistaken for a full one.
+DEFERRED = {
+    "x86_64-unknown-linux-musl": {
+        "compatibility": {"wsl1-ubuntu-22.04-x64", "wsl2-ubuntu-22.04-x64"},
+    },
+    "x86_64-pc-windows-msvc": {
+        "native-conformance": {"windows-10-1809-x64", "windows-server-2019-x64"},
+        "compatibility": {"windows-10-1809-x64", "windows-server-2019-x64"},
+    },
+}
+
 # Every (target, gate, lane) the matrix permits — a record outside this exact
 # set is refused (no "any globally known lane on any gate").
 PERMITTED = {
     (target, gate, lane)
-    for target, gates in REQUIRED.items()
+    for table in (REQUIRED, DEFERRED)
+    for target, gates in table.items()
     for gate, lanes in gates.items()
     for lane in lanes
 }
@@ -225,6 +230,7 @@ def main() -> None:
     bare = version[1:]
 
     targets_object = {}
+    unverified = []
     sums_lines = []
     for target in TARGETS:
         build = load_json(os.path.join(records_dir, f"build-{target}.json"), f"build record for {target}")
@@ -274,6 +280,13 @@ def main() -> None:
             if missing:
                 fail(f"{target}: gate {gate} is missing required lanes {sorted(missing)}")
 
+        # A deferred lane is optional, never silent: whatever this run could not
+        # verify is carried into the manifest verbatim.
+        for gate, lanes in DEFERRED.get(target, {}).items():
+            covered = {ref["lane"] for ref in references if ref["gate"] == gate}
+            for lane in sorted(lanes - covered):
+                unverified.append({"target": target, "gate": gate, "lane": lane})
+
         references.sort(
             key=lambda ref: (
                 GATE_ORDER.index(ref["gate"]),
@@ -294,6 +307,26 @@ def main() -> None:
         }
         sums_lines.append(f"{sha256}  {asset}\n")
 
+    # Deterministic order, and never an empty array (serialize refuses one):
+    # a full matrix states "full-matrix" and carries no unverified list at all.
+    #
+    # The label is derived from WHICH deferred pairs are missing, not merely
+    # from whether any are: once a runner is enrolled for some deferred lanes
+    # but not others, the candidate is no longer hosted-only, and a label that
+    # still said so would be the one part of this object a reader trusts at a
+    # glance while it was wrong.
+    unverified.sort(key=lambda entry: (entry["target"], entry["gate"], entry["lane"]))
+    deferred_total = sum(len(lanes) for gates in DEFERRED.values() for lanes in gates.values())
+    if not unverified:
+        closure = "full-matrix"
+    elif len(unverified) == deferred_total:
+        closure = "hosted-only"
+    else:
+        closure = "partial"
+    coverage = {"requiredClosure": closure}
+    if unverified:
+        coverage["unverified"] = unverified
+
     manifest = {
         "schemaVersion": 1,
         "repository": REPOSITORY,
@@ -304,6 +337,7 @@ def main() -> None:
             "workflowRunAttempt": run_attempt,
             "metadataArtifactName": "moor-release-candidate-v1",
         },
+        "coverage": coverage,
         "targets": targets_object,
     }
 
