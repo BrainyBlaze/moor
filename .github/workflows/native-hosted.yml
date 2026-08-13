@@ -153,7 +153,20 @@ jobs:
             $hash = (Get-FileHash -Algorithm SHA256 $file).Hash.ToLowerInvariant()
             "$hash  $([IO.Path]::GetFileName($file))"
           }
-          $hashes | Set-Content -Encoding utf8NoBOM "$out/SHA256SUMS"
+          [System.IO.File]::WriteAllText("$out/SHA256SUMS", (($hashes -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding $false))
+          # Fail fast if SHA256SUMS is not portable to the Linux release-candidate aggregation (#27).
+          $sumsBytes = [System.IO.File]::ReadAllBytes("$out/SHA256SUMS")
+          if ($sumsBytes -contains 13) {
+            Write-Error "SHA256SUMS contains a CR byte (0x0D); it must be LF-only so Linux 'sha256sum -c' resolves moor.exe"
+            exit 1
+          }
+          foreach ($line in (Get-Content "$out/SHA256SUMS")) {
+            if ($line -eq "") { continue }
+            if ($line -notmatch '^[0-9a-f]{64}  moor\.exe$') {
+              Write-Error "SHA256SUMS line is not '<sha256>  moor.exe': $line"
+              exit 1
+            }
+          }
           & "$out/moor.exe" --version *>> "$out/smoke.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$out/moor.exe" --help *>> "$out/smoke.log"
