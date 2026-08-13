@@ -457,7 +457,6 @@ jobs:
     name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
     needs: [validate, build]
     runs-on: ${{ matrix.runner }}
-    container: rust:1-alpine3.20
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -466,9 +465,6 @@ jobs:
           - {target: x86_64-unknown-linux-musl, runner: ubuntu-22.04, lane: alpine-3.20-x64}
           - {target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, lane: alpine-3.20-arm64}
     steps:
-      - name: Install lane prerequisites
-        run: apk add --no-cache bash curl jq python3 unzip musl-dev github-cli file git
-
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -506,6 +502,16 @@ jobs:
           TARGET: ${{ matrix.target }}
           BARE: ${{ needs.validate.outputs.bare }}
         run: |
+          # A job-level `container:` cannot carry this lane: GitHub supports
+          # JavaScript actions in Alpine containers on x64 runners only, so the
+          # arm64 lane died during initialisation with "JavaScript Actions in
+          # Alpine containers are only supported on x64 Linux runners". The musl
+          # work therefore runs through `docker run` from the host — the same
+          # mechanism native-hosted.yml already proves on both alpine lanes —
+          # which keeps checkout/download/upload executing on the host runner.
+          cat > musl-lane.sh <<'LANE'
+          set -eu
+          apk add --no-cache bash jq musl-dev >/dev/null
           ASSET="$(jq -r .asset "records/build-$TARGET.json")"
           SHA_EXPECTED="$(jq -r .sha256 "records/build-$TARGET.json")"
           printf '%s %s\n' "$ASSET" "$BARE" > expected.bin
@@ -525,6 +531,13 @@ jobs:
             "$exe"
           done < tests.txt
           test "$(sha256sum "$BIN" | cut -d' ' -f1)" = "$SHA_EXPECTED"
+          LANE
+          docker run --rm \
+            -e TARGET \
+            -e BARE \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            rust:1-alpine3.20 /bin/sh -e musl-lane.sh
 
       - name: Record the compatibility reference
         shell: bash
