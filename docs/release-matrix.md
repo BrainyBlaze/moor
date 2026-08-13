@@ -110,10 +110,11 @@ Three properties keep that from becoming a silent waiver:
 1. The deferred pairs remain **permitted**. A record from one of these lanes is
    accepted the moment its runner is enrolled, with no change to the matrix or
    the producer — restoring the full matrix is enrolment, not a code edit.
-2. The candidate **names what it lacks**: its `coverage` object declares
-   `"hosted-only"` and lists each deferred pair it did not verify
-   (`docs/release-manifest-v1.md`). A candidate that verified all of them
-   declares `"full-matrix"` instead.
+2. The candidate **names what it lacks**: its `coverage` object lists each
+   deferred pair it did not verify and labels the closure by which pairs are
+   missing, never by whether any are (`docs/release-manifest-v1.md`) —
+   `"hosted-only"` if and only if all six are missing, `"partial"` if and only
+   if one to five are missing, and `"full-matrix"` if and only if none are.
 3. A deferred lane that runs is held to the same standard as any other: its
    record must cite the exact candidate commit and the exact asset digest, and
    a deferred lane that runs and **fails** still refuses the candidate. Only

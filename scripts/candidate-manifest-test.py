@@ -213,6 +213,22 @@ def main() -> None:
     assert list(full["coverage"]) == ["requiredClosure"], list(full["coverage"])
     assert list(full) == list(manifest), "the full-matrix top level drifted from the narrowed one"
 
+    # Anti-drift: every label the producer can emit must be documented in both
+    # normative files. A new or renamed label that only lands in code fails
+    # here, so the documents cannot silently fall behind the producer.
+    emitted_labels = {
+        manifest["coverage"]["requiredClosure"],
+        partial["coverage"]["requiredClosure"],
+        full["coverage"]["requiredClosure"],
+    }
+    assert emitted_labels == {"hosted-only", "partial", "full-matrix"}, emitted_labels
+    for relative in ("release-manifest-v1.md", "release-matrix.md"):
+        path = os.path.join(HERE, os.pardir, "docs", relative)
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        for label in sorted(emitted_labels):
+            assert f'"{label}"' in text, f"{relative} does not document the {label} closure"
+
     cases = 0
 
     # A deferred lane still has to be a real verification of these exact bytes.
