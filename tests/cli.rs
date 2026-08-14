@@ -198,7 +198,9 @@ fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
             assert!(parses(&args), "{args:?}");
         }
     }
-    for token in ["attach", "a", "push", "p", "kill", "k", "list", "l", "ls", "current"] {
+    for token in [
+        "attach", "a", "push", "p", "kill", "k", "list", "l", "ls", "current",
+    ] {
         let args = match token {
             "list" | "l" | "ls" | "current" => vec![token],
             _ => vec![token, "session"],
@@ -228,7 +230,10 @@ fn removed_legacy_spellings_are_rejected_as_modes_not_reinterpreted() {
 #[test]
 fn remaining_argument_diagnostics_name_the_real_command() {
     for (args, message) in [
-        (&["kill", "--bogus", "session"][..], "Invalid mode '--bogus'"),
+        (
+            &["kill", "--bogus", "session"][..],
+            "Invalid mode '--bogus'",
+        ),
         (
             &["start", "-f", "session"][..],
             "Option '-f' is not valid for 'start'",

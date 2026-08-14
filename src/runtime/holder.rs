@@ -1029,7 +1029,7 @@ impl<N: Native> Runtime<N> {
             .log
             .map(|commit| (commit.epoch, commit.index, commit.start, commit.end))
             .unwrap_or_default();
-        let mut payload = Vec::with_capacity(self.status.len() + 69);
+        let mut payload = Vec::with_capacity(self.status.len() + 73);
         payload.extend_from_slice(&self.status);
         if let Some(commit) = snapshot.event
             && let Some(fields) = payload.get_mut(self.commit_at..self.commit_at + 49)
@@ -1039,6 +1039,12 @@ impl<N: Native> Runtime<N> {
             fields[9..17].copy_from_slice(&commit.length.to_le_bytes());
             fields[17..49].copy_from_slice(&commit.hash);
         }
+        // v4: the descriptor carries the holder's stored geometry, mandatory
+        // and nonzero — the pair exists from child birth (headless creation
+        // assigns 24x80) and updates only after a native resize succeeds, so
+        // there is no "unknown" state to encode. Columns first, like RESIZE.
+        payload.extend_from_slice(&self.geometry.1.to_le_bytes());
+        payload.extend_from_slice(&self.geometry.0.to_le_bytes());
         payload.extend(
             StatusTail {
                 replay,

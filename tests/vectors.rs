@@ -1049,39 +1049,39 @@ fn v16_semantic_gap_no_producer_side_payload_decoder() {
 // suite has no collisions.
 
 const V16_INPUT_V7: &str = "
-    4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
-    11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
-    00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
-    00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
-    D3 42 42";
+    4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
+    11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
+    00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
+    00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
+    06 42 42";
 
 const V16_INPUT_V8: &str = "
-    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0A 00 00 00
-    2B 00 00 00 EA B3 81 BB 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 0A 00 00 07 00 00 00 0A 00 00 00
+    2B 00 00 00 F2 7F 7D 6E 03 00 00 00 01 00 00 00
     00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
     08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
     00 00 00";
 
 const V16_INPUT_V9: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 16 00 00 00
-    13 00 00 00 BA FD 47 3C 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 16 00 00 00
+    13 00 00 00 A2 31 BB E9 03 00 00 00 01 00 00 00
     00 00 00 00 00 41 41 41 41 42 42";
 
 const V16_INPUT_V10: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 17 00 00 00
-    16 00 00 00 D6 1B 1C D3 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 17 00 00 00
+    16 00 00 00 CE D7 E0 06 03 00 00 00 01 00 00 00
     00 00 00 00 00 44 49 46 46 45 52 45 4E 54";
 
 const V16_INPUT_V16: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 1E 00 00 00
-    2A 00 00 00 88 95 3C 6B 03 00 00 00 02 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 1E 00 00 00
+    2A 00 00 00 90 59 C0 BE 03 00 00 00 02 00 00 00
     00 00 00 00 01 20 21 22 23 24 25 26 27 28 29 2A
     2B 2C 2D 2E 2F 06 00 63 6C 61 75 64 65 68 65 6C
     6C 6F";
 
 const V16_INPUT_V18: &str = "
-    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0B 00 00 00
-    2B 00 00 00 CD CE BD F2 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 0A 00 00 07 00 00 00 0B 00 00 00
+    2B 00 00 00 D5 02 41 27 03 00 00 00 01 00 00 00
     00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
     08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
     00 00 00";
@@ -1712,8 +1712,8 @@ fn v16_framing_hex(s: &str) -> Vec<u8> {
 // flags are reserved zero.
 fn v16_framing_v1() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
-         21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+        "4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
+         21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
          00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
          30 30 30 2F 62 75 69 6C 64",
     )
@@ -1722,8 +1722,8 @@ fn v16_framing_v1() -> Vec<u8> {
 // §16 V2 — OUTPUT, record sequence 42, byte offset 4096, payload `hi`.
 fn v16_framing_v2() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 06 00 00 07 00 00 00 09 00 00 00
-         12 00 00 00 85 A9 11 DC 2A 00 00 00 00 00 00 00
+        "4D 4F 4F 52 04 06 00 00 07 00 00 00 09 00 00 00
+         12 00 00 00 9D 65 ED 09 2A 00 00 00 00 00 00 00
          00 10 00 00 00 00 00 00 68 69",
     )
 }
@@ -1732,8 +1732,8 @@ fn v16_framing_v2() -> Vec<u8> {
 // lease.
 fn v16_framing_v3() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00
-         05 00 00 00 35 5C 53 49 00 00 00 00 01",
+        "4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
+         05 00 00 00 2D 90 AF 9C 00 00 00 00 01",
     )
 }
 
@@ -1741,8 +1741,8 @@ fn v16_framing_v3() -> Vec<u8> {
 // then geometry.
 fn v16_framing_v4() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0B 00 00 00
-         08 00 00 00 7E AE 34 20 03 00 00 00 50 00 18 00",
+        "4D 4F 4F 52 04 0B 00 00 07 00 00 00 0B 00 00 00
+         08 00 00 00 66 62 C8 F5 03 00 00 00 50 00 18 00",
     )
 }
 
@@ -1750,8 +1750,8 @@ fn v16_framing_v4() -> Vec<u8> {
 // HALF_SPECIFIED_GEOMETRY.
 fn v16_framing_v5() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0C 00 00 00
-         08 00 00 00 7A AB 6D DA 03 00 00 00 50 00 00 00",
+        "4D 4F 4F 52 04 0B 00 00 07 00 00 00 0C 00 00 00
+         08 00 00 00 62 67 91 0F 03 00 00 00 50 00 00 00",
     )
 }
 
@@ -1759,16 +1759,16 @@ fn v16_framing_v5() -> Vec<u8> {
 // OUTPUT_ACK.
 fn v16_framing_v6() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 07 00 00 00 00 00 00 03 00 00 00
-         08 00 00 00 DA 77 CE 5D 01 00 00 00 00 00 00 00",
+        "4D 4F 4F 52 04 07 00 00 00 00 00 00 03 00 00 00
+         08 00 00 00 C2 BB 32 88 01 00 00 00 00 00 00 00",
     )
 }
 
 // §16 V11 — ERROR carrying GENERATION_MISMATCH (9).
 fn v16_framing_v11() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 13 00 00 07 00 00 00 0D 00 00 00
-         1E 00 00 00 3F E0 B5 E8 09 00 1A 00 67 65 6E 65
+        "4D 4F 4F 52 04 13 00 00 07 00 00 00 0D 00 00 00
+         1E 00 00 00 27 2C 49 3D 09 00 1A 00 67 65 6E 65
          72 61 74 69 6F 6E 20 33 20 69 73 20 73 75 70 65
          72 73 65 64 65 64",
     )
@@ -1786,7 +1786,7 @@ fn v16_framing_v1_identity() -> Vec<u8> {
 fn v16_framing_assert_header(frame: &[u8]) {
     assert!(frame.len() >= 24, "frame shorter than the 24-byte header");
     assert_eq!(&frame[0..4], b"MOOR", "frozen magic");
-    assert_eq!(frame[4], 0x03, "frozen wire-schema-3 version byte");
+    assert_eq!(frame[4], 0x04, "frozen wire-schema-4 version byte");
     let frozen = u32::from_le_bytes(frame[20..24].try_into().unwrap());
     assert_eq!(
         moor::wire::crc32c(&frame[..20]),
@@ -1865,7 +1865,7 @@ fn v16_framing_v1_hello_frame_decodes_through_codec_and_controller_decoder() {
     // §3.1: magic repeat, schema version, two reserved-zero flag bytes, then
     // the canonical session identity — wide-length-prefixed (§1.1.1, 4 bytes).
     let identity = v16_framing_v1_identity();
-    assert_eq!(&message.payload[..7], b"MOOR\x03\0\0");
+    assert_eq!(&message.payload[..7], b"MOOR\x04\0\0");
     assert_eq!(
         &message.payload[7..11],
         &[0x16, 0x00, 0x00, 0x00],
@@ -2311,19 +2311,19 @@ fn v16_framing_header_crc32c_recomputes_for_every_group_vector() {
 
 /// §16 V1 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
 const V16_EXTRA_V1: &str = "\
-4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00 \
-21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16 \
+4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00 \
+21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16 \
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31 \
 30 30 30 2F 62 75 69 6C 64";
 
 /// §16 V7 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
 /// Two frames: 24+17 bytes (MORE=1), then 24+2 bytes (MORE=0).
 const V16_EXTRA_V7: &str = "\
-4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00 \
-11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00 \
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00 \
-00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22 \
-D3 42 42";
+4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00 \
+11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00 \
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00 \
+00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE \
+06 42 42";
 
 fn v16_extra_hex(s: &str) -> Vec<u8> {
     s.split_whitespace()
@@ -2381,10 +2381,13 @@ fn v16_extra_frozen_v1_control_still_decodes() {
 
 #[test]
 fn v16_extra_framing_unknown_version_is_refused() {
-    // §1: version is frozen at 3 for the controller profile; §17 "an unknown
-    // version". Byte 4 of the frozen V1 header is the version.
+    // §1: version is frozen at 4 for the controller profile; §17 "an unknown
+    // version". Byte 4 of the frozen V1 header is the version. `3` is the
+    // retired dialect: v4 ships no v3 decoder, so the predecessor is refused
+    // exactly like any other unknown version — that is what a version
+    // increment means, as against another in-place amendment.
     let mut bytes = v16_extra_hex(V16_EXTRA_V1);
-    bytes[4] = 4;
+    bytes[4] = 3;
     v16_extra_patch_crc(&mut bytes, 0);
     assert_eq!(
         v16_extra_feed_controller(&bytes),
@@ -2575,8 +2578,8 @@ fn v16_extra_hello_nonzero_flags_are_refused() {
 const V25_HEADER: &[u8] = b"{\"v\":2,\"type\":\"header\",\"ts\":0,\"session\":\"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==\",\"generation\":7,\"epoch\":0,\"next_seq\":0,\"first_retained\":0}\n";
 
 fn v25() -> Vec<u8> {
-    hex("4D 4F 4F 52 03 0E 00 00 07 00 00 00 01 00 00 00
-         F4 00 00 00 65 4E 0F 46 16 00 00 00 01 2F 74 6D
+    hex("4D 4F 4F 52 04 0E 00 00 07 00 00 00 01 00 00 00
+         F8 00 00 00 68 D0 95 1E 16 00 00 00 01 2F 74 6D
          70 2F 2E 6D 6F 6F 72 2D 31 30 30 30 2F 62 75 69
          6C 64 07 00 00 00 00 01 02 03 04 05 06 07 08 09
          0A 0B 0C 0D 0E 0F 02 0B 00 00 00 2F 74 6D 70 2F
@@ -2587,26 +2590,26 @@ fn v25() -> Vec<u8> {
          00 00 00 00 00 00 00 03 03 03 03 03 03 03 03 03
          03 03 03 03 03 03 03 04 00 00 00 2F 74 6D 70 34
          12 00 00 78 56 00 00 10 11 12 13 14 15 16 17 18
-         19 1A 1B 1C 1D 1E 1F 00 00 00 00 00 00 00 00 00
+         19 1A 1B 1C 1D 1E 1F 50 00 18 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-         00 00 00 00 00 00 00 E3 03 00 00 00 00 00 00 0F
-         01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00
-         00 00 00 00 00 00 00 00 00 00 00 00")
+         00 00 00 00 00 00 00 00 00 00 00 E3 03 00 00 00
+         00 00 00 0F 01 00 00 00 01 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
 }
 
 #[test]
 fn v16_status_v25_frame_is_self_consistent_and_decodes() {
     let frame = v25();
-    // Header shape and the declared 244-byte payload, per §1.
+    // Header shape and the declared 248-byte payload, per §1.
     assert_eq!(&frame[0..4], b"MOOR");
-    assert_eq!(frame[4], 0x03, "wire version");
+    assert_eq!(frame[4], 0x04, "wire version");
     assert_eq!(frame[5], 0x0E, "STATUS_REPLY type");
     assert_eq!(
         u32::from_le_bytes(frame[16..20].try_into().unwrap()),
-        0xF4,
+        0xF8,
         "declared payload length"
     );
-    assert_eq!(frame.len() - 24, 0xF4, "actual body length");
+    assert_eq!(frame.len() - 24, 0xF8, "actual body length");
     assert_eq!(
         moor::wire::crc32c(&frame[..20]),
         u32::from_le_bytes(frame[20..24].try_into().unwrap()),
@@ -2684,8 +2687,8 @@ fn v16_status_v28_heartbeat_round_trips_and_encodes_exactly() {
     // Drives the real encoder and the real decoder against the frozen bytes,
     // so this is an end-to-end check of the five defined health bits rather
     // than an inspection of the vector.
-    let frame = hex("4D 4F 4F 52 03 12 00 00 07 00 00 00 04 00 00 00
-         09 00 00 00 34 6D 58 74 08 07 06 05 04 03 02 01
+    let frame = hex("4D 4F 4F 52 04 12 00 00 07 00 00 00 04 00 00 00
+         09 00 00 00 2C A1 A4 A1 08 07 06 05 04 03 02 01
          1F");
     assert_eq!(frame[5], 0x12, "HEARTBEAT type");
     assert_eq!(
@@ -2735,8 +2738,8 @@ fn v16_status_v28_reserved_heartbeat_bits_are_refused() {
 
 #[test]
 fn v16_status_v30_clear_request_encodes_exactly() {
-    let frame = hex("4D 4F 4F 52 03 19 00 00 07 00 00 00 06 00 00 00
-         18 00 00 00 E7 F8 D1 48 00 01 02 03 04 05 06 07
+    let frame = hex("4D 4F 4F 52 04 19 00 00 07 00 00 00 06 00 00 00
+         18 00 00 00 FF 34 2D 9D 00 01 02 03 04 05 06 07
          08 09 0A 0B 0C 0D 0E 0F 05 00 00 00 00 00 00 00");
     assert_eq!(frame[5], 0x19, "LOG_CLEAR type");
     assert_eq!(frame.len() - 24, 0x18, "declared 24-byte payload");
@@ -2939,10 +2942,10 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
 // plain u16 zero length, NOT an absent frame. Both use per-direction
 // sequence 2. Exact hex from the schema.
 
-const V26_ATTACH: &str = "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00 \
-                          05 00 00 00 35 5C 53 49 00 00 00 00 02";
-const V26_PREAMBLE: &str = "4D 4F 4F 52 03 05 00 00 07 00 00 00 02 00 00 00 \
-                            02 00 00 00 08 9C 99 04 00 00";
+const V26_ATTACH: &str = "4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00 \
+                          05 00 00 00 2D 90 AF 9C 00 00 00 00 02";
+const V26_PREAMBLE: &str = "4D 4F 4F 52 04 05 00 00 07 00 00 00 02 00 00 00 \
+                            02 00 00 00 10 50 65 D1 00 00";
 
 #[test]
 fn v26_both_frames_reproduce_the_frozen_bytes() {
@@ -3110,18 +3113,18 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
 // §16 V29 — fresh viewer lease grant followed by explicit release. Controller
 // sequences 4 then 5; holder sequences 5 then 6. Exact hex from the schema.
 
-const V29_REQUEST: &str = "4D 4F 4F 52 03 15 00 00 07 00 00 00 04 00 00 00 \
-                           28 00 00 00 F1 56 7C 4D 00 00 00 00 00 00 00 00 \
+const V29_REQUEST: &str = "4D 4F 4F 52 04 15 00 00 07 00 00 00 04 00 00 00 \
+                           28 00 00 00 E9 9A 80 98 00 00 00 00 00 00 00 00 \
                            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
                            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
-const V29_GRANT: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 05 00 00 00 \
-                         18 00 00 00 63 89 92 92 00 00 00 00 03 00 00 00 \
+const V29_GRANT: &str = "4D 4F 4F 52 04 16 00 00 07 00 00 00 05 00 00 00 \
+                         18 00 00 00 7B 45 6E 47 00 00 00 00 03 00 00 00 \
                          00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
-const V29_RELEASE: &str = "4D 4F 4F 52 03 17 00 00 07 00 00 00 05 00 00 00 \
-                           14 00 00 00 77 26 7A 78 03 00 00 00 00 01 02 03 \
+const V29_RELEASE: &str = "4D 4F 4F 52 04 17 00 00 07 00 00 00 05 00 00 00 \
+                           14 00 00 00 6F EA 86 AD 03 00 00 00 00 01 02 03 \
                            04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
-const V29_RELEASED: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 06 00 00 00 \
-                            18 00 00 00 0A 0E D6 49 02 00 00 00 03 00 00 00 \
+const V29_RELEASED: &str = "4D 4F 4F 52 04 16 00 00 07 00 00 00 06 00 00 00 \
+                            18 00 00 00 12 C2 2A 9C 02 00 00 00 03 00 00 00 \
                             00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 
 fn v29_token() -> [u8; 16] {
@@ -3440,11 +3443,11 @@ fn v29_refuses_every_inconsistent_lease_request_and_result() {
 // 0102030405060708, lease epoch 3, echoed class 04, plain u16 byte lengths.
 // Both directions use frame sequence 3. Exact hex from the schema.
 
-const V27_QUERY: &str = "4D 4F 4F 52 03 14 00 00 07 00 00 00 03 00 00 00 \
-                         18 00 00 00 42 0B EA EE 08 07 06 05 04 03 02 01 \
+const V27_QUERY: &str = "4D 4F 4F 52 04 14 00 00 07 00 00 00 03 00 00 00 \
+                         18 00 00 00 5A C7 16 3B 08 07 06 05 04 03 02 01 \
                          03 00 00 00 04 09 00 1B 5B 3F 32 30 30 34 24 70";
-const V27_REPLY: &str = "4D 4F 4F 52 03 0C 00 00 07 00 00 00 03 00 00 00\
-                         1A 00 00 00 EE BD 48 07 08 07 06 05 04 03 02 01 \
+const V27_REPLY: &str = "4D 4F 4F 52 04 0C 00 00 07 00 00 00 03 00 00 00\
+                         1A 00 00 00 F6 71 B4 D2 08 07 06 05 04 03 02 01 \
                          03 00 00 00 04 0B 00 1B 5B 3F 32 30 30 34 3B 31 \
                          24 79";
 const V27_CORRELATION: u64 = 0x0102_0304_0506_0708;

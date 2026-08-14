@@ -239,7 +239,7 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
             false,
         );
         let mut codec = Codec::new(Profile::Controller);
-        let mut hello = b"MOOR\x03\0\0".to_vec();
+        let mut hello = b"MOOR\x04\0\0".to_vec();
         put_wide(&mut hello, identity).unwrap();
         send(&mut codec, &mut client, 0, 1, &hello);
         let mut attach = Vec::new();

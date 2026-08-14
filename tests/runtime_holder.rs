@@ -195,6 +195,9 @@ fn fixture_with_native<N: Native>(native: N) -> (Runtime<N>, PathBuf) {
     (runtime, root)
 }
 
+// The fixtures above build a runtime with an EMPTY base status, so a status
+// payload in these tests is the v4 geometry pair (4 bytes) followed by the
+// tail — which is why tail offsets here start at 36 rather than 32.
 fn event_fixture() -> (Runtime<FakeNative>, [PathBuf; 2]) {
     event_fixture_with(1, 1)
 }
@@ -825,12 +828,12 @@ fn invalid_query_reply_does_not_refresh_the_lease() {
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
     assert_eq!(
-        status.payload[32] & 0x10,
+        status.payload[36] & 0x10,
         0,
         "class-mismatched reply extended ownership"
     );
     assert_eq!(
-        u32::from_le_bytes(status.payload[33..37].try_into().unwrap()),
+        u32::from_le_bytes(status.payload[37..41].try_into().unwrap()),
         lease.epoch
     );
     drop(runtime);
@@ -1254,7 +1257,7 @@ fn expired_viewer_ownership_is_removed_from_status_queries_and_resize() {
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
     assert_eq!(
-        status.payload[32] & 0x30,
+        status.payload[36] & 0x30,
         0x20,
         "observer remains attached without ownership"
     );
@@ -1290,7 +1293,7 @@ fn non_vt_attach_omits_terminal_bytes_without_erasing_tracked_exactness() {
     peer.send(7, 3, &[0, 0, 0, 0, 3]);
     assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
     let status = peer.recv_kind(&mut runtime, 4);
-    assert_eq!(status.payload[32] & 2, 2);
+    assert_eq!(status.payload[36] & 2, 2);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1702,7 +1705,7 @@ fn v25_status_emitter_patches_exact_selected_commit_region() {
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
 
-    assert_eq!(status.payload.len(), 244, "frozen V25 payload shape");
+    assert_eq!(status.payload.len(), 248, "frozen V25 payload shape");
     assert_eq!(
         &status.payload[commit_at..commit_at + COMMIT.len()],
         &COMMIT,

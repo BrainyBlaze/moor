@@ -527,10 +527,7 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
                 _ => {}
             }
             let status = platform::create(mode, &path, command, &options, invoked)?;
-            crate::return_if!(
-                status != 0 || matches!(mode, CreateMode::Run),
-                Ok(status)
-            );
+            crate::return_if!(status != 0 || matches!(mode, CreateMode::Run), Ok(status));
             if let Some(verb) = verb {
                 announce(&session, options.quiet, verb);
             }

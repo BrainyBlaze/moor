@@ -211,6 +211,9 @@ fn status(first: u64, last: u64, start: u64, end: u64, flags: u8) -> Vec<u8> {
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&[1; 16]);
+    // v4 descriptor geometry: mandatory and nonzero, columns then rows.
+    out.extend_from_slice(&80_u16.to_le_bytes());
+    out.extend_from_slice(&24_u16.to_le_bytes());
     for value in [first, last, start, end] {
         out.extend_from_slice(&value.to_le_bytes());
     }

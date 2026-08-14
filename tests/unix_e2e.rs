@@ -2526,7 +2526,10 @@ fn current_reads_only_the_v2_ancestry_carrier() {
     // a process holding only the dead variable now is: outside any session.
     let alone = run(Some(b"/tmp/a:/tmp/b"), None);
     assert_eq!(alone.status.code(), Some(1), "{alone:?}");
-    assert!(alone.stdout.is_empty() && alone.stderr.is_empty(), "{alone:?}");
+    assert!(
+        alone.stdout.is_empty() && alone.stderr.is_empty(),
+        "{alone:?}"
+    );
 }
 
 #[test]

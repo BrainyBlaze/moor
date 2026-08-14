@@ -304,6 +304,9 @@ fn status_prefix() -> Vec<u8> {
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&[1; 16]);
+    // v4 descriptor geometry: mandatory and nonzero, columns then rows.
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
     payload
 }
 
@@ -312,17 +315,17 @@ fn decode_status(payload: &[u8]) -> Result<StatusTail, WireError> {
 }
 
 const V1: &str = "
-4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
-21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
+21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
 30 30 30 2F 62 75 69 6C 64";
 
 const V7: &str = "
-4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
-11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
-00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
-D3 42 42";
+4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
+11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
+00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
+06 42 42";
 
 const V14: &str = "
 4D 4F 4F 53 01 01 00 00 00 00 00 00 01 00 00 00
@@ -465,6 +468,8 @@ fn status_rejects_the_superseded_event_layout_nobody_emits() {
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&[1; 16]);
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
     payload.extend_from_slice(
         &StatusTail {
             replay: ReplayDescriptor {

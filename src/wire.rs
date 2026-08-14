@@ -145,7 +145,7 @@ type ProfileRules = ([u8; 4], u8, usize, usize, u8, u32, &'static [(u8, usize)])
 const PROFILES: [ProfileRules; 2] = [
     (
         *b"MOOR",
-        3,
+        4,
         1 << 20,
         16 << 20,
         0x1a,
@@ -405,10 +405,10 @@ wire_rules!(pure pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> Run
 wire_rules!(pure fn semantic_code(error: SemanticRefusal) -> u16 = [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10, 15][error as usize]);
 wire_rules!(pure pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> = wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u16).to_le_bytes(); diagnostic));
 wire_rules!(pure pub fn decode_error_payload(payload: &[u8]) -> Option<(u16, &[u8])> = { let code = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?); get_compact(payload, 2, true).map(|text| (code, text)) });
-wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x03\0\0".to_vec(), identity));
+wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x04\0\0".to_vec(), identity));
 
-wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [3]; generation.to_le_bytes(); incarnation), identity) });
-wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == 3 && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
+wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [4]; generation.to_le_bytes(); incarnation), identity) });
+wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == 4 && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
 
 pub use crc32c::crc32c;
 
@@ -499,7 +499,7 @@ pub fn decode_controller(
 ) -> Result<ControllerRequest<'_>, WireError> {
     use ControllerRequest::*;
     wire_rules!(bounded payload; input => match kind {
-        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x03\0\0")?; Hello(input.wide()?) },
+        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x04\0\0")?; Hello(input.wide()?) },
         3 => { let (columns, rows, flags) = (input.u16()?, input.u16()?, input.byte()?); well_formed(flags & !3 == 0)?; wire_rules!(controller Attach; columns; rows; flags & 1 != 0; flags & 2 != 0; token) },
         7 => wire_rules!(controller OutputAck; input.u64()?),
         9 => { let (epoch, request_id, form) = (input.u32()?, input.u64()?, input.byte()?); let exact_payload = payload.into();
@@ -580,13 +580,13 @@ impl StatusTail {
 
 wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(), WireError> = {
     wire_rules!(read input; identity = input.wide(); generation = input.positive(); incarnation = input.identifier::<16>(); layout = input.byte(); event_identity = input.wide(); slot = input.byte(); commit = input.u64(); body_length = input.u64(); body_hash = input.exact::<32>()); input.exact::<32>()?;
-    wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>());
+    wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>(); columns = input.u16(); rows = input.u16());
     let identity_ok = matches!(identity, [1, b'/', ..]) || identity.len() == 25 && identity.first() == Some(&2);
     let commit_ok = if layout == 2 { slot <= 1 && commit != 0 && body_length != 0 && nonzero(&body_hash) } else { slot == 0xff && commit == 0 && body_length == 0 && !nonzero(&body_hash) };
     // Layout `01` is the superseded legacy layout: never emitted by any
     // holder (§5 — both platforms report `2`, disabled logging reports `0`),
     // so a descriptor carrying it is a forgery or corruption, not history.
-    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty())
+    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))
 });
 
 schema!(struct pub Heartbeat derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; monotonic_ms: u64, flags: u8);
@@ -603,7 +603,8 @@ impl Heartbeat {
 schema!(struct pub QueryShape derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; class: u8, csi8: bool, mode: Option<u32>);
 
 wire_rules!(pure pub(crate) fn csi(bytes: &[u8]) -> Option<(bool, &[u8])> = bytes.strip_prefix(b"\x1b[").map(|tail| (false, tail)).or_else(|| bytes.strip_prefix(&[0x9b]).map(|tail| (true, tail))));
-#[cfg(windows)]
+// v4: the status descriptor carries a mandatory geometry pair on every
+// platform, so the size rule is portable wire logic, not a Windows detail.
 wire_rules!(pure pub(crate) fn valid_size(size: (u16, u16)) -> bool = size.0 != 0 && size.1 != 0 && size.0 <= i16::MAX as u16 && size.1 <= i16::MAX as u16 && u32::from(size.0) * u32::from(size.1) <= 2_000_000);
 fn csi_body<'a>(bytes: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
     csi(bytes)?.1.strip_prefix(prefix)?.strip_suffix(suffix)

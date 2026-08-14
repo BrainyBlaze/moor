@@ -2,7 +2,7 @@
 
 **Companion artefact to [moor-spec.md](./moor-spec.md).** §10.2 of that document fixes what this schema must satisfy; this file fixes the shapes. Where the two disagree the specification wins and this file is a defect.
 
-**Version:** `wire-schema-3`. This is the one-time pre-implementation amendment authorised before any conforming implementation shipped: the schema label and controller version byte remain `03`, and the published document digest identifies this amended dialect. No mixed old/new dialect is supported. Every later frozen-layout change requires a version increment rather than another in-place edit. Semantic-producer frames use their separately versioned `MOOS` header (§14). Integer layouts are portable, while native paths are raw bytes on POSIX and canonical WTF-8 on Windows. This revision freezes the Windows marker (§12), the portable event/log/lifecycle commit record (§13), and private launch records (§15). It is referenced by the specification as *the accompanying vectors* (§0.2).
+**Version:** `wire-schema-4`. Revision 4 increments the controller version byte to `04` because it changes frozen layouts: the status descriptor gains a mandatory geometry pair, the superseded event layout `01` is refused, and the reference tool's legacy command grammar is gone. There is no `03` decoder — a v3 peer is refused as an unknown version, which is precisely what a version increment buys over another in-place amendment. The schema label and controller version byte are `04`, and the published document digest identifies this amended dialect. No mixed old/new dialect is supported. Every later frozen-layout change requires a version increment rather than another in-place edit. Semantic-producer frames use their separately versioned `MOOS` header (§14). Integer layouts are portable, while native paths are raw bytes on POSIX and canonical WTF-8 on Windows. This revision freezes the Windows marker (§12), the portable event/log/lifecycle commit record (§13), and private launch records (§15). It is referenced by the specification as *the accompanying vectors* (§0.2).
 
 **Integer encoding:** all multi-byte integers are unsigned, **little-endian**, of the stated width. There is no variable-length encoding anywhere.
 
@@ -161,6 +161,8 @@ Carried by `ATTACH_ACK` and `STATUS_REPLY` (OB-39).
 | 4 | child process identifier | OB-35 |
 | 4 | **child containment-set token** — process-group identifier on Linux/macOS; holder-minted nonzero token unique within the holder incarnation on Windows, never a job-object id | OB-35 |
 | 16 | **child birth token** — an opaque value derived at child creation, not reused when a process identifier is | OB-35 |
+| 2 | **terminal columns** — the holder's stored geometry, mandatory and nonzero | §4 |
+| 2 | **terminal rows** — the holder's stored geometry, mandatory and nonzero | §4 |
 | 8 | retained history, first output record sequence present; zero iff empty | — |
 | 8 | retained history, last output record sequence present, inclusive; zero iff empty | — |
 | 8 | retained history, first byte offset still present | — |
@@ -176,6 +178,8 @@ Carried by `ATTACH_ACK` and `STATUS_REPLY` (OB-39).
 | 8 | retained log exclusive end coordinate; zero when logging is disabled | specification §7.3 |
 
 **Both clock fields are present, always.** The wall clock is for display; age is computed from the monotonic value, and only when the boot identity matches the consumer's own — otherwise age is reported as unknown rather than wrong (OB-31). This is the resolution of "monotonic basis *or* boot identity": it is both, and the boot identity is what makes the monotonic value comparable.
+
+The geometry pair is the holder's own stored size, the same value a `RESIZE` updates, and it is present from child birth onward: an interactive creation takes the viewer's size and a headless one is assigned 24x80, so there is no "unknown" state and no zero encoding. It is written after the child exists and before any replay, updated only after a native resize actually succeeds, and validated against the §4 bounds — a descriptor whose pair is zero, out of range, or over the area cap is malformed. Columns precede rows, matching `RESIZE`. This is the authoritative answer to "what size is this session", so no consumer needs to keep a second copy.
 
 Linux/WSL carries the 16 parsed UUID bytes from `/proc/sys/kernel/random/boot_id`; macOS carries little-endian `kern.boottime` seconds in bytes 0–7, microseconds in bytes 8–11 and ASCII `MAC1` in bytes 12–15; Windows carries documented WMI `LastBootUpTime` converted to UTC FILETIME ticks in little-endian bytes 0–7 with bytes 8–15 zero. Sixteen zero bytes mean unavailable and never compare equal. The matching monotonic clocks and failure rules are frozen in specification §12.6. The active event fields are copied from the same validated layout-`02` commit record a reader would select, not from uncommitted writer state. Layout `00` uses empty event identity, slot `FF`, and zero commit index/length/hash. Disabled logging clears health bit 0 and zeros all four log fields; before child exit a successfully initialized lifecycle store sets health bit 1. Observer exactness is independent of tracked-mode exactness. A probe and an input-only connection never set viewer-presence bit 5.
 

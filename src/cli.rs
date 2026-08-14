@@ -240,9 +240,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, Error> {
                 options,
             })
         }
-        Some("push" | "p") => Ok(Action::Push(
-            fixed(rest, "push", 0, true)?.3.unwrap(),
-        )),
+        Some("push" | "p") => Ok(Action::Push(fixed(rest, "push", 0, true)?.3.unwrap())),
         Some("list" | "l" | "ls") => Ok(Action::List {
             all: flags(rest, "list", ALL)? & ALL != 0,
         }),
