@@ -200,6 +200,11 @@ fn frame_header(
     let fixed = message_size(profile, header.scope, header.kind)?;
     well_formed(header.more <= 1 && header.reserved == 0)?;
     well_formed(header.more == 0 || fixed.is_none())?;
+    // A fixed-size kind admits exactly its frozen length on the way IN as
+    // well as out: a WAKEUP with a smuggled payload byte, or a truncated
+    // lease frame, is malformed at the framing layer — not an ignored
+    // payload for some later decode stage to shrug at.
+    well_formed(fixed.is_none_or(|size| header.length as usize == size))?;
     let error = if next == u32::MAX {
         WireError::ResourceExhausted
     } else {

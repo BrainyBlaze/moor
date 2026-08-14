@@ -428,6 +428,84 @@ fn lease_result_before_terminal_state_is_refused() {
 }
 
 #[test]
+fn inbound_fixed_size_kinds_admit_exactly_their_frozen_length() {
+    // The profile's fixed-size table binds BOTH directions. Inbound, a
+    // fixed-size kind whose header length disagrees with the frozen size is
+    // malformed at the framing layer: a WAKEUP with a smuggled payload byte
+    // must die in the codec, not fall through some later decode stage as an
+    // ignored payload.
+    fn crc32c(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (index, slot) in table.iter_mut().enumerate() {
+            let mut crc = index as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82F6_3B78 } else { 0 };
+            }
+            *slot = crc;
+        }
+        let mut crc = 0xFFFF_FFFF_u32;
+        for byte in data {
+            crc = table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    // The controller profile's frozen fixed-size table, verbatim.
+    const FIXED: &[(u8, usize)] = &[
+        (10, 43),
+        (0x11, 0),
+        (0x15, 40),
+        (0x16, 24),
+        (0x17, 20),
+        (0x18, 20),
+        (0x19, 24),
+        (0x1a, 32),
+    ];
+    for &(kind, size) in FIXED {
+        // Positive control: the exact frozen length passes the framing layer
+        // (content validation is a later stage and not at issue here).
+        let mut sender = Codec::new(Profile::Controller);
+        let mut frame = Vec::new();
+        sender.encode(7, kind, &vec![0; size], &mut frame).unwrap();
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        receiver.feed(0, &frame, &mut messages).unwrap();
+        assert_eq!(messages.len(), 1, "kind {kind:#04x}: exact length");
+
+        // One smuggled byte: header length size+1, recomputed CRC. Malformed.
+        let mut oversized = frame.clone();
+        oversized[16..20].copy_from_slice(&(size as u32 + 1).to_le_bytes());
+        let checksum = crc32c(&oversized[..20]).to_le_bytes();
+        oversized[20..24].copy_from_slice(&checksum);
+        oversized.push(0xA5);
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        assert_eq!(
+            receiver.feed(0, &oversized, &mut messages),
+            Err(WireError::Malformed),
+            "kind {kind:#04x} accepted a smuggled byte"
+        );
+
+        // One byte short of the frozen size: equally malformed, never a
+        // partial frame the codec waits to complete.
+        if size > 0 {
+            let mut truncated = frame.clone();
+            truncated[16..20].copy_from_slice(&(size as u32 - 1).to_le_bytes());
+            let checksum = crc32c(&truncated[..20]).to_le_bytes();
+            truncated[20..24].copy_from_slice(&checksum);
+            truncated.truncate(24 + size - 1);
+            let mut receiver = Codec::new(Profile::Controller);
+            let mut messages = Vec::new();
+            assert_eq!(
+                receiver.feed(0, &truncated, &mut messages),
+                Err(WireError::Malformed),
+                "kind {kind:#04x} accepted a truncated frame"
+            );
+        }
+    }
+}
+
+#[test]
 fn input_receipts_round_trip_exact_identity_and_outcome() {
     let written = InputReceipt {
         epoch: 2,

@@ -2320,6 +2320,107 @@ fn failed_upgrade_lease_reply_send_rolls_back_the_standalone_fresh_grant() {
 }
 
 #[test]
+fn geometry_survives_a_failed_prefix_and_the_next_status_reports_it() {
+    // The honest exception to the attach transaction's unwinding. The native
+    // resize happens BEFORE the prefix is built; once it has succeeded, a
+    // later prefix failure rolls back the LEASE but may not guess the
+    // geometry back with a compensating resize — the native effect may
+    // already be visible. The frozen rule: the applied geometry stands, and
+    // the next status descriptor reports the geometry actually in force.
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GatedWriter {
+        inner: UnixStream,
+        gate: Arc<AtomicBool>,
+    }
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    // Calibration: the on-wire sizes of the NON_VT fresh-lease prefix.
+    let (mut calibrate, calibration_root) = fixture();
+    let mut probe = connect(&mut calibrate);
+    hello(&mut probe, &mut calibrate);
+    probe.send(7, 3, &[0, 0, 0, 0, 3]);
+    let status_len = 24 + probe.recv_kind(&mut calibrate, 4).payload.len();
+    let terminal_len = 24 + probe.recv_kind(&mut calibrate, 5).payload.len();
+    drop(calibrate);
+    fs::remove_dir_all(calibration_root).unwrap();
+
+    let (mut runtime, root) = fixture();
+    let gate = Arc::new(AtomicBool::new(true));
+    let (client, server) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let writer = GatedWriter {
+        inner: server.try_clone().unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let close = server.try_clone().unwrap();
+    runtime.accept(
+        Duplex::closing(server, writer, status_len + terminal_len, move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        }),
+        true,
+        None,
+        false,
+    );
+    let mut first = Peer {
+        stream: client,
+        codec: Codec::new(Profile::Controller),
+        queued: VecDeque::new(),
+    };
+    hello(&mut first, &mut runtime);
+    std::thread::sleep(Duration::from_millis(50));
+    gate.store(false, Ordering::Relaxed);
+    // Fresh-lease NON_VT attach carrying 100x30: the policy grant succeeds,
+    // the native resize succeeds, status and terminal enqueue — and the
+    // token frame hits the exhausted budget, failing the prefix.
+    first.send(7, 3, &[100, 0, 30, 0, 3]);
+    for _ in 0..50 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(first);
+
+    // The lease unwound (Granted at epoch 1 proves it) and the geometry
+    // stood: the successor's descriptor reports 100x30, not the 80x24 the
+    // session was born with.
+    let mut second = connect(&mut runtime);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[0, 0, 0, 0, 1]);
+    let descriptor = second.recv_kind(&mut runtime, 4);
+    // The fixture's status prefix is empty, so the mandatory geometry pair
+    // opens the payload: columns first, like RESIZE.
+    let columns = u16::from_le_bytes(descriptor.payload[0..2].try_into().unwrap());
+    let rows = u16::from_le_bytes(descriptor.payload[2..4].try_into().unwrap());
+    assert_eq!(
+        (columns, rows),
+        (100, 30),
+        "the next status must report the geometry actually in force"
+    );
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        (lease.outcome, lease.epoch),
+        (ResultOutcome::Granted, 1),
+        "the lease side of the failed attach must still unwind"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn failed_resume_lease_reply_send_restores_the_entire_prior_reservation() {
     // Resume ROTATES the token as it re-establishes ownership. When the
     // result frame carrying the rotated token cannot enqueue, the requester

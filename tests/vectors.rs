@@ -66,9 +66,7 @@ fn progressed_codec(
 }
 
 fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: u32) {
-    use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition,
-    };
+    use moor::session::{Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition};
 
     for epoch in 1..=count {
         let token = [epoch as u8; 16];
@@ -1134,9 +1132,7 @@ fn v16_input_decode(
 /// A Machine matching V8's frozen receipt: generation 7, incarnation 00..0F,
 /// with a freshly granted input lease at epoch 3 for controller connection 1.
 fn v16_input_machine() -> moor::session::Machine {
-    use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition,
-    };
+    use moor::session::{Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition};
     let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]);
     machine.register_controller(1);
     allocate_and_release(&mut machine, 1, 2);
