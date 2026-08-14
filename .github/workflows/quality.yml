@@ -47,6 +47,11 @@ jobs:
       - name: SHA256SUMS portability regression
         run: sh ci/sha256sums-portable.test.sh
 
+      # Runs the guard AND its own proof, so a guard that silently stopped
+      # rejecting anything fails the build instead of passing it.
+      - name: Internal working documents must not be tracked
+        run: sh ci/tracked-paths.test.sh
+
       - name: Run strict Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
