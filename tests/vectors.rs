@@ -3038,8 +3038,18 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     // event carrying zero bytes, and it is what sets the stream's terminal
     // state. An absent preamble leaves that state unset, so the two are
     // observably different — which is the whole point of the requirement.
+    // v4 status-first attach: TERMINAL_STATE arrives after the descriptor,
+    // so the stream models a viewer that has already consumed its status.
     let mut stream = ViewerStream {
         non_vt: true,
+        replay: Some(moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
         ..ViewerStream::default()
     };
     assert!(!stream.terminal, "the preamble has not been consumed yet");
@@ -3101,7 +3111,18 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     );
     // The same nonempty preamble is valid when NON_VT was not requested,
     // proving the refusal above is the NON_VT rule and not a framing accident.
-    let mut vt = ViewerStream::default();
+    // (Post-status, per the v4 status-first prefix.)
+    let mut vt = ViewerStream {
+        replay: Some(moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
+        ..ViewerStream::default()
+    };
     assert_eq!(
         decode_viewer(&mut vt, &nonempty_message, (b"".as_slice(), 7, [9; 16])),
         Ok(Some(ViewerEvent::Terminal(b"hi"))),

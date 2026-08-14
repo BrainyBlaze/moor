@@ -3143,7 +3143,7 @@ mod native {
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
         runtime.set_geometry(geometry.0, geometry.1);
         let status = runtime.drive(|_, _| None, || None)?.unwrap_or(observed);
-        let (exit, durable) = runtime.finish_exit(&running, status, None);
+        let (exit, durable) = runtime.finish_exit(&running, status, runtime.termination_method());
         require(durable, "prepublication child exit was not durable")?;
         crate::return_if!(!report, Ok(exit));
         eprintln!(

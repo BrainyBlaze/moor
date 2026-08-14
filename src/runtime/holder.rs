@@ -48,6 +48,27 @@ impl<N: Native> Runtime<N> {
                         self.disconnect(id);
                         continue;
                     }
+                    // v4: the requested geometry is applied FIRST and fails
+                    // the attach closed. A viewer whose size the platform
+                    // refused must not be attached under a descriptor that
+                    // would claim a size the pty does not have.
+                    if let Some((rows, columns)) = resize {
+                        if !self.resize(rows, columns, false) {
+                            self.disconnect(id);
+                            continue;
+                        }
+                        // ATTACH has no redraw bit; winch is its matching RESIZE.
+                        self.redraw = Some((id, rows, columns));
+                    }
+                    // v4 status-first: ATTACH_ACK opens the prefix, so the
+                    // viewer learns the authoritative geometry and replay
+                    // window before a single terminal byte.
+                    if !self.send_status(id, true, snapshot, deadline, clock) {
+                        continue;
+                    }
+                    if let Some(peer) = self.peers.get_mut(&id) {
+                        peer.deadline = 0;
+                    }
                     let mut state = if non_vt {
                         Vec::new()
                     } else {
@@ -55,25 +76,11 @@ impl<N: Native> Runtime<N> {
                     };
                     let size = (state.len() as u16).to_le_bytes();
                     state.splice(..0, size);
-                    if clock() >= deadline {
-                        self.disconnect(id);
-                        continue;
-                    }
                     if !self.send(id, 5, &state) {
                         continue;
                     }
-                    if let Some((rows, columns)) = resize {
-                        self.resize(rows, columns, false);
-                        // ATTACH has no redraw bit; winch is its matching RESIZE.
-                        self.redraw = Some((id, rows, columns));
-                    }
-                    if self.send_status(id, true, snapshot, deadline, clock) {
-                        if let Some(peer) = self.peers.get_mut(&id) {
-                            peer.deadline = 0;
-                        }
-                        if let Some(result) = result {
-                            self.reply(id, Reply::Lease(result));
-                        }
+                    if let Some(result) = result {
+                        self.reply(id, Reply::Lease(result));
                     }
                 }
                 PolicyEffect::Resize(id, rows, columns) => {
@@ -178,19 +185,21 @@ impl<N: Native> Runtime<N> {
     /// so it may only adopt a geometry the platform actually applied: adopting a
     /// failed resize makes the next preamble claim a default region that is not
     /// the child's (§6 of the schema, §5.2).
-    fn resize(&mut self, rows: u16, columns: u16, redraw: bool) {
+    fn resize(&mut self, rows: u16, columns: u16, redraw: bool) -> bool {
         if !redraw && self.geometry == (rows, columns) {
-            return;
+            return true;
         }
         let applied = if redraw {
             self.native.redraw(rows, columns)
         } else {
             self.native.resize(rows, columns)
         };
-        if applied.is_ok() {
+        let applied = applied.is_ok();
+        if applied {
             self.geometry = (rows, columns);
             self.scanner.set_rows(rows);
         }
+        applied
     }
 
     fn reply(&mut self, id: ConnId, reply: Reply) {
@@ -398,11 +407,21 @@ impl<N: Native> Runtime<N> {
         status: NativeExit,
         termination: Option<bool>,
     ) -> (i32, bool) {
-        let method = termination.map(|forced| if forced { "forced" } else { "graceful" });
-        let ended = method.map_or("exited", |_| "terminated");
+        // v4: the exit MECHANISM and the holder's termination INTENT are
+        // orthogonal, and both are mandatory on every closed record. `none`
+        // states the holder had no termination state — it never claims who
+        // outside the holder caused a signal. The old Windows-only
+        // `terminated` ending folded the two axes into one branch and left
+        // a POSIX wire terminate byte-identical to an external SIGTERM;
+        // that asymmetry is exactly what this revision removes.
+        let method = match termination {
+            None => "none",
+            Some(false) => "graceful",
+            Some(true) => "forced",
+        };
         let (exit, outcome) = match status {
-            NativeExit::Code(code) => (code as i32, (ended, "code", u64::from(code), method)),
-            NativeExit::Signal(signal) => (1, ("signalled", "signal", u64::from(signal), None)),
+            NativeExit::Code(code) => (code as i32, ("exited", "code", u64::from(code), method)),
+            NativeExit::Signal(signal) => (1, ("signalled", "signal", u64::from(signal), method)),
         };
         let ts = now();
         let records = exit_records(running, (ts, now()), self.output_end(), outcome);
@@ -488,7 +507,8 @@ impl<N: Native> Runtime<N> {
         self.tick(monotonic());
     }
 
-    #[cfg(windows)]
+    // v4: every platform reports the holder's termination intent in its
+    // closed record, so the accessor is portable, not a Windows detail.
     pub(crate) fn termination_method(&self) -> Option<bool> {
         self.machine.termination_forced()
     }
@@ -1043,10 +1063,15 @@ impl<N: Native> Runtime<N> {
         // and nonzero — the pair exists from child birth (headless creation
         // assigns 24x80) and updates only after a native resize succeeds, so
         // there is no "unknown" state to encode. Columns first, like RESIZE.
+        // The same pair rides on the tail struct below, whose encode()
+        // validates it with the same §4 bound the reader applies — the
+        // producer cannot emit what a consumer would refuse.
         payload.extend_from_slice(&self.geometry.1.to_le_bytes());
         payload.extend_from_slice(&self.geometry.0.to_le_bytes());
         payload.extend(
             StatusTail {
+                columns: self.geometry.1,
+                rows: self.geometry.0,
                 replay,
                 owns_lease: policy.owns_lease,
                 viewers: policy.viewers,

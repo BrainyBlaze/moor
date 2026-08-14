@@ -126,7 +126,11 @@ fn output_events_clear_and_lifecycle_use_bounded_worker_lanes() {
             &[event(
                 "exit",
                 20,
-                &[("ended", Json::String("exited")), ("code", Json::Number(7))],
+                &[
+                    ("ended", Json::String("exited")),
+                    ("code", Json::Number(7)),
+                    ("method", Json::String("none")),
+                ],
             )],
         )
         .unwrap();
@@ -173,7 +177,13 @@ fn output_events_clear_and_lifecycle_use_bounded_worker_lanes() {
 
     storage
         .lifecycle(
-            lifecycle_exit(&running, 20, 6, "\"ended\":\"exited\",\"code\":0").into_bytes(),
+            lifecycle_exit(
+                &running,
+                20,
+                6,
+                "\"ended\":\"exited\",\"code\":0,\"method\":\"none\"",
+            )
+            .into_bytes(),
             6,
         )
         .unwrap();
@@ -700,7 +710,13 @@ fn shutdown_stages_lifecycle_before_one_ordered_final_event_transaction() {
     );
     storage
         .lifecycle(
-            lifecycle_exit(&running, 20, 7, "\"ended\":\"exited\",\"code\":0").into_bytes(),
+            lifecycle_exit(
+                &running,
+                20,
+                7,
+                "\"ended\":\"exited\",\"code\":0,\"method\":\"none\"",
+            )
+            .into_bytes(),
             7,
         )
         .unwrap();
@@ -729,7 +745,11 @@ fn shutdown_stages_lifecycle_before_one_ordered_final_event_transaction() {
     let exit = event(
         "exit",
         20,
-        &[("ended", Json::String("exited")), ("code", Json::Number(0))],
+        &[
+            ("ended", Json::String("exited")),
+            ("code", Json::Number(0)),
+            ("method", Json::String("none")),
+        ],
     );
     storage
         .commit(Purpose::Final, &[source(b"a", 1), source(b"b", 2), exit])

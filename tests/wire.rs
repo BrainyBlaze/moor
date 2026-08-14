@@ -41,7 +41,20 @@ fn progressed_codec(profile: Profile, next_in: u32, next_out: u32) -> Codec {
 
 #[test]
 fn viewer_decoder_types_borrowed_stream_records_and_rejects_bad_boundaries() {
-    let mut stream = ViewerStream::default();
+    let mut stream = ViewerStream {
+        // v4 status-first: terminal bytes are legal only after the
+        // descriptor, so a terminal-typing fixture models a post-status
+        // stream explicitly.
+        replay: Some(ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
+        ..ViewerStream::default()
+    };
     let terminal = Message {
         scope: 7,
         kind: 5,
@@ -71,9 +84,10 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         kind: 5,
         payload: [0, 0].as_slice().into(),
     };
-    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 0,
             last: 0,
@@ -105,6 +119,8 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &ack, expected), Ok(None));
+    // v4 status-first: the terminal preamble follows the descriptor.
+    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     for (sequence, offset, bytes) in [(1_u64, 0_u64, b"a".as_slice()), (2, 1, b"bc".as_slice())] {
         let mut payload = Vec::from(sequence.to_le_bytes());
@@ -147,11 +163,12 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         kind: 5,
         payload: [0, 0].as_slice().into(),
     };
-    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let mut payload = status_prefix();
     payload.extend(
         StatusTail {
+            columns: 80,
+            rows: 24,
             replay: ReplayDescriptor {
                 first: 1,
                 last: 3,
@@ -184,6 +201,8 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &status, expected), Ok(None));
+    // v4 status-first: the terminal preamble follows the descriptor.
+    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let live_payload = [&4_u64.to_le_bytes()[..], &3_u64.to_le_bytes(), b"x"].concat();
     let live = Message {
@@ -392,6 +411,8 @@ fn termination_results_encode_all_five_outcomes_and_reject_reserved_shapes() {
 fn status_tail_round_trips_replay_and_health_as_one_shape() {
     let mut payload = status_prefix();
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 2,
             last: 3,
@@ -472,6 +493,8 @@ fn status_rejects_the_superseded_event_layout_nobody_emits() {
     payload.extend_from_slice(&24u16.to_le_bytes());
     payload.extend_from_slice(
         &StatusTail {
+            columns: 80,
+            rows: 24,
             replay: ReplayDescriptor {
                 first: 0,
                 last: 0,
@@ -862,6 +885,8 @@ fn configured_log_keeps_its_frontier_when_the_lane_is_unwritable() {
         retained_end: 140,
     };
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 0,
             last: 0,

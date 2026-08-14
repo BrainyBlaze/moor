@@ -445,10 +445,14 @@ pub fn decode_viewer<'a>(
             let consistent = stream.next.is_none_or(|(sequence, offset)| if replay.first == 0 { offset == replay.end } else {
                 replay.first <= sequence && sequence <= replay.last.saturating_add(1) && (sequence != replay.first || offset == replay.start) && (sequence != replay.last.saturating_add(1) || offset == replay.end)
             });
-            well_formed(stream.replay.is_none() && stream.received.is_none() && stream.terminal && consistent)?;
+            // v4 status-first attach: the descriptor is the FIRST item of the
+            // prefix, so the viewer knows the authoritative geometry and
+            // replay window before any terminal bytes arrive. A descriptor
+            // after terminal-state is the retired v3 order and is malformed.
+            well_formed(stream.replay.is_none() && stream.received.is_none() && !stream.terminal && consistent)?;
             if stream.next.is_none() && replay.first <= 1 { stream.next = Some((1, if replay.first == 0 { replay.end } else { replay.start })); }
             stream.received = Some(if replay.first == 0 { (1, replay.end) } else { (replay.first, replay.start) }); stream.replay = Some(replay); None },
-        5 => { let length = input.u16()? as usize; let bytes = input.rest(); well_formed(!stream.terminal && stream.replay.is_none() && bytes.len() == length && length <= 4096 && (!stream.non_vt || bytes.is_empty()))?; stream.terminal = true; Some(Terminal(bytes)) },
+        5 => { let length = input.u16()? as usize; let bytes = input.rest(); well_formed(!stream.terminal && stream.replay.is_some() && bytes.len() == length && length <= 4096 && (!stream.non_vt || bytes.is_empty()))?; stream.terminal = true; Some(Terminal(bytes)) },
         6 => { let (sequence, offset) = (input.u64()?, input.u64()?); let bytes = input.rest(); well_formed((1..=65536).contains(&bytes.len()))?;
             let end = offset.checked_add(bytes.len() as u64).ok_or(WireError::Malformed)?;
             let replay = stream.replay.ok_or(WireError::Malformed)?;
@@ -554,31 +558,31 @@ impl StatusExtension {
 }
 
 schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; first: u64, last: u64, start: u64, end: u64, complete: bool, modes_exact: bool);
-schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
+schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; columns: u16, rows: u16, replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
 schema!(struct TailRecord fields; first: u64, last: u64, start: u64, end: u64, flags: u8, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: [u8; 29]);
 binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malformed; fixed {} fields { first: U64<LE>, last: U64<LE>, start: U64<LE>, end: U64<LE>, flags: u8, lease_epoch: U32<LE>, semantic_flags: u8, semantic_pending: U16<LE>, extension: [u8; 29] });
 
 impl StatusTail {
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
         let range = replay.first == 0 && replay.last == 0 && replay.start == replay.end || replay.first != 0 && replay.first <= replay.last && replay.start < replay.end;
-        range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0)
+        range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0) && valid_size((this.rows, this.columns))
     });
     wire_rules!(method pub fn encode(this: &Self) -> Result<[u8; 69], WireError> = { well_formed(this.valid())?;
         let flags = u8::from(this.replay.complete) | u8::from(this.replay.modes_exact) << 1 | u8::from(this.owns_lease) << 4 | u8::from(this.viewers) << 5 | u8::from(this.running) << 6 | u8::from(this.event_writable) << 7;
         Ok(wire_rules!(value TailRecord; first = this.replay.first; last = this.replay.last; start = this.replay.start; end = this.replay.end; flags = flags; lease_epoch = this.lease_epoch; semantic_flags = this.semantic_flags; semantic_pending = this.semantic_pending; extension = this.extension.encode(this.extension.logging())?).encode_raw())
     });
     wire_rules!(pure fn decode_with(payload: &[u8], expected: Option<(&[u8], u32, [u8; 16])>) -> Result<Self, WireError> = {
-        let mut input = Reader(payload); validate_status_base(&mut input, expected)?;
+        let mut input = Reader(payload); let (columns, rows) = validate_status_base(&mut input, expected)?;
         let record = TailRecord::decode_raw(input.rest())?; validate_status_flags(record.flags)?;
         let replay = wire_rules!(value ReplayDescriptor; first = record.first; last = record.last; start = record.start; end = record.end; complete = record.flags & 1 != 0; modes_exact = record.flags & 2 != 0);
         let extension = wire_rules!(checked StatusExtension::decode_raw(&record.extension)?; |value: &StatusExtension| value.valid(value.logging()))?;
-        let value = wire_rules!(value Self; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
+        let value = wire_rules!(value Self; columns = columns; rows = rows; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
         validated(value.valid(), value)
     });
     wire_rules!(pure pub fn decode_for(payload: &[u8], identity: &[u8], generation: u32, incarnation: [u8; 16]) -> Result<Self, WireError> = Self::decode_with(payload, Some((identity, generation, incarnation))));
 }
 
-wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(), WireError> = {
+wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(u16, u16), WireError> = {
     wire_rules!(read input; identity = input.wide(); generation = input.positive(); incarnation = input.identifier::<16>(); layout = input.byte(); event_identity = input.wide(); slot = input.byte(); commit = input.u64(); body_length = input.u64(); body_hash = input.exact::<32>()); input.exact::<32>()?;
     wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>(); columns = input.u16(); rows = input.u16());
     let identity_ok = matches!(identity, [1, b'/', ..]) || identity.len() == 25 && identity.first() == Some(&2);
@@ -586,7 +590,8 @@ wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Optio
     // Layout `01` is the superseded legacy layout: never emitted by any
     // holder (§5 — both platforms report `2`, disabled logging reports `0`),
     // so a descriptor carrying it is a forgery or corruption, not history.
-    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))
+    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))?;
+    Ok((columns, rows))
 });
 
 schema!(struct pub Heartbeat derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; monotonic_ms: u64, flags: u8);

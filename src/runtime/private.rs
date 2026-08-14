@@ -563,7 +563,7 @@ pub fn lifecycle_running(
     let (wall, mono, boot) = (start.0, start.1, Base64Display::new(&start.2, &STANDARD));
     let (encoding, event, instrument) = (paths.0, path(paths.1), path(paths.2));
     format!(
-        "{{\"v\":1,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"{session}\",\"generation\":{allocated},\"wire_generation\":{wire},\"incarnation\":\"{incarnation}\",\"start_wall_ms\":\"{wall}\",\"start_mono_ms\":\"{mono}\",\"boot_id\":\"{boot}\",\"path_encoding\":\"{encoding}\",\"event_path\":{event},\"instrument_path\":{instrument}}}\n"
+        "{{\"v\":2,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"{session}\",\"generation\":{allocated},\"wire_generation\":{wire},\"incarnation\":\"{incarnation}\",\"start_wall_ms\":\"{wall}\",\"start_mono_ms\":\"{mono}\",\"boot_id\":\"{boot}\",\"path_encoding\":\"{encoding}\",\"event_path\":{event},\"instrument_path\":{instrument}}}\n"
     )
 }
 
@@ -746,22 +746,17 @@ pub fn exit_records(
     running: &str,
     ts: (u64, u64),
     end: u64,
-    outcome: (&str, &str, u64, Option<&str>),
+    outcome: (&str, &str, u64, &str),
 ) -> (Event, Vec<u8>) {
     let (ended, key, value, method) = outcome;
-    let include_method = method.is_some();
-    let method = method.unwrap_or_default();
     let fields = [
         ("ended", Json::String(ended)),
         (key, Json::Number(value)),
         ("method", Json::String(method)),
     ];
-    let mut suffix = format!("\"ended\":\"{ended}\",\"{key}\":{value}");
-    if include_method {
-        write!(suffix, ",\"method\":\"{method}\"").unwrap();
-    }
+    let suffix = format!("\"ended\":\"{ended}\",\"{key}\":{value},\"method\":\"{method}\"");
     (
-        events::event("exit", ts.0, &fields[..2 + usize::from(include_method)]),
+        events::event("exit", ts.0, &fields),
         lifecycle_exit(running, ts.1, end, &suffix).into_bytes(),
     )
 }

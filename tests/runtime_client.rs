@@ -525,10 +525,12 @@ fn attach_fences_gap_duplicates_offsets_and_empty_output() {
     codec
         .encode(7, 2, &ack(7, [9; 16], &identity), &mut inbound)
         .unwrap();
-    codec.encode(7, 5, &[1, 0, b'P'], &mut inbound).unwrap();
+    // v4 status-first attach prefix: the descriptor opens the exchange and
+    // the terminal preamble follows it.
     codec
         .encode(7, 4, &status(2, 3, 4, 8, 2), &mut inbound)
         .unwrap();
+    codec.encode(7, 5, &[1, 0, b'P'], &mut inbound).unwrap();
     let gap = [&1u64.to_le_bytes()[..], &1u64.to_le_bytes()].concat();
     codec.encode(7, 8, &gap, &mut inbound).unwrap();
     let first = [&2u64.to_le_bytes()[..], &4u64.to_le_bytes(), b"aa"].concat();

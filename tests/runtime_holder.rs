@@ -375,8 +375,8 @@ fn live_holder_ancestry_refuses_attach_before_any_attach_state_change() {
     let mut unrelated = connect_as_with(&mut runtime, Profile::Controller, true, Some(42));
     hello(&mut unrelated, &mut runtime);
     unrelated.send(7, 3, &[80, 0, 24, 0, 1]);
-    assert_eq!(unrelated.recv(&mut runtime).kind, 5);
     assert_eq!(unrelated.recv(&mut runtime).kind, 4);
+    assert_eq!(unrelated.recv(&mut runtime).kind, 5);
     let lease = LeaseResult::decode_wire(&unrelated.recv_kind(&mut runtime, 0x16).payload).unwrap();
     assert_eq!(lease.outcome, ResultOutcome::Granted);
     assert_eq!(unrelated.recv(&mut runtime).kind, 6);
@@ -656,8 +656,8 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
         ]
         .concat(),
     );
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     peer.send(
         7,
@@ -717,8 +717,8 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
                 3,
                 &[0u16.to_le_bytes().as_slice(), &0u16.to_le_bytes(), &[1]].concat(),
             );
-            peer.recv_kind(&mut runtime, 5);
             peer.recv_kind(&mut runtime, 4);
+            peer.recv_kind(&mut runtime, 5);
             let lease =
                 LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
             peer.send(
@@ -807,8 +807,8 @@ fn invalid_query_reply_does_not_refresh_the_lease() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     let granted = monotonic();
     runtime.output(b"\x1b[?2004$p".to_vec());
@@ -848,8 +848,8 @@ fn split_queries_are_delegated_before_exact_raw_release_and_quiet_candidates_exp
         let mut peer = connect(&mut runtime);
         hello(&mut peer, &mut runtime);
         peer.send(7, 3, &[0, 0, 0, 0, 1]);
-        peer.recv_kind(&mut runtime, 5);
         peer.recv_kind(&mut runtime, 4);
+        peer.recv_kind(&mut runtime, 5);
         peer.recv_kind(&mut runtime, 0x16);
         while peer.try_recv(&mut runtime).is_some() {}
         runtime.output(query[..split].to_vec());
@@ -875,8 +875,8 @@ fn split_queries_are_delegated_before_exact_raw_release_and_quiet_candidates_exp
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0; 5]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     while peer.try_recv(&mut runtime).is_some() {}
     runtime.output(b"\x1b[".to_vec());
     assert!(peer.try_recv(&mut runtime).is_none());
@@ -981,8 +981,8 @@ fn a_quiet_session_never_wakes_a_controller() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     for _ in 0..8 {
         runtime.poll();
     }
@@ -1132,8 +1132,8 @@ fn viewer_resume_cannot_restart_the_whole_attach_exchange_deadline() {
     let mut owner = connect(&mut runtime);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[0, 0, 0, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
     owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
     drop(owner);
@@ -1250,8 +1250,8 @@ fn expired_viewer_ownership_is_removed_from_status_queries_and_resize() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let granted = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     runtime.tick(monotonic().saturating_add(10_001));
     peer.send(7, 13, &[]);
@@ -1291,9 +1291,9 @@ fn non_vt_attach_omits_terminal_bytes_without_erasing_tracked_exactness() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 3]);
-    assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
     let status = peer.recv_kind(&mut runtime, 4);
     assert_eq!(status.payload[36] & 2, 2);
+    assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1423,8 +1423,8 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
     let mut peer = connect_as(&mut runtime, Profile::Controller);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0; 5]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     while peer.try_recv(&mut runtime).is_some() {}
     assert_eq!(
         runtime.drive(|_, _| None, || None).unwrap(),
@@ -1719,7 +1719,7 @@ fn v25_status_emitter_patches_exact_selected_commit_region() {
 }
 
 #[test]
-fn failed_native_resize_does_not_change_the_scanner_row_model() {
+fn failed_native_resize_refuses_the_attach_and_keeps_the_row_model() {
     struct FailResize;
     impl Native for FailResize {
         fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
@@ -1768,9 +1768,29 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
     let mut owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[80, 0, 50, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
-    owner.recv_kind(&mut runtime, 4);
-    owner.recv_kind(&mut runtime, 0x16);
+    // v4: the platform refused the requested 50-row size, so the attach
+    // fails CLOSED — no descriptor claiming a size the pty does not have,
+    // no terminal bytes, no lease. The holder closes the link instead.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let refused = loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match owner.stream.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(_) => break false,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break true,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(
+        refused,
+        "a failed attach resize must close the link, not attach"
+    );
 
     // Runtime starts at 24 rows. Because the requested 50-row resize failed,
     // 1..24 is still the full/default region and must serialize as CSI r.
@@ -1857,8 +1877,8 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     let mut owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[80, 0, 24, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
     owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     assert!(calls.lock().unwrap().is_empty(), "redraw none resized");
 
@@ -1893,8 +1913,8 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     let mut redraw_owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut redraw_owner, &mut runtime);
     redraw_owner.send(7, 3, &[80, 0, 24, 0, 1]);
-    redraw_owner.recv_kind(&mut runtime, 5);
     redraw_owner.recv_kind(&mut runtime, 4);
+    redraw_owner.recv_kind(&mut runtime, 5);
     let lease =
         LeaseResult::decode_wire(&redraw_owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     let resize = [

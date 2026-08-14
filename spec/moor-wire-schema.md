@@ -87,7 +87,7 @@ Tag `02` therefore has total content length 25. An unknown tag or a wrong fixed 
 | `0E` | `STATUS_REPLY` | holder → controller | the status descriptor, §5 |
 | `0F` | `TERMINATE` | controller → holder | §9 |
 | `10` | `TERMINATE_RESULT` | holder → controller | outcome, containment result, termination method, then length-prefixed diagnostic (§9.2) |
-| `11` | `WAKEUP` | holder → controller | empty — the event stream advanced (OB-30) |
+| `11` | `WAKEUP` | holder → controller | empty — the event stream advanced (OB-30). Legal at EVERY post-`HELLO_ACK` phase, including between `HELLO_ACK` and `ATTACH_ACK`: a durable advance does not wait for the controller to finish attaching, and a controller MUST accept it there rather than fault the handshake |
 | `12` | `HEARTBEAT` | holder → controller | §10 |
 | `13` | `ERROR` | either | 2 bytes code (§11), then a nonempty length-prefixed diagnostic |
 | `14` | `QUERY` | holder → controller | u64 correlation id, u32 lease epoch, 1 byte class (§8), then plain length-prefixed exact query bytes |
@@ -189,7 +189,7 @@ Linux/WSL carries the 16 parsed UUID bytes from `/proc/sys/kernel/random/boot_id
 
 `TERMINAL_STATE` carries a plain length-prefixed run of raw bytes that a viewer writes into its own emulator. It is sent **exactly once per attaching connection, before `ATTACH_ACK`**, and **carries the connection's own generation** like every other frame — the header rule of §1 admits no exception. Its connection-locality is expressed by the fact that it carries **no record sequence and no byte offset**, so it cannot advance any output cursor and is never logged (§10.2.6). A zero-length run is legal in exactly two branches: tracked-mode exactness is false, in which case the following ACK clears its mode-exact bit; or the attach set `NON_VT`, in which case the ACK retains the actual exactness bit but no terminal controls are sent. A probe or input-only connection receives no preamble.
 
-Attach output order is exact: `TERMINAL_STATE`; `ATTACH_ACK`; `LEASE_RESULT` when the attach requested a fresh viewer lease; the frozen `GAP`/`OUTPUT` replay baseline; then live output. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
+Attach output order is exact and is revision 4's status-first sequence: `ATTACH_ACK`; `TERMINAL_STATE`; `LEASE_RESULT` when the attach requested a fresh viewer lease; the frozen `GAP`/`OUTPUT` replay baseline; then live output. The descriptor opens the prefix so the viewer holds the authoritative geometry and replay window before a single terminal byte arrives; a decoder MUST refuse a descriptor after terminal state, which was the retired v3 order. The requested attach geometry is applied to the native pty BEFORE the descriptor is built, and a native refusal fails the attach closed — the holder closes the link rather than attach a viewer under a descriptor claiming a size the pty does not have. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
 
 **The tracked mode set is exactly twelve, and their canonical bytes are frozen.** All twelve are emitted on every attach, in the order below — see the note after the table for why never only the deviations.
 
@@ -565,7 +565,7 @@ No counter wraps. Event sequence/epoch/commit exhaustion uses the specification'
 
 The running lifecycle prefix is exactly one canonical JSON object plus LF with this closed key order: `v`, `type`, `phase`, `session`, `generation`, `wire_generation`, `incarnation`, `start_wall_ms`, `start_mono_ms`, `boot_id`, `path_encoding`, `event_path`, `instrument_path`. Values are respectively `1`, `"lifecycle"`, `"running"`, canonical padded-base64 tagged session identity, allocated u32 or JSON `null`, nonzero wire u32, padded-base64 16-byte incarnation, canonical decimal-string u64 wall/monotonic starts, padded-base64 16-byte boot identity, `"posix-bytes"` or `"windows-wtf8"`, and canonical padded base64 of the exact native event and immutable staged-instrument paths or JSON `null`. `instrument_path` never carries the caller's `-S` spelling.
 
-The exited replacement changes phase to `"exited"`, retains those common values, then appends `end_wall_ms`, `output_end`, `ended`, and its branch keys. The first two are canonical decimal-string u64. Closed outcome branches are POSIX normal `ended:"exited",code:<u8>`; POSIX signal `ended:"signalled",signal:<positive platform signal>` with no code; Windows external/normal `ended:"exited",code:<u32>`; or holder-caused Windows `ended:"terminated",code:<u32>,method:"graceful"|"forced"`. The foreground shell status is not serialized as the child outcome. The selected lifecycle coordinate equals `output_end` on exit.
+The exited replacement changes phase to `"exited"`, retains those common values, then appends `end_wall_ms`, `output_end`, `ended`, its branch key, and `method`. The first two are canonical decimal-string u64. Revision 4 makes the exit MECHANISM and the holder's termination INTENT two orthogonal, mandatory axes. `ended` names only the mechanism: POSIX normal `ended:"exited",code:<u8>`; POSIX signal `ended:"signalled",signal:<positive platform signal>` with no code; Windows `ended:"exited",code:<u32>`. `method:"none"|"graceful"|"forced"` separately states whether the holder was asked to end the child — `none` means the holder had no termination state, and it never claims who outside the holder caused a signal. This is exactly the distinction the retired Windows-only `ended:"terminated"` branch folded into one value while POSIX carried nothing, which made a holder-initiated wire terminate byte-identical to an external `SIGTERM` and cost a real investigation its answer. The lifecycle record's `v` is `2`; a validator accepts only the v2 shape — there is no dual validator. The foreground shell status is not serialized as the child outcome. The selected lifecycle coordinate equals `output_end` on exit.
 
 ## 14. Semantic producer wire — version 1
 
@@ -774,8 +774,8 @@ Byte-exact records an implementation must produce and accept. Every checksum is 
 **V1** — side-effect-free `HELLO`, exact generation 7, sequence 1; hello flags are reserved zero
 
 ```
-4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
-21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
+21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
 30 30 30 2F 62 75 69 6C 64
 ```
@@ -783,54 +783,54 @@ Byte-exact records an implementation must produce and accept. Every checksum is 
 **V2** — `OUTPUT`, record sequence 42, byte offset 4096, payload `hi`
 
 ```
-4D 4F 4F 52 03 06 00 00 07 00 00 00 09 00 00 00
-12 00 00 00 85 A9 11 DC 2A 00 00 00 00 00 00 00
+4D 4F 4F 52 04 06 00 00 07 00 00 00 09 00 00 00
+12 00 00 00 9D 65 ED 09 2A 00 00 00 00 00 00 00
 00 10 00 00 00 00 00 00 68 69
 ```
 
 **V3** — `ATTACH` with geometry 0×0 — *preserve both* (OB-19) — requesting the lease
 
 ```
-4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00
-05 00 00 00 35 5C 53 49 00 00 00 00 01
+4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
+05 00 00 00 2D 90 AF 9C 00 00 00 00 01
 ```
 
 **V4** — `RESIZE`, lease epoch 3, geometry 80×24 — payload is 8 bytes: epoch then geometry
 
 ```
-4D 4F 4F 52 03 0B 00 00 07 00 00 00 0B 00 00 00
-08 00 00 00 7E AE 34 20 03 00 00 00 50 00 18 00
+4D 4F 4F 52 04 0B 00 00 07 00 00 00 0B 00 00 00
+08 00 00 00 66 62 C8 F5 03 00 00 00 50 00 18 00
 ```
 
 **V5** — `RESIZE` with 80×0 — half-specified, MUST be refused with `HALF_SPECIFIED_GEOMETRY`
 
 ```
-4D 4F 4F 52 03 0B 00 00 07 00 00 00 0C 00 00 00
-08 00 00 00 7A AB 6D DA 03 00 00 00 50 00 00 00
+4D 4F 4F 52 04 0B 00 00 07 00 00 00 0C 00 00 00
+08 00 00 00 62 67 91 0F 03 00 00 00 50 00 00 00
 ```
 
 **V6** — any frame with generation 0 — MUST be refused; shown as `OUTPUT_ACK`
 
 ```
-4D 4F 4F 52 03 07 00 00 00 00 00 00 03 00 00 00
-08 00 00 00 DA 77 CE 5D 01 00 00 00 00 00 00 00
+4D 4F 4F 52 04 07 00 00 00 00 00 00 03 00 00 00
+08 00 00 00 C2 BB 32 88 01 00 00 00 00 00 00 00
 ```
 
 **V7** — a `MORE` run of two `INPUT` frames. The first carries lease epoch 3, request id 1 and flags `00`, then `AAAA`; the continuation carries `BB` and no metadata. They reassemble to one request whose data is `AAAABB`
 
 ```
-4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
-11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
-00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
-D3 42 42
+4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
+11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
+00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
+06 42 42
 ```
 
 **V8** — the `INPUT_RECEIPT` answering V7: lease epoch 3, request id 1, 6 bytes written, status `00`, result code zero. This is the receipt payload the holder caches
 
 ```
-4D 4F 4F 52 03 0A 00 00 07 00 00 00 0A 00 00 00
-2B 00 00 00 EA B3 81 BB 03 00 00 00 01 00 00 00
+4D 4F 4F 52 04 0A 00 00 07 00 00 00 0A 00 00 00
+2B 00 00 00 F2 7F 7D 6E 03 00 00 00 01 00 00 00
 00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
 00 00 00
@@ -839,24 +839,24 @@ D3 42 42
 **V9** — **a replay of V7** — same lease epoch 3, same request id 1, identical bytes. The holder MUST write nothing and return the cached V8 receipt payload in a newly sequenced frame (V18)
 
 ```
-4D 4F 4F 52 03 09 00 00 07 00 00 00 16 00 00 00
-13 00 00 00 BA FD 47 3C 03 00 00 00 01 00 00 00
+4D 4F 4F 52 04 09 00 00 07 00 00 00 16 00 00 00
+13 00 00 00 A2 31 BB E9 03 00 00 00 01 00 00 00
 00 00 00 00 00 41 41 41 41 42 42
 ```
 
 **V10** — **same request id, different bytes** — lease epoch 3, request id 1, payload `DIFFERENT`. MUST be refused with `BAD_SEQUENCE` and **nothing written**
 
 ```
-4D 4F 4F 52 03 09 00 00 07 00 00 00 17 00 00 00
-16 00 00 00 D6 1B 1C D3 03 00 00 00 01 00 00 00
+4D 4F 4F 52 04 09 00 00 07 00 00 00 17 00 00 00
+16 00 00 00 CE D7 E0 06 03 00 00 00 01 00 00 00
 00 00 00 00 00 44 49 46 46 45 52 45 4E 54
 ```
 
 **V11** — `ERROR` carrying `GENERATION_MISMATCH` (9)
 
 ```
-4D 4F 4F 52 03 13 00 00 07 00 00 00 0D 00 00 00
-1E 00 00 00 3F E0 B5 E8 09 00 1A 00 67 65 6E 65
+4D 4F 4F 52 04 13 00 00 07 00 00 00 0D 00 00 00
+1E 00 00 00 27 2C 49 3D 09 00 1A 00 67 65 6E 65
 72 61 74 69 6F 6E 20 33 20 69 73 20 73 75 70 65
 72 73 65 64 65 64
 ```
@@ -913,8 +913,8 @@ F8 D4 BF 7A D7 43 ED FB 28 95 8D 91
 **V16** — controller `INPUT` requiring a receipt from source `claude`, application id `20..2F`, data `hello`
 
 ```
-4D 4F 4F 52 03 09 00 00 07 00 00 00 1E 00 00 00
-2A 00 00 00 88 95 3C 6B 03 00 00 00 02 00 00 00
+4D 4F 4F 52 04 09 00 00 07 00 00 00 1E 00 00 00
+2A 00 00 00 90 59 C0 BE 03 00 00 00 02 00 00 00
 00 00 00 00 01 20 21 22 23 24 25 26 27 28 29 2A
 2B 2C 2D 2E 2F 06 00 63 6C 61 75 64 65 68 65 6C
 6C 6F
@@ -934,8 +934,8 @@ F8 D4 BF 7A D7 43 ED FB 28 95 8D 91
 **V18** — the replay response to V9. Its payload is byte-identical to V8, while its holder-to-controller frame sequence advances from 10 to 11
 
 ```
-4D 4F 4F 52 03 0A 00 00 07 00 00 00 0B 00 00 00
-2B 00 00 00 CD CE BD F2 03 00 00 00 01 00 00 00
+4D 4F 4F 52 04 0A 00 00 07 00 00 00 0B 00 00 00
+2B 00 00 00 D5 02 41 27 03 00 00 00 01 00 00 00
 00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
 00 00 00
@@ -1010,11 +1010,11 @@ Its SHA-256 is `d1621c3151336cab7c3305fb456c7ca0f88a252c43d480802a7f31a19226bf96
 {"v":2,"type":"header","ts":0,"session":"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==","generation":7,"epoch":0,"next_seq":0,"first_retained":0}
 ```
 
-Start wall/monotonic are `1/2`, boot identity is `03` repeated 16, working directory `/tmp`, PID `0x1234`, containment token `0x5678`, birth token `10..1F`, and retained output is empty at coordinate zero. Main flags are `E3` (complete, tracked exact, viewer present, child running, event writable), lease epoch is 3, semantic flags/count are zero, health flags are `0F`, and selected log epoch/index/range are `1/1/[0,0)`. The frame uses generation 7, sequence 1, and this exact 244-byte status payload:
+Start wall/monotonic are `1/2`, boot identity is `03` repeated 16, working directory `/tmp`, PID `0x1234`, containment token `0x5678`, birth token `10..1F`, geometry `80x24` (columns then rows, per the mandatory revision-4 pair), and retained output is empty at coordinate zero. Main flags are `E3` (complete, tracked exact, viewer present, child running, event writable), lease epoch is 3, semantic flags/count are zero, health flags are `0F`, and selected log epoch/index/range are `1/1/[0,0)`. The frame uses generation 7, sequence 1, and this exact 248-byte status payload:
 
 ```
-4D 4F 4F 52 03 0E 00 00 07 00 00 00 01 00 00 00
-F4 00 00 00 65 4E 0F 46 16 00 00 00 01 2F 74 6D
+4D 4F 4F 52 04 0E 00 00 07 00 00 00 01 00 00 00
+F8 00 00 00 68 D0 95 1E 16 00 00 00 01 2F 74 6D
 70 2F 2E 6D 6F 6F 72 2D 31 30 30 30 2F 62 75 69
 6C 64 07 00 00 00 00 01 02 03 04 05 06 07 08 09
 0A 0B 0C 0D 0E 0F 02 0B 00 00 00 2F 74 6D 70 2F
@@ -1025,32 +1025,32 @@ A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
 00 00 00 00 00 00 00 03 03 03 03 03 03 03 03 03
 03 03 03 03 03 03 03 04 00 00 00 2F 74 6D 70 34
 12 00 00 78 56 00 00 10 11 12 13 14 15 16 17 18
-19 1A 1B 1C 1D 1E 1F 00 00 00 00 00 00 00 00 00
+19 1A 1B 1C 1D 1E 1F 50 00 18 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 E3 03 00 00 00 00 00 00 0F
-01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 E3 03 00 00 00
+00 00 00 0F 01 00 00 00 01 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 **V26** — `NON_VT` attach and its required empty preamble. The attach preserves geometry and sets only flag bit 1. The preamble payload is the plain u16 zero length, not an absent frame; tracked exactness may remain set in the following ACK. These frames use their respective per-direction sequence 2:
 
 ```
-4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00
-05 00 00 00 35 5C 53 49 00 00 00 00 02
+4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
+05 00 00 00 2D 90 AF 9C 00 00 00 00 02
 
-4D 4F 4F 52 03 05 00 00 07 00 00 00 02 00 00 00
-02 00 00 00 08 9C 99 04 00 00
+4D 4F 4F 52 04 05 00 00 07 00 00 00 02 00 00 00
+02 00 00 00 10 50 65 D1 00 00
 ```
 
 **V27** — private-mode query/reply with correlation `0102030405060708`, lease epoch 3, echoed class `04`, and plain u16 byte lengths. The query is `CSI7 ?2004$p`; the accepted reply is `CSI7 ?2004;1$y`. Both directions use frame sequence 3:
 
 ```
-4D 4F 4F 52 03 14 00 00 07 00 00 00 03 00 00 00
-18 00 00 00 42 0B EA EE 08 07 06 05 04 03 02 01
+4D 4F 4F 52 04 14 00 00 07 00 00 00 03 00 00 00
+18 00 00 00 5A C7 16 3B 08 07 06 05 04 03 02 01
 03 00 00 00 04 09 00 1B 5B 3F 32 30 30 34 24 70
 
-4D 4F 4F 52 03 0C 00 00 07 00 00 00 03 00 00 00
-1A 00 00 00 EE BD 48 07 08 07 06 05 04 03 02 01
+4D 4F 4F 52 04 0C 00 00 07 00 00 00 03 00 00 00
+1A 00 00 00 F6 71 B4 D2 08 07 06 05 04 03 02 01
 03 00 00 00 04 0B 00 1B 5B 3F 32 30 30 34 3B 31
 24 79
 ```
@@ -1058,70 +1058,70 @@ A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
 **V28** — expanded `HEARTBEAT`, generation 7/sequence 4, monotonic value `0102030405060708`, with all five defined health bits set and reserved bits clear:
 
 ```
-4D 4F 4F 52 03 12 00 00 07 00 00 00 04 00 00 00
-09 00 00 00 34 6D 58 74 08 07 06 05 04 03 02 01
+4D 4F 4F 52 04 12 00 00 07 00 00 00 04 00 00 00
+09 00 00 00 2C A1 A4 A1 08 07 06 05 04 03 02 01
 1F
 ```
 
 **V29** — fresh viewer lease grant followed by explicit release. The fresh request carries operation/role zero and 36 zero freshness bytes; the grant allocates epoch 3 and token `00..0F`; release echoes that tuple; released result carries outcome `02`, epoch 3, and zero token. Controller sequences are 4 then 5; holder sequences are 5 then 6:
 
 ```
-4D 4F 4F 52 03 15 00 00 07 00 00 00 04 00 00 00
-28 00 00 00 F1 56 7C 4D 00 00 00 00 00 00 00 00
+4D 4F 4F 52 04 15 00 00 07 00 00 00 04 00 00 00
+28 00 00 00 E9 9A 80 98 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 16 00 00 07 00 00 00 05 00 00 00
-18 00 00 00 63 89 92 92 00 00 00 00 03 00 00 00
+4D 4F 4F 52 04 16 00 00 07 00 00 00 05 00 00 00
+18 00 00 00 7B 45 6E 47 00 00 00 00 03 00 00 00
 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
 
-4D 4F 4F 52 03 17 00 00 07 00 00 00 05 00 00 00
-14 00 00 00 77 26 7A 78 03 00 00 00 00 01 02 03
+4D 4F 4F 52 04 17 00 00 07 00 00 00 05 00 00 00
+14 00 00 00 6F EA 86 AD 03 00 00 00 00 01 02 03
 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
 
-4D 4F 4F 52 03 16 00 00 07 00 00 00 06 00 00 00
-18 00 00 00 0A 0E D6 49 02 00 00 00 03 00 00 00
+4D 4F 4F 52 04 16 00 00 07 00 00 00 06 00 00 00
+18 00 00 00 12 C2 2A 9C 02 00 00 00 03 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 **V30** — ordered clear request and every `LOG_CLEAR_RESULT` row. The request uses incarnation `00..0F`, observed index `P=5`, generation 7, controller sequence 6:
 
 ```
-4D 4F 4F 52 03 19 00 00 07 00 00 00 06 00 00 00
-18 00 00 00 E7 F8 D1 48 00 01 02 03 04 05 06 07
+4D 4F 4F 52 04 19 00 00 07 00 00 00 06 00 00 00
+18 00 00 00 FF 34 2D 9D 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 05 00 00 00 00 00 00 00
 ```
 
 The six independent result fixtures are, in order: cleared (`epoch=3,P=5,index=7,E=9`); already empty (`epoch=2,P=5,index=6,E=9`); disabled (`epoch=0,P=0,index=0,end=0`); stale status (`epoch=2,P=5,index=6,current-end=8`); unavailable (`P=5`, other numeric fields zero); corrupt (`P=5`, other numeric fields zero). Holder sequences are 7 through 12:
 
 ```
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 07 00 00 00
-20 00 00 00 93 44 7B 61 00 00 00 00 03 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 07 00 00 00
+20 00 00 00 8B 88 87 B4 00 00 00 00 03 00 00 00
 05 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00
 09 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 08 00 00 00
-20 00 00 00 4D 45 19 D9 01 00 00 00 02 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 08 00 00 00
+20 00 00 00 55 89 E5 0C 01 00 00 00 02 00 00 00
 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00
 09 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 09 00 00 00
-20 00 00 00 6A 38 25 90 01 00 00 00 00 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 09 00 00 00
+20 00 00 00 72 F4 D9 45 01 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 0A 00 00 00
-20 00 00 00 03 BF 61 4B 02 01 00 00 02 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 0A 00 00 00
+20 00 00 00 1B 73 9D 9E 02 01 00 00 02 00 00 00
 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00
 08 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 0B 00 00 00
-20 00 00 00 24 C2 5D 02 02 02 00 00 00 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 0B 00 00 00
+20 00 00 00 3C 0E A1 D7 02 02 00 00 00 00 00 00
 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 03 1A 00 00 07 00 00 00 0C 00 00 00
-20 00 00 00 20 C7 04 F8 02 03 00 00 00 00 00 00
+4D 4F 4F 52 04 1A 00 00 07 00 00 00 0C 00 00 00
+20 00 00 00 38 0B F8 2D 02 03 00 00 00 00 00 00
 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 ```

@@ -13,7 +13,7 @@ If the two artifacts disagree, the behavioural specification wins and the wire
 schema must be reported as defective. This README defines the handoff procedure
 only; it adds no behavioural requirements.
 
-`wire-schema-3` and `event-schema-2` received one in-place amendment before any
+`wire-schema-4` and `event-schema-2` are the current revisions; `wire-schema-3` received one in-place amendment before any
 conforming implementation existed. No mixed old/amended dialect is supported.
 Every later change to a frozen layout requires the corresponding version
 increment.
