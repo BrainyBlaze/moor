@@ -31,8 +31,8 @@ const STORE_EVENT_END: u64 = 1 << 53;
 const STORE_EVENT_CAP: u64 = 256 << 10;
 const STORE_HEADER: &str =
     "v:2,type:=header,ts:*,session:*,generation:*,epoch:u,next_seq:*,first_retained:*";
-const STORE_LIFECYCLE: &str = "v:1,type:=lifecycle,phase:t,session:*,generation:*,wire_generation:u,incarnation:b16,start_wall_ms:D,start_mono_ms:D,boot_id:b16,path_encoding:=posix-bytes/windows-wtf8,event_path:n,instrument_path:n";
-const STORE_LIFECYCLE_END: &str = "|end_wall_ms:D,output_end:D,ended:=exited,code:u|end_wall_ms:D,output_end:D,ended:=signalled,signal:p|end_wall_ms:D,output_end:D,ended:=terminated,code:u,method:=graceful/forced";
+const STORE_LIFECYCLE: &str = "v:2,type:=lifecycle,phase:t,session:*,generation:*,wire_generation:u,incarnation:b16,start_wall_ms:D,start_mono_ms:D,boot_id:b16,path_encoding:=posix-bytes/windows-wtf8,event_path:n,instrument_path:n";
+const STORE_LIFECYCLE_END: &str = "|end_wall_ms:D,output_end:D,ended:=exited,code:u,method:=none/graceful/forced|end_wall_ms:D,output_end:D,ended:=signalled,signal:p,method:=none/graceful/forced";
 
 pub fn event(name: &'static str, ts: u64, fields: &[(&str, Json<'_>)]) -> Event {
     let mut tail = String::with_capacity(fields.len().saturating_mul(32));
@@ -156,7 +156,7 @@ schema!(map fn event_schema(name: &str) -> &'static str;
     "application-receipt" => "type:=application-receipt,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,source_seq:d,event_id:b16,application_request_id:b16,lease_epoch:p,request_id:d,status:=accepted/refused,provider_session:b4096,provider_turn:b4096",
     "application-receipt-missing" => "type:=application-receipt-missing,ts:*,epoch:u,seq:*,kind:=transition,source:s,producer:b16,source_epoch:p,application_request_id:b16,lease_epoch:p,request_id:d,reason:=deadline/source-lost/retention-expired",
     "stream-exhausted" => "type:=stream-exhausted,ts:*,epoch:u,seq:*,kind:=transition,axis:=seq/epoch/commit",
-    "exit" => "type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=exited,code:u|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=signalled,signal:p|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=terminated,code:u,method:=graceful/forced",
+    "exit" => "type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=exited,code:u,method:=none/graceful/forced|type:=exit,ts:*,epoch:u,seq:*,kind:=transition,ended:=signalled,signal:p,method:=none/graceful/forced",
     "observer-degraded" => "type:=observer-degraded,ts:*,epoch:u,seq:*,kind:=transition,scanner:=osc/query,reason:=deadline/limit/cancelled/malformed",
 );
 
@@ -261,8 +261,11 @@ pub(crate) fn valid_stored_lifecycle(
                         .as_u64()
                         .is_some_and(|code| windows || code <= 255)
             }
+            // v4: the mechanism says HOW the child ended; the mandatory
+            // `method` field separately says whether the holder was asked to
+            // end it. Signals stay a POSIX mechanism; the old Windows-only
+            // `terminated` ending is gone with its folded axes.
             (Some("exited"), Some("signalled")) => closed && !windows,
-            (Some("exited"), Some("terminated")) => closed && windows,
             _ => false,
         })
     .then_some(())

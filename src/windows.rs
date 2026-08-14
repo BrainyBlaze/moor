@@ -3143,7 +3143,7 @@ mod native {
         let mut runtime = artifacts.runtime(pty, (synthetic, host));
         runtime.set_geometry(geometry.0, geometry.1);
         let status = runtime.drive(|_, _| None, || None)?.unwrap_or(observed);
-        let (exit, durable) = runtime.finish_exit(&running, status, None);
+        let (exit, durable) = runtime.finish_exit(&running, status, runtime.termination_method());
         require(durable, "prepublication child exit was not durable")?;
         crate::return_if!(!report, Ok(exit));
         eprintln!(
@@ -3161,11 +3161,8 @@ mod native {
         options: &Options,
         invoked: &OsStr,
     ) -> CommandResult<i32> {
-        let foreground = matches!(mode, CreateMode::Run | CreateMode::LegacyRun);
-        let interactive = matches!(
-            mode,
-            CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
-        );
+        let foreground = matches!(mode, CreateMode::Run);
+        let interactive = matches!(mode, CreateMode::Bare | CreateMode::New);
         let selected = std::env::var_os(DETACHED_HOLDER).as_deref() == Some(OsStr::new("1"));
         unsafe { std::env::remove_var(DETACHED_HOLDER) };
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };

@@ -2478,37 +2478,57 @@ fn child_exit_after_instrument_ack_is_finalized_before_publication() {
 }
 
 #[test]
-fn current_uses_canonical_v2_ancestry_and_rejects_bad_carriers() {
+fn current_reads_only_the_v2_ancestry_carrier() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     let first = b"/tmp/has:colon";
     let second = b"/tmp/inner";
-    let legacy = [first.as_slice(), b":", second.as_slice()].concat();
     let v2 = format!("v2:{}:{}", STANDARD.encode(first), STANDARD.encode(second));
-    let run = |legacy: &[u8], v2: &str| {
-        Command::new(env!("CARGO_BIN_EXE_moor"))
+    let run = |legacy: Option<&[u8]>, v2: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
+        command
             .arg("current")
-            .env(
-                "MOOR_SESSION",
-                std::ffi::OsString::from_vec(legacy.to_vec()),
-            )
-            .env("MOOR_SESSION_V2", v2)
-            .output()
-            .unwrap()
+            .env_remove("MOOR_SESSION")
+            .env_remove("MOOR_SESSION_V2");
+        if let Some(value) = legacy {
+            command.env("MOOR_SESSION", std::ffi::OsString::from_vec(value.to_vec()));
+        }
+        if let Some(value) = v2 {
+            command.env("MOOR_SESSION_V2", value);
+        }
+        command.output().unwrap()
     };
-    let output = run(&legacy, &v2);
+
+    // V2 alone is the whole contract: no second carrier is consulted or needed.
+    let output = run(None, Some(&v2));
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"has\\x3Acolon > inner\n");
-    let malformed = run(&legacy, "v2:not-base64");
+
+    // A malformed V2 is an error, never a downgrade to guessing.
+    let malformed = run(None, Some("v2:not-base64"));
     assert_eq!(malformed.status.code(), Some(1));
     assert_eq!(
         malformed.stderr,
         b"moor: session ancestry v2 is malformed\n"
     );
-    let mismatch = run(b"/tmp/different", &v2);
-    assert_eq!(mismatch.status.code(), Some(1));
-    assert_eq!(
-        mismatch.stderr,
-        b"moor: session ancestry carriers disagree\n"
+
+    // The retired carrier is DEAD, not merely optional: a contradictory
+    // MOOR_SESSION changes nothing, because nothing reads it. Under the old
+    // dual-carrier contract this exact input was the frozen "carriers
+    // disagree" failure; v2 removed the second carrier, so there is nothing
+    // left to disagree with.
+    let ignored = run(Some(b"/tmp/different"), Some(&v2));
+    assert!(ignored.status.success(), "{ignored:?}");
+    assert_eq!(ignored.stdout, b"has\\x3Acolon > inner\n");
+
+    // And the retired carrier alone yields NO ancestry — the ambiguous
+    // colon-joined value must never be parsed again. Outside any session
+    // `current` is frozen as exit 1 with no output, and that is exactly what
+    // a process holding only the dead variable now is: outside any session.
+    let alone = run(Some(b"/tmp/a:/tmp/b"), None);
+    assert_eq!(alone.status.code(), Some(1), "{alone:?}");
+    assert!(
+        alone.stdout.is_empty() && alone.stderr.is_empty(),
+        "{alone:?}"
     );
 }
 

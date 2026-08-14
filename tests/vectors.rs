@@ -66,9 +66,7 @@ fn progressed_codec(
 }
 
 fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: u32) {
-    use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
-    };
+    use moor::session::{Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition};
 
     for epoch in 1..=count {
         let token = [epoch as u8; 16];
@@ -81,7 +79,7 @@ fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: 
             .unwrap()
             .into_iter()
             .find_map(|effect| match effect {
-                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                Effect::LeaseReply(id, result) if id == conn => Some(result),
                 _ => None,
             })
             .expect("lease grant");
@@ -1049,39 +1047,39 @@ fn v16_semantic_gap_no_producer_side_payload_decoder() {
 // suite has no collisions.
 
 const V16_INPUT_V7: &str = "
-    4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
-    11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
-    00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
-    00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
-    D3 42 42";
+    4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
+    11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
+    00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
+    00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
+    06 42 42";
 
 const V16_INPUT_V8: &str = "
-    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0A 00 00 00
-    2B 00 00 00 EA B3 81 BB 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 0A 00 00 07 00 00 00 0A 00 00 00
+    2B 00 00 00 F2 7F 7D 6E 03 00 00 00 01 00 00 00
     00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
     08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
     00 00 00";
 
 const V16_INPUT_V9: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 16 00 00 00
-    13 00 00 00 BA FD 47 3C 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 16 00 00 00
+    13 00 00 00 A2 31 BB E9 03 00 00 00 01 00 00 00
     00 00 00 00 00 41 41 41 41 42 42";
 
 const V16_INPUT_V10: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 17 00 00 00
-    16 00 00 00 D6 1B 1C D3 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 17 00 00 00
+    16 00 00 00 CE D7 E0 06 03 00 00 00 01 00 00 00
     00 00 00 00 00 44 49 46 46 45 52 45 4E 54";
 
 const V16_INPUT_V16: &str = "
-    4D 4F 4F 52 03 09 00 00 07 00 00 00 1E 00 00 00
-    2A 00 00 00 88 95 3C 6B 03 00 00 00 02 00 00 00
+    4D 4F 4F 52 04 09 00 00 07 00 00 00 1E 00 00 00
+    2A 00 00 00 90 59 C0 BE 03 00 00 00 02 00 00 00
     00 00 00 00 01 20 21 22 23 24 25 26 27 28 29 2A
     2B 2C 2D 2E 2F 06 00 63 6C 61 75 64 65 68 65 6C
     6C 6F";
 
 const V16_INPUT_V18: &str = "
-    4D 4F 4F 52 03 0A 00 00 07 00 00 00 0B 00 00 00
-    2B 00 00 00 CD CE BD F2 03 00 00 00 01 00 00 00
+    4D 4F 4F 52 04 0A 00 00 07 00 00 00 0B 00 00 00
+    2B 00 00 00 D5 02 41 27 03 00 00 00 01 00 00 00
     00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
     08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
     00 00 00";
@@ -1134,9 +1132,7 @@ fn v16_input_decode(
 /// A Machine matching V8's frozen receipt: generation 7, incarnation 00..0F,
 /// with a freshly granted input lease at epoch 3 for controller connection 1.
 fn v16_input_machine() -> moor::session::Machine {
-    use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
-    };
+    use moor::session::{Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition};
     let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]);
     machine.register_controller(1);
     allocate_and_release(&mut machine, 1, 2);
@@ -1150,7 +1146,7 @@ fn v16_input_machine() -> moor::session::Machine {
     let granted = effects
         .into_iter()
         .find_map(|effect| match effect {
-            Effect::Send(1, Reply::Lease(result)) => Some(result),
+            Effect::LeaseReply(1, result) => Some(result),
             _ => None,
         })
         .expect("lease result");
@@ -1712,8 +1708,8 @@ fn v16_framing_hex(s: &str) -> Vec<u8> {
 // flags are reserved zero.
 fn v16_framing_v1() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
-         21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+        "4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
+         21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
          00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
          30 30 30 2F 62 75 69 6C 64",
     )
@@ -1722,8 +1718,8 @@ fn v16_framing_v1() -> Vec<u8> {
 // §16 V2 — OUTPUT, record sequence 42, byte offset 4096, payload `hi`.
 fn v16_framing_v2() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 06 00 00 07 00 00 00 09 00 00 00
-         12 00 00 00 85 A9 11 DC 2A 00 00 00 00 00 00 00
+        "4D 4F 4F 52 04 06 00 00 07 00 00 00 09 00 00 00
+         12 00 00 00 9D 65 ED 09 2A 00 00 00 00 00 00 00
          00 10 00 00 00 00 00 00 68 69",
     )
 }
@@ -1732,8 +1728,8 @@ fn v16_framing_v2() -> Vec<u8> {
 // lease.
 fn v16_framing_v3() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00
-         05 00 00 00 35 5C 53 49 00 00 00 00 01",
+        "4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
+         05 00 00 00 2D 90 AF 9C 00 00 00 00 01",
     )
 }
 
@@ -1741,8 +1737,8 @@ fn v16_framing_v3() -> Vec<u8> {
 // then geometry.
 fn v16_framing_v4() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0B 00 00 00
-         08 00 00 00 7E AE 34 20 03 00 00 00 50 00 18 00",
+        "4D 4F 4F 52 04 0B 00 00 07 00 00 00 0B 00 00 00
+         08 00 00 00 66 62 C8 F5 03 00 00 00 50 00 18 00",
     )
 }
 
@@ -1750,8 +1746,8 @@ fn v16_framing_v4() -> Vec<u8> {
 // HALF_SPECIFIED_GEOMETRY.
 fn v16_framing_v5() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 0B 00 00 07 00 00 00 0C 00 00 00
-         08 00 00 00 7A AB 6D DA 03 00 00 00 50 00 00 00",
+        "4D 4F 4F 52 04 0B 00 00 07 00 00 00 0C 00 00 00
+         08 00 00 00 62 67 91 0F 03 00 00 00 50 00 00 00",
     )
 }
 
@@ -1759,16 +1755,16 @@ fn v16_framing_v5() -> Vec<u8> {
 // OUTPUT_ACK.
 fn v16_framing_v6() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 07 00 00 00 00 00 00 03 00 00 00
-         08 00 00 00 DA 77 CE 5D 01 00 00 00 00 00 00 00",
+        "4D 4F 4F 52 04 07 00 00 00 00 00 00 03 00 00 00
+         08 00 00 00 C2 BB 32 88 01 00 00 00 00 00 00 00",
     )
 }
 
 // §16 V11 — ERROR carrying GENERATION_MISMATCH (9).
 fn v16_framing_v11() -> Vec<u8> {
     v16_framing_hex(
-        "4D 4F 4F 52 03 13 00 00 07 00 00 00 0D 00 00 00
-         1E 00 00 00 3F E0 B5 E8 09 00 1A 00 67 65 6E 65
+        "4D 4F 4F 52 04 13 00 00 07 00 00 00 0D 00 00 00
+         1E 00 00 00 27 2C 49 3D 09 00 1A 00 67 65 6E 65
          72 61 74 69 6F 6E 20 33 20 69 73 20 73 75 70 65
          72 73 65 64 65 64",
     )
@@ -1786,7 +1782,7 @@ fn v16_framing_v1_identity() -> Vec<u8> {
 fn v16_framing_assert_header(frame: &[u8]) {
     assert!(frame.len() >= 24, "frame shorter than the 24-byte header");
     assert_eq!(&frame[0..4], b"MOOR", "frozen magic");
-    assert_eq!(frame[4], 0x03, "frozen wire-schema-3 version byte");
+    assert_eq!(frame[4], 0x04, "frozen wire-schema-4 version byte");
     let frozen = u32::from_le_bytes(frame[20..24].try_into().unwrap());
     assert_eq!(
         moor::wire::crc32c(&frame[..20]),
@@ -1865,7 +1861,7 @@ fn v16_framing_v1_hello_frame_decodes_through_codec_and_controller_decoder() {
     // §3.1: magic repeat, schema version, two reserved-zero flag bytes, then
     // the canonical session identity — wide-length-prefixed (§1.1.1, 4 bytes).
     let identity = v16_framing_v1_identity();
-    assert_eq!(&message.payload[..7], b"MOOR\x03\0\0");
+    assert_eq!(&message.payload[..7], b"MOOR\x04\0\0");
     assert_eq!(
         &message.payload[7..11],
         &[0x16, 0x00, 0x00, 0x00],
@@ -2311,19 +2307,19 @@ fn v16_framing_header_crc32c_recomputes_for_every_group_vector() {
 
 /// §16 V1 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
 const V16_EXTRA_V1: &str = "\
-4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00 \
-21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16 \
+4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00 \
+21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16 \
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31 \
 30 30 30 2F 62 75 69 6C 64";
 
 /// §16 V7 — frozen bytes copied verbatim from spec/moor-wire-schema.md.
 /// Two frames: 24+17 bytes (MORE=1), then 24+2 bytes (MORE=0).
 const V16_EXTRA_V7: &str = "\
-4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00 \
-11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00 \
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00 \
-00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22 \
-D3 42 42";
+4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00 \
+11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00 \
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00 \
+00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE \
+06 42 42";
 
 fn v16_extra_hex(s: &str) -> Vec<u8> {
     s.split_whitespace()
@@ -2381,10 +2377,13 @@ fn v16_extra_frozen_v1_control_still_decodes() {
 
 #[test]
 fn v16_extra_framing_unknown_version_is_refused() {
-    // §1: version is frozen at 3 for the controller profile; §17 "an unknown
-    // version". Byte 4 of the frozen V1 header is the version.
+    // §1: version is frozen at 4 for the controller profile; §17 "an unknown
+    // version". Byte 4 of the frozen V1 header is the version. `3` is the
+    // retired dialect: v4 ships no v3 decoder, so the predecessor is refused
+    // exactly like any other unknown version — that is what a version
+    // increment means, as against another in-place amendment.
     let mut bytes = v16_extra_hex(V16_EXTRA_V1);
-    bytes[4] = 4;
+    bytes[4] = 3;
     v16_extra_patch_crc(&mut bytes, 0);
     assert_eq!(
         v16_extra_feed_controller(&bytes),
@@ -2575,8 +2574,8 @@ fn v16_extra_hello_nonzero_flags_are_refused() {
 const V25_HEADER: &[u8] = b"{\"v\":2,\"type\":\"header\",\"ts\":0,\"session\":\"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==\",\"generation\":7,\"epoch\":0,\"next_seq\":0,\"first_retained\":0}\n";
 
 fn v25() -> Vec<u8> {
-    hex("4D 4F 4F 52 03 0E 00 00 07 00 00 00 01 00 00 00
-         F4 00 00 00 65 4E 0F 46 16 00 00 00 01 2F 74 6D
+    hex("4D 4F 4F 52 04 0E 00 00 07 00 00 00 01 00 00 00
+         F8 00 00 00 68 D0 95 1E 16 00 00 00 01 2F 74 6D
          70 2F 2E 6D 6F 6F 72 2D 31 30 30 30 2F 62 75 69
          6C 64 07 00 00 00 00 01 02 03 04 05 06 07 08 09
          0A 0B 0C 0D 0E 0F 02 0B 00 00 00 2F 74 6D 70 2F
@@ -2587,26 +2586,26 @@ fn v25() -> Vec<u8> {
          00 00 00 00 00 00 00 03 03 03 03 03 03 03 03 03
          03 03 03 03 03 03 03 04 00 00 00 2F 74 6D 70 34
          12 00 00 78 56 00 00 10 11 12 13 14 15 16 17 18
-         19 1A 1B 1C 1D 1E 1F 00 00 00 00 00 00 00 00 00
+         19 1A 1B 1C 1D 1E 1F 50 00 18 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-         00 00 00 00 00 00 00 E3 03 00 00 00 00 00 00 0F
-         01 00 00 00 01 00 00 00 00 00 00 00 00 00 00 00
-         00 00 00 00 00 00 00 00 00 00 00 00")
+         00 00 00 00 00 00 00 00 00 00 00 E3 03 00 00 00
+         00 00 00 0F 01 00 00 00 01 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00")
 }
 
 #[test]
 fn v16_status_v25_frame_is_self_consistent_and_decodes() {
     let frame = v25();
-    // Header shape and the declared 244-byte payload, per §1.
+    // Header shape and the declared 248-byte payload, per §1.
     assert_eq!(&frame[0..4], b"MOOR");
-    assert_eq!(frame[4], 0x03, "wire version");
+    assert_eq!(frame[4], 0x04, "wire version");
     assert_eq!(frame[5], 0x0E, "STATUS_REPLY type");
     assert_eq!(
         u32::from_le_bytes(frame[16..20].try_into().unwrap()),
-        0xF4,
+        0xF8,
         "declared payload length"
     );
-    assert_eq!(frame.len() - 24, 0xF4, "actual body length");
+    assert_eq!(frame.len() - 24, 0xF8, "actual body length");
     assert_eq!(
         moor::wire::crc32c(&frame[..20]),
         u32::from_le_bytes(frame[20..24].try_into().unwrap()),
@@ -2684,8 +2683,8 @@ fn v16_status_v28_heartbeat_round_trips_and_encodes_exactly() {
     // Drives the real encoder and the real decoder against the frozen bytes,
     // so this is an end-to-end check of the five defined health bits rather
     // than an inspection of the vector.
-    let frame = hex("4D 4F 4F 52 03 12 00 00 07 00 00 00 04 00 00 00
-         09 00 00 00 34 6D 58 74 08 07 06 05 04 03 02 01
+    let frame = hex("4D 4F 4F 52 04 12 00 00 07 00 00 00 04 00 00 00
+         09 00 00 00 2C A1 A4 A1 08 07 06 05 04 03 02 01
          1F");
     assert_eq!(frame[5], 0x12, "HEARTBEAT type");
     assert_eq!(
@@ -2735,8 +2734,8 @@ fn v16_status_v28_reserved_heartbeat_bits_are_refused() {
 
 #[test]
 fn v16_status_v30_clear_request_encodes_exactly() {
-    let frame = hex("4D 4F 4F 52 03 19 00 00 07 00 00 00 06 00 00 00
-         18 00 00 00 E7 F8 D1 48 00 01 02 03 04 05 06 07
+    let frame = hex("4D 4F 4F 52 04 19 00 00 07 00 00 00 06 00 00 00
+         18 00 00 00 FF 34 2D 9D 00 01 02 03 04 05 06 07
          08 09 0A 0B 0C 0D 0E 0F 05 00 00 00 00 00 00 00");
     assert_eq!(frame[5], 0x19, "LOG_CLEAR type");
     assert_eq!(frame.len() - 24, 0x18, "declared 24-byte payload");
@@ -2936,19 +2935,20 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
 // ---------------------------------------------------------------- V26 ----
 // §16 V26 — NON_VT attach and its required empty preamble. The attach
 // preserves geometry and sets only flag bit 1. The preamble payload is the
-// plain u16 zero length, NOT an absent frame. Both use per-direction
-// sequence 2. Exact hex from the schema.
+// plain u16 zero length, NOT an absent frame. The attach uses controller
+// sequence 2; under the status-first prefix the preamble FOLLOWS the
+// sequence-2 ATTACH_ACK at holder sequence 3. Exact hex from the schema.
 
-const V26_ATTACH: &str = "4D 4F 4F 52 03 03 00 00 07 00 00 00 02 00 00 00 \
-                          05 00 00 00 35 5C 53 49 00 00 00 00 02";
-const V26_PREAMBLE: &str = "4D 4F 4F 52 03 05 00 00 07 00 00 00 02 00 00 00 \
-                            02 00 00 00 08 9C 99 04 00 00";
+const V26_ATTACH: &str = "4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00 \
+                          05 00 00 00 2D 90 AF 9C 00 00 00 00 02";
+const V26_PREAMBLE: &str = "4D 4F 4F 52 04 05 00 00 07 00 00 00 03 00 00 00 \
+                            02 00 00 00 37 2D 59 98 00 00";
 
 #[test]
 fn v26_both_frames_reproduce_the_frozen_bytes() {
-    for (kind, payload, bytes, label) in [
-        (3u8, vec![0, 0, 0, 0, 2], V26_ATTACH, "NON_VT attach"),
-        (5, vec![0, 0], V26_PREAMBLE, "empty preamble"),
+    for (sequence, kind, payload, bytes, label) in [
+        (2, 3u8, vec![0, 0, 0, 0, 2], V26_ATTACH, "NON_VT attach"),
+        (3, 5, vec![0, 0], V26_PREAMBLE, "empty preamble"),
     ] {
         let frame = hex(bytes);
         v16_framing_assert_header(&frame);
@@ -2958,9 +2958,9 @@ fn v26_both_frames_reproduce_the_frozen_bytes() {
             "{label}: frozen payload disagrees with the schema text"
         );
         assert_eq!(
-            v16_framing_encode_frame(2, 7, kind, &payload),
+            v16_framing_encode_frame(sequence, 7, kind, &payload),
             frame,
-            "{label}: encoder must reproduce the frozen frame at sequence 2"
+            "{label}: encoder must reproduce the frozen frame at its real sequence"
         );
     }
 }
@@ -3024,19 +3024,140 @@ fn v26_non_vt_attach_preserves_child_geometry_and_grants_no_lease() {
     );
 }
 
+// ---------------------------------------------------------------- V33 ----
+// §16 V33 — WAKEUP interposed between HELLO_ACK and ATTACH_ACK, at the REAL
+// sequence numbers: HELLO_ACK consumed holder sequence 1, so the WAKEUP is 2,
+// the ATTACH_ACK that follows is 3, and the terminal preamble is 4. The
+// frozen bytes come from the schema text, never from the encoder, so encoder
+// and decoder cannot drift together while this stays green.
+
+const V33_WAKEUP: &str = "4D 4F 4F 52 04 11 00 00 07 00 00 00 02 00 00 00 \
+                          00 00 00 00 52 17 53 91";
+
+#[test]
+fn v33_wakeup_is_legal_between_hello_ack_and_attach_ack() {
+    use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
+    // WAKEUP is legal at EVERY post-HELLO_ACK phase, including the window
+    // between HELLO_ACK and ATTACH_ACK. A holder whose event store advanced
+    // durably announces it immediately; it does not wait for the controller
+    // to finish attaching, and a controller that faults its handshake over
+    // that announcement loses exactly the session it was joining (OB-30 /
+    // the desk#54 incident class).
+    let frame = hex(V33_WAKEUP);
+    v16_framing_assert_header(&frame);
+    assert_eq!(frame.len(), 24, "V33 is header-only");
+    assert_eq!(
+        v16_framing_encode_frame(2, 7, 0x11, &[]),
+        frame,
+        "the encoder must reproduce the frozen V33 bytes at sequence 2"
+    );
+    let wakeup = v16_framing_feed_one(2, &frame);
+    assert_eq!((wakeup.scope, wakeup.kind), (7, 0x11));
+
+    let mut stream = ViewerStream::default();
+    // The WAKEUP lands before any attach state exists — and changes nothing.
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &wakeup,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(None),
+        "a WAKEUP between HELLO_ACK and ATTACH_ACK must be accepted"
+    );
+    assert!(
+        stream.replay.is_none() && !stream.terminal,
+        "the pre-attach WAKEUP must not fabricate attach state"
+    );
+
+    // And the attach that follows proceeds exactly as if the WAKEUP had
+    // never happened — status-first, then the terminal preamble — at the
+    // shifted-by-one holder sequences 3 and 4.
+    let mut payload = Vec::new();
+    moor::wire::put_wide(&mut payload, b"\x01/tmp/session").unwrap();
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&[9; 16]);
+    payload.push(0);
+    moor::wire::put_wide(&mut payload, b"").unwrap();
+    payload.push(0xff);
+    payload.extend_from_slice(&[0; 48 + 32]);
+    moor::wire::put_wide(&mut payload, b"/tmp").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
+    let tail = moor::wire::StatusTail {
+        columns: 80,
+        rows: 24,
+        replay: moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        },
+        owns_lease: false,
+        viewers: false,
+        running: true,
+        event_writable: false,
+        lease_epoch: 1,
+        semantic_flags: 0,
+        semantic_pending: 0,
+        extension: moor::wire::StatusExtension {
+            health: 0,
+            log_epoch: 0,
+            log_index: 0,
+            retained_start: 0,
+            retained_end: 0,
+        },
+    };
+    payload.extend_from_slice(&tail.encode().unwrap());
+    let status = v16_framing_feed_one(3, &v16_framing_encode_frame(3, 7, 4, &payload));
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &status,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(None)
+    );
+    let terminal = v16_framing_feed_one(4, &v16_framing_encode_frame(4, 7, 5, &[0, 0]));
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &terminal,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(Some(ViewerEvent::Terminal(b""))),
+        "the attach after a pre-attach WAKEUP completes normally"
+    );
+}
+
 #[test]
 fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
     let frame = hex(V26_PREAMBLE);
-    let message = v16_framing_feed_one(2, &frame);
+    let message = v16_framing_feed_one(3, &frame);
     assert_eq!((message.scope, message.kind), (7, 5));
 
     // Present-and-empty, not absent: the frame is delivered as a Terminal
     // event carrying zero bytes, and it is what sets the stream's terminal
     // state. An absent preamble leaves that state unset, so the two are
     // observably different — which is the whole point of the requirement.
+    // v4 status-first attach: TERMINAL_STATE arrives after the descriptor,
+    // so the stream models a viewer that has already consumed its status.
     let mut stream = ViewerStream {
         non_vt: true,
+        replay: Some(moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
         ..ViewerStream::default()
     };
     assert!(!stream.terminal, "the preamble has not been consumed yet");
@@ -3098,7 +3219,18 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     );
     // The same nonempty preamble is valid when NON_VT was not requested,
     // proving the refusal above is the NON_VT rule and not a framing accident.
-    let mut vt = ViewerStream::default();
+    // (Post-status, per the v4 status-first prefix.)
+    let mut vt = ViewerStream {
+        replay: Some(moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
+        ..ViewerStream::default()
+    };
     assert_eq!(
         decode_viewer(&mut vt, &nonempty_message, (b"".as_slice(), 7, [9; 16])),
         Ok(Some(ViewerEvent::Terminal(b"hi"))),
@@ -3110,18 +3242,18 @@ fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
 // §16 V29 — fresh viewer lease grant followed by explicit release. Controller
 // sequences 4 then 5; holder sequences 5 then 6. Exact hex from the schema.
 
-const V29_REQUEST: &str = "4D 4F 4F 52 03 15 00 00 07 00 00 00 04 00 00 00 \
-                           28 00 00 00 F1 56 7C 4D 00 00 00 00 00 00 00 00 \
+const V29_REQUEST: &str = "4D 4F 4F 52 04 15 00 00 07 00 00 00 04 00 00 00 \
+                           28 00 00 00 E9 9A 80 98 00 00 00 00 00 00 00 00 \
                            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
                            00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
-const V29_GRANT: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 05 00 00 00 \
-                         18 00 00 00 63 89 92 92 00 00 00 00 03 00 00 00 \
+const V29_GRANT: &str = "4D 4F 4F 52 04 16 00 00 07 00 00 00 05 00 00 00 \
+                         18 00 00 00 7B 45 6E 47 00 00 00 00 03 00 00 00 \
                          00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
-const V29_RELEASE: &str = "4D 4F 4F 52 03 17 00 00 07 00 00 00 05 00 00 00 \
-                           14 00 00 00 77 26 7A 78 03 00 00 00 00 01 02 03 \
+const V29_RELEASE: &str = "4D 4F 4F 52 04 17 00 00 07 00 00 00 05 00 00 00 \
+                           14 00 00 00 6F EA 86 AD 03 00 00 00 00 01 02 03 \
                            04 05 06 07 08 09 0A 0B 0C 0D 0E 0F";
-const V29_RELEASED: &str = "4D 4F 4F 52 03 16 00 00 07 00 00 00 06 00 00 00 \
-                            18 00 00 00 0A 0E D6 49 02 00 00 00 03 00 00 00 \
+const V29_RELEASED: &str = "4D 4F 4F 52 04 16 00 00 07 00 00 00 06 00 00 00 \
+                            18 00 00 00 12 C2 2A 9C 02 00 00 00 03 00 00 00 \
                             00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00";
 
 fn v29_token() -> [u8; 16] {
@@ -3440,11 +3572,11 @@ fn v29_refuses_every_inconsistent_lease_request_and_result() {
 // 0102030405060708, lease epoch 3, echoed class 04, plain u16 byte lengths.
 // Both directions use frame sequence 3. Exact hex from the schema.
 
-const V27_QUERY: &str = "4D 4F 4F 52 03 14 00 00 07 00 00 00 03 00 00 00 \
-                         18 00 00 00 42 0B EA EE 08 07 06 05 04 03 02 01 \
+const V27_QUERY: &str = "4D 4F 4F 52 04 14 00 00 07 00 00 00 03 00 00 00 \
+                         18 00 00 00 5A C7 16 3B 08 07 06 05 04 03 02 01 \
                          03 00 00 00 04 09 00 1B 5B 3F 32 30 30 34 24 70";
-const V27_REPLY: &str = "4D 4F 4F 52 03 0C 00 00 07 00 00 00 03 00 00 00\
-                         1A 00 00 00 EE BD 48 07 08 07 06 05 04 03 02 01 \
+const V27_REPLY: &str = "4D 4F 4F 52 04 0C 00 00 07 00 00 00 03 00 00 00\
+                         1A 00 00 00 F6 71 B4 D2 08 07 06 05 04 03 02 01 \
                          03 00 00 00 04 0B 00 1B 5B 3F 32 30 30 34 3B 31 \
                          24 79";
 const V27_CORRELATION: u64 = 0x0102_0304_0506_0708;
@@ -3605,14 +3737,14 @@ const V23_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 02 07 00 00 00
 
 // §16 V24 — the exact 286-byte lifecycle body, final LF included, copied
 // verbatim from the ```jsonl block in the schema.
-const V24_BODY: &[u8] = b"{\"v\":1,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"AS9z\",\"generation\":7,\"wire_generation\":7,\"incarnation\":\"AgICAgICAgICAgICAgICAg==\",\"start_wall_ms\":\"1\",\"start_mono_ms\":\"2\",\"boot_id\":\"AwMDAwMDAwMDAwMDAwMDAw==\",\"path_encoding\":\"posix-bytes\",\"event_path\":null,\"instrument_path\":null}\n";
+const V24_BODY: &[u8] = b"{\"v\":2,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"AS9z\",\"generation\":7,\"wire_generation\":7,\"incarnation\":\"AgICAgICAgICAgICAgICAg==\",\"start_wall_ms\":\"1\",\"start_mono_ms\":\"2\",\"boot_id\":\"AwMDAwMDAwMDAwMDAwMDAw==\",\"path_encoding\":\"posix-bytes\",\"event_path\":null,\"instrument_path\":null}\n";
 
 const V24_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 03 07 00 00 00
      01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
      1E 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-     00 00 00 00 00 00 00 00 D1 62 1C 31 51 33 6C AB
-     7C 33 05 FB 45 6C 7C A0 F8 8A 25 2C 43 D4 80 80
-     2A 7F 31 A1 92 26 BF 96 1A 7F 68 02";
+     00 00 00 00 00 00 00 00 FA E7 1F CF 6C AD 5E 79
+     D0 AB E5 FE 84 63 80 34 09 E5 0E C8 3F 2C F5 79
+     93 66 0C 8B A0 C5 22 4E D7 28 8F 9E";
 
 /// Hashes `body` through the crate's own digest entrypoint, so the frozen
 /// SHA-256 is confirmed against real hashing code and not restated here.
@@ -3695,11 +3827,47 @@ fn v16_platform_v24_lifecycle_commit_matches_the_ratified_record() {
     let hash = v23_digest_of(V24_BODY, "platform-v24");
     assert_eq!(
         hash,
-        <[u8; 32]>::try_from(hex("D1 62 1C 31 51 33 6C AB 7C 33 05 FB 45 6C 7C A0
-                 F8 8A 25 2C 43 D4 80 80 2A 7F 31 A1 92 26 BF 96"))
+        <[u8; 32]>::try_from(hex("FA E7 1F CF 6C AD 5E 79 D0 AB E5 FE 84 63 80 34
+                 09 E5 0E C8 3F 2C F5 79 93 66 0C 8B A0 C5 22 4E"))
         .unwrap(),
         "the lifecycle body digest must be the value §16 V24 states"
     );
+
+    // The frozen body is not merely self-consistent: the REAL lifecycle
+    // store accepts it, and the same bytes with the retired `"v":1` are
+    // refused. Store::create routes through the production validator, so
+    // this pins the v2-only contract with the exact §16 bytes rather than
+    // a restatement of them.
+    {
+        use moor::store::{Kind, Store};
+        let path = std::env::temp_dir().join(format!(
+            "moor-v16-v24-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::create(&path, Kind::Exit, 7, V24_BODY, 0, 0)
+            .expect("the frozen §16 V24 body must be accepted by the real lifecycle store");
+        drop(store);
+        std::fs::remove_dir_all(&path).unwrap();
+
+        let downgraded = {
+            let mut body = V24_BODY.to_vec();
+            let at = body
+                .windows(5)
+                .position(|window| window == b"\"v\":2")
+                .expect("the frozen body carries its version");
+            body[at + 4] = b'1';
+            body
+        };
+        assert!(
+            Store::create(&path, Kind::Exit, 7, &downgraded, 0, 0).is_err(),
+            "the retired v1 lifecycle shape must be refused by the real store"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
     // Kind exit 03, generation 7, epoch 1, index 1, coordinates [0,0).
     let produced = Commit {
         slot: 0,

@@ -13,21 +13,19 @@ fn exit_records(
     code: u32,
     forced: Option<bool>,
 ) -> (moor::events::Event, Vec<u8>) {
-    let method = forced.map(|forced| if forced { "forced" } else { "graceful" });
+    // v4: mechanism and intent are orthogonal — a code exit stays `exited`
+    // whether or not the holder was asked to terminate, and the mandatory
+    // method carries the intent (`none` when there was none).
+    let method = match forced {
+        None => "none",
+        Some(false) => "graceful",
+        Some(true) => "forced",
+    };
     shared_exit_records(
         running,
         (ts, ts),
         end,
-        (
-            if method.is_some() {
-                "terminated"
-            } else {
-                "exited"
-            },
-            "code",
-            u64::from(code),
-            method,
-        ),
+        ("exited", "code", u64::from(code), method),
     )
 }
 
@@ -179,23 +177,28 @@ fn windows_native_paths_round_trip_through_canonical_wtf8() {
 }
 
 #[test]
-fn holder_caused_windows_exits_are_terminated_in_both_durable_records() {
+fn holder_caused_windows_exits_carry_method_orthogonally_to_the_mechanism() {
     use moor::events::EventStream;
+    // v4: the ending names the MECHANISM and stays `exited`; the mandatory
+    // method carries the holder's intent. The retired `terminated` ending
+    // folded both axes into one Windows-only branch and must never reappear.
     for (forced, method) in [(false, "graceful"), (true, "forced")] {
         let (event, lifecycle) = exit_records(&running(), 10, 12, 0xc000_013a, Some(forced));
         let record = EventStream::new().transact(&[], &[event], false).unwrap().0;
         let lifecycle = String::from_utf8(lifecycle).unwrap();
         for body in [&record, &lifecycle] {
-            assert!(body.contains("\"ended\":\"terminated\""));
+            assert!(body.contains("\"ended\":\"exited\""));
+            assert!(!body.contains("\"ended\":\"terminated\""));
             assert!(body.contains(&format!("\"method\":\"{method}\"")));
             assert!(body.contains("\"code\":3221225786"));
         }
     }
+    // No termination state is a statement too, and it is never omitted.
     let (event, lifecycle) = exit_records(&running(), 10, 12, 7, None);
     let record = EventStream::new().transact(&[], &[event], false).unwrap().0;
     for body in [&record, std::str::from_utf8(&lifecycle).unwrap()] {
         assert!(body.contains("\"ended\":\"exited\""));
-        assert!(!body.contains("\"method\""));
+        assert!(body.contains("\"method\":\"none\""));
     }
 }
 
@@ -239,7 +242,7 @@ fn shared_holder_resizes_only_for_the_lease_owner() {
             false,
         );
         let mut codec = Codec::new(Profile::Controller);
-        let mut hello = b"MOOR\x03\0\0".to_vec();
+        let mut hello = b"MOOR\x04\0\0".to_vec();
         put_wide(&mut hello, identity).unwrap();
         send(&mut codec, &mut client, 0, 1, &hello);
         let mut attach = Vec::new();

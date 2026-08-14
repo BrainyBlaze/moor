@@ -145,7 +145,7 @@ type ProfileRules = ([u8; 4], u8, usize, usize, u8, u32, &'static [(u8, usize)])
 const PROFILES: [ProfileRules; 2] = [
     (
         *b"MOOR",
-        3,
+        4,
         1 << 20,
         16 << 20,
         0x1a,
@@ -213,6 +213,14 @@ fn frame_header(
         header.length as usize <= frame_max,
         WireError::OversizedFrame,
     )?;
+    // A fixed-size kind admits exactly its frozen length on the way IN as
+    // well as out: a WAKEUP with a smuggled payload byte, or a truncated
+    // lease frame, is malformed at the framing layer — not an ignored
+    // payload for some later decode stage to shrug at. The check sits AFTER
+    // the universal frame bound on purpose: a declaration above the 1 MiB
+    // frame maximum is OVERSIZED_FRAME for every kind, fixed or variable —
+    // the frozen §1 bound owns that overlap.
+    well_formed(fixed.is_none_or(|size| header.length as usize == size))?;
     well_formed(header.checksum == crc32c(&bytes[..20]))?;
     Ok((bytes.len() >= 24 + header.length as usize).then_some(header))
 }
@@ -405,10 +413,10 @@ wire_rules!(pure pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> Run
 wire_rules!(pure fn semantic_code(error: SemanticRefusal) -> u16 = [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10, 15][error as usize]);
 wire_rules!(pure pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> = wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u16).to_le_bytes(); diagnostic));
 wire_rules!(pure pub fn decode_error_payload(payload: &[u8]) -> Option<(u16, &[u8])> = { let code = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?); get_compact(payload, 2, true).map(|text| (code, text)) });
-wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x03\0\0".to_vec(), identity));
+wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x04\0\0".to_vec(), identity));
 
-wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [3]; generation.to_le_bytes(); incarnation), identity) });
-wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == 3 && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
+wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [4]; generation.to_le_bytes(); incarnation), identity) });
+wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == 4 && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
 
 pub use crc32c::crc32c;
 
@@ -445,11 +453,15 @@ pub fn decode_viewer<'a>(
             let consistent = stream.next.is_none_or(|(sequence, offset)| if replay.first == 0 { offset == replay.end } else {
                 replay.first <= sequence && sequence <= replay.last.saturating_add(1) && (sequence != replay.first || offset == replay.start) && (sequence != replay.last.saturating_add(1) || offset == replay.end)
             });
-            well_formed(stream.replay.is_none() && stream.received.is_none() && stream.terminal && consistent)?;
+            // v4 status-first attach: the descriptor is the FIRST item of the
+            // prefix, so the viewer knows the authoritative geometry and
+            // replay window before any terminal bytes arrive. A descriptor
+            // after terminal-state is the retired v3 order and is malformed.
+            well_formed(stream.replay.is_none() && stream.received.is_none() && !stream.terminal && consistent)?;
             if stream.next.is_none() && replay.first <= 1 { stream.next = Some((1, if replay.first == 0 { replay.end } else { replay.start })); }
             stream.received = Some(if replay.first == 0 { (1, replay.end) } else { (replay.first, replay.start) }); stream.replay = Some(replay); None },
-        5 => { let length = input.u16()? as usize; let bytes = input.rest(); well_formed(!stream.terminal && stream.replay.is_none() && bytes.len() == length && length <= 4096 && (!stream.non_vt || bytes.is_empty()))?; stream.terminal = true; Some(Terminal(bytes)) },
-        6 => { let (sequence, offset) = (input.u64()?, input.u64()?); let bytes = input.rest(); well_formed((1..=65536).contains(&bytes.len()))?;
+        5 => { let length = input.u16()? as usize; let bytes = input.rest(); well_formed(!stream.terminal && stream.replay.is_some() && bytes.len() == length && length <= 4096 && (!stream.non_vt || bytes.is_empty()))?; stream.terminal = true; Some(Terminal(bytes)) },
+        6 => { let (sequence, offset) = (input.u64()?, input.u64()?); let bytes = input.rest(); well_formed(stream.terminal && (1..=65536).contains(&bytes.len()))?;
             let end = offset.checked_add(bytes.len() as u64).ok_or(WireError::Malformed)?;
             let replay = stream.replay.ok_or(WireError::Malformed)?;
             let (expected, expected_offset) = stream.next.ok_or(WireError::Malformed)?;
@@ -461,10 +473,10 @@ pub fn decode_viewer<'a>(
             let applicable = if apply { sequence == expected && offset == expected_offset } else { sequence < expected && end <= expected_offset };
             well_formed((baseline || live) && contiguous && applicable)?;
             stream.received = sequence.checked_add(1).map(|next| (next, end)); if apply { stream.next = sequence.checked_add(1).map(|next| (next, end)); } Some(Output(sequence, apply, bytes)) },
-        8 => { let (first, last) = (input.u64()?, input.u64()?); let replay = stream.replay.ok_or(WireError::Malformed)?; well_formed(first == 1 && replay.first.checked_sub(1) == Some(last) && stream.next.is_none_or(|(sequence, _)| sequence >= replay.first))?; input.end()?; stream.next.get_or_insert((replay.first, replay.start)); None },
-        10 => Some(Receipt(InputReceipt::decode(&message.payload)?)),
-        0x14 => { let query = decode_query(&message.payload)?; let shape = recognize_query(&query.bytes).ok_or(WireError::Malformed)?; well_formed(query.class == shape.class && Some(query.epoch) == stream.lease_epoch)?; stream.queries.push((query, shape)); None },
-        0x16 => { well_formed(stream.replay.is_some())?; Some(Lease(LeaseResult::decode_wire(&message.payload)?)) },
+        8 => { let (first, last) = (input.u64()?, input.u64()?); let replay = stream.replay.ok_or(WireError::Malformed)?; well_formed(stream.terminal && first == 1 && replay.first.checked_sub(1) == Some(last) && stream.next.is_none_or(|(sequence, _)| sequence >= replay.first))?; input.end()?; stream.next.get_or_insert((replay.first, replay.start)); None },
+        10 => { well_formed(stream.replay.is_none() || stream.terminal)?; Some(Receipt(InputReceipt::decode(&message.payload)?)) },
+        0x14 => { well_formed(stream.replay.is_none() || stream.terminal)?; let query = decode_query(&message.payload)?; let shape = recognize_query(&query.bytes).ok_or(WireError::Malformed)?; well_formed(query.class == shape.class && Some(query.epoch) == stream.lease_epoch)?; stream.queries.push((query, shape)); None },
+        0x16 => { well_formed(stream.replay.is_some() && stream.terminal)?; Some(Lease(LeaseResult::decode_wire(&message.payload)?)) },
         _ => None,
     })
 }
@@ -499,7 +511,7 @@ pub fn decode_controller(
 ) -> Result<ControllerRequest<'_>, WireError> {
     use ControllerRequest::*;
     wire_rules!(bounded payload; input => match kind {
-        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x03\0\0")?; Hello(input.wide()?) },
+        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x04\0\0")?; Hello(input.wide()?) },
         3 => { let (columns, rows, flags) = (input.u16()?, input.u16()?, input.byte()?); well_formed(flags & !3 == 0)?; wire_rules!(controller Attach; columns; rows; flags & 1 != 0; flags & 2 != 0; token) },
         7 => wire_rules!(controller OutputAck; input.u64()?),
         9 => { let (epoch, request_id, form) = (input.u32()?, input.u64()?, input.byte()?); let exact_payload = payload.into();
@@ -554,36 +566,40 @@ impl StatusExtension {
 }
 
 schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; first: u64, last: u64, start: u64, end: u64, complete: bool, modes_exact: bool);
-schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
+schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; columns: u16, rows: u16, replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
 schema!(struct TailRecord fields; first: u64, last: u64, start: u64, end: u64, flags: u8, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: [u8; 29]);
 binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malformed; fixed {} fields { first: U64<LE>, last: U64<LE>, start: U64<LE>, end: U64<LE>, flags: u8, lease_epoch: U32<LE>, semantic_flags: u8, semantic_pending: U16<LE>, extension: [u8; 29] });
 
 impl StatusTail {
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
         let range = replay.first == 0 && replay.last == 0 && replay.start == replay.end || replay.first != 0 && replay.first <= replay.last && replay.start < replay.end;
-        range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0)
+        range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0) && valid_size((this.rows, this.columns))
     });
     wire_rules!(method pub fn encode(this: &Self) -> Result<[u8; 69], WireError> = { well_formed(this.valid())?;
         let flags = u8::from(this.replay.complete) | u8::from(this.replay.modes_exact) << 1 | u8::from(this.owns_lease) << 4 | u8::from(this.viewers) << 5 | u8::from(this.running) << 6 | u8::from(this.event_writable) << 7;
         Ok(wire_rules!(value TailRecord; first = this.replay.first; last = this.replay.last; start = this.replay.start; end = this.replay.end; flags = flags; lease_epoch = this.lease_epoch; semantic_flags = this.semantic_flags; semantic_pending = this.semantic_pending; extension = this.extension.encode(this.extension.logging())?).encode_raw())
     });
     wire_rules!(pure fn decode_with(payload: &[u8], expected: Option<(&[u8], u32, [u8; 16])>) -> Result<Self, WireError> = {
-        let mut input = Reader(payload); validate_status_base(&mut input, expected)?;
+        let mut input = Reader(payload); let (columns, rows) = validate_status_base(&mut input, expected)?;
         let record = TailRecord::decode_raw(input.rest())?; validate_status_flags(record.flags)?;
         let replay = wire_rules!(value ReplayDescriptor; first = record.first; last = record.last; start = record.start; end = record.end; complete = record.flags & 1 != 0; modes_exact = record.flags & 2 != 0);
         let extension = wire_rules!(checked StatusExtension::decode_raw(&record.extension)?; |value: &StatusExtension| value.valid(value.logging()))?;
-        let value = wire_rules!(value Self; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
+        let value = wire_rules!(value Self; columns = columns; rows = rows; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
         validated(value.valid(), value)
     });
     wire_rules!(pure pub fn decode_for(payload: &[u8], identity: &[u8], generation: u32, incarnation: [u8; 16]) -> Result<Self, WireError> = Self::decode_with(payload, Some((identity, generation, incarnation))));
 }
 
-wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(), WireError> = {
+wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(u16, u16), WireError> = {
     wire_rules!(read input; identity = input.wide(); generation = input.positive(); incarnation = input.identifier::<16>(); layout = input.byte(); event_identity = input.wide(); slot = input.byte(); commit = input.u64(); body_length = input.u64(); body_hash = input.exact::<32>()); input.exact::<32>()?;
-    wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>());
+    wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>(); columns = input.u16(); rows = input.u16());
     let identity_ok = matches!(identity, [1, b'/', ..]) || identity.len() == 25 && identity.first() == Some(&2);
     let commit_ok = if layout == 2 { slot <= 1 && commit != 0 && body_length != 0 && nonzero(&body_hash) } else { slot == 0xff && commit == 0 && body_length == 0 && !nonzero(&body_hash) };
-    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && layout <= 2 && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty())
+    // Layout `01` is the superseded legacy layout: never emitted by any
+    // holder (§5 — both platforms report `2`, disabled logging reports `0`),
+    // so a descriptor carrying it is a forgery or corruption, not history.
+    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))?;
+    Ok((columns, rows))
 });
 
 schema!(struct pub Heartbeat derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; monotonic_ms: u64, flags: u8);
@@ -600,7 +616,8 @@ impl Heartbeat {
 schema!(struct pub QueryShape derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; class: u8, csi8: bool, mode: Option<u32>);
 
 wire_rules!(pure pub(crate) fn csi(bytes: &[u8]) -> Option<(bool, &[u8])> = bytes.strip_prefix(b"\x1b[").map(|tail| (false, tail)).or_else(|| bytes.strip_prefix(&[0x9b]).map(|tail| (true, tail))));
-#[cfg(windows)]
+// v4: the status descriptor carries a mandatory geometry pair on every
+// platform, so the size rule is portable wire logic, not a Windows detail.
 wire_rules!(pure pub(crate) fn valid_size(size: (u16, u16)) -> bool = size.0 != 0 && size.1 != 0 && size.0 <= i16::MAX as u16 && size.1 <= i16::MAX as u16 && u32::from(size.0) * u32::from(size.1) <= 2_000_000);
 fn csi_body<'a>(bytes: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
     csi(bytes)?.1.strip_prefix(prefix)?.strip_suffix(suffix)

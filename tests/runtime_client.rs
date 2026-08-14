@@ -506,6 +506,9 @@ fn status(first: u64, last: u64, start: u64, end: u64, flags: u8) -> Vec<u8> {
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&[1; 16]);
+    // v4 descriptor geometry: mandatory and nonzero, columns then rows.
+    out.extend_from_slice(&80_u16.to_le_bytes());
+    out.extend_from_slice(&24_u16.to_le_bytes());
     for value in [first, last, start, end] {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -522,10 +525,12 @@ fn attach_fences_gap_duplicates_offsets_and_empty_output() {
     codec
         .encode(7, 2, &ack(7, [9; 16], &identity), &mut inbound)
         .unwrap();
-    codec.encode(7, 5, &[1, 0, b'P'], &mut inbound).unwrap();
+    // v4 status-first attach prefix: the descriptor opens the exchange and
+    // the terminal preamble follows it.
     codec
         .encode(7, 4, &status(2, 3, 4, 8, 2), &mut inbound)
         .unwrap();
+    codec.encode(7, 5, &[1, 0, b'P'], &mut inbound).unwrap();
     let gap = [&1u64.to_le_bytes()[..], &1u64.to_le_bytes()].concat();
     codec.encode(7, 8, &gap, &mut inbound).unwrap();
     let first = [&2u64.to_le_bytes()[..], &4u64.to_le_bytes(), b"aa"].concat();

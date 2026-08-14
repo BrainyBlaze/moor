@@ -52,6 +52,12 @@ jobs:
       - name: Internal working documents must not be tracked
         run: sh ci/tracked-paths.test.sh
 
+      # The digest gate proves the documents were re-pinned; this proves their
+      # content stopped saying the retired thing. Both are needed: a reviewer
+      # caught every one of these patterns ALIVE after a re-pin.
+      - name: Retired normative surfaces must stay retired
+        run: sh ci/spec-normative-patterns.test.sh
+
       - name: Run strict Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -62,14 +68,14 @@ jobs:
         run: |
           cd spec
           sha256sum --check --strict <<'SUMS'
-          9ec8425d99d89a78c2d7bf1cadabf08c48c703eee9b5be327d8eb08af21f5a76  moor-spec.md
-          d87ed30d764cafc300859b10c087dd36224328207a2a4bb3abd6073a67e8daed  moor-wire-schema.md
+          e1e6f73e014521855b66b248132a5913e91cc830665f8b220de7b79595b1b77a  moor-spec.md
+          44ebe0865d531d94f4187100109d7f9e456583abd7060c18453bc271542c909f  moor-wire-schema.md
           SUMS
           # The literal README table cells intentionally include Markdown backticks.
           # shellcheck disable=SC2016
-          grep -F '`moor-spec.md` | `9ec8425d99d89a78c2d7bf1cadabf08c48c703eee9b5be327d8eb08af21f5a76`' README.md
+          grep -F '`moor-spec.md` | `e1e6f73e014521855b66b248132a5913e91cc830665f8b220de7b79595b1b77a`' README.md
           # shellcheck disable=SC2016
-          grep -F '`moor-wire-schema.md` | `d87ed30d764cafc300859b10c087dd36224328207a2a4bb3abd6073a67e8daed`' README.md
+          grep -F '`moor-wire-schema.md` | `44ebe0865d531d94f4187100109d7f9e456583abd7060c18453bc271542c909f`' README.md
 
       - name: Verify and build the sole release command
         run: |

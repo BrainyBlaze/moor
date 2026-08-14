@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 schema!(enum pub Redraw [Clone, Copy, Debug, Eq, PartialEq]; None, CtrlL, Winch);
 schema!(enum pub Reset [Clone, Copy, Debug, Eq, PartialEq]; None, Move);
-schema!(enum pub CreateMode [Clone, Copy, Debug, Eq, PartialEq]; Bare, New, Start, Run, LegacyA, LegacyC, LegacyStart, LegacyRun);
+schema!(enum pub CreateMode [Clone, Copy, Debug, Eq, PartialEq]; Bare, New, Start, Run);
 
 schema!(struct default pub Options derive [Clone, Debug, Eq, PartialEq] pub fields; detach: Option<u8> = Some(0x1c), redraw: Redraw = Redraw::None, reset: Reset = Reset::None, pass_suspend: bool = false, quiet: bool = false, non_vt: bool = false, log_cap: u64 = 1 << 20, stderr: Option<PathBuf> = None, events: Option<PathBuf> = None, instrument: Option<PathBuf> = None, directory: Option<PathBuf> = None);
 
@@ -128,7 +128,6 @@ fn scan<'a>(
     command: &str,
     allowed: u16,
     creating: bool,
-    legacy: bool,
 ) -> CliResult<Scan<'a>> {
     let (mut options, mut seen, mut lines, mut operands) =
         (Options::default(), 0, 10, smallvec::SmallVec::new());
@@ -151,14 +150,7 @@ fn scan<'a>(
                 return Err(invalid_mode(arg));
             };
             let bit = 1 << id;
-            return_if!(
-                allowed & bit == 0,
-                Err(if legacy {
-                    invalid_args()
-                } else {
-                    bad_option(arg, command)
-                })
-            );
+            return_if!(allowed & bit == 0, Err(bad_option(arg, command)));
             seen |= bit;
             let value = if VALUES & bit == 0 {
                 None
@@ -188,9 +180,8 @@ fn fixed(
     command: &str,
     allowed: u16,
     required: bool,
-    legacy: bool,
 ) -> CliResult<(Options, u16, u32, Option<OsString>)> {
-    let (options, seen, lines, mut operands) = scan(args, command, allowed, false, legacy)?;
+    let (options, seen, lines, mut operands) = scan(args, command, allowed, false)?;
     return_if!(
         operands.len() > 1 || required && operands.is_empty(),
         Err(invalid_args())
@@ -204,12 +195,12 @@ fn fixed(
 }
 
 fn flags(args: &[OsString], command: &str, allowed: u16) -> CliResult<u16> {
-    let (_, seen, _, operands) = scan(args, command, allowed, false, false)?;
+    let (_, seen, _, operands) = scan(args, command, allowed, false)?;
     operands.is_empty().then_some(seen).ok_or_else(invalid_args)
 }
 
 fn create(args: &[OsString], mode: CreateMode, command: &str) -> CliResult<Action> {
-    let (options, _, _, operands) = scan(args, command, CREATE, true, false)?;
+    let (options, _, _, operands) = scan(args, command, CREATE, true)?;
     let mut operands = operands.into_iter();
     let session = session(operands.next().ok_or_else(invalid_args)?)?;
     Ok(Action::Create {
@@ -221,7 +212,7 @@ fn create(args: &[OsString], mode: CreateMode, command: &str) -> CliResult<Actio
 }
 
 fn remove(args: &[OsString]) -> CliResult<Action> {
-    let (options, seen, _, session) = fixed(args, "rm", ALL | 1 << 5, false, false)?;
+    let (options, seen, _, session) = fixed(args, "rm", ALL | 1 << 5, false)?;
     let all = seen & ALL != 0;
     return_if!(all == session.is_some(), Err(invalid_args()));
     Ok(Action::Remove {
@@ -239,37 +230,24 @@ pub fn parse(args: &[OsString]) -> Result<Action, Error> {
         Some(command @ ("new" | "n")) => create(rest, CreateMode::New, command),
         Some(command @ ("start" | "s")) => create(rest, CreateMode::Start, command),
         Some(command @ "run") => create(rest, CreateMode::Run, command),
-        Some(command @ "-A") => create(rest, CreateMode::LegacyA, command),
-        Some(command @ "-c") => create(rest, CreateMode::LegacyC, command),
-        Some(command @ "-n") => create(rest, CreateMode::LegacyStart, command),
-        Some(command @ "-N") => create(rest, CreateMode::LegacyRun, command),
         Some("--help" | "-h" | "?") if args.len() == 2 => Ok(Action::Help),
         Some("--version") if args.len() == 2 => Ok(Action::Version),
         Some("--help" | "-h" | "?" | "--version") => Err(invalid_args()),
-        Some("attach" | "a" | "-a") => {
-            let (options, _, _, session) = fixed(rest, "attach", VIEW, true, false)?;
+        Some("attach" | "a") => {
+            let (options, _, _, session) = fixed(rest, "attach", VIEW, true)?;
             Ok(Action::Attach {
                 session: session.unwrap(),
                 options,
             })
         }
-        Some("push" | "p" | "-p") => Ok(Action::Push(
-            fixed(rest, "push", 0, true, false)?.3.unwrap(),
-        )),
-        Some("list" | "l" | "ls" | "-l") => Ok(Action::List {
+        Some("push" | "p") => Ok(Action::Push(fixed(rest, "push", 0, true)?.3.unwrap())),
+        Some("list" | "l" | "ls") => Ok(Action::List {
             all: flags(rest, "list", ALL)? & ALL != 0,
         }),
-        Some("current" | "-i") => flags(rest, "current", 0).map(|_| Action::Current),
-        Some("clear") => Ok(Action::Clear(fixed(rest, "clear", 0, false, false)?.3)),
-        Some("kill" | "k" | "-k") => {
-            let legacy = first == "-k";
-            let (options, seen, _, session) = fixed(
-                rest,
-                "kill",
-                if legacy { 0 } else { FORCE | 1 << 5 },
-                true,
-                legacy,
-            )?;
+        Some("current") => flags(rest, "current", 0).map(|_| Action::Current),
+        Some("clear") => Ok(Action::Clear(fixed(rest, "clear", 0, false)?.3)),
+        Some("kill" | "k") => {
+            let (options, seen, _, session) = fixed(rest, "kill", FORCE | 1 << 5, true)?;
             Ok(Action::Kill {
                 session: session.unwrap(),
                 force: seen & FORCE != 0,
@@ -278,7 +256,7 @@ pub fn parse(args: &[OsString]) -> Result<Action, Error> {
         }
         Some("rm") => remove(rest),
         Some("tail") => {
-            let (_, seen, lines, session) = fixed(rest, "tail", FORCE | NUMBER, true, false)?;
+            let (_, seen, lines, session) = fixed(rest, "tail", FORCE | NUMBER, true)?;
             Ok(Action::Tail {
                 session: session.unwrap(),
                 follow: seen & FORCE != 0,

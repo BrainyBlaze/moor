@@ -83,7 +83,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .find_map(|effect| match effect {
-                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                Effect::LeaseReply(id, result) if id == conn => Some(result),
                 _ => None,
             })
             .expect("lease result")

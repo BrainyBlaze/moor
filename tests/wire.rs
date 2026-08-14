@@ -41,7 +41,20 @@ fn progressed_codec(profile: Profile, next_in: u32, next_out: u32) -> Codec {
 
 #[test]
 fn viewer_decoder_types_borrowed_stream_records_and_rejects_bad_boundaries() {
-    let mut stream = ViewerStream::default();
+    let mut stream = ViewerStream {
+        // v4 status-first: terminal bytes are legal only after the
+        // descriptor, so a terminal-typing fixture models a post-status
+        // stream explicitly.
+        replay: Some(ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        }),
+        ..ViewerStream::default()
+    };
     let terminal = Message {
         scope: 7,
         kind: 5,
@@ -71,9 +84,10 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         kind: 5,
         payload: [0, 0].as_slice().into(),
     };
-    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 0,
             last: 0,
@@ -105,6 +119,8 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &ack, expected), Ok(None));
+    // v4 status-first: the terminal preamble follows the descriptor.
+    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     for (sequence, offset, bytes) in [(1_u64, 0_u64, b"a".as_slice()), (2, 1, b"bc".as_slice())] {
         let mut payload = Vec::from(sequence.to_le_bytes());
@@ -147,11 +163,12 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         kind: 5,
         payload: [0, 0].as_slice().into(),
     };
-    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let mut payload = status_prefix();
     payload.extend(
         StatusTail {
+            columns: 80,
+            rows: 24,
             replay: ReplayDescriptor {
                 first: 1,
                 last: 3,
@@ -184,6 +201,8 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &status, expected), Ok(None));
+    // v4 status-first: the terminal preamble follows the descriptor.
+    assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let live_payload = [&4_u64.to_le_bytes()[..], &3_u64.to_le_bytes(), b"x"].concat();
     let live = Message {
@@ -195,6 +214,311 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         decode_viewer(&mut stream, &live, expected),
         Err(WireError::Malformed)
     );
+}
+
+fn expected_identity() -> (&'static [u8], u32, [u8; 16]) {
+    (b"\x01/tmp/session".as_slice(), 1, [1; 16])
+}
+
+/// A stream whose connection consumed the `ATTACH_ACK` descriptor but NOT yet
+/// the mandatory `TERMINAL_STATE`. Every v4 prefix follower fed to this stream
+/// is overtaking the frozen order.
+fn descriptor_only(first: u64) -> ViewerStream {
+    let mut stream = ViewerStream::default();
+    let mut payload = status_prefix();
+    payload.extend(
+        StatusTail {
+            columns: 80,
+            rows: 24,
+            replay: ReplayDescriptor {
+                first,
+                last: first,
+                start: first - 1,
+                end: first,
+                complete: first == 1,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: true,
+            running: true,
+            event_writable: true,
+            lease_epoch: 0,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    let ack = Message {
+        scope: 1,
+        kind: 4,
+        payload: payload.as_slice().into(),
+    };
+    assert_eq!(
+        decode_viewer(&mut stream, &ack, expected_identity()),
+        Ok(None)
+    );
+    stream
+}
+
+fn consume_terminal(stream: &mut ViewerStream) {
+    let terminal = Message {
+        scope: 1,
+        kind: 5,
+        payload: [0, 0].as_slice().into(),
+    };
+    assert!(matches!(
+        decode_viewer(stream, &terminal, expected_identity()),
+        Ok(Some(ViewerEvent::Terminal(b"")))
+    ));
+}
+
+#[test]
+fn baseline_output_before_terminal_state_is_refused() {
+    let payload = [&1_u64.to_le_bytes()[..], &0_u64.to_le_bytes(), b"a"].concat();
+    let output = Message {
+        scope: 1,
+        kind: 6,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &output, expected_identity()),
+        Err(WireError::Malformed),
+        "baseline output must not overtake the mandatory terminal state"
+    );
+    // Positive control: the SAME frame is the legal baseline once the
+    // terminal state has been consumed, so the refusal above can only be
+    // the phase fence.
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert!(matches!(
+        decode_viewer(&mut stream, &output, expected_identity()),
+        Ok(Some(ViewerEvent::Output(1, true, b"a")))
+    ));
+}
+
+#[test]
+fn gap_before_terminal_state_is_refused() {
+    let payload = [&1_u64.to_le_bytes()[..], &1_u64.to_le_bytes()].concat();
+    let gap = Message {
+        scope: 1,
+        kind: 8,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(2);
+    assert_eq!(
+        decode_viewer(&mut stream, &gap, expected_identity()),
+        Err(WireError::Malformed),
+        "a gap must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(2);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &gap, expected_identity()),
+        Ok(None)
+    );
+}
+
+#[test]
+fn input_receipt_before_terminal_state_is_refused() {
+    let receipt = InputReceipt {
+        epoch: 2,
+        request: 3,
+        generation: 4,
+        incarnation: [5; 16],
+        written: 6,
+        status: 0,
+        result: 0,
+    };
+    let bytes = receipt.encode().unwrap();
+    let message = Message {
+        scope: 1,
+        kind: 10,
+        payload: bytes.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &message, expected_identity()),
+        Err(WireError::Malformed),
+        "an input receipt must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &message, expected_identity()),
+        Ok(Some(ViewerEvent::Receipt(receipt)))
+    );
+    // An input-only connection never receives a descriptor at all: with no
+    // prefix in flight the receipt is connection-level and stays legal.
+    let mut input_only = ViewerStream::default();
+    assert_eq!(
+        decode_viewer(&mut input_only, &message, expected_identity()),
+        Ok(Some(ViewerEvent::Receipt(receipt)))
+    );
+}
+
+#[test]
+fn query_before_terminal_state_is_refused() {
+    let payload = [
+        &1_u64.to_le_bytes()[..],
+        &1_u32.to_le_bytes(),
+        &[1],
+        &3_u16.to_le_bytes(),
+        b"\x1b[c",
+    ]
+    .concat();
+    let query = Message {
+        scope: 1,
+        kind: 0x14,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    stream.lease_epoch = Some(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &query, expected_identity()),
+        Err(WireError::Malformed),
+        "a query must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    stream.lease_epoch = Some(1);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &query, expected_identity()),
+        Ok(None)
+    );
+    assert_eq!(stream.queries.len(), 1);
+}
+
+#[test]
+fn lease_result_before_terminal_state_is_refused() {
+    let payload = LeaseResult {
+        outcome: ResultOutcome::Granted,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 1,
+        token: [7; 16],
+    }
+    .encode_wire()
+    .unwrap();
+    let lease = Message {
+        scope: 1,
+        kind: 0x16,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &lease, expected_identity()),
+        Err(WireError::Malformed),
+        "a lease result must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert!(matches!(
+        decode_viewer(&mut stream, &lease, expected_identity()),
+        Ok(Some(ViewerEvent::Lease(_)))
+    ));
+}
+
+#[test]
+fn inbound_fixed_size_kinds_admit_exactly_their_frozen_length() {
+    // The profile's fixed-size table binds BOTH directions. Inbound, a
+    // fixed-size kind whose header length disagrees with the frozen size is
+    // malformed at the framing layer: a WAKEUP with a smuggled payload byte
+    // must die in the codec, not fall through some later decode stage as an
+    // ignored payload.
+    fn crc32c(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (index, slot) in table.iter_mut().enumerate() {
+            let mut crc = index as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82F6_3B78 } else { 0 };
+            }
+            *slot = crc;
+        }
+        let mut crc = 0xFFFF_FFFF_u32;
+        for byte in data {
+            crc = table[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    }
+
+    // The controller profile's frozen fixed-size table, verbatim.
+    const FIXED: &[(u8, usize)] = &[
+        (10, 43),
+        (0x11, 0),
+        (0x15, 40),
+        (0x16, 24),
+        (0x17, 20),
+        (0x18, 20),
+        (0x19, 24),
+        (0x1a, 32),
+    ];
+    for &(kind, size) in FIXED {
+        // Positive control: the exact frozen length passes the framing layer
+        // (content validation is a later stage and not at issue here).
+        let mut sender = Codec::new(Profile::Controller);
+        let mut frame = Vec::new();
+        sender.encode(7, kind, &vec![0; size], &mut frame).unwrap();
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        receiver.feed(0, &frame, &mut messages).unwrap();
+        assert_eq!(messages.len(), 1, "kind {kind:#04x}: exact length");
+
+        // One smuggled byte: header length size+1, recomputed CRC. Malformed.
+        let mut oversized = frame.clone();
+        oversized[16..20].copy_from_slice(&(size as u32 + 1).to_le_bytes());
+        let checksum = crc32c(&oversized[..20]).to_le_bytes();
+        oversized[20..24].copy_from_slice(&checksum);
+        oversized.push(0xA5);
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        assert_eq!(
+            receiver.feed(0, &oversized, &mut messages),
+            Err(WireError::Malformed),
+            "kind {kind:#04x} accepted a smuggled byte"
+        );
+
+        // A declaration above the universal 1 MiB frame bound is
+        // OVERSIZED_FRAME for a fixed kind exactly as for a variable one:
+        // the frozen §1 bound owns that overlap, and the fixed-size equality
+        // check must not shadow it with Malformed.
+        let mut unbounded = frame.clone();
+        unbounded[16..20].copy_from_slice(&((1 << 20) as u32 + 1).to_le_bytes());
+        let checksum = crc32c(&unbounded[..20]).to_le_bytes();
+        unbounded[20..24].copy_from_slice(&checksum);
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        assert_eq!(
+            receiver.feed(0, &unbounded, &mut messages),
+            Err(WireError::OversizedFrame),
+            "kind {kind:#04x}: the universal frame bound owns declarations above 1 MiB"
+        );
+
+        // One byte short of the frozen size: equally malformed, never a
+        // partial frame the codec waits to complete.
+        if size > 0 {
+            let mut truncated = frame.clone();
+            truncated[16..20].copy_from_slice(&(size as u32 - 1).to_le_bytes());
+            let checksum = crc32c(&truncated[..20]).to_le_bytes();
+            truncated[20..24].copy_from_slice(&checksum);
+            truncated.truncate(24 + size - 1);
+            let mut receiver = Codec::new(Profile::Controller);
+            let mut messages = Vec::new();
+            assert_eq!(
+                receiver.feed(0, &truncated, &mut messages),
+                Err(WireError::Malformed),
+                "kind {kind:#04x} accepted a truncated frame"
+            );
+        }
+    }
 }
 
 #[test]
@@ -304,6 +628,9 @@ fn status_prefix() -> Vec<u8> {
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&1u32.to_le_bytes());
     payload.extend_from_slice(&[1; 16]);
+    // v4 descriptor geometry: mandatory and nonzero, columns then rows.
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
     payload
 }
 
@@ -312,17 +639,17 @@ fn decode_status(payload: &[u8]) -> Result<StatusTail, WireError> {
 }
 
 const V1: &str = "
-4D 4F 4F 52 03 01 00 00 07 00 00 00 01 00 00 00
-21 00 00 00 26 04 0D F1 4D 4F 4F 52 03 00 00 16
+4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
+21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
 30 30 30 2F 62 75 69 6C 64";
 
 const V7: &str = "
-4D 4F 4F 52 03 09 01 00 07 00 00 00 14 00 00 00
-11 00 00 00 33 71 5F 45 03 00 00 00 01 00 00 00
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 03 09 00
-00 07 00 00 00 15 00 00 00 02 00 00 00 56 61 22
-D3 42 42";
+4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
+11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
+00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
+06 42 42";
 
 const V14: &str = "
 4D 4F 4F 53 01 01 00 00 00 00 00 00 01 00 00 00
@@ -389,6 +716,8 @@ fn termination_results_encode_all_five_outcomes_and_reject_reserved_shapes() {
 fn status_tail_round_trips_replay_and_health_as_one_shape() {
     let mut payload = status_prefix();
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 2,
             last: 3,
@@ -438,6 +767,76 @@ fn status_tail_round_trips_replay_and_health_as_one_shape() {
     malformed = payload;
     malformed[42] = 0;
     assert_eq!(decode_status(&malformed), Err(WireError::Malformed));
+}
+
+#[test]
+fn status_rejects_the_superseded_event_layout_nobody_emits() {
+    // Layout `01` is "superseded legacy layout and never emitted" (§5): both
+    // platform holders hardcode `2` and disabled logging reports `0`, so a
+    // descriptor carrying `1` cannot come from any real holder — only from a
+    // forgery or corruption. An acceptor for a value no producer can produce
+    // is exactly the reader-side legacy this revision removes.
+    //
+    // Built honestly for the layout-1 shape: a NON-empty event identity (the
+    // empty-identity rule already rejects layout != 0 with an empty path, and
+    // a rejection for that reason would prove nothing about the layout byte),
+    // with the non-layout-2 commit constraints (slot ff, zero index/length/
+    // hash) satisfied — so the ONLY ground for refusal is the layout itself.
+    let mut payload = Vec::new();
+    put_wide(&mut payload, b"\x01/tmp/session").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.push(1);
+    put_wide(&mut payload, b"\x01/tmp/events").unwrap();
+    payload.push(0xff);
+    payload.extend_from_slice(&[0; 48 + 32]);
+    put_wide(&mut payload, b"/tmp").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
+    payload.extend_from_slice(
+        &StatusTail {
+            columns: 80,
+            rows: 24,
+            replay: ReplayDescriptor {
+                first: 0,
+                last: 0,
+                start: 0,
+                end: 0,
+                complete: true,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: false,
+            running: true,
+            event_writable: false,
+            lease_epoch: 1,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    assert_eq!(decode_status(&payload), Err(WireError::Malformed));
+
+    // The same bytes with layout `2` and its commit constraints do decode, so
+    // the refusal above is the layout byte and not an accident of this shape.
+    payload[37] = 2;
+    let slot_at = 38 + 4 + 12; // wide length prefix + "\x01/tmp/events"
+    payload[slot_at] = 0;
+    payload[slot_at + 1..slot_at + 9].copy_from_slice(&1u64.to_le_bytes());
+    payload[slot_at + 9..slot_at + 17].copy_from_slice(&1u64.to_le_bytes());
+    payload[slot_at + 17..slot_at + 49].fill(1);
+    decode_status(&payload).unwrap();
 }
 
 #[test]
@@ -791,6 +1190,8 @@ fn configured_log_keeps_its_frontier_when_the_lane_is_unwritable() {
         retained_end: 140,
     };
     let tail = StatusTail {
+        columns: 80,
+        rows: 24,
         replay: ReplayDescriptor {
             first: 0,
             last: 0,

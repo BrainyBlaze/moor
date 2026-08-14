@@ -514,10 +514,8 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
             let (live, attach_after, verb) = match mode {
                 CreateMode::Bare => (Attach, true, Some("created")),
                 CreateMode::New => (Already, true, Some("created")),
-                CreateMode::LegacyA => (Attach, true, None),
-                CreateMode::LegacyC => (Already, true, None),
                 CreateMode::Start => (Already, false, Some("started")),
-                _ => (Already, false, None),
+                CreateMode::Run => (Already, false, None),
             };
             match decide(
                 &session,
@@ -529,10 +527,7 @@ pub fn execute_commands(action: Action, program: &str, invoked: &OsStr) -> Comma
                 _ => {}
             }
             let status = platform::create(mode, &path, command, &options, invoked)?;
-            crate::return_if!(
-                status != 0 || matches!(mode, CreateMode::Run | CreateMode::LegacyRun),
-                Ok(status)
-            );
+            crate::return_if!(status != 0 || matches!(mode, CreateMode::Run), Ok(status));
             if let Some(verb) = verb {
                 announce(&session, options.quiet, verb);
             }

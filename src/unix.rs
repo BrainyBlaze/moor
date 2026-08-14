@@ -279,10 +279,7 @@ pub(crate) fn create(
     options: &Options,
     invoked: &OsStr,
 ) -> CommandResult<i32> {
-    let interactive = matches!(
-        mode,
-        CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
-    );
+    let interactive = matches!(mode, CreateMode::Bare | CreateMode::New);
     let terminal = terminal_config(interactive)?;
     let root = root(invoked)?;
     let event = validate_event_target(options.events.as_deref(), &root, path)?;
@@ -381,7 +378,7 @@ pub(crate) fn create(
         instrument,
     };
     crate::return_if!(
-        matches!(mode, CreateMode::Run | CreateMode::LegacyRun),
+        matches!(mode, CreateMode::Run),
         Ok(holder(config, listener, None)?)
     );
     let (parent, child) = UnixStream::pair().text()?;
@@ -622,7 +619,7 @@ fn holder(
     else {
         return Ok(125);
     };
-    let (exit, durable) = state.finish_exit(&running, status, None);
+    let (exit, durable) = state.finish_exit(&running, status, state.termination_method());
     let owned = fs::symlink_metadata(path)
         .is_ok_and(|meta| meta.file_type().is_socket() && owned(&meta) && file_id(&meta) == marker);
     let unlinked = durable && owned && fs::remove_file(path).is_ok();
@@ -638,7 +635,7 @@ fn finalize_unpublished_exit(
     ready: &mut shared::LaunchReporter<UnixStream>,
 ) -> Result<i32> {
     let status = state.drive(|_, _| None, || None)?.unwrap_or(observed);
-    let (exit, durable) = state.finish_exit(running, status, None);
+    let (exit, durable) = state.finish_exit(running, status, state.termination_method());
     if durable {
         config.retain_stores();
     }
@@ -2189,9 +2186,13 @@ fn headless_termios() -> libc::termios {
 fn terminal_config(interactive: bool) -> Result<(Option<libc::termios>, libc::winsize)> {
     crate::return_if!(!interactive, Ok((Some(headless_termios()), window(24, 80))));
     let terminal = ViewerTerminal::detect(libc::STDIN_FILENO).ok_or("no controlling terminal")?;
+    // v4: the creation size obeys the same §4 bound the descriptor's reader
+    // enforces — Windows already validated with valid_size while this path
+    // only rejected zeros, so a pathological terminal could seed a geometry
+    // every consumer would then refuse. Symmetric now.
     let (rows, columns) = terminal
         .size()
-        .filter(|(rows, columns)| *rows != 0 && *columns != 0)
+        .filter(|size| crate::wire::valid_size(*size))
         .ok_or("no controlling terminal")?;
     Ok((Some(terminal.saved), window(rows, columns)))
 }

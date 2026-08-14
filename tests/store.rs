@@ -221,7 +221,12 @@ fn log_and_lifecycle_start_at_epoch_one_and_lifecycle_exits_once() {
 
     let path = temp("lifecycle");
     let running = running(7);
-    let exited = lifecycle_exit(&running, 3, 9, "\"ended\":\"exited\",\"code\":0");
+    let exited = lifecycle_exit(
+        &running,
+        3,
+        9,
+        "\"ended\":\"exited\",\"code\":0,\"method\":\"none\"",
+    );
     let mut store = Store::create(&path, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
     assert_eq!((store.selected().epoch, store.selected().index), (1, 1));
     store.replace(exited.as_bytes(), 1, 9, 9).unwrap();
@@ -712,13 +717,24 @@ fn every_event_schema_row_enforces_kind_order_and_dependent_values() {
         ",\"axis\":\"unknown\"",
         false,
     );
+    // v4: mechanism and intent are orthogonal; `method` is mandatory on every
+    // exit and `terminated` no longer exists as an ending. A method-less
+    // record and the old folded ending are both refused, pinned below.
+    for tail in [
+        ",\"ended\":\"exited\",\"code\":0,\"method\":\"none\"",
+        ",\"ended\":\"exited\",\"code\":0,\"method\":\"graceful\"",
+        ",\"ended\":\"signalled\",\"signal\":9,\"method\":\"none\"",
+        ",\"ended\":\"signalled\",\"signal\":15,\"method\":\"forced\"",
+    ] {
+        stored_event_case("exit", "transition", tail, true);
+    }
     for tail in [
         ",\"ended\":\"exited\",\"code\":0",
         ",\"ended\":\"signalled\",\"signal\":9",
         ",\"ended\":\"terminated\",\"code\":1,\"method\":\"graceful\"",
         ",\"ended\":\"terminated\",\"code\":1,\"method\":\"forced\"",
     ] {
-        stored_event_case("exit", "transition", tail, true);
+        stored_event_case("exit", "transition", tail, false);
     }
     for (scanner, reason) in [
         ("osc", "deadline"),

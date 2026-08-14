@@ -195,6 +195,9 @@ fn fixture_with_native<N: Native>(native: N) -> (Runtime<N>, PathBuf) {
     (runtime, root)
 }
 
+// The fixtures above build a runtime with an EMPTY base status, so a status
+// payload in these tests is the v4 geometry pair (4 bytes) followed by the
+// tail — which is why tail offsets here start at 36 rather than 32.
 fn event_fixture() -> (Runtime<FakeNative>, [PathBuf; 2]) {
     event_fixture_with(1, 1)
 }
@@ -372,8 +375,8 @@ fn live_holder_ancestry_refuses_attach_before_any_attach_state_change() {
     let mut unrelated = connect_as_with(&mut runtime, Profile::Controller, true, Some(42));
     hello(&mut unrelated, &mut runtime);
     unrelated.send(7, 3, &[80, 0, 24, 0, 1]);
-    assert_eq!(unrelated.recv(&mut runtime).kind, 5);
     assert_eq!(unrelated.recv(&mut runtime).kind, 4);
+    assert_eq!(unrelated.recv(&mut runtime).kind, 5);
     let lease = LeaseResult::decode_wire(&unrelated.recv_kind(&mut runtime, 0x16).payload).unwrap();
     assert_eq!(lease.outcome, ResultOutcome::Granted);
     assert_eq!(unrelated.recv(&mut runtime).kind, 6);
@@ -653,8 +656,8 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
         ]
         .concat(),
     );
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     peer.send(
         7,
@@ -714,8 +717,8 @@ fn geometry_bounds_are_enforced_at_both_ingresses_with_distinct_frozen_codes() {
                 3,
                 &[0u16.to_le_bytes().as_slice(), &0u16.to_le_bytes(), &[1]].concat(),
             );
-            peer.recv_kind(&mut runtime, 5);
             peer.recv_kind(&mut runtime, 4);
+            peer.recv_kind(&mut runtime, 5);
             let lease =
                 LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
             peer.send(
@@ -804,8 +807,8 @@ fn invalid_query_reply_does_not_refresh_the_lease() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     let granted = monotonic();
     runtime.output(b"\x1b[?2004$p".to_vec());
@@ -825,12 +828,12 @@ fn invalid_query_reply_does_not_refresh_the_lease() {
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
     assert_eq!(
-        status.payload[32] & 0x10,
+        status.payload[36] & 0x10,
         0,
         "class-mismatched reply extended ownership"
     );
     assert_eq!(
-        u32::from_le_bytes(status.payload[33..37].try_into().unwrap()),
+        u32::from_le_bytes(status.payload[37..41].try_into().unwrap()),
         lease.epoch
     );
     drop(runtime);
@@ -845,8 +848,8 @@ fn split_queries_are_delegated_before_exact_raw_release_and_quiet_candidates_exp
         let mut peer = connect(&mut runtime);
         hello(&mut peer, &mut runtime);
         peer.send(7, 3, &[0, 0, 0, 0, 1]);
-        peer.recv_kind(&mut runtime, 5);
         peer.recv_kind(&mut runtime, 4);
+        peer.recv_kind(&mut runtime, 5);
         peer.recv_kind(&mut runtime, 0x16);
         while peer.try_recv(&mut runtime).is_some() {}
         runtime.output(query[..split].to_vec());
@@ -872,8 +875,8 @@ fn split_queries_are_delegated_before_exact_raw_release_and_quiet_candidates_exp
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0; 5]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     while peer.try_recv(&mut runtime).is_some() {}
     runtime.output(b"\x1b[".to_vec());
     assert!(peer.try_recv(&mut runtime).is_none());
@@ -978,8 +981,8 @@ fn a_quiet_session_never_wakes_a_controller() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     for _ in 0..8 {
         runtime.poll();
     }
@@ -1129,8 +1132,8 @@ fn viewer_resume_cannot_restart_the_whole_attach_exchange_deadline() {
     let mut owner = connect(&mut runtime);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[0, 0, 0, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
     owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
     drop(owner);
@@ -1247,14 +1250,14 @@ fn expired_viewer_ownership_is_removed_from_status_queries_and_resize() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 1]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     let granted = LeaseResult::decode_wire(&peer.recv_kind(&mut runtime, 0x16).payload).unwrap();
     runtime.tick(monotonic().saturating_add(10_001));
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
     assert_eq!(
-        status.payload[32] & 0x30,
+        status.payload[36] & 0x30,
         0x20,
         "observer remains attached without ownership"
     );
@@ -1288,9 +1291,9 @@ fn non_vt_attach_omits_terminal_bytes_without_erasing_tracked_exactness() {
     let mut peer = connect(&mut runtime);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0, 0, 0, 0, 3]);
-    assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
     let status = peer.recv_kind(&mut runtime, 4);
-    assert_eq!(status.payload[32] & 2, 2);
+    assert_eq!(status.payload[36] & 2, 2);
+    assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1420,8 +1423,8 @@ fn child_exit_waits_for_delayed_pty_eof_and_final_bytes() {
     let mut peer = connect_as(&mut runtime, Profile::Controller);
     hello(&mut peer, &mut runtime);
     peer.send(7, 3, &[0; 5]);
-    peer.recv_kind(&mut runtime, 5);
     peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
     while peer.try_recv(&mut runtime).is_some() {}
     assert_eq!(
         runtime.drive(|_, _| None, || None).unwrap(),
@@ -1702,7 +1705,7 @@ fn v25_status_emitter_patches_exact_selected_commit_region() {
     peer.send(7, 13, &[]);
     let status = peer.recv_kind(&mut runtime, 14);
 
-    assert_eq!(status.payload.len(), 244, "frozen V25 payload shape");
+    assert_eq!(status.payload.len(), 248, "frozen V25 payload shape");
     assert_eq!(
         &status.payload[commit_at..commit_at + COMMIT.len()],
         &COMMIT,
@@ -1716,7 +1719,7 @@ fn v25_status_emitter_patches_exact_selected_commit_region() {
 }
 
 #[test]
-fn failed_native_resize_does_not_change_the_scanner_row_model() {
+fn failed_native_resize_refuses_the_attach_and_keeps_the_row_model() {
     struct FailResize;
     impl Native for FailResize {
         fn resize(&mut self, _: u16, _: u16) -> Result<(), String> {
@@ -1765,9 +1768,29 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
     let mut owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[80, 0, 50, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
-    owner.recv_kind(&mut runtime, 4);
-    owner.recv_kind(&mut runtime, 0x16);
+    // v4: the platform refused the requested 50-row size, so the attach
+    // fails CLOSED — no descriptor claiming a size the pty does not have,
+    // no terminal bytes, no lease. The holder closes the link instead.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let refused = loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match owner.stream.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(_) => break false,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break true,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(
+        refused,
+        "a failed attach resize must close the link, not attach"
+    );
 
     // Runtime starts at 24 rows. Because the requested 50-row resize failed,
     // 1..24 is still the full/default region and must serialize as CSI r.
@@ -1780,6 +1803,794 @@ fn failed_native_resize_does_not_change_the_scanner_row_model() {
     assert!(preamble.windows(3).any(|part| part == b"\x1b[r"));
     assert!(!preamble.windows(7).any(|part| part == b"\x1b[1;24r"));
 
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_attach_resize_rolls_back_the_provisional_lease_for_the_next_controller() {
+    // The attach transaction grants the fresh lease BEFORE the holder can
+    // attempt the fallible native resize. When that resize fails, the holder
+    // closes the link without ever delivering the token — so if the grant
+    // survived, it would sit as an invisible reservation until its deadline,
+    // refusing every honest fresh controller for a lease nobody can use. The
+    // grant is provisional until its token is delivered inside the attach
+    // prefix: any earlier failure must roll it back entirely.
+    struct FailTall;
+    impl Native for FailTall {
+        fn resize(&mut self, rows: u16, _: u16) -> Result<(), String> {
+            if rows > 24 {
+                Err("injected resize failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-lease-rollback-{}-{nonce}",
+        std::process::id()
+    ));
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: FailTall,
+    });
+
+    // First controller requests a fresh lease together with a 50-row attach
+    // the platform will refuse. The failure must close the link with no
+    // successful prefix byte.
+    let mut first = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut first, &mut runtime);
+    first.send(7, 3, &[80, 0, 50, 0, 1]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match first.stream.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(_) => panic!("a failed attach resize must emit no prefix bytes"),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The very next fresh controller must find the lease FREE and the session
+    // geometry untouched by the refused 50-row request. Without rollback the
+    // provisional grant lingers until its deadline and this attach receives
+    // Refused for a token nobody ever held.
+    let mut second = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[80, 0, 24, 0, 1]);
+    assert_eq!(second.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        lease.outcome,
+        ResultOutcome::Granted,
+        "the rolled-back provisional lease must not shadow the next controller"
+    );
+    // The attach/grant transaction is atomic: the uncommitted grant consumed
+    // no epoch, so the successor receives exactly the number the rolled-back
+    // grant would have carried — not a silently skipped one.
+    assert_eq!(
+        lease.epoch, 1,
+        "an uncommitted provisional grant must not consume a protocol epoch"
+    );
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_resumed_attach_resize_preserves_the_reservation_for_exact_resume() {
+    // The mirror side of the rollback rule. A RESUMED viewer already holds a
+    // known epoch/token from before this attach: its resize failure is
+    // ordinary transport loss, so the reservation must survive — a competing
+    // fresh controller may not steal the lease, and the owner must be able to
+    // resume with its exact tuple afterwards. Only the fresh grant whose token
+    // was never delivered rolls back.
+    struct FailTall;
+    impl Native for FailTall {
+        fn resize(&mut self, rows: u16, _: u16) -> Result<(), String> {
+            if rows > 24 {
+                Err("injected resize failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-resume-reservation-{}-{nonce}",
+        std::process::id()
+    ));
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: FailTall,
+    });
+
+    // The owner takes a fresh viewer lease with a geometry-free attach, then
+    // loses its link: ordinary reservation, epoch/token intact.
+    let mut owner = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut owner, &mut runtime);
+    owner.send(7, 3, &[0, 0, 0, 0, 1]);
+    owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
+    let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(lease.outcome, ResultOutcome::Granted);
+    owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(owner);
+    for _ in 0..10 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The owner resumes on a new connection, then requests an attach whose
+    // 50-row geometry the platform refuses. The holder closes the link.
+    let mut resumed = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut resumed, &mut runtime);
+    resumed.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::Viewer,
+            epoch: lease.epoch,
+            incarnation: [1; 16],
+            token: lease.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let rotated = LeaseResult::decode_wire(&resumed.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(rotated.outcome, ResultOutcome::Resumed);
+    resumed.send(7, 3, &[80, 0, 50, 0, 0]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match resumed.stream.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(_) => panic!("a failed resumed attach resize must emit no prefix bytes"),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // A competing fresh controller must NOT obtain the lease: the reservation
+    // belongs to the resumed owner's known tuple.
+    let mut thief = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut thief, &mut runtime);
+    thief.send(7, 3, &[80, 0, 24, 0, 1]);
+    assert_eq!(thief.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(thief.recv_kind(&mut runtime, 5).kind, 5);
+    assert_eq!(
+        LeaseResult::decode_wire(&thief.recv_kind(&mut runtime, 0x16).payload)
+            .unwrap()
+            .outcome,
+        ResultOutcome::Refused,
+        "the preserved reservation must refuse a competing fresh grant"
+    );
+
+    // And the owner's exact tuple still resumes.
+    let mut returning = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut returning, &mut runtime);
+    returning.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::Viewer,
+            epoch: rotated.epoch,
+            incarnation: [1; 16],
+            // Resume rotates the token: the owner's known tuple is the one
+            // from its LAST successful lease exchange.
+            token: rotated.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let comeback =
+        LeaseResult::decode_wire(&returning.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        comeback.outcome,
+        ResultOutcome::Resumed,
+        "the reservation must still admit the owner's exact tuple: {comeback:?}"
+    );
+    assert_eq!(
+        comeback.epoch, rotated.epoch,
+        "a resumed viewer's failure keeps its existing epoch, never a new one"
+    );
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_lease_reply_send_rolls_back_the_provisional_grant_at_the_queue_boundary() {
+    // The provisional transaction extends through the delivery of the token
+    // frame ITSELF. The status and terminal frames can enqueue while the
+    // LEASE_RESULT that carries the only copy of the token hits a full
+    // outbound queue: the holder disconnects, and without rollback the
+    // ownerless reservation and its consumed epoch survive to refuse the
+    // next honest controller. The gated transport reproduces that queue
+    // boundary deterministically.
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GatedWriter {
+        inner: UnixStream,
+        gate: Arc<AtomicBool>,
+    }
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let fixture = |tag: &str| {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "moor-holder-token-boundary-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        let running = lifecycle_running(
+            b"\x01/session",
+            (Some(7), 7),
+            [1; 16],
+            (1, 1, [2; 16]),
+            ("posix-bytes", None, None),
+        );
+        let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+        let runtime = Runtime::new(HolderConfig {
+            core: CoreConfig {
+                generation: 7,
+                identity: b"session".to_vec(),
+                incarnation: [1; 16],
+                semantic_token: [0; 16],
+                replay_limit: 1024,
+            },
+            pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+            storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+            status: Vec::new(),
+            commit_at: 0,
+            synthetic: 0,
+            native: FakeNative,
+        });
+        (runtime, root)
+    };
+
+    // Calibration round on a separate fixture: measure the exact on-wire
+    // sizes of the status descriptor and the empty NON_VT preamble, so the
+    // gated budget below admits exactly those two frames and nothing more.
+    let (mut calibrate, calibration_root) = fixture("calibrate");
+    let mut probe = connect_as(&mut calibrate, Profile::Controller);
+    hello(&mut probe, &mut calibrate);
+    probe.send(7, 3, &[0, 0, 0, 0, 3]);
+    let status_len = 24 + probe.recv_kind(&mut calibrate, 4).payload.len();
+    let terminal_len = 24 + probe.recv_kind(&mut calibrate, 5).payload.len();
+    probe.recv_kind(&mut calibrate, 0x16);
+    drop(calibrate);
+    fs::remove_dir_all(calibration_root).unwrap();
+
+    // Gated round: the handshake drains through the open gate; the gate then
+    // closes, so the budget frees nothing and admits exactly status+terminal.
+    let (mut runtime, root) = fixture("gated");
+    let gate = Arc::new(AtomicBool::new(true));
+    let (client, server) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let writer = GatedWriter {
+        inner: server.try_clone().unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let close = server.try_clone().unwrap();
+    runtime.accept(
+        Duplex::closing(server, writer, status_len + terminal_len, move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        }),
+        true,
+        None,
+        false,
+    );
+    let mut first = Peer {
+        stream: client,
+        codec: Codec::new(Profile::Controller),
+        queued: VecDeque::new(),
+    };
+    hello(&mut first, &mut runtime);
+    // Let the transport thread finish accounting for the drained HELLO_ACK
+    // before the gate closes, so the budget is exactly the two-frame one.
+    std::thread::sleep(Duration::from_millis(50));
+    gate.store(false, Ordering::Relaxed);
+    first.send(7, 3, &[0, 0, 0, 0, 3]);
+    // Let the holder process the attach: status and terminal enqueue into the
+    // exact two-frame budget, the token frame hits Full, and the holder
+    // disconnects the requester. The successor below is the detector — its
+    // lease outcome distinguishes rollback from a leaked reservation. (The
+    // first link's own closure is not observable here: the gated writer
+    // thread parks inside the closed gate, so the transport's close callback
+    // cannot run until the gate reopens at the end of the test.)
+    for _ in 0..50 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(first);
+
+    // The token never left the holder, so the grant was not committed: the
+    // very next fresh controller must receive it — at epoch 1 exactly.
+    let mut second = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[0, 0, 0, 0, 1]);
+    assert_eq!(second.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        (lease.outcome, lease.epoch),
+        (ResultOutcome::Granted, 1),
+        "a token frame that never enqueued must roll the provisional grant back"
+    );
+
+    // Reopen the gate so the parked writer thread can finish against the
+    // now-dead socket and the runtime can join it on drop.
+    gate.store(true, Ordering::Relaxed);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_upgrade_lease_reply_send_rolls_back_the_standalone_fresh_grant() {
+    // The standalone LEASE exchange has the same queue boundary as the attach
+    // shorthand: the session mutates the grant FIRST and only then emits the
+    // result frame. An observer upgrading to a fresh viewer lease whose
+    // result frame cannot enqueue must not leave an invisible reservation —
+    // the grant was never committed, so the next fresh controller receives
+    // that very epoch.
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GatedWriter {
+        inner: UnixStream,
+        gate: Arc<AtomicBool>,
+    }
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    // Calibration: the exact on-wire sizes of the observer prefix.
+    let (mut calibrate, calibration_root) = fixture();
+    let mut probe = connect(&mut calibrate);
+    hello(&mut probe, &mut calibrate);
+    probe.send(7, 3, &[0, 0, 0, 0, 0]);
+    let status_len = 24 + probe.recv_kind(&mut calibrate, 4).payload.len();
+    let terminal_len = 24 + probe.recv_kind(&mut calibrate, 5).payload.len();
+    drop(calibrate);
+    fs::remove_dir_all(calibration_root).unwrap();
+
+    let (mut runtime, root) = fixture();
+    let gate = Arc::new(AtomicBool::new(true));
+    let (client, server) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let writer = GatedWriter {
+        inner: server.try_clone().unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let close = server.try_clone().unwrap();
+    runtime.accept(
+        Duplex::closing(server, writer, status_len + terminal_len, move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        }),
+        true,
+        None,
+        false,
+    );
+    let mut observer = Peer {
+        stream: client,
+        codec: Codec::new(Profile::Controller),
+        queued: VecDeque::new(),
+    };
+    hello(&mut observer, &mut runtime);
+    std::thread::sleep(Duration::from_millis(50));
+    gate.store(false, Ordering::Relaxed);
+    // The observer prefix exactly fills the gated budget, so the upgrade's
+    // result frame below cannot enqueue.
+    observer.send(7, 3, &[0, 0, 0, 0, 0]);
+    for _ in 0..25 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    observer.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Fresh,
+            role: LeaseRole::Viewer,
+            epoch: 0,
+            incarnation: [0; 16],
+            token: [0; 16],
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    for _ in 0..25 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(observer);
+
+    let mut second = connect(&mut runtime);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[0, 0, 0, 0, 1]);
+    assert_eq!(second.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        (lease.outcome, lease.epoch),
+        (ResultOutcome::Granted, 1),
+        "an upgrade result that never enqueued must roll the standalone grant back"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn geometry_survives_a_failed_prefix_and_the_next_status_reports_it() {
+    // The honest exception to the attach transaction's unwinding. The native
+    // resize happens BEFORE the prefix is built; once it has succeeded, a
+    // later prefix failure rolls back the LEASE but may not guess the
+    // geometry back with a compensating resize — the native effect may
+    // already be visible. The frozen rule: the applied geometry stands, and
+    // the next status descriptor reports the geometry actually in force.
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GatedWriter {
+        inner: UnixStream,
+        gate: Arc<AtomicBool>,
+    }
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    // Calibration: the on-wire sizes of the NON_VT fresh-lease prefix.
+    let (mut calibrate, calibration_root) = fixture();
+    let mut probe = connect(&mut calibrate);
+    hello(&mut probe, &mut calibrate);
+    probe.send(7, 3, &[0, 0, 0, 0, 3]);
+    let status_len = 24 + probe.recv_kind(&mut calibrate, 4).payload.len();
+    let terminal_len = 24 + probe.recv_kind(&mut calibrate, 5).payload.len();
+    drop(calibrate);
+    fs::remove_dir_all(calibration_root).unwrap();
+
+    let (mut runtime, root) = fixture();
+    let gate = Arc::new(AtomicBool::new(true));
+    let (client, server) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let writer = GatedWriter {
+        inner: server.try_clone().unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let close = server.try_clone().unwrap();
+    runtime.accept(
+        Duplex::closing(server, writer, status_len + terminal_len, move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        }),
+        true,
+        None,
+        false,
+    );
+    let mut first = Peer {
+        stream: client,
+        codec: Codec::new(Profile::Controller),
+        queued: VecDeque::new(),
+    };
+    hello(&mut first, &mut runtime);
+    std::thread::sleep(Duration::from_millis(50));
+    gate.store(false, Ordering::Relaxed);
+    // Fresh-lease NON_VT attach carrying 100x30: the policy grant succeeds,
+    // the native resize succeeds, status and terminal enqueue — and the
+    // token frame hits the exhausted budget, failing the prefix.
+    first.send(7, 3, &[100, 0, 30, 0, 3]);
+    for _ in 0..50 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(first);
+
+    // The lease unwound (Granted at epoch 1 proves it) and the geometry
+    // stood: the successor's descriptor reports 100x30, not the 80x24 the
+    // session was born with.
+    let mut second = connect(&mut runtime);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[0, 0, 0, 0, 1]);
+    let descriptor = second.recv_kind(&mut runtime, 4);
+    // The fixture's status prefix is empty, so the mandatory geometry pair
+    // opens the payload: columns first, like RESIZE.
+    let columns = u16::from_le_bytes(descriptor.payload[0..2].try_into().unwrap());
+    let rows = u16::from_le_bytes(descriptor.payload[2..4].try_into().unwrap());
+    assert_eq!(
+        (columns, rows),
+        (100, 30),
+        "the next status must report the geometry actually in force"
+    );
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        (lease.outcome, lease.epoch),
+        (ResultOutcome::Granted, 1),
+        "the lease side of the failed attach must still unwind"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_resume_lease_reply_send_restores_the_entire_prior_reservation() {
+    // Resume ROTATES the token as it re-establishes ownership. When the
+    // result frame carrying the rotated token cannot enqueue, the requester
+    // still knows only the OLD tuple — so the mutation must unwind entirely:
+    // ownerless state, the old token, and the original deadline all return,
+    // and the owner's next resume with the old tuple succeeds. A refused
+    // result stays nonmutating throughout (the first, wrong-token resume
+    // below proves it: the reservation it bounced off is the one restored).
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GatedWriter {
+        inner: UnixStream,
+        gate: Arc<AtomicBool>,
+    }
+    impl Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            while !self.gate.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    let (mut runtime, root) = fixture();
+
+    // The owner takes a standalone fresh input-only lease, then loses its
+    // link: an ordinary reservation under the granted token.
+    let mut owner = connect(&mut runtime);
+    hello(&mut owner, &mut runtime);
+    owner.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Fresh,
+            role: LeaseRole::InputOnly,
+            epoch: 0,
+            incarnation: [0; 16],
+            token: [0; 16],
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let granted_frame = owner.recv_kind(&mut runtime, 0x16);
+    let result_len = 24 + granted_frame.payload.len();
+    let granted = LeaseResult::decode_wire(&granted_frame.payload).unwrap();
+    assert_eq!(granted.outcome, ResultOutcome::Granted);
+    owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(owner);
+    for _ in 0..10 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Gated connection: HELLO_ACK drains through the open gate; the gate
+    // then closes. The budget is one ACK — it admits exactly one parked
+    // result frame, and the second cannot enqueue.
+    let gate = Arc::new(AtomicBool::new(true));
+    let (client, server) = UnixStream::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    let writer = GatedWriter {
+        inner: server.try_clone().unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let close = server.try_clone().unwrap();
+    let mut resumer = Peer {
+        stream: client,
+        codec: Codec::new(Profile::Controller),
+        queued: VecDeque::new(),
+    };
+    resumer.send(0, 1, &wire::controller_hello(b"session").unwrap());
+    // Measure the ACK to size the budget; accept AFTER building the frame so
+    // the limit can depend on it? The limit must be fixed at accept time, so
+    // derive it from the calibration constant instead: the ACK for this
+    // fixture is deterministic, measured on the owner connection above.
+    let ack_len = {
+        let (mut calibrate, calibration_root) = fixture();
+        let mut probe = connect(&mut calibrate);
+        probe.send(0, 1, &wire::controller_hello(b"session").unwrap());
+        let ack = probe.recv(&mut calibrate);
+        assert_eq!(ack.kind, 2);
+        let len = 24 + ack.payload.len();
+        drop(calibrate);
+        fs::remove_dir_all(calibration_root).unwrap();
+        len
+    };
+    assert!(
+        result_len <= ack_len && ack_len < 2 * result_len,
+        "budget precondition: result {result_len}, ack {ack_len} — recalibrate the gated budget"
+    );
+    runtime.accept(
+        Duplex::closing(server, writer, ack_len, move || {
+            let _ = close.shutdown(std::net::Shutdown::Both);
+        }),
+        true,
+        None,
+        false,
+    );
+    assert_eq!(resumer.recv(&mut runtime).kind, 2);
+    std::thread::sleep(Duration::from_millis(50));
+    gate.store(false, Ordering::Relaxed);
+
+    // First resume: WRONG token. Refused, nonmutating — and its parked
+    // result frame consumes the remaining budget.
+    resumer.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::InputOnly,
+            epoch: granted.epoch,
+            incarnation: [1; 16],
+            token: [0xEE; 16],
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    for _ in 0..25 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Second resume: the RIGHT tuple. The mutation succeeds, the rotated
+    // token cannot enqueue, and the whole reservation must unwind.
+    resumer.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::InputOnly,
+            epoch: granted.epoch,
+            incarnation: [1; 16],
+            token: granted.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    for _ in 0..25 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    drop(resumer);
+
+    // The owner returns with the OLD tuple — the only one it ever saw.
+    let mut returning = connect(&mut runtime);
+    hello(&mut returning, &mut runtime);
+    returning.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::InputOnly,
+            epoch: granted.epoch,
+            incarnation: [1; 16],
+            token: granted.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let comeback =
+        LeaseResult::decode_wire(&returning.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        (comeback.outcome, comeback.epoch),
+        (ResultOutcome::Resumed, granted.epoch),
+        "a rotated token that never enqueued must restore the prior reservation: {comeback:?}"
+    );
+
+    gate.store(true, Ordering::Relaxed);
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -1854,8 +2665,8 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     let mut owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut owner, &mut runtime);
     owner.send(7, 3, &[80, 0, 24, 0, 1]);
-    owner.recv_kind(&mut runtime, 5);
     owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
     let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     assert!(calls.lock().unwrap().is_empty(), "redraw none resized");
 
@@ -1890,8 +2701,8 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     let mut redraw_owner = connect_as(&mut runtime, Profile::Controller);
     hello(&mut redraw_owner, &mut runtime);
     redraw_owner.send(7, 3, &[80, 0, 24, 0, 1]);
-    redraw_owner.recv_kind(&mut runtime, 5);
     redraw_owner.recv_kind(&mut runtime, 4);
+    redraw_owner.recv_kind(&mut runtime, 5);
     let lease =
         LeaseResult::decode_wire(&redraw_owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
     let resize = [

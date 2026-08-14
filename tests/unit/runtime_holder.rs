@@ -136,7 +136,13 @@ mod descriptor_deadline_tests {
         let mut calls = 0;
         runtime.poll_descriptors_with(&mut || {
             calls += 1;
-            if calls < 4 { now } else { now + 51 }
+            // v4's status-first attach dropped one deadline recheck from the
+            // prefix, so the whole exchange makes exactly three clock reads:
+            // the loop admission, the Attached precheck, and send_status's
+            // post-payload check. The lapse lands on that LAST read — the one
+            // after the slow native operation — which is precisely the
+            // recheck this test exists to pin.
+            if calls < 3 { now } else { now + 51 }
         });
 
         assert!(runtime.native.0, "the first descriptor did not run slowly");

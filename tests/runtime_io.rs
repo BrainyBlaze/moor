@@ -211,6 +211,9 @@ fn status(first: u64, last: u64, start: u64, end: u64, flags: u8) -> Vec<u8> {
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&1_u32.to_le_bytes());
     out.extend_from_slice(&[1; 16]);
+    // v4 descriptor geometry: mandatory and nonzero, columns then rows.
+    out.extend_from_slice(&80_u16.to_le_bytes());
+    out.extend_from_slice(&24_u16.to_le_bytes());
     for value in [first, last, start, end] {
         out.extend_from_slice(&value.to_le_bytes());
     }
@@ -259,8 +262,8 @@ fn attach_acknowledges_each_applied_output_record() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(1, 1, 0, 1, 1));
+        peer.send(7, 5, &[0, 0]);
         let output = [
             1_u64.to_le_bytes().as_slice(),
             0_u64.to_le_bytes().as_slice(),
@@ -305,8 +308,8 @@ fn idle_viewer_renews_then_releases_its_lease() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -394,8 +397,8 @@ fn viewer_allows_only_one_input_until_its_exact_receipt() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -504,8 +507,8 @@ fn viewer_routes_terminal_query_replies_without_altering_ordinary_input() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(1, 1, 0, 4, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -638,8 +641,8 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             (attach.kind, attach.payload.as_ref()),
             (3, [80, 0, 24, 0, 1].as_slice())
         );
-        first.send(7, 5, &[0, 0]);
         first.send(7, 4, &status(1, 1, 0, 1, 1));
+        first.send(7, 5, &[0, 0]);
         first.send(
             7,
             0x16,
@@ -735,8 +738,23 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
             "viewer sent a frame before resumed ATTACH was acknowledged"
         );
         second.stream.set_read_timeout(None).unwrap();
-        second.send(7, 5, &[0, 0]);
         second.send(7, 4, &status(1, 2, 0, 2, 1));
+        // v4 fence: the resumed adoption may not release ANYTHING between the
+        // descriptor and the mandatory terminal state — no queued INPUT (9),
+        // no RESIZE (0x0b), no mutation at all escapes mid-prefix. The
+        // descriptor is the FIRST prefix item now, so a gate that fires on it
+        // would emit exactly here.
+        second
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut fenced = [0; 256];
+        assert!(
+            matches!(second.stream.read(&mut fenced), Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "the resumed viewer mutated the wire between ATTACH_ACK and TERMINAL_STATE"
+        );
+        second.stream.set_read_timeout(None).unwrap();
+        second.send(7, 5, &[0, 0]);
         second.send(
             7,
             6,
@@ -858,8 +876,8 @@ fn transport_loss_after_release_request_is_not_a_successful_detach() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -920,8 +938,8 @@ fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -1028,8 +1046,8 @@ fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 5, &[0, 0]);
         peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
             0x16,
@@ -1402,8 +1420,8 @@ fn move_reset_homes_the_cursor_even_after_an_empty_preamble() {
                 &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
             );
             assert_eq!(peer.recv().kind, 3);
-            peer.send(7, 5, &body);
             peer.send(7, 4, &status(1, 1, 0, 1, 1));
+            peer.send(7, 5, &body);
             let output = [
                 1_u64.to_le_bytes().as_slice(),
                 0_u64.to_le_bytes().as_slice(),

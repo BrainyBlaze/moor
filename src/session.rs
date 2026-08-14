@@ -89,6 +89,25 @@ impl OwnedInput {
 
 schema!(struct default Lease fields; owner: Option<ConnId> = None, role: LeaseRole = LeaseRole::Viewer, epoch: u32 = 0, token: [u8; 16] = [0; 16], deadline: u64 = 0, cached: Option<(OwnedInput, [u8; 43])> = None, inflight: Option<OwnedInput> = None);
 
+/// The undo ledger for one in-flight standalone lease reply. A grant or a
+/// resume mutates the machine BEFORE its result frame is enqueued; if that
+/// enqueue fails, the requester never saw the token, so the mutation must
+/// unwind: a fresh grant restores the (empty) prior lease and the prior
+/// allocation, a resume restores ownerless state, the old token, and the
+/// original deadline while leaving the request cache untouched. Refusals
+/// never create an entry — they are nonmutating by construction.
+enum LeaseUndo {
+    Fresh {
+        prior: Lease,
+        allocated: u32,
+    },
+    Resume {
+        owner: Option<ConnId>,
+        token: [u8; 16],
+        deadline: u64,
+    },
+}
+
 schema!(enum ordinal pub Phase; Unattached, InputOnly, Resumed, Observer, Viewer, Closing);
 
 pub const fn legal_in_phase(phase: Phase, kind: u8) -> bool {
@@ -329,7 +348,7 @@ schema!(struct pub ReceiptProjection pub fields; receipt: ApplicationReceipt, st
 schema!(struct pub PolicyStatus derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; owns_lease: bool, viewers: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, query_available: bool, replay: ReplayDescriptor);
 schema!(struct pub OutputRecord derive [Clone, Debug, Eq, PartialEq] pub fields; sequence: u64, offset: u64, bytes: Arc<[u8]>);
 schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(Vec<u8>), Notice(InputNotice), NoticeCancel(ApplicationReceipt), SemanticAck(SemanticAck), SemanticRefused(Option<SemanticEvent>, SemanticRefusal), SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]), Termination(u8, u8, u8, &'static [u8]));
-schema!(enum pub Effect; Send(ConnId, Reply), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16), Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool), CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>), QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64), OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
+schema!(enum pub Effect; Send(ConnId, Reply), LeaseReply(ConnId, LeaseResult), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16), Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool), CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>), QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64), OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
 schema!(enum pub Completion; Write(u64, Option<u16>), Sources(bool), Semantic(Result<EventPosition, SemanticRefusal>));
 schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>), Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16), Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello), SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat, QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
 schema!(enum pub Transition<'a>; Peer(u64, ConnId, Request<'a>), Complete(u64, CommitTicket, Completion), Query(u64, Arc<[u8]>, QueryShape, Option<Vec<u8>>), Output(u64, Vec<u8>), Shutdown(u64, bool), TerminationApplied(u8, bool), ReportTermination(ConnId), Retired(bool, bool), Tick(u64), Disconnect(ConnId), Writable(bool), Ending);
@@ -345,7 +364,7 @@ impl Termination {
     }
 }
 schema!(enum SourceTrigger [Clone, Copy]; Timeout(u64), Closed(ConnId), Ending);
-schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8; 16] = [0; 16], allocated: u32 = 0, lease: Lease = Lease::default(), semantic_token: [u8; 16] = [0; 16], sources: BTreeMap<Arc<[u8]>, Source> = BTreeMap::new(), applications: BTreeMap<[u8; 16], Application> = BTreeMap::new(), writable: bool = true, peers: BTreeMap<ConnId, Peer> = BTreeMap::new(), pending: HashMap<Ticket, Pending> = HashMap::new(), next_ticket: u64 = 1, queries: VecDeque<PendingQuery> = VecDeque::new(), query_next: u64 = 1, query_exhaustion_pending: bool = false, replay: VecDeque<OutputRecord> = VecDeque::new(), replay_limit: u64 = u64::MAX, next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(), termination: Option<Termination> = None, effects: Effects = Effects::new());
+schema!(struct default pub Machine fields; generation: u32 = 0, incarnation: [u8; 16] = [0; 16], allocated: u32 = 0, lease: Lease = Lease::default(), semantic_token: [u8; 16] = [0; 16], sources: BTreeMap<Arc<[u8]>, Source> = BTreeMap::new(), applications: BTreeMap<[u8; 16], Application> = BTreeMap::new(), writable: bool = true, peers: BTreeMap<ConnId, Peer> = BTreeMap::new(), pending: HashMap<Ticket, Pending> = HashMap::new(), next_ticket: u64 = 1, queries: VecDeque<PendingQuery> = VecDeque::new(), query_next: u64 = 1, query_exhaustion_pending: bool = false, replay: VecDeque<OutputRecord> = VecDeque::new(), replay_limit: u64 = u64::MAX, next_sequence: u64 = 1, next_offset: u64 = 0, lost: u64 = 0, identity: Vec<u8> = Vec::new(), termination: Option<Termination> = None, effects: Effects = Effects::new(), lease_undo: Option<(ConnId, LeaseUndo)> = None);
 
 impl Machine {
     fn send(&mut self, conn: ConnId, reply: Reply) {
@@ -428,6 +447,7 @@ impl Machine {
         request: &LeaseRequest,
         now: u64,
         token: Option<[u8; 16]>,
+        transactional: bool,
     ) -> LeaseResult {
         self.expire_lease(now);
         let fresh = request.operation == LeaseOperation::Fresh;
@@ -461,20 +481,90 @@ impl Machine {
             return self.lease_refusal(request.role, ResultReason::Exhausted);
         };
         if fresh {
+            let allocated = self.allocated;
             self.allocated = epoch;
-            self.lease = Lease {
-                owner: Some(conn),
-                role: request.role,
-                epoch,
-                token,
-                deadline: now.saturating_add(10_000),
-                ..Lease::default()
-            };
+            let prior = std::mem::replace(
+                &mut self.lease,
+                Lease {
+                    owner: Some(conn),
+                    role: request.role,
+                    epoch,
+                    token,
+                    deadline: now.saturating_add(10_000),
+                    ..Lease::default()
+                },
+            );
+            if transactional {
+                self.lease_undo = Some((conn, LeaseUndo::Fresh { prior, allocated }));
+            }
         } else {
+            if transactional {
+                self.lease_undo = Some((
+                    conn,
+                    LeaseUndo::Resume {
+                        owner: self.lease.owner,
+                        token: self.lease.token,
+                        deadline: self.lease.deadline,
+                    },
+                ));
+            }
             (self.lease.owner, self.lease.token) = (Some(conn), token);
             self.lease.deadline = now.saturating_add(10_000);
         }
         LeaseResult::success(outcome, request.role, epoch, token)
+    }
+
+    pub fn lease_reply_delivered(&mut self, conn: ConnId) {
+        if self
+            .lease_undo
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending == conn)
+        {
+            self.lease_undo = None;
+        }
+    }
+
+    pub fn lease_reply_failed(&mut self, conn: ConnId) {
+        let Some((pending, undo)) = self.lease_undo.take_if(|(pending, _)| *pending == conn) else {
+            return;
+        };
+        debug_assert_eq!(pending, conn);
+        match undo {
+            LeaseUndo::Fresh { prior, allocated } => {
+                self.lease = prior;
+                self.allocated = allocated;
+            }
+            LeaseUndo::Resume {
+                owner,
+                token,
+                deadline,
+            } => {
+                (self.lease.owner, self.lease.token) = (owner, token);
+                self.lease.deadline = deadline;
+            }
+        }
+    }
+
+    pub fn rollback_attach(&mut self, epoch: u32) {
+        // A fresh grant made inside an attach transaction is PROVISIONAL until
+        // the holder has delivered its token in the attach prefix. When any
+        // earlier step fails — deadline, native resize, a prefix send — the
+        // requester can never present the token, so a surviving reservation
+        // would refuse every honest fresh controller until its deadline for a
+        // lease nobody can use. The epoch identifies the exact grant: a stale
+        // rollback of a superseded epoch changes nothing. The allocation
+        // counter is restored too — no frame carrying this epoch ever left
+        // the holder (the descriptor is part of the same failed prefix), so
+        // the attach/grant transaction is atomic and an uncommitted grant may
+        // not consume an epoch: the next fresh controller receives this very
+        // number.
+        return_if!(self.lease.epoch != epoch);
+        if self.allocated == epoch {
+            self.allocated = epoch - 1;
+        }
+        if let Some(conn) = std::mem::take(&mut self.lease).owner {
+            self.queries_gone(conn);
+        }
     }
 
     fn release_lease(&mut self, conn: ConnId, epoch: u32, token: [u8; 16]) -> LeaseResult {
@@ -1256,7 +1346,13 @@ impl Machine {
                 let resumed = phase == Phase::Resumed && !lease && self.lease.owner == Some(conn);
                 require_policy(resumed || phase == Phase::Unattached && (columns == 0 || lease))?;
                 let result = lease.then(|| {
-                    self.request_lease(conn, &LeaseRequest::fresh(LeaseRole::Viewer), now, token)
+                    self.request_lease(
+                        conn,
+                        &LeaseRequest::fresh(LeaseRole::Viewer),
+                        now,
+                        token,
+                        false,
+                    )
                 });
                 let owns = resumed
                     || matches!(&result, Some(value) if value.outcome == ResultOutcome::Granted);
@@ -1278,8 +1374,8 @@ impl Machine {
                 let phase = self.phase(conn).ok_or(WireError::Malformed)?;
                 let flags = request.operation as u8 | (request.role as u8) << 1;
                 require_policy(next_phase(phase, 0x15, flags).is_some())?;
-                let result = self.request_lease(conn, &request, now, token);
-                self.send(conn, Reply::Lease(result));
+                let result = self.request_lease(conn, &request, now, token, true);
+                self.effects.push(Effect::LeaseReply(conn, result));
             }
             Request::Release(epoch, token) => {
                 self.expire_lease(now);

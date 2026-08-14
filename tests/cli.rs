@@ -169,7 +169,7 @@ fn option_terminator_is_permanent_and_legacy_k_has_frozen_error() {
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         format!(
-            "{}: Invalid number of arguments\nTry '{} --help' for more information.\n",
+            "{}: Invalid mode '-k'\nTry '{} --help' for more information.\n",
             program(),
             program()
         )
@@ -193,17 +193,16 @@ fn repeated_flags_and_known_option_ownership_are_exact() {
 
 #[test]
 fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
-    for token in ["new", "n", "-c", "start", "s", "-n", "run", "-N", "-A"] {
+    for token in ["new", "n", "start", "s", "run"] {
         for args in [vec![token, "-q", "session"], vec![token, "session", "-q"]] {
             assert!(parses(&args), "{args:?}");
         }
     }
     for token in [
-        "attach", "a", "-a", "push", "p", "-p", "kill", "k", "-k", "list", "l", "ls", "-l",
-        "current", "-i",
+        "attach", "a", "push", "p", "kill", "k", "list", "l", "ls", "current",
     ] {
         let args = match token {
-            "list" | "l" | "ls" | "-l" | "current" | "-i" => vec![token],
+            "list" | "l" | "ls" | "current" => vec![token],
             _ => vec![token, "session"],
         };
         assert!(parses(&args), "{args:?}");
@@ -211,9 +210,30 @@ fn every_frozen_spelling_and_option_phase_reaches_dispatch() {
 }
 
 #[test]
+fn removed_legacy_spellings_are_rejected_as_modes_not_reinterpreted() {
+    // v4 removed the reference tool's dash-spelled command tokens. A removed
+    // token must fail as an unknown MODE, by name — not fall through to the
+    // bare form (where `-A session` would create a session named `-A`), and
+    // not resolve to some neighbouring command. Each spelling is pinned
+    // individually because the old rows were not aliases of one another.
+    for token in ["-A", "-c", "-n", "-N", "-k", "-i", "-a", "-p", "-l"] {
+        let out = run(&[token, "session"]);
+        assert_eq!(out.status.code(), Some(1), "{token}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains(&format!("Invalid mode '{token}'")),
+            "{token}: {text}"
+        );
+    }
+}
+
+#[test]
 fn remaining_argument_diagnostics_name_the_real_command() {
     for (args, message) in [
-        (&["-k", "--bogus", "session"][..], "Invalid mode '--bogus'"),
+        (
+            &["kill", "--bogus", "session"][..],
+            "Invalid mode '--bogus'",
+        ),
         (
             &["start", "-f", "session"][..],
             "Option '-f' is not valid for 'start'",
@@ -278,7 +298,7 @@ fn every_owned_option_is_accepted_in_each_legal_phase() {
         &["-S", "module"],
         &["-d", "."],
     ];
-    for token in ["new", "n", "-c", "start", "s", "-n", "run", "-N", "-A"] {
+    for token in ["new", "n", "start", "s", "run"] {
         for option in viewer.iter().chain(create) {
             let mut before_session = vec![token];
             before_session.extend_from_slice(option);
@@ -290,7 +310,7 @@ fn every_owned_option_is_accepted_in_each_legal_phase() {
         }
         assert_eq!(run(&["-q", token, "session"]).status.code(), Some(1));
     }
-    for token in ["attach", "a", "-a"] {
+    for token in ["attach", "a"] {
         for option in viewer {
             let mut args = vec![token];
             args.extend_from_slice(option);
@@ -435,10 +455,6 @@ fn action_spellings_preserve_their_distinct_modes_and_payloads() {
         ("start", CreateMode::Start),
         ("s", CreateMode::Start),
         ("run", CreateMode::Run),
-        ("-A", CreateMode::LegacyA),
-        ("-c", CreateMode::LegacyC),
-        ("-n", CreateMode::LegacyStart),
-        ("-N", CreateMode::LegacyRun),
     ] {
         let Action::Create {
             mode: actual,
@@ -457,7 +473,6 @@ fn action_spellings_preserve_their_distinct_modes_and_payloads() {
     assert!(matches!(action(&["a", "session"]), Action::Attach { .. }));
     assert_eq!(action(&["p", "session"]), Action::Push("session".into()));
     assert_eq!(action(&["ls", "-a"]), Action::List { all: true });
-    assert_eq!(action(&["-i"]), Action::Current);
     assert_eq!(
         action(&["tail", "-f", "-n", "4294967295", "session"]),
         Action::Tail {
