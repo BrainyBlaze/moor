@@ -148,7 +148,7 @@ Carried by `ATTACH_ACK` and `STATUS_REPLY` (OB-39).
 | var | canonical session identity, wide-length-prefixed | OB-17 |
 | 4 | generation | §10.1 |
 | 16 | holder incarnation | — |
-| 1 | event storage layout: `00` disabled, `01` superseded legacy layout and never emitted by an amended holder, `02` portable four-slot committed directory on every platform | OB-39 |
+| 1 | event storage layout: `00` disabled, `02` portable four-slot committed directory on every platform. `01` named a superseded pre-amendment layout that no conforming holder ever emitted; a validator MUST reject it — an acceptor for a value no producer can produce is a forgery hole, not compatibility | OB-39 |
 | var | event-stream identity, wide-length-prefixed native path; empty only when layout is `00` | OB-39 |
 | 1 | active event body slot: `00`/`01` for layout `02`, otherwise `FF` | §8.4.2 |
 | 8 | active event commit index; zero outside layout `02` | §8.4.2 |

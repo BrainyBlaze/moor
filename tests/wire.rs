@@ -441,6 +441,72 @@ fn status_tail_round_trips_replay_and_health_as_one_shape() {
 }
 
 #[test]
+fn status_rejects_the_superseded_event_layout_nobody_emits() {
+    // Layout `01` is "superseded legacy layout and never emitted" (§5): both
+    // platform holders hardcode `2` and disabled logging reports `0`, so a
+    // descriptor carrying `1` cannot come from any real holder — only from a
+    // forgery or corruption. An acceptor for a value no producer can produce
+    // is exactly the reader-side legacy this revision removes.
+    //
+    // Built honestly for the layout-1 shape: a NON-empty event identity (the
+    // empty-identity rule already rejects layout != 0 with an empty path, and
+    // a rejection for that reason would prove nothing about the layout byte),
+    // with the non-layout-2 commit constraints (slot ff, zero index/length/
+    // hash) satisfied — so the ONLY ground for refusal is the layout itself.
+    let mut payload = Vec::new();
+    put_wide(&mut payload, b"\x01/tmp/session").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.push(1);
+    put_wide(&mut payload, b"\x01/tmp/events").unwrap();
+    payload.push(0xff);
+    payload.extend_from_slice(&[0; 48 + 32]);
+    put_wide(&mut payload, b"/tmp").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.extend_from_slice(
+        &StatusTail {
+            replay: ReplayDescriptor {
+                first: 0,
+                last: 0,
+                start: 0,
+                end: 0,
+                complete: true,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: false,
+            running: true,
+            event_writable: false,
+            lease_epoch: 1,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    assert_eq!(decode_status(&payload), Err(WireError::Malformed));
+
+    // The same bytes with layout `2` and its commit constraints do decode, so
+    // the refusal above is the layout byte and not an accident of this shape.
+    payload[37] = 2;
+    let slot_at = 38 + 4 + 12; // wide length prefix + "\x01/tmp/events"
+    payload[slot_at] = 0;
+    payload[slot_at + 1..slot_at + 9].copy_from_slice(&1u64.to_le_bytes());
+    payload[slot_at + 9..slot_at + 17].copy_from_slice(&1u64.to_le_bytes());
+    payload[slot_at + 17..slot_at + 49].fill(1);
+    decode_status(&payload).unwrap();
+}
+
+#[test]
 fn frozen_controller_vector_decodes_at_every_boundary_and_encodes_exactly() {
     let bytes = hex(V1);
     for split in 0..=bytes.len() {

@@ -377,33 +377,17 @@ pub fn terminal_environment(invoked: &OsStr) -> u8 {
     u8::from(enabled) | u8::from(supplied) << 1
 }
 
-fn ancestry_text(paths: &[PathBuf]) -> OsString {
-    let mut joined = OsString::new();
-    for path in paths {
-        if !joined.is_empty() {
-            joined.push(":");
-        }
-        joined.push(path);
-    }
-    joined
-}
-
 pub fn ancestry_paths(
     invoked: &OsStr,
     mut decode: impl FnMut(&[u8]) -> Result<OsString>,
 ) -> Result<Vec<PathBuf>> {
-    let legacy = std::env::var_os(environment_key(invoked, "_SESSION"));
-    let encoded = std::env::var_os(environment_key(invoked, "_SESSION_V2"));
-    let Some(text) = encoded else {
-        let Some(value) = legacy else {
-            return Ok(Vec::new());
-        };
-        return value
-            .as_encoded_bytes()
-            .split(|byte| *byte == b':')
-            .filter(|part| !part.is_empty())
-            .map(|part| decode(part).map(PathBuf::from))
-            .collect();
+    // Revision v2 of the ancestry contract: `_SESSION_V2` is the ONLY
+    // carrier. The colon-joined `_SESSION` value it once mirrored was
+    // ambiguous for names containing `:` and existed for pre-cutover
+    // consumers; the cutover is complete, so a missing V2 means no ancestry
+    // rather than an invitation to guess from ambiguous bytes.
+    let Some(text) = std::env::var_os(environment_key(invoked, "_SESSION_V2")) else {
+        return Ok(Vec::new());
     };
     const INVALID: &str = "session ancestry v2 is malformed";
     let text = text
@@ -418,11 +402,7 @@ pub fn ancestry_paths(
             decode(&bytes).map(PathBuf::from)
         })
         .collect::<Result<Vec<_>>>()?;
-    let carriers_agree = legacy.is_none_or(|value| value == ancestry_text(&paths));
-    crate::ensure!(
-        !paths.is_empty() && carriers_agree,
-        "session ancestry carriers disagree"
-    );
+    crate::ensure!(!paths.is_empty(), INVALID);
     Ok(paths)
 }
 
@@ -440,7 +420,6 @@ pub fn extend_ancestry(
         STANDARD.encode_string(encode(path.as_os_str()), &mut v2);
     }
     unsafe {
-        std::env::set_var(environment_key(invoked, "_SESSION"), ancestry_text(&paths));
         std::env::set_var(environment_key(invoked, "_SESSION_V2"), v2);
     }
     Ok(())

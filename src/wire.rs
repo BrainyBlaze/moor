@@ -583,7 +583,10 @@ wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Optio
     wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>());
     let identity_ok = matches!(identity, [1, b'/', ..]) || identity.len() == 25 && identity.first() == Some(&2);
     let commit_ok = if layout == 2 { slot <= 1 && commit != 0 && body_length != 0 && nonzero(&body_hash) } else { slot == 0xff && commit == 0 && body_length == 0 && !nonzero(&body_hash) };
-    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && layout <= 2 && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty())
+    // Layout `01` is the superseded legacy layout: never emitted by any
+    // holder (§5 — both platforms report `2`, disabled logging reports `0`),
+    // so a descriptor carrying it is a forgery or corruption, not history.
+    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty())
 });
 
 schema!(struct pub Heartbeat derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; monotonic_ms: u64, flags: u8);

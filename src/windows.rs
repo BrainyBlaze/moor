@@ -3161,11 +3161,8 @@ mod native {
         options: &Options,
         invoked: &OsStr,
     ) -> CommandResult<i32> {
-        let foreground = matches!(mode, CreateMode::Run | CreateMode::LegacyRun);
-        let interactive = matches!(
-            mode,
-            CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
-        );
+        let foreground = matches!(mode, CreateMode::Run);
+        let interactive = matches!(mode, CreateMode::Bare | CreateMode::New);
         let selected = std::env::var_os(DETACHED_HOLDER).as_deref() == Some(OsStr::new("1"));
         unsafe { std::env::remove_var(DETACHED_HOLDER) };
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };

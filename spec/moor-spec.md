@@ -177,7 +177,7 @@ The program is invoked either with a session name directly, or with a subcommand
 
 It is **not** a synonym for any single command in §3.2, and an earlier pass of this document wrongly said it was equivalent to `attach` when live and `new` when not. It differs from both: `attach` rejects a trailing command operand while this form accepts one, and `new` *fails* against a live session while this form attaches to it. §3.6 gives its own row and §3.7 gives its behaviour in each liveness state; those two are authoritative.
 
-**Which tokens are session names.** The first operand is a session name unless it is exactly one of the command tokens or legacy mode tokens in §3.6. There is no lookup, no prefix matching, and no fuzzy correction: an unrecognised word is a session name, which is why `moor mysession` works at all.
+**Which tokens are session names.** The first operand is a session name unless it is exactly one of the command tokens in §3.6. There is no lookup, no prefix matching, and no fuzzy correction: an unrecognised word is a session name, which is why `moor mysession` works at all.
 
 **[NEW] A token beginning with `-` is never an implicit session name.** Verified against the reference: an unrecognised single-dash token is rejected as an invalid mode, but an unrecognised *double-dash* token is silently accepted as a session name — so a mistyped long option creates a session named after the typo instead of reporting the typo. The two spellings MUST behave the same, and that behaviour MUST be rejection. A caller that genuinely wants a session name starting with `-` introduces it with `--`. *Failure prevented:* a typo that silently launches a shell nobody knows about, holding a pseudo-terminal until the machine is rebooted.
 
@@ -293,7 +293,7 @@ Requirements common to the creating commands:
 
 The working-directory option is **[NEW]**: the current program accepts an argument vector and no directory, so every automated caller wraps its child in a shell that changes directory first — adding a process to every session, changing which process receives terminal-generated signals, and making a failed directory change indistinguishable from a failed command. The path must be an existing directory the invoking user can enter; if it cannot be entered the session is not created and the diagnostic names the directory, distinctly from a child that could not be executed (§13.1). Without `-d` the child inherits the creating process's directory, as today.
 
-**Option placement is a three-phase grammar.** Modern and legacy options may surround the session operand after the command token and until the first child-command operand. In the bare form the session is consumed first, after which options are recognised until the child command. `--` ends option recognition and may introduce a dash-leading session. A token before a modern command, such as `-T <path> start`, is an invalid mode. Every spelling in §3.6 gets a conformance vector in every legal phase.
+**Option placement is a three-phase grammar.** Options may surround the session operand after the command token and until the first child-command operand. In the bare form the session is consumed first, after which options are recognised until the child command. `--` ends option recognition and may introduce a dash-leading session. A token before a modern command, such as `-T <path> start`, is an invalid mode. Every surviving spelling in §3.6 gets a conformance vector in every legal phase, and every removed spelling gets a rejection vector.
 
 Repeated booleans are idempotent. Repeated scalar options use the last occurrence; among mutually exclusive choices, including `-e` and `-E`, the last occurrence wins. Defaults are `-r none`, `-R none`, detach byte `1C`, suspend byte `1A`, log cap 1 MiB, and tail count 10.
 
@@ -303,41 +303,28 @@ Repeated booleans are idempotent. Repeated scalar options use the last occurrenc
 
 The reference accepts more spellings than its help text lists. All of them are in production use and all of them MUST be implemented.
 
-**Command tokens.** The legacy tokens are **not** aliases of the modern commands. Grouping them into equivalence sets is wrong, and an earlier pass of this document did exactly that — it filed `-i` under attach when `-i` is `current`, and `-n`/`-N` under `new` when neither attaches. Every token therefore gets its own row, and every row gets its own differential vector.
+**Command tokens.** Revision v2 removed the reference tool's dash-spelled command tokens (`-a`, `-A`, `-c`, `-n`, `-N`, `-p`, `-k`, `-l`, `-i`) from the grammar: the word commands and their short word forms below are the entire command surface. A removed spelling MUST be rejected as `Invalid mode '<token>'` — never reinterpreted as a neighbouring command and never allowed to fall through to the bare form, where `-A session` would have silently created a session named `-A`. Each removed spelling gets its own rejection vector, because the old rows were not aliases of one another and a regression could resurrect any one of them independently.
 
-Behaviour was established black-box against the reference, under a real pseudo-terminal where attaching required one.
+Behaviour of the remaining rows was established black-box against the reference, under a real pseudo-terminal where attaching required one.
 
 | token(s) | operands | session missing | session live | attaches | holder | announces on create |
 |---|---|---|---|---|---|---|
-| `attach`, `a`, `-a` | name only — a command is `Invalid number of arguments` | fail `session '<name>' does not exist`, **1** | attach | yes | — | — |
+| `attach`, `a` | name only — a command is `Invalid number of arguments` | fail `session '<name>' does not exist`, **1** | attach | yes | — | — |
 | bare `<name>` (§3.1) | name, optional command | create, then attach | attach, unless a create-only option was supplied — then fail `already running`, **1** | yes | background | `session '<name>' created` |
-| `-A` | name, optional command | create, then attach | attach, unless a create-only option was supplied — then fail `already running`, **1** | yes | background | **silent** |
 | `new`, `n` | name, optional command | create, then attach | fail, **1** | yes | background | `session '<name>' created` |
-| `-c` | name, optional command | create, then attach | fail, **1** | yes | background | **silent** |
 | `start`, `s` | name, optional command | create | fail, **1** | no | background | `session '<name>' started` |
-| `-n` | name, optional command | create | fail, **1** | no | background | **silent** |
 | `run` | name, optional command | create | fail `session '<name>' is already running`, **1** | no | **foreground** | silent |
-| `-N` | name, optional command | create | fail `session '<name>' is already running`, **1** | no | **foreground** | silent |
-| `push`, `p`, `-p` | name only | fail, **1** | — | — | — | — |
+| `push`, `p` | name only | fail, **1** | — | — | — | — |
 | `kill`, `k` | name only, accepts `-f` | fail, **1** | terminate | — | — | `session '<name>' stopped`; with `-f`, `session '<name>' killed` |
-| `-k` | name only, **rejects `-f`** | fail, **1** | terminate | — | — | as above |
-| `list`, `l`, `ls`, `-l` | `-a` | — | — | — | — | — |
-| `current`, `-i` | none | — | — | — | — | — |
+| `list`, `l`, `ls` | `-a` | — | — | — | — | — |
+| `current` | none | — | — | — | — | — |
 | `rm` | exactly one of `-a` or name | fail, **1** | refuse (§3.3) | — | — | three frozen forms, §3.3 |
 | `clear` | optional name | succeed, **0** (§3.4) | ordered committed live clear | — | — | — |
 | `tail` | `-f`, `-n N`, name | fail `no log for session '<name>'`, **1** | — | — | — | — |
 | `--help`, `-h`, `?`, no arguments | none | — | — | — | — | — |
 | `--version` | none | — | — | — | — | — |
 
-Three distinctions in that table are easy to lose and each breaks a caller:
-
-- **`-A` and the bare form differ only in whether they announce.** Both create-or-attach; the bare form prints `session '<name>' created` and `-A` prints nothing. A script that greps for that line works under one spelling and not the other.
-- **`-c` is create-only, `-A` is create-or-attach.** Against a live session `-c` fails and `-A` attaches. Collapsing them turns a guard into a no-op: a caller using `-c` to assert "this session did not previously exist" would silently start attaching instead.
-- **`-n` is `start` and `-N` is `run`.** One returns as soon as the session is up; the other blocks for the child's entire life. A supervisor that treats them as interchangeable either hangs forever or proceeds before the session exists.
-
-**Only `run` and `-N` put the holder in the invoking process.** Every other creating form leaves a holder in the background and, where it attaches, the invoking process is merely a *viewer* of it. The distinction is not observable by timing — an attaching form also blocks — and an earlier pass of this document got it wrong for exactly that reason, recording the holder as running "in the caller" wherever the command did not return promptly. The observable test is what survives the invoking process: kill the client of `new`, `-A`, `-c` or the bare form and the session is still listed; kill `run` or `-N` and the session is gone, because there the holder *was* the process.
-
-- **`-k` is not `kill` with a different name.** `kill -f` and `k -f` terminate and exit 0; `-k -f` fails with `Invalid number of arguments`. The legacy spelling takes a session name and nothing else. Merging the rows would make a working command line fail, or a failing one succeed — in both directions silently.
+**Only `run` puts the holder in the invoking process.** Every other creating form leaves a holder in the background and, where it attaches, the invoking process is merely a *viewer* of it. The distinction is not observable by timing — an attaching form also blocks — and an earlier pass of this document got it wrong for exactly that reason, recording the holder as running "in the caller" wherever the command did not return promptly. The observable test is what survives the invoking process: kill the client of `new` or the bare form and the session is still listed; kill `run` and the session is gone, because there the holder *was* the process.
 
 **Success messages are frozen too, not only creation announcements.** Callers match on these: `session '<name>' stopped` for a graceful termination and `session '<name>' killed` for a forced one — two different strings, so a caller can tell which path ran. Removal has **three** distinct forms depending on whether it was addressed by name or in bulk; they are tabulated in §3.3 and are not interchangeable. The `announces` column above covers creation only because that is where the *spellings* diverge; every message named anywhere in §3 is part of the frozen surface.
 
@@ -395,10 +382,10 @@ An implementation that routes all diagnostics to standard error is more conventi
 | command | verified-live | stale | indeterminate |
 |---|---|---|---|
 | bare `<name>`, `-A` | attach, unless a create-only option was supplied — then fail `already running`, exit 1 | replace residue, create, attach | **refuse**, exit 1 |
-| `attach`, `a`, `-a` | attach | fail `session '<name>' is not running` | **refuse**, exit 1 |
+| `attach`, `a` | attach | fail `session '<name>' is not running` | **refuse**, exit 1 |
 | `new`, `n`, `-c` | fail `already running` | replace residue, create, attach | **refuse**, exit 1 |
 | `start`, `s`, `-n`, `run`, `-N` | fail `already running` | replace residue, create | **refuse**, exit 1 |
-| `push`, `p`, `-p` | deliver | fail `session '<name>' is not running` | **refuse, deliver nothing**, exit 1 |
+| `push`, `p` | deliver | fail `session '<name>' is not running` | **refuse, deliver nothing**, exit 1 |
 | `kill`, `k`, `-k` | terminate | fail — nothing is running to stop | **refuse to terminate**, exit 1 |
 | `rm <name>` | refuse, `is running` | remove | **refuse**, exit 1 |
 | `rm -a` | skip | remove | **skip**, and say so |

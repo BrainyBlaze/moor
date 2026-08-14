@@ -279,10 +279,7 @@ pub(crate) fn create(
     options: &Options,
     invoked: &OsStr,
 ) -> CommandResult<i32> {
-    let interactive = matches!(
-        mode,
-        CreateMode::Bare | CreateMode::New | CreateMode::LegacyA | CreateMode::LegacyC
-    );
+    let interactive = matches!(mode, CreateMode::Bare | CreateMode::New);
     let terminal = terminal_config(interactive)?;
     let root = root(invoked)?;
     let event = validate_event_target(options.events.as_deref(), &root, path)?;
@@ -381,7 +378,7 @@ pub(crate) fn create(
         instrument,
     };
     crate::return_if!(
-        matches!(mode, CreateMode::Run | CreateMode::LegacyRun),
+        matches!(mode, CreateMode::Run),
         Ok(holder(config, listener, None)?)
     );
     let (parent, child) = UnixStream::pair().text()?;
