@@ -67,7 +67,7 @@ fn progressed_codec(
 
 fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: u32) {
     use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
+        Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition,
     };
 
     for epoch in 1..=count {
@@ -81,7 +81,7 @@ fn allocate_and_release(machine: &mut moor::session::Machine, conn: u64, count: 
             .unwrap()
             .into_iter()
             .find_map(|effect| match effect {
-                Effect::Send(id, Reply::Lease(result)) if id == conn => Some(result),
+                Effect::LeaseReply(id, result) if id == conn => Some(result),
                 _ => None,
             })
             .expect("lease grant");
@@ -1135,7 +1135,7 @@ fn v16_input_decode(
 /// with a freshly granted input lease at epoch 3 for controller connection 1.
 fn v16_input_machine() -> moor::session::Machine {
     use moor::session::{
-        Effect, LeaseRequest, LeaseRole, Reply, Request, ResultOutcome, Transition,
+        Effect, LeaseRequest, LeaseRole, Request, ResultOutcome, Transition,
     };
     let mut machine = moor::session::Machine::new(7, v16_input_incarnation(), [8; 16]);
     machine.register_controller(1);
@@ -1150,7 +1150,7 @@ fn v16_input_machine() -> moor::session::Machine {
     let granted = effects
         .into_iter()
         .find_map(|effect| match effect {
-            Effect::Send(1, Reply::Lease(result)) => Some(result),
+            Effect::LeaseReply(1, result) => Some(result),
             _ => None,
         })
         .expect("lease result");

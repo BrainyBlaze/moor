@@ -41,7 +41,20 @@ impl<N: Native> Runtime<N> {
     ) {
         for effect in effects {
             match effect {
-                PolicyEffect::Send(id, reply) => self.reply(id, reply),
+                PolicyEffect::Send(id, reply) => {
+                    self.reply(id, reply);
+                }
+                PolicyEffect::LeaseReply(id, result) => {
+                    // A standalone grant/resume is provisional until its
+                    // result frame — the only copy of the (rotated) token —
+                    // enqueues. The machine holds the undo ledger; report
+                    // which way the boundary went.
+                    if self.reply(id, Reply::Lease(result)) {
+                        self.machine.lease_reply_delivered(id);
+                    } else {
+                        self.machine.lease_reply_failed(id);
+                    }
+                }
                 PolicyEffect::Attached(id, non_vt, result, resize) => {
                     let (snapshot, deadline) = attach.expect("attach descriptor context");
                     // A fresh grant carried by this attach is provisional
@@ -97,7 +110,14 @@ impl<N: Native> Runtime<N> {
                         continue;
                     }
                     if let Some(result) = result {
-                        self.reply(id, Reply::Lease(result));
+                        // The provisional transaction extends through the
+                        // delivery of the token frame ITSELF: a LEASE_RESULT
+                        // that cannot enqueue carries the only copy of the
+                        // token out of existence, so the grant it announced
+                        // was never committed.
+                        if !self.reply(id, Reply::Lease(result)) {
+                            rollback(&mut self.machine);
+                        }
                     }
                 }
                 PolicyEffect::Resize(id, rows, columns) => {
@@ -219,18 +239,16 @@ impl<N: Native> Runtime<N> {
         applied
     }
 
-    fn reply(&mut self, id: ConnId, reply: Reply) {
+    fn reply(&mut self, id: ConnId, reply: Reply) -> bool {
         match wire::encode_reply(reply, self.config.incarnation) {
-            wire::RuntimeReply::Frame(kind, payload) => {
-                self.send(id, kind, &payload);
-            }
+            wire::RuntimeReply::Frame(kind, payload) => self.send(id, kind, &payload),
             wire::RuntimeReply::Scoped(scope, kind, payload) => {
                 if let Some(peer) = self.peers.get_mut(&id) {
                     peer.handshaking = false;
                     peer.deadline = 0;
                     peer.scope = scope;
                 }
-                self.send(id, kind, &payload);
+                self.send(id, kind, &payload)
             }
         }
     }
