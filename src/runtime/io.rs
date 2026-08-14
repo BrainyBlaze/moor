@@ -65,14 +65,6 @@ impl Viewer<'_> {
             ),
         )
         .map_err(crate::protocol)?;
-        if message.kind == 4 && matches!(self.phase, ViewerPhase::Reattaching) {
-            self.phase = ViewerPhase::Attached;
-            if self.options.redraw == Redraw::Winch {
-                let (rows, columns) = self.size.unwrap();
-                self.command(Command::Resize(rows, columns))?;
-            }
-            self.advance(vec![])?;
-        }
         let Some(event) = event else {
             return Ok(false);
         };
@@ -84,6 +76,20 @@ impl Viewer<'_> {
                 // an implicit downgrade to `none`.
                 if self.options.reset == Reset::Move {
                     self.write(b"\x1b[H")?;
+                }
+                // v4 status-first: the descriptor OPENS the prefix, so a
+                // resuming viewer adopts — releases its redraw and queued
+                // input — only on the mandatory TERMINAL_STATE that closes
+                // the preamble. Adopting on the descriptor would mutate the
+                // wire mid-prefix, which the decoder fences on the holder's
+                // own frames and this controller must not do either.
+                if matches!(self.phase, ViewerPhase::Reattaching) {
+                    self.phase = ViewerPhase::Attached;
+                    if self.options.redraw == Redraw::Winch {
+                        let (rows, columns) = self.size.unwrap();
+                        self.command(Command::Resize(rows, columns))?;
+                    }
+                    self.advance(vec![])?;
                 }
             }
             ViewerEvent::Output(sequence, apply, bytes) => {

@@ -477,6 +477,28 @@ impl Machine {
         LeaseResult::success(outcome, request.role, epoch, token)
     }
 
+    pub fn rollback_attach(&mut self, epoch: u32) {
+        // A fresh grant made inside an attach transaction is PROVISIONAL until
+        // the holder has delivered its token in the attach prefix. When any
+        // earlier step fails — deadline, native resize, a prefix send — the
+        // requester can never present the token, so a surviving reservation
+        // would refuse every honest fresh controller until its deadline for a
+        // lease nobody can use. The epoch identifies the exact grant: a stale
+        // rollback of a superseded epoch changes nothing. The allocation
+        // counter is restored too — no frame carrying this epoch ever left
+        // the holder (the descriptor is part of the same failed prefix), so
+        // the attach/grant transaction is atomic and an uncommitted grant may
+        // not consume an epoch: the next fresh controller receives this very
+        // number.
+        return_if!(self.lease.epoch != epoch);
+        if self.allocated == epoch {
+            self.allocated = epoch - 1;
+        }
+        if let Some(conn) = std::mem::take(&mut self.lease).owner {
+            self.queries_gone(conn);
+        }
+    }
+
     fn release_lease(&mut self, conn: ConnId, epoch: u32, token: [u8; 16]) -> LeaseResult {
         let role = match self.lease.epoch {
             0 => LeaseRole::Viewer,

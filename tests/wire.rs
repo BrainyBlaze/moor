@@ -216,6 +216,217 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
     );
 }
 
+fn expected_identity() -> (&'static [u8], u32, [u8; 16]) {
+    (b"\x01/tmp/session".as_slice(), 1, [1; 16])
+}
+
+/// A stream whose connection consumed the `ATTACH_ACK` descriptor but NOT yet
+/// the mandatory `TERMINAL_STATE`. Every v4 prefix follower fed to this stream
+/// is overtaking the frozen order.
+fn descriptor_only(first: u64) -> ViewerStream {
+    let mut stream = ViewerStream::default();
+    let mut payload = status_prefix();
+    payload.extend(
+        StatusTail {
+            columns: 80,
+            rows: 24,
+            replay: ReplayDescriptor {
+                first,
+                last: first,
+                start: first - 1,
+                end: first,
+                complete: first == 1,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: true,
+            running: true,
+            event_writable: true,
+            lease_epoch: 0,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    let ack = Message {
+        scope: 1,
+        kind: 4,
+        payload: payload.as_slice().into(),
+    };
+    assert_eq!(
+        decode_viewer(&mut stream, &ack, expected_identity()),
+        Ok(None)
+    );
+    stream
+}
+
+fn consume_terminal(stream: &mut ViewerStream) {
+    let terminal = Message {
+        scope: 1,
+        kind: 5,
+        payload: [0, 0].as_slice().into(),
+    };
+    assert!(matches!(
+        decode_viewer(stream, &terminal, expected_identity()),
+        Ok(Some(ViewerEvent::Terminal(b"")))
+    ));
+}
+
+#[test]
+fn baseline_output_before_terminal_state_is_refused() {
+    let payload = [&1_u64.to_le_bytes()[..], &0_u64.to_le_bytes(), b"a"].concat();
+    let output = Message {
+        scope: 1,
+        kind: 6,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &output, expected_identity()),
+        Err(WireError::Malformed),
+        "baseline output must not overtake the mandatory terminal state"
+    );
+    // Positive control: the SAME frame is the legal baseline once the
+    // terminal state has been consumed, so the refusal above can only be
+    // the phase fence.
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert!(matches!(
+        decode_viewer(&mut stream, &output, expected_identity()),
+        Ok(Some(ViewerEvent::Output(1, true, b"a")))
+    ));
+}
+
+#[test]
+fn gap_before_terminal_state_is_refused() {
+    let payload = [&1_u64.to_le_bytes()[..], &1_u64.to_le_bytes()].concat();
+    let gap = Message {
+        scope: 1,
+        kind: 8,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(2);
+    assert_eq!(
+        decode_viewer(&mut stream, &gap, expected_identity()),
+        Err(WireError::Malformed),
+        "a gap must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(2);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &gap, expected_identity()),
+        Ok(None)
+    );
+}
+
+#[test]
+fn input_receipt_before_terminal_state_is_refused() {
+    let receipt = InputReceipt {
+        epoch: 2,
+        request: 3,
+        generation: 4,
+        incarnation: [5; 16],
+        written: 6,
+        status: 0,
+        result: 0,
+    };
+    let bytes = receipt.encode().unwrap();
+    let message = Message {
+        scope: 1,
+        kind: 10,
+        payload: bytes.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &message, expected_identity()),
+        Err(WireError::Malformed),
+        "an input receipt must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &message, expected_identity()),
+        Ok(Some(ViewerEvent::Receipt(receipt)))
+    );
+    // An input-only connection never receives a descriptor at all: with no
+    // prefix in flight the receipt is connection-level and stays legal.
+    let mut input_only = ViewerStream::default();
+    assert_eq!(
+        decode_viewer(&mut input_only, &message, expected_identity()),
+        Ok(Some(ViewerEvent::Receipt(receipt)))
+    );
+}
+
+#[test]
+fn query_before_terminal_state_is_refused() {
+    let payload = [
+        &1_u64.to_le_bytes()[..],
+        &1_u32.to_le_bytes(),
+        &[1],
+        &3_u16.to_le_bytes(),
+        b"\x1b[c",
+    ]
+    .concat();
+    let query = Message {
+        scope: 1,
+        kind: 0x14,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    stream.lease_epoch = Some(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &query, expected_identity()),
+        Err(WireError::Malformed),
+        "a query must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    stream.lease_epoch = Some(1);
+    consume_terminal(&mut stream);
+    assert_eq!(
+        decode_viewer(&mut stream, &query, expected_identity()),
+        Ok(None)
+    );
+    assert_eq!(stream.queries.len(), 1);
+}
+
+#[test]
+fn lease_result_before_terminal_state_is_refused() {
+    let payload = LeaseResult {
+        outcome: ResultOutcome::Granted,
+        reason: ResultReason::None,
+        role: LeaseRole::Viewer,
+        epoch: 1,
+        token: [7; 16],
+    }
+    .encode_wire()
+    .unwrap();
+    let lease = Message {
+        scope: 1,
+        kind: 0x16,
+        payload: payload.as_slice().into(),
+    };
+    let mut stream = descriptor_only(1);
+    assert_eq!(
+        decode_viewer(&mut stream, &lease, expected_identity()),
+        Err(WireError::Malformed),
+        "a lease result must not overtake the mandatory terminal state"
+    );
+    let mut stream = descriptor_only(1);
+    consume_terminal(&mut stream);
+    assert!(matches!(
+        decode_viewer(&mut stream, &lease, expected_identity()),
+        Ok(Some(ViewerEvent::Lease(_)))
+    ));
+}
+
 #[test]
 fn input_receipts_round_trip_exact_identity_and_outcome() {
     let written = InputReceipt {

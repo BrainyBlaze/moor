@@ -1808,6 +1808,273 @@ fn failed_native_resize_refuses_the_attach_and_keeps_the_row_model() {
 }
 
 #[test]
+fn failed_attach_resize_rolls_back_the_provisional_lease_for_the_next_controller() {
+    // The attach transaction grants the fresh lease BEFORE the holder can
+    // attempt the fallible native resize. When that resize fails, the holder
+    // closes the link without ever delivering the token — so if the grant
+    // survived, it would sit as an invisible reservation until its deadline,
+    // refusing every honest fresh controller for a lease nobody can use. The
+    // grant is provisional until its token is delivered inside the attach
+    // prefix: any earlier failure must roll it back entirely.
+    struct FailTall;
+    impl Native for FailTall {
+        fn resize(&mut self, rows: u16, _: u16) -> Result<(), String> {
+            if rows > 24 {
+                Err("injected resize failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-lease-rollback-{}-{nonce}",
+        std::process::id()
+    ));
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: FailTall,
+    });
+
+    // First controller requests a fresh lease together with a 50-row attach
+    // the platform will refuse. The failure must close the link with no
+    // successful prefix byte.
+    let mut first = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut first, &mut runtime);
+    first.send(7, 3, &[80, 0, 50, 0, 1]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match first.stream.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(_) => panic!("a failed attach resize must emit no prefix bytes"),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The very next fresh controller must find the lease FREE and the session
+    // geometry untouched by the refused 50-row request. Without rollback the
+    // provisional grant lingers until its deadline and this attach receives
+    // Refused for a token nobody ever held.
+    let mut second = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut second, &mut runtime);
+    second.send(7, 3, &[80, 0, 24, 0, 1]);
+    assert_eq!(second.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(second.recv_kind(&mut runtime, 5).kind, 5);
+    let lease = LeaseResult::decode_wire(&second.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        lease.outcome,
+        ResultOutcome::Granted,
+        "the rolled-back provisional lease must not shadow the next controller"
+    );
+    // The attach/grant transaction is atomic: the uncommitted grant consumed
+    // no epoch, so the successor receives exactly the number the rolled-back
+    // grant would have carried — not a silently skipped one.
+    assert_eq!(
+        lease.epoch, 1,
+        "an uncommitted provisional grant must not consume a protocol epoch"
+    );
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_resumed_attach_resize_preserves_the_reservation_for_exact_resume() {
+    // The mirror side of the rollback rule. A RESUMED viewer already holds a
+    // known epoch/token from before this attach: its resize failure is
+    // ordinary transport loss, so the reservation must survive — a competing
+    // fresh controller may not steal the lease, and the owner must be able to
+    // resume with its exact tuple afterwards. Only the fresh grant whose token
+    // was never delivered rolls back.
+    struct FailTall;
+    impl Native for FailTall {
+        fn resize(&mut self, rows: u16, _: u16) -> Result<(), String> {
+            if rows > 24 {
+                Err("injected resize failure".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate(&mut self, _: bool) -> (u8, bool) {
+            (0, false)
+        }
+        fn exited(&mut self) -> Result<Option<NativeExit>, String> {
+            Ok(None)
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "moor-holder-resume-reservation-{}-{nonce}",
+        std::process::id()
+    ));
+    let running = lifecycle_running(
+        b"\x01/session",
+        (Some(7), 7),
+        [1; 16],
+        (1, 1, [2; 16]),
+        ("posix-bytes", None, None),
+    );
+    let lifecycle = Store::create(&root, Kind::Exit, 7, running.as_bytes(), 0, 0).unwrap();
+    let mut runtime = Runtime::new(HolderConfig {
+        core: CoreConfig {
+            generation: 7,
+            identity: b"session".to_vec(),
+            incarnation: [1; 16],
+            semantic_token: [0; 16],
+            replay_limit: 1024,
+        },
+        pty: duplex(Cursor::new(Vec::new()), std::io::sink(), 1024),
+        storage: SessionStorage::new(None, None, lifecycle, 8, 1 << 20),
+        status: Vec::new(),
+        commit_at: 0,
+        synthetic: 0,
+        native: FailTall,
+    });
+
+    // The owner takes a fresh viewer lease with a geometry-free attach, then
+    // loses its link: ordinary reservation, epoch/token intact.
+    let mut owner = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut owner, &mut runtime);
+    owner.send(7, 3, &[0, 0, 0, 0, 1]);
+    owner.recv_kind(&mut runtime, 4);
+    owner.recv_kind(&mut runtime, 5);
+    let lease = LeaseResult::decode_wire(&owner.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(lease.outcome, ResultOutcome::Granted);
+    owner.stream.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(owner);
+    for _ in 0..10 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // The owner resumes on a new connection, then requests an attach whose
+    // 50-row geometry the platform refuses. The holder closes the link.
+    let mut resumed = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut resumed, &mut runtime);
+    resumed.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::Viewer,
+            epoch: lease.epoch,
+            incarnation: [1; 16],
+            token: lease.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let rotated = LeaseResult::decode_wire(&resumed.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(rotated.outcome, ResultOutcome::Resumed);
+    resumed.send(7, 3, &[80, 0, 50, 0, 0]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        runtime.poll();
+        let mut bytes = [0; 256];
+        match resumed.stream.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(_) => panic!("a failed resumed attach resize must emit no prefix bytes"),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder neither replied nor closed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // A competing fresh controller must NOT obtain the lease: the reservation
+    // belongs to the resumed owner's known tuple.
+    let mut thief = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut thief, &mut runtime);
+    thief.send(7, 3, &[80, 0, 24, 0, 1]);
+    assert_eq!(thief.recv_kind(&mut runtime, 4).kind, 4);
+    assert_eq!(thief.recv_kind(&mut runtime, 5).kind, 5);
+    assert_eq!(
+        LeaseResult::decode_wire(&thief.recv_kind(&mut runtime, 0x16).payload)
+            .unwrap()
+            .outcome,
+        ResultOutcome::Refused,
+        "the preserved reservation must refuse a competing fresh grant"
+    );
+
+    // And the owner's exact tuple still resumes.
+    let mut returning = connect_as(&mut runtime, Profile::Controller);
+    hello(&mut returning, &mut runtime);
+    returning.send(
+        7,
+        0x15,
+        &LeaseRequest {
+            operation: LeaseOperation::Resume,
+            role: LeaseRole::Viewer,
+            epoch: rotated.epoch,
+            incarnation: [1; 16],
+            // Resume rotates the token: the owner's known tuple is the one
+            // from its LAST successful lease exchange.
+            token: rotated.token,
+        }
+        .encode_wire()
+        .unwrap(),
+    );
+    let comeback =
+        LeaseResult::decode_wire(&returning.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(
+        comeback.outcome,
+        ResultOutcome::Resumed,
+        "the reservation must still admit the owner's exact tuple: {comeback:?}"
+    );
+    assert_eq!(
+        comeback.epoch, rotated.epoch,
+        "a resumed viewer's failure keeps its existing epoch, never a new one"
+    );
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn geometry_notifications_are_change_only_with_one_attach_redraw() {
     use std::sync::{Arc, Mutex};
 

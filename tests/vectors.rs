@@ -2939,19 +2939,20 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
 // ---------------------------------------------------------------- V26 ----
 // §16 V26 — NON_VT attach and its required empty preamble. The attach
 // preserves geometry and sets only flag bit 1. The preamble payload is the
-// plain u16 zero length, NOT an absent frame. Both use per-direction
-// sequence 2. Exact hex from the schema.
+// plain u16 zero length, NOT an absent frame. The attach uses controller
+// sequence 2; under the status-first prefix the preamble FOLLOWS the
+// sequence-2 ATTACH_ACK at holder sequence 3. Exact hex from the schema.
 
 const V26_ATTACH: &str = "4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00 \
                           05 00 00 00 2D 90 AF 9C 00 00 00 00 02";
-const V26_PREAMBLE: &str = "4D 4F 4F 52 04 05 00 00 07 00 00 00 02 00 00 00 \
-                            02 00 00 00 10 50 65 D1 00 00";
+const V26_PREAMBLE: &str = "4D 4F 4F 52 04 05 00 00 07 00 00 00 03 00 00 00 \
+                            02 00 00 00 37 2D 59 98 00 00";
 
 #[test]
 fn v26_both_frames_reproduce_the_frozen_bytes() {
-    for (kind, payload, bytes, label) in [
-        (3u8, vec![0, 0, 0, 0, 2], V26_ATTACH, "NON_VT attach"),
-        (5, vec![0, 0], V26_PREAMBLE, "empty preamble"),
+    for (sequence, kind, payload, bytes, label) in [
+        (2, 3u8, vec![0, 0, 0, 0, 2], V26_ATTACH, "NON_VT attach"),
+        (3, 5, vec![0, 0], V26_PREAMBLE, "empty preamble"),
     ] {
         let frame = hex(bytes);
         v16_framing_assert_header(&frame);
@@ -2961,9 +2962,9 @@ fn v26_both_frames_reproduce_the_frozen_bytes() {
             "{label}: frozen payload disagrees with the schema text"
         );
         assert_eq!(
-            v16_framing_encode_frame(2, 7, kind, &payload),
+            v16_framing_encode_frame(sequence, 7, kind, &payload),
             frame,
-            "{label}: encoder must reproduce the frozen frame at sequence 2"
+            "{label}: encoder must reproduce the frozen frame at its real sequence"
         );
     }
 }
@@ -3027,16 +3028,34 @@ fn v26_non_vt_attach_preserves_child_geometry_and_grants_no_lease() {
     );
 }
 
+// ---------------------------------------------------------------- V33 ----
+// §16 V33 — WAKEUP interposed between HELLO_ACK and ATTACH_ACK, at the REAL
+// sequence numbers: HELLO_ACK consumed holder sequence 1, so the WAKEUP is 2,
+// the ATTACH_ACK that follows is 3, and the terminal preamble is 4. The
+// frozen bytes come from the schema text, never from the encoder, so encoder
+// and decoder cannot drift together while this stays green.
+
+const V33_WAKEUP: &str = "4D 4F 4F 52 04 11 00 00 07 00 00 00 02 00 00 00 \
+                          00 00 00 00 52 17 53 91";
+
 #[test]
-fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
+fn v33_wakeup_is_legal_between_hello_ack_and_attach_ack() {
     use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
-    // §16 durable-advance vector: WAKEUP is legal at EVERY post-HELLO_ACK
-    // phase, including the window between HELLO_ACK and ATTACH_ACK. A holder
-    // whose event store advanced durably announces it immediately; it does
-    // not wait for the controller to finish attaching, and a controller that
-    // faults its handshake over that announcement loses exactly the session
-    // it was joining (OB-30 / the desk#54 incident class).
-    let wakeup = v16_framing_feed_one(1, &v16_framing_encode_frame(1, 7, 0x11, &[]));
+    // WAKEUP is legal at EVERY post-HELLO_ACK phase, including the window
+    // between HELLO_ACK and ATTACH_ACK. A holder whose event store advanced
+    // durably announces it immediately; it does not wait for the controller
+    // to finish attaching, and a controller that faults its handshake over
+    // that announcement loses exactly the session it was joining (OB-30 /
+    // the desk#54 incident class).
+    let frame = hex(V33_WAKEUP);
+    v16_framing_assert_header(&frame);
+    assert_eq!(frame.len(), 24, "V33 is header-only");
+    assert_eq!(
+        v16_framing_encode_frame(2, 7, 0x11, &[]),
+        frame,
+        "the encoder must reproduce the frozen V33 bytes at sequence 2"
+    );
+    let wakeup = v16_framing_feed_one(2, &frame);
     assert_eq!((wakeup.scope, wakeup.kind), (7, 0x11));
 
     let mut stream = ViewerStream::default();
@@ -3056,7 +3075,8 @@ fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
     );
 
     // And the attach that follows proceeds exactly as if the WAKEUP had
-    // never happened: status-first, then the terminal preamble.
+    // never happened — status-first, then the terminal preamble — at the
+    // shifted-by-one holder sequences 3 and 4.
     let mut payload = Vec::new();
     moor::wire::put_wide(&mut payload, b"\x01/tmp/session").unwrap();
     payload.extend_from_slice(&7u32.to_le_bytes());
@@ -3098,7 +3118,7 @@ fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
         },
     };
     payload.extend_from_slice(&tail.encode().unwrap());
-    let status = v16_framing_feed_one(2, &v16_framing_encode_frame(2, 7, 4, &payload));
+    let status = v16_framing_feed_one(3, &v16_framing_encode_frame(3, 7, 4, &payload));
     assert_eq!(
         decode_viewer(
             &mut stream,
@@ -3107,7 +3127,7 @@ fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
         ),
         Ok(None)
     );
-    let terminal = v16_framing_feed_one(3, &v16_framing_encode_frame(3, 7, 5, &[0, 0]));
+    let terminal = v16_framing_feed_one(4, &v16_framing_encode_frame(4, 7, 5, &[0, 0]));
     assert_eq!(
         decode_viewer(
             &mut stream,
@@ -3123,7 +3143,7 @@ fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
 fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
     let frame = hex(V26_PREAMBLE);
-    let message = v16_framing_feed_one(2, &frame);
+    let message = v16_framing_feed_one(3, &frame);
     assert_eq!((message.scope, message.kind), (7, 5));
 
     // Present-and-empty, not absent: the frame is delivered as a Terminal
@@ -3721,14 +3741,14 @@ const V23_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 02 07 00 00 00
 
 // §16 V24 — the exact 286-byte lifecycle body, final LF included, copied
 // verbatim from the ```jsonl block in the schema.
-const V24_BODY: &[u8] = b"{\"v\":1,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"AS9z\",\"generation\":7,\"wire_generation\":7,\"incarnation\":\"AgICAgICAgICAgICAgICAg==\",\"start_wall_ms\":\"1\",\"start_mono_ms\":\"2\",\"boot_id\":\"AwMDAwMDAwMDAwMDAwMDAw==\",\"path_encoding\":\"posix-bytes\",\"event_path\":null,\"instrument_path\":null}\n";
+const V24_BODY: &[u8] = b"{\"v\":2,\"type\":\"lifecycle\",\"phase\":\"running\",\"session\":\"AS9z\",\"generation\":7,\"wire_generation\":7,\"incarnation\":\"AgICAgICAgICAgICAgICAg==\",\"start_wall_ms\":\"1\",\"start_mono_ms\":\"2\",\"boot_id\":\"AwMDAwMDAwMDAwMDAwMDAw==\",\"path_encoding\":\"posix-bytes\",\"event_path\":null,\"instrument_path\":null}\n";
 
 const V24_RECORD: &str = "4D 4F 4F 52 43 4D 54 31 01 00 00 03 07 00 00 00
      01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
      1E 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-     00 00 00 00 00 00 00 00 D1 62 1C 31 51 33 6C AB
-     7C 33 05 FB 45 6C 7C A0 F8 8A 25 2C 43 D4 80 80
-     2A 7F 31 A1 92 26 BF 96 1A 7F 68 02";
+     00 00 00 00 00 00 00 00 FA E7 1F CF 6C AD 5E 79
+     D0 AB E5 FE 84 63 80 34 09 E5 0E C8 3F 2C F5 79
+     93 66 0C 8B A0 C5 22 4E D7 28 8F 9E";
 
 /// Hashes `body` through the crate's own digest entrypoint, so the frozen
 /// SHA-256 is confirmed against real hashing code and not restated here.
@@ -3811,11 +3831,47 @@ fn v16_platform_v24_lifecycle_commit_matches_the_ratified_record() {
     let hash = v23_digest_of(V24_BODY, "platform-v24");
     assert_eq!(
         hash,
-        <[u8; 32]>::try_from(hex("D1 62 1C 31 51 33 6C AB 7C 33 05 FB 45 6C 7C A0
-                 F8 8A 25 2C 43 D4 80 80 2A 7F 31 A1 92 26 BF 96"))
+        <[u8; 32]>::try_from(hex("FA E7 1F CF 6C AD 5E 79 D0 AB E5 FE 84 63 80 34
+                 09 E5 0E C8 3F 2C F5 79 93 66 0C 8B A0 C5 22 4E"))
         .unwrap(),
         "the lifecycle body digest must be the value §16 V24 states"
     );
+
+    // The frozen body is not merely self-consistent: the REAL lifecycle
+    // store accepts it, and the same bytes with the retired `"v":1` are
+    // refused. Store::create routes through the production validator, so
+    // this pins the v2-only contract with the exact §16 bytes rather than
+    // a restatement of them.
+    {
+        use moor::store::{Kind, Store};
+        let path = std::env::temp_dir().join(format!(
+            "moor-v16-v24-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::create(&path, Kind::Exit, 7, V24_BODY, 0, 0)
+            .expect("the frozen §16 V24 body must be accepted by the real lifecycle store");
+        drop(store);
+        std::fs::remove_dir_all(&path).unwrap();
+
+        let downgraded = {
+            let mut body = V24_BODY.to_vec();
+            let at = body
+                .windows(5)
+                .position(|window| window == b"\"v\":2")
+                .expect("the frozen body carries its version");
+            body[at + 4] = b'1';
+            body
+        };
+        assert!(
+            Store::create(&path, Kind::Exit, 7, &downgraded, 0, 0).is_err(),
+            "the retired v1 lifecycle shape must be refused by the real store"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
     // Kind exit 03, generation 7, epoch 1, index 1, coordinates [0,0).
     let produced = Commit {
         slot: 0,

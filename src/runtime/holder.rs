@@ -44,7 +44,21 @@ impl<N: Native> Runtime<N> {
                 PolicyEffect::Send(id, reply) => self.reply(id, reply),
                 PolicyEffect::Attached(id, non_vt, result, resize) => {
                     let (snapshot, deadline) = attach.expect("attach descriptor context");
+                    // A fresh grant carried by this attach is provisional
+                    // until its token is delivered: every failure below rolls
+                    // it back so no invisible reservation outlives a prefix
+                    // the requester never received.
+                    let provisional = result
+                        .as_ref()
+                        .filter(|value| value.outcome == crate::session::ResultOutcome::Granted)
+                        .map(|value| value.epoch);
+                    let rollback = |machine: &mut Machine| {
+                        if let Some(epoch) = provisional {
+                            machine.rollback_attach(epoch);
+                        }
+                    };
                     if clock() >= deadline {
+                        rollback(&mut self.machine);
                         self.disconnect(id);
                         continue;
                     }
@@ -54,6 +68,7 @@ impl<N: Native> Runtime<N> {
                     // would claim a size the pty does not have.
                     if let Some((rows, columns)) = resize {
                         if !self.resize(rows, columns, false) {
+                            rollback(&mut self.machine);
                             self.disconnect(id);
                             continue;
                         }
@@ -64,6 +79,7 @@ impl<N: Native> Runtime<N> {
                     // viewer learns the authoritative geometry and replay
                     // window before a single terminal byte.
                     if !self.send_status(id, true, snapshot, deadline, clock) {
+                        rollback(&mut self.machine);
                         continue;
                     }
                     if let Some(peer) = self.peers.get_mut(&id) {
@@ -77,6 +93,7 @@ impl<N: Native> Runtime<N> {
                     let size = (state.len() as u16).to_le_bytes();
                     state.splice(..0, size);
                     if !self.send(id, 5, &state) {
+                        rollback(&mut self.machine);
                         continue;
                     }
                     if let Some(result) = result {

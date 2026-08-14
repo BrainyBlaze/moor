@@ -1,4 +1,4 @@
-# Wire schema and conformance vectors — version 3
+# Wire schema and conformance vectors — version 4
 
 **Companion artefact to [moor-spec.md](./moor-spec.md).** §10.2 of that document fixes what this schema must satisfy; this file fixes the shapes. Where the two disagree the specification wins and this file is a defect.
 
@@ -15,7 +15,7 @@ Every frame begins with a fixed 24-byte header.
 | offset | width | field | value / notes |
 |---|---|---|---|
 | 0 | 4 | magic | the four bytes `4D 4F 4F 52` in file order, in that order — the program's name in ASCII. It is a **byte sequence, not an integer**, so it is unaffected by byte order |
-| 4 | 1 | version | `03` for this schema |
+| 4 | 1 | version | `04` for this schema |
 | 5 | 1 | type | §2 |
 | 6 | 1 | flags | bit 0 = `MORE` (continued, §10.2.2); bits 1–7 reserved, must be `0` |
 | 7 | 1 | reserved | must be `00` |
@@ -187,9 +187,9 @@ Linux/WSL carries the 16 parsed UUID bytes from `/proc/sys/kernel/random/boot_id
 
 ## 6. The terminal-state preamble
 
-`TERMINAL_STATE` carries a plain length-prefixed run of raw bytes that a viewer writes into its own emulator. It is sent **exactly once per attaching connection, before `ATTACH_ACK`**, and **carries the connection's own generation** like every other frame — the header rule of §1 admits no exception. Its connection-locality is expressed by the fact that it carries **no record sequence and no byte offset**, so it cannot advance any output cursor and is never logged (§10.2.6). A zero-length run is legal in exactly two branches: tracked-mode exactness is false, in which case the following ACK clears its mode-exact bit; or the attach set `NON_VT`, in which case the ACK retains the actual exactness bit but no terminal controls are sent. A probe or input-only connection receives no preamble.
+`TERMINAL_STATE` carries a plain length-prefixed run of raw bytes that a viewer writes into its own emulator. It is sent **exactly once per attaching connection, immediately after `ATTACH_ACK`**, and **carries the connection's own generation** like every other frame — the header rule of §1 admits no exception. Its connection-locality is expressed by the fact that it carries **no record sequence and no byte offset**, so it cannot advance any output cursor and is never logged (§10.2.6). A zero-length run is legal in exactly two branches: tracked-mode exactness is false, in which case the following ACK clears its mode-exact bit; or the attach set `NON_VT`, in which case the ACK retains the actual exactness bit but no terminal controls are sent. A probe or input-only connection receives no preamble.
 
-Attach output order is exact and is revision 4's status-first sequence: `ATTACH_ACK`; `TERMINAL_STATE`; `LEASE_RESULT` when the attach requested a fresh viewer lease; the frozen `GAP`/`OUTPUT` replay baseline; then live output. The descriptor opens the prefix so the viewer holds the authoritative geometry and replay window before a single terminal byte arrives; a decoder MUST refuse a descriptor after terminal state, which was the retired v3 order. The requested attach geometry is applied to the native pty BEFORE the descriptor is built, and a native refusal fails the attach closed — the holder closes the link rather than attach a viewer under a descriptor claiming a size the pty does not have. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
+Attach output order is exact and is revision 4's status-first sequence: `ATTACH_ACK`; `TERMINAL_STATE`; `LEASE_RESULT` when the attach requested a fresh viewer lease; the frozen `GAP`/`OUTPUT` replay baseline; then live output. The descriptor opens the prefix so the viewer holds the authoritative geometry and replay window before a single terminal byte arrives; a decoder MUST refuse a descriptor after terminal state, which was the retired v3 order. The requested attach geometry is applied to the native pty BEFORE the descriptor is built, and a native refusal fails the attach closed — the holder closes the link rather than attach a viewer under a descriptor claiming a size the pty does not have. The attach/grant transaction is atomic: a fresh lease granted by that failing attach is rolled back entirely, reservation and epoch allocation both, because no frame of the failed prefix ever left the holder — the next fresh controller receives that very epoch. A resumed viewer's failure instead preserves its known epoch/token reservation exactly as ordinary link loss does. Prefix followers are fenced symmetrically on the decode side: after the descriptor, a viewer MUST refuse `OUTPUT`, `GAP`, `INPUT_RECEIPT`, `QUERY`, and `LEASE_RESULT` until the mandatory `TERMINAL_STATE` has arrived. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
 
 **The tracked mode set is exactly twelve, and their canonical bytes are frozen.** All twelve are emitted on every attach, in the order below — see the note after the table for why never only the deviations.
 
@@ -231,7 +231,7 @@ An `OUTPUT` message is nonempty. Its record sequence starts at `1` for the holde
 
 Both coordinates are unsigned u64 and never wrap. Record sequence `FFFFFFFFFFFFFFFF` may name the final output record. An output is admitted only when its exclusive end is representable as u64. If another child byte would require a successor after the maximum sequence or an end above `FFFFFFFFFFFFFFFF`, the holder sends `RESOURCE_EXHAUSTED` to every authenticated controller, marks the output path failed, and terminates its owned session through §12.4 of the specification rather than silently dropping or misnumbering output. `OUTPUT_ACK` value zero means no output record consumed; any acknowledgement above the highest record sent is `BAD_SEQUENCE`.
 
-Each `OUTPUT` payload carries 1–65536 child bytes. The holder retains complete newest records up to 4 MiB of payload per holder incarnation. After `TERMINAL_STATE`, `ATTACH_ACK`, and the optional attach-requested `LEASE_RESULT`, every attach receives a frozen baseline: `GAP{1, first_retained-1}` when `first_retained > 1`, then every record from the ACK's inclusive first/last range, then later live records. Empty history emits neither. The connection serialises output that arrives during replay after that baseline. A controller with an existing cursor discards duplicate record sequences; a new controller applies all of them. Bit 0 in the ACK is set exactly when the empty history is still at byte offset zero or the nonempty retained range begins at record 1/byte 0. This is raw replay only: there is no checkpoint frame in wire v3.
+Each `OUTPUT` payload carries 1–65536 child bytes. The holder retains complete newest records up to 4 MiB of payload per holder incarnation. After `ATTACH_ACK`, `TERMINAL_STATE`, and the optional attach-requested `LEASE_RESULT`, every attach receives a frozen baseline: `GAP{1, first_retained-1}` when `first_retained > 1`, then every record from the ACK's inclusive first/last range, then later live records. Empty history emits neither. The connection serialises output that arrives during replay after that baseline. A controller with an existing cursor discards duplicate record sequences; a new controller applies all of them. Bit 0 in the ACK is set exactly when the empty history is still at byte offset zero or the nonempty retained range begins at record 1/byte 0. This is raw replay only: there is no checkpoint frame in revision 4.
 
 ## 7. `INPUT` and `INPUT_RECEIPT` — the transport receipt
 
@@ -563,7 +563,7 @@ No counter wraps. Event sequence/epoch/commit exhaustion uses the specification'
 
 ### 13.1 Canonical lifecycle body
 
-The running lifecycle prefix is exactly one canonical JSON object plus LF with this closed key order: `v`, `type`, `phase`, `session`, `generation`, `wire_generation`, `incarnation`, `start_wall_ms`, `start_mono_ms`, `boot_id`, `path_encoding`, `event_path`, `instrument_path`. Values are respectively `1`, `"lifecycle"`, `"running"`, canonical padded-base64 tagged session identity, allocated u32 or JSON `null`, nonzero wire u32, padded-base64 16-byte incarnation, canonical decimal-string u64 wall/monotonic starts, padded-base64 16-byte boot identity, `"posix-bytes"` or `"windows-wtf8"`, and canonical padded base64 of the exact native event and immutable staged-instrument paths or JSON `null`. `instrument_path` never carries the caller's `-S` spelling.
+The running lifecycle prefix is exactly one canonical JSON object plus LF with this closed key order: `v`, `type`, `phase`, `session`, `generation`, `wire_generation`, `incarnation`, `start_wall_ms`, `start_mono_ms`, `boot_id`, `path_encoding`, `event_path`, `instrument_path`. Values are respectively `2`, `"lifecycle"`, `"running"`, canonical padded-base64 tagged session identity, allocated u32 or JSON `null`, nonzero wire u32, padded-base64 16-byte incarnation, canonical decimal-string u64 wall/monotonic starts, padded-base64 16-byte boot identity, `"posix-bytes"` or `"windows-wtf8"`, and canonical padded base64 of the exact native event and immutable staged-instrument paths or JSON `null`. `instrument_path` never carries the caller's `-S` spelling.
 
 The exited replacement changes phase to `"exited"`, retains those common values, then appends `end_wall_ms`, `output_end`, `ended`, its branch key, and `method`. The first two are canonical decimal-string u64. Revision 4 makes the exit MECHANISM and the holder's termination INTENT two orthogonal, mandatory axes. `ended` names only the mechanism: POSIX normal `ended:"exited",code:<u8>`; POSIX signal `ended:"signalled",signal:<positive platform signal>` with no code; Windows `ended:"exited",code:<u32>`. `method:"none"|"graceful"|"forced"` separately states whether the holder was asked to end the child — `none` means the holder had no termination state, and it never claims who outside the holder caused a signal. This is exactly the distinction the retired Windows-only `ended:"terminated"` branch folded into one value while POSIX carried nothing, which made a holder-initiated wire terminate byte-identical to an external `SIGTERM` and cost a real investigation its answer. The lifecycle record's `v` is `2`; a validator accepts only the v2 shape — there is no dual validator. The foreground shell status is not serialized as the child outcome. The selected lifecycle coordinate equals `output_end` on exit.
 
@@ -990,18 +990,18 @@ A4 95 99 1B 78 52 B8 55 CE 64 F3 A0
 **V24** — portable canonical-running lifecycle initial commit. The exact 286-byte body, including LF, is:
 
 ```jsonl
-{"v":1,"type":"lifecycle","phase":"running","session":"AS9z","generation":7,"wire_generation":7,"incarnation":"AgICAgICAgICAgICAgICAg==","start_wall_ms":"1","start_mono_ms":"2","boot_id":"AwMDAwMDAwMDAwMDAwMDAw==","path_encoding":"posix-bytes","event_path":null,"instrument_path":null}
+{"v":2,"type":"lifecycle","phase":"running","session":"AS9z","generation":7,"wire_generation":7,"incarnation":"AgICAgICAgICAgICAgICAg==","start_wall_ms":"1","start_mono_ms":"2","boot_id":"AwMDAwMDAwMDAwMDAwMDAw==","path_encoding":"posix-bytes","event_path":null,"instrument_path":null}
 ```
 
-Its SHA-256 is `d1621c3151336cab7c3305fb456c7ca0f88a252c43d480802a7f31a19226bf96`; kind is `03`, generation 7, epoch 1, index 1, and coordinates are `[0,0)`:
+Its SHA-256 is `fae71fcf6cad5e79d0abe5fe8463803409e50ec83f2cf57993660c8ba0c5224e`; kind is `03`, generation 7, epoch 1, index 1, and coordinates are `[0,0)`:
 
 ```
 4D 4F 4F 52 43 4D 54 31 01 00 00 03 07 00 00 00
 01 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00
 1E 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-00 00 00 00 00 00 00 00 D1 62 1C 31 51 33 6C AB
-7C 33 05 FB 45 6C 7C A0 F8 8A 25 2C 43 D4 80 80
-2A 7F 31 A1 92 26 BF 96 1A 7F 68 02
+00 00 00 00 00 00 00 00 FA E7 1F CF 6C AD 5E 79
+D0 AB E5 FE 84 63 80 34 09 E5 0E C8 3F 2C F5 79
+93 66 0C 8B A0 C5 22 4E D7 28 8F 9E
 ```
 
 **V25** — POSIX `STATUS_REPLY`, layout `02`. Session identity is tag `01` plus `/tmp/.moor-1000/build`; event path is `/tmp/events`; holder incarnation is `00..0F`; selected event slot/index/length are `0/1/133`. That event prefix is exactly this LF-terminated header, whose SHA-256 is `2bbeefb637546612d6a3a6bd7cbdb7be2942d6daddc733395445f9edd788b64b`:
@@ -1032,14 +1032,14 @@ A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
-**V26** — `NON_VT` attach and its required empty preamble. The attach preserves geometry and sets only flag bit 1. The preamble payload is the plain u16 zero length, not an absent frame; tracked exactness may remain set in the following ACK. These frames use their respective per-direction sequence 2:
+**V26** — `NON_VT` attach and its required empty preamble. The attach preserves geometry and sets only flag bit 1. The preamble payload is the plain u16 zero length, not an absent frame; tracked exactness may remain set in the ACK. The attach uses controller-direction sequence 2; under revision 4's status-first prefix the empty preamble FOLLOWS the sequence-2 `ATTACH_ACK`, so it carries holder-direction sequence 3:
 
 ```
 4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
 05 00 00 00 2D 90 AF 9C 00 00 00 00 02
 
-4D 4F 4F 52 04 05 00 00 07 00 00 00 02 00 00 00
-02 00 00 00 10 50 65 D1 00 00
+4D 4F 4F 52 04 05 00 00 07 00 00 00 03 00 00 00
+02 00 00 00 37 2D 59 98 00 00
 ```
 
 **V27** — private-mode query/reply with correlation `0102030405060708`, lease epoch 3, echoed class `04`, and plain u16 byte lengths. The query is `CSI7 ?2004$p`; the accepted reply is `CSI7 ?2004;1$y`. Both directions use frame sequence 3:
@@ -1164,7 +1164,16 @@ CLI numeric fixtures are byte strings, parsed without locale:
 | `01k`, `1kb` | `-C` | invalid spelling |
 | `1k` | `tail -n` | invalid because tail counts are unsuffixed u32 |
 
-For the same-size redraw fixture, current and requested geometry are both `80 × 24`, the attach wins its lease, and redraw is `winch`: after the terminal-state/ACK/lease-result/replay prefix, exactly one platform resize notification is issued even though stored geometry remains `80 × 24`. Redraw `none` issues none; `ctrl_l` writes exactly byte `0C` instead of issuing a resize. No other unchanged geometry causes a notification.
+For the same-size redraw fixture, current and requested geometry are both `80 × 24`, the attach wins its lease, and redraw is `winch`: after the ACK/terminal-state/lease-result/replay prefix, exactly one platform resize notification is issued even though stored geometry remains `80 × 24`. Redraw `none` issues none; `ctrl_l` writes exactly byte `0C` instead of issuing a resize. No other unchanged geometry causes a notification.
+
+**V33** — `WAKEUP` interposed between `HELLO_ACK` and `ATTACH_ACK`. `WAKEUP` is legal at EVERY post-`HELLO_ACK` phase (§7), and this is the exceptional pre-attach window an independent implementer would otherwise guess about. The sequence numbers are the real ones: `HELLO_ACK` consumed holder-direction sequence 1, so the interposed `WAKEUP` carries sequence 2, the `ATTACH_ACK` that follows carries sequence 3, and the terminal-state preamble carries sequence 4. The frame is header-only — kind `11`, generation 7, zero payload — and its CRC-32C covers the twenty header bytes:
+
+```
+4D 4F 4F 52 04 11 00 00 07 00 00 00 02 00 00 00
+00 00 00 00 52 17 53 91
+```
+
+A controller receiving this frame before its `ATTACH_ACK` continues its handshake unchanged: the frame creates no attach state, and the prefix that follows is byte-identical to the one an uninterrupted attach would deliver, at sequence numbers shifted by exactly one.
 
 ---
 

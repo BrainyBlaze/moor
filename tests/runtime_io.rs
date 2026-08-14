@@ -739,6 +739,21 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
         );
         second.stream.set_read_timeout(None).unwrap();
         second.send(7, 4, &status(1, 2, 0, 2, 1));
+        // v4 fence: the resumed adoption may not release ANYTHING between the
+        // descriptor and the mandatory terminal state — no queued INPUT (9),
+        // no RESIZE (0x0b), no mutation at all escapes mid-prefix. The
+        // descriptor is the FIRST prefix item now, so a gate that fires on it
+        // would emit exactly here.
+        second
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut fenced = [0; 256];
+        assert!(
+            matches!(second.stream.read(&mut fenced), Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "the resumed viewer mutated the wire between ATTACH_ACK and TERMINAL_STATE"
+        );
+        second.stream.set_read_timeout(None).unwrap();
         second.send(7, 5, &[0, 0]);
         second.send(
             7,

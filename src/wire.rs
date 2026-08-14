@@ -453,7 +453,7 @@ pub fn decode_viewer<'a>(
             if stream.next.is_none() && replay.first <= 1 { stream.next = Some((1, if replay.first == 0 { replay.end } else { replay.start })); }
             stream.received = Some(if replay.first == 0 { (1, replay.end) } else { (replay.first, replay.start) }); stream.replay = Some(replay); None },
         5 => { let length = input.u16()? as usize; let bytes = input.rest(); well_formed(!stream.terminal && stream.replay.is_some() && bytes.len() == length && length <= 4096 && (!stream.non_vt || bytes.is_empty()))?; stream.terminal = true; Some(Terminal(bytes)) },
-        6 => { let (sequence, offset) = (input.u64()?, input.u64()?); let bytes = input.rest(); well_formed((1..=65536).contains(&bytes.len()))?;
+        6 => { let (sequence, offset) = (input.u64()?, input.u64()?); let bytes = input.rest(); well_formed(stream.terminal && (1..=65536).contains(&bytes.len()))?;
             let end = offset.checked_add(bytes.len() as u64).ok_or(WireError::Malformed)?;
             let replay = stream.replay.ok_or(WireError::Malformed)?;
             let (expected, expected_offset) = stream.next.ok_or(WireError::Malformed)?;
@@ -465,10 +465,10 @@ pub fn decode_viewer<'a>(
             let applicable = if apply { sequence == expected && offset == expected_offset } else { sequence < expected && end <= expected_offset };
             well_formed((baseline || live) && contiguous && applicable)?;
             stream.received = sequence.checked_add(1).map(|next| (next, end)); if apply { stream.next = sequence.checked_add(1).map(|next| (next, end)); } Some(Output(sequence, apply, bytes)) },
-        8 => { let (first, last) = (input.u64()?, input.u64()?); let replay = stream.replay.ok_or(WireError::Malformed)?; well_formed(first == 1 && replay.first.checked_sub(1) == Some(last) && stream.next.is_none_or(|(sequence, _)| sequence >= replay.first))?; input.end()?; stream.next.get_or_insert((replay.first, replay.start)); None },
-        10 => Some(Receipt(InputReceipt::decode(&message.payload)?)),
-        0x14 => { let query = decode_query(&message.payload)?; let shape = recognize_query(&query.bytes).ok_or(WireError::Malformed)?; well_formed(query.class == shape.class && Some(query.epoch) == stream.lease_epoch)?; stream.queries.push((query, shape)); None },
-        0x16 => { well_formed(stream.replay.is_some())?; Some(Lease(LeaseResult::decode_wire(&message.payload)?)) },
+        8 => { let (first, last) = (input.u64()?, input.u64()?); let replay = stream.replay.ok_or(WireError::Malformed)?; well_formed(stream.terminal && first == 1 && replay.first.checked_sub(1) == Some(last) && stream.next.is_none_or(|(sequence, _)| sequence >= replay.first))?; input.end()?; stream.next.get_or_insert((replay.first, replay.start)); None },
+        10 => { well_formed(stream.replay.is_none() || stream.terminal)?; Some(Receipt(InputReceipt::decode(&message.payload)?)) },
+        0x14 => { well_formed(stream.replay.is_none() || stream.terminal)?; let query = decode_query(&message.payload)?; let shape = recognize_query(&query.bytes).ok_or(WireError::Malformed)?; well_formed(query.class == shape.class && Some(query.epoch) == stream.lease_epoch)?; stream.queries.push((query, shape)); None },
+        0x16 => { well_formed(stream.replay.is_some() && stream.terminal)?; Some(Lease(LeaseResult::decode_wire(&message.payload)?)) },
         _ => None,
     })
 }
