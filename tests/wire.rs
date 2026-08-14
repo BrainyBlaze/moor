@@ -486,6 +486,22 @@ fn inbound_fixed_size_kinds_admit_exactly_their_frozen_length() {
             "kind {kind:#04x} accepted a smuggled byte"
         );
 
+        // A declaration above the universal 1 MiB frame bound is
+        // OVERSIZED_FRAME for a fixed kind exactly as for a variable one:
+        // the frozen §1 bound owns that overlap, and the fixed-size equality
+        // check must not shadow it with Malformed.
+        let mut unbounded = frame.clone();
+        unbounded[16..20].copy_from_slice(&((1 << 20) as u32 + 1).to_le_bytes());
+        let checksum = crc32c(&unbounded[..20]).to_le_bytes();
+        unbounded[20..24].copy_from_slice(&checksum);
+        let mut receiver = Codec::new(Profile::Controller);
+        let mut messages = Vec::new();
+        assert_eq!(
+            receiver.feed(0, &unbounded, &mut messages),
+            Err(WireError::OversizedFrame),
+            "kind {kind:#04x}: the universal frame bound owns declarations above 1 MiB"
+        );
+
         // One byte short of the frozen size: equally malformed, never a
         // partial frame the codec waits to complete.
         if size > 0 {
