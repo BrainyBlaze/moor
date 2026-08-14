@@ -3028,6 +3028,98 @@ fn v26_non_vt_attach_preserves_child_geometry_and_grants_no_lease() {
 }
 
 #[test]
+fn v16_wakeup_is_legal_between_hello_ack_and_attach_ack() {
+    use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
+    // §16 durable-advance vector: WAKEUP is legal at EVERY post-HELLO_ACK
+    // phase, including the window between HELLO_ACK and ATTACH_ACK. A holder
+    // whose event store advanced durably announces it immediately; it does
+    // not wait for the controller to finish attaching, and a controller that
+    // faults its handshake over that announcement loses exactly the session
+    // it was joining (OB-30 / the desk#54 incident class).
+    let wakeup = v16_framing_feed_one(1, &v16_framing_encode_frame(1, 7, 0x11, &[]));
+    assert_eq!((wakeup.scope, wakeup.kind), (7, 0x11));
+
+    let mut stream = ViewerStream::default();
+    // The WAKEUP lands before any attach state exists — and changes nothing.
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &wakeup,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(None),
+        "a WAKEUP between HELLO_ACK and ATTACH_ACK must be accepted"
+    );
+    assert!(
+        stream.replay.is_none() && !stream.terminal,
+        "the pre-attach WAKEUP must not fabricate attach state"
+    );
+
+    // And the attach that follows proceeds exactly as if the WAKEUP had
+    // never happened: status-first, then the terminal preamble.
+    let mut payload = Vec::new();
+    moor::wire::put_wide(&mut payload, b"\x01/tmp/session").unwrap();
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&[9; 16]);
+    payload.push(0);
+    moor::wire::put_wide(&mut payload, b"").unwrap();
+    payload.push(0xff);
+    payload.extend_from_slice(&[0; 48 + 32]);
+    moor::wire::put_wide(&mut payload, b"/tmp").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[1; 16]);
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
+    let tail = moor::wire::StatusTail {
+        columns: 80,
+        rows: 24,
+        replay: moor::wire::ReplayDescriptor {
+            first: 0,
+            last: 0,
+            start: 0,
+            end: 0,
+            complete: true,
+            modes_exact: true,
+        },
+        owns_lease: false,
+        viewers: false,
+        running: true,
+        event_writable: false,
+        lease_epoch: 1,
+        semantic_flags: 0,
+        semantic_pending: 0,
+        extension: moor::wire::StatusExtension {
+            health: 0,
+            log_epoch: 0,
+            log_index: 0,
+            retained_start: 0,
+            retained_end: 0,
+        },
+    };
+    payload.extend_from_slice(&tail.encode().unwrap());
+    let status = v16_framing_feed_one(2, &v16_framing_encode_frame(2, 7, 4, &payload));
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &status,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(None)
+    );
+    let terminal = v16_framing_feed_one(3, &v16_framing_encode_frame(3, 7, 5, &[0, 0]));
+    assert_eq!(
+        decode_viewer(
+            &mut stream,
+            &terminal,
+            (b"\x01/tmp/session".as_slice(), 7, [9; 16])
+        ),
+        Ok(Some(ViewerEvent::Terminal(b""))),
+        "the attach after a pre-attach WAKEUP completes normally"
+    );
+}
+
+#[test]
 fn v26_empty_preamble_is_a_present_frame_with_a_plain_u16_zero_length() {
     use moor::wire::{ViewerEvent, ViewerStream, decode_viewer};
     let frame = hex(V26_PREAMBLE);
