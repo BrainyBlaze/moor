@@ -1198,10 +1198,11 @@ mod launch_paths {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
-        assert_eq!(
-            output.stderr, b"moor: supervised launch rejected (selector-invalid)\n",
-            "{output:?}"
+        let expected = format!(
+            "{}: supervised launch rejected (selector-invalid)\n",
+            moor::name::program(invoked)
         );
+        assert_eq!(output.stderr, expected.as_bytes(), "{output:?}");
         assert!(std::fs::symlink_metadata(marker).is_err(), "{output:?}");
     }
 
