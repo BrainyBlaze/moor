@@ -1,0 +1,39 @@
+[package]
+name = "moor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+crossbeam-channel = "0.5"
+crc32c = "0.6.8"
+fs2 = "0.4"
+getrandom = "0.3"
+interprocess = "=2.4.2"
+libc = "0.2"
+path-absolutize = "=3.1.1"
+rayon = "1"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+smallvec = "1"
+time = { version = "0.3", default-features = false, features = ["macros", "parsing"] }
+zerocopy = { version = "0.8", features = ["derive"] }
+uuid = "=1.18.1"
+
+[target.'cfg(unix)'.dependencies]
+close_fds = "=0.3.2"
+nix = { version = "0.30", features = ["dir", "poll", "term", "user"] }
+signal-hook = "0.3"
+
+[[bin]]
+name = "moor"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

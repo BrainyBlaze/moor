@@ -1,0 +1,162 @@
+name: Hosted native evidence
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native-posix:
+    name: Native hosted / ${{ matrix.lane }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: ubuntu-22.04-x64
+            runner: ubuntu-22.04
+          - lane: ubuntu-24.04-arm64
+            runner: ubuntu-24.04-arm
+          - lane: macos-15-intel
+            runner: macos-15-intel
+          - lane: macos-15-arm64
+            runner: macos-15
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Initialize the evidence directory
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          out="ci-output/$LANE"
+          mkdir -p "$out"
+          {
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'runner=%s\n' "$RUNNER_NAME"
+            printf 'os=%s\n' "$RUNNER_OS"
+            printf 'arch=%s\n' "$RUNNER_ARCH"
+            uname -a
+          } > "$out/identity.txt"
+
+      - name: Build the release command
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -o pipefail
+          cargo build --release --bin moor 2>&1 | tee "ci-output/$LANE/build.log"
+
+      - name: Package, hash, and smoke the release command
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          out="ci-output/$LANE"
+          cp target/release/moor "$out/moor"
+          (
+            cd "$out"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum moor
+            else
+              shasum -a 256 moor
+            fi > SHA256SUMS
+          )
+          {
+            "$out/moor" --version
+            "$out/moor" --help
+          } >> "$out/smoke.log" 2>&1
+          cat "$out/SHA256SUMS" "$out/smoke.log"
+
+      - name: Run all applicable real-process tests
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -o pipefail
+          cargo test --release --all-targets 2>&1 | tee "ci-output/$LANE/test.log"
+
+      - name: Upload logs, binaries, and artifact identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.lane }}-${{ github.sha }}
+          path: ci-output/${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 14
+
+  native-alpine:
+    name: Native hosted / ${{ matrix.lane }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: alpine-3.20-x64
+            runner: ubuntu-22.04
+          - lane: alpine-3.20-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build, hash, smoke, and test inside Alpine 3.20
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          docker run --rm \
+            -e GITHUB_SHA \
+            -e LANE \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            alpine:3.20 /bin/sh -ec '
+              set -o pipefail
+              apk add --no-cache build-base ca-certificates rustup
+              export CARGO_HOME=/opt/cargo
+              export RUSTUP_HOME=/opt/rustup
+              export PATH="$CARGO_HOME/bin:$PATH"
+              rustup-init -y --no-modify-path --profile minimal --default-toolchain stable
+              out="ci-output/$LANE"
+              mkdir -p "$out"
+              {
+                printf "commit=%s\n" "$GITHUB_SHA"
+                printf "alpine=%s\n" "$(cat /etc/alpine-release)"
+                printf "arch=%s\n" "$(uname -m)"
+                uname -a
+              } > "$out/identity.txt"
+              cargo build --release --bin moor 2>&1 | tee "$out/build.log"
+              cp target/release/moor "$out/moor"
+              (cd "$out" && sha256sum moor > SHA256SUMS)
+              {
+                "$out/moor" --version
+                "$out/moor" --help
+              } >> "$out/smoke.log" 2>&1
+              cat "$out/SHA256SUMS" "$out/smoke.log"
+              cargo test --release --all-targets 2>&1 | tee "$out/test.log"
+            '
+
+      - name: Upload logs, binaries, and artifact identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.lane }}-${{ github.sha }}
+          path: ci-output/${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 14

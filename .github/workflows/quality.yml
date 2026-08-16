@@ -1,0 +1,141 @@
+name: Hosted quality
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Ubuntu 22.04 x64 / strict quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install stable Rust with quality components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check whitespace in the event range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          git diff --check
+          # A base that is not a commit (a branch-creation event, or the
+          # first push of a clean-root history) falls back to HEAD's parent —
+          # and a root commit has none, so the fallback below diffs against
+          # the empty tree instead of failing before quality ever ran.
+          BASE_SHA="$(sh ci/diff-base.sh "$BASE_SHA")"
+          git diff --check "$BASE_SHA" HEAD
+
+      - name: Event-range diff base is root-safe
+        run: sh ci/diff-base.test.sh
+
+      # Runs the guard AND its own proof, so a guard that silently stopped
+      # rejecting anything fails the build instead of passing it.
+      - name: Internal working documents must not be tracked
+        run: sh ci/tracked-paths.test.sh
+
+      # The digest gate proves the documents were re-pinned; this proves their
+      # content stopped saying the retired thing. Both are needed: a reviewer
+      # caught every one of these patterns ALIVE after a re-pin.
+      - name: Retired normative surfaces must stay retired
+        run: sh ci/spec-normative-patterns.test.sh
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run all-target tests
+        run: cargo test --all-targets --all-features
+
+      - name: Verify the reviewed handoff hashes
+        run: |
+          cd spec
+          sha256sum --check --strict <<'SUMS'
+          f76a8ead39292d7f67446813ded5db27e8e6f999289118e2a96425fb6b678e06  moor-spec.md
+          d00dc527d41975c29640de6b8ca0fabab47d14a951653e376e9246742e4fd52a  moor-wire-schema.md
+          SUMS
+          # The literal README table cells intentionally include Markdown backticks.
+          # shellcheck disable=SC2016
+          grep -F '`moor-spec.md` | `f76a8ead39292d7f67446813ded5db27e8e6f999289118e2a96425fb6b678e06`' README.md
+          # shellcheck disable=SC2016
+          grep -F '`moor-wire-schema.md` | `d00dc527d41975c29640de6b8ca0fabab47d14a951653e376e9246742e4fd52a`' README.md
+
+      - name: Verify and build the sole release command
+        run: |
+          test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "moor") | .targets[] | select(.kind == ["bin"]) | .name')" = moor
+          cargo build --release --bin moor
+
+  production-loc:
+    name: Production source report
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust with rustfmt
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Count first-party production source
+        run: scripts/count-production-loc.sh
+
+  compile-evidence:
+    name: Compile evidence only / ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust and the target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Label the evidence boundary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          printf '%s\n' '### Compile evidence only' '' \
+            "Target: \`$TARGET\`" '' \
+            'This job is not native conformance evidence.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check all targets without claiming native conformance
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --all-targets --all-features --target "$TARGET"
