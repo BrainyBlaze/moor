@@ -2103,20 +2103,27 @@ pub(crate) fn cleanup(path: &Path) -> Result<()> {
 }
 
 fn launch_generation(invoked: &OsStr) -> Result<(u32, bool)> {
-    shared::supervised_generation(
-        invoked,
-        true,
-        "supervised launch record is invalid",
-        |selector| {
-            let fd = selector
-                .to_str()
-                .and_then(crate::canonical_u64)
-                .and_then(|fd| i32::try_from(fd).ok())
-                .ok_or("supervised launch selector is malformed")?;
-            shared::decode_launch_record(&fixed_record::<32>(unsafe { File::from_raw_fd(fd) })?)
-                .ok_or_else(|| "supervised launch record is invalid".into())
-        },
-    )
+    use shared::SupervisedLaunchCause::{IoError, SelectorInvalid};
+
+    shared::supervised_generation(invoked, true, None, |selector| {
+        let fd = selector
+            .to_str()
+            .and_then(crate::canonical_u64)
+            .and_then(|fd| i32::try_from(fd).ok())
+            .ok_or(SelectorInvalid)?;
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let kind = file.metadata().map_err(|_| IoError)?.file_type();
+        if !kind.is_fifo() {
+            return Err(SelectorInvalid);
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+            return Err(IoError);
+        }
+        shared::read_supervised_launch_record(&mut file, |remaining| {
+            readable(fd, remaining).map(|ready| Some(usize::from(ready) * usize::MAX))
+        })
+    })
+    .map_err(shared::SupervisedLaunchCause::rejection)
 }
 
 fn fixed_record<const N: usize>(mut file: File) -> Result<[u8; N]> {

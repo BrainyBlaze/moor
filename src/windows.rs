@@ -395,6 +395,28 @@ mod native {
         )?;
         require(flags & PIPE_TYPE_MESSAGE == 0, what)
     }
+    fn validate_supervised_pipe(handle: HANDLE) -> std::result::Result<(), SupervisedLaunchCause> {
+        if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
+            return Err(SupervisedLaunchCause::SelectorInvalid);
+        }
+        let mut flags = 0;
+        if unsafe {
+            GetNamedPipeInfo(
+                handle,
+                &mut flags,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(SupervisedLaunchCause::IoError);
+        }
+        if flags & PIPE_TYPE_MESSAGE != 0 {
+            return Err(SupervisedLaunchCause::SelectorInvalid);
+        }
+        Ok(())
+    }
     fn pipe_available(handle: HANDLE) -> io::Result<Option<usize>> {
         let mut available = 0;
         if unsafe {
@@ -3197,29 +3219,26 @@ mod native {
         let user = sid()?;
         let stage_root = root(invoked)?;
         let random = random_array::<64>()?;
-        let generation = supervised_generation(
-            invoked,
-            false,
-            "supervised-launch acknowledgement was invalid",
-            |selector| {
-                let text = selector
-                    .to_str()
-                    .ok_or("invalid supervised-launch handle")?;
-                let raw = usize::from_str_radix(text, 16)
-                    .ok()
-                    .filter(|raw| {
-                        *raw != 0
-                            && text.len() <= 16
-                            && !text.starts_with('0')
-                            && lowercase_hex(text.as_bytes())
-                    })
-                    .ok_or("invalid supervised-launch handle")?;
-                let channel = unsafe { Handle::owned(raw as HANDLE) };
-                validate_pipe(channel.raw(), "supervised-launch channel")?;
-                decode_launch_record(&channel.record::<32>(true, "supervised-launch record")?)
-                    .ok_or_else(|| "supervised-launch acknowledgement was invalid".into())
-            },
-        )?
+        let generation = supervised_generation(invoked, false, None, |selector| {
+            let text = selector
+                .to_str()
+                .ok_or(SupervisedLaunchCause::SelectorInvalid)?;
+            let raw = usize::from_str_radix(text, 16)
+                .ok()
+                .filter(|raw| {
+                    *raw != 0
+                        && text.len() <= 16
+                        && !text.starts_with('0')
+                        && lowercase_hex(text.as_bytes())
+                })
+                .ok_or(SupervisedLaunchCause::SelectorInvalid)?;
+            let channel = unsafe { Handle::owned(raw as HANDLE) };
+            validate_supervised_pipe(channel.raw())?;
+            let raw = channel.raw();
+            let mut file = channel.into_file();
+            read_supervised_launch_record(&mut file, |_| pipe_available(raw))
+        })
+        .map_err(SupervisedLaunchCause::rejection)?
         .0;
         ready.generation = generation;
         let marker = Marker::new(

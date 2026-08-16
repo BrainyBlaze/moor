@@ -52,6 +52,41 @@ pub fn copy_digest(input: &mut fs::File, mut output: Option<&mut fs::File>) -> R
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SupervisedLaunchCause {
+    GenerationMissing,
+    GenerationMalformed,
+    GenerationDisagree,
+    SelectorInvalid,
+    ChannelTimeout,
+    RecordWrongLength,
+    RecordMalformed,
+    GenerationMismatch,
+    PreparationFailed,
+    IoError,
+}
+
+impl SupervisedLaunchCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerationMissing => "generation-missing",
+            Self::GenerationMalformed => "generation-malformed",
+            Self::GenerationDisagree => "generation-disagree",
+            Self::SelectorInvalid => "selector-invalid",
+            Self::ChannelTimeout => "channel-timeout",
+            Self::RecordWrongLength => "record-wrong-length",
+            Self::RecordMalformed => "record-malformed",
+            Self::GenerationMismatch => "generation-mismatch",
+            Self::PreparationFailed => "preparation-failed",
+            Self::IoError => "io-error",
+        }
+    }
+
+    pub fn rejection(self) -> String {
+        format!("supervised launch rejected ({})", self.as_str())
+    }
+}
+
 pub fn decode_launch_record(bytes: &[u8]) -> Option<u32> {
     let record: &[u8; 32] = bytes.try_into().ok()?;
     let generation = u32::from_le_bytes(record[12..16].try_into().unwrap());
@@ -179,6 +214,58 @@ pub fn fixed_record<const N: usize>(
             None => {
                 crate::ensure!(eof && used == N, invalid);
                 return Ok(record);
+            }
+        }
+    }
+}
+
+pub fn read_supervised_launch_record(
+    input: &mut impl Read,
+    poll: impl FnMut(Duration) -> io::Result<Option<usize>>,
+) -> std::result::Result<u32, SupervisedLaunchCause> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    read_supervised_launch_record_with(
+        input,
+        || deadline.saturating_duration_since(Instant::now()),
+        poll,
+    )
+}
+
+pub fn read_supervised_launch_record_with(
+    input: &mut impl Read,
+    mut remaining: impl FnMut() -> Duration,
+    mut poll: impl FnMut(Duration) -> io::Result<Option<usize>>,
+) -> std::result::Result<u32, SupervisedLaunchCause> {
+    use SupervisedLaunchCause::{ChannelTimeout, IoError, RecordMalformed, RecordWrongLength};
+
+    let mut bytes = [0; 33];
+    let mut used = 0;
+    loop {
+        let available_for = remaining();
+        if available_for.is_zero() {
+            return Err(ChannelTimeout);
+        }
+        match poll(available_for).map_err(|_| IoError)? {
+            Some(0) => thread::sleep(Duration::from_millis(2)),
+            Some(available) => {
+                let end = used + available.min(bytes.len() - used);
+                let count = input.read(&mut bytes[used..end]).map_err(|_| IoError)?;
+                if count == 0 {
+                    if used != 32 {
+                        return Err(RecordWrongLength);
+                    }
+                    return decode_launch_record(&bytes[..32]).ok_or(RecordMalformed);
+                }
+                used += count;
+                if used == bytes.len() {
+                    return Err(RecordWrongLength);
+                }
+            }
+            None => {
+                if used != 32 {
+                    return Err(RecordWrongLength);
+                }
+                return decode_launch_record(&bytes[..32]).ok_or(RecordMalformed);
             }
         }
     }
@@ -336,9 +423,13 @@ pub fn environment_key(invoked: &OsStr, suffix: &str) -> OsString {
 pub fn supervised_generation(
     invoked: &OsStr,
     clear_supervised: bool,
-    invalid: &str,
-    read: impl FnOnce(&OsStr) -> Result<u32>,
-) -> Result<(u32, bool)> {
+    deferred: Option<SupervisedLaunchCause>,
+    read: impl FnOnce(&OsStr) -> std::result::Result<u32, SupervisedLaunchCause>,
+) -> std::result::Result<(u32, bool), SupervisedLaunchCause> {
+    use SupervisedLaunchCause::{
+        GenerationDisagree, GenerationMalformed, GenerationMismatch, GenerationMissing,
+    };
+
     let key = environment_key(invoked, "_GENERATION");
     let launch_channel_key = environment_key(invoked, "_LAUNCH_CHANNEL");
     let selector = std::env::var_os(&launch_channel_key);
@@ -355,9 +446,27 @@ pub fn supervised_generation(
         return Ok((1, false));
     };
     let generation = read(&selector)?;
-    let expected = OsString::from(generation.to_string());
-    let valid = first.as_ref() == Some(&expected) && second.as_ref() == Some(&expected);
-    crate::ensure!(valid, invalid);
+    let (Some(first), Some(second)) = (first, second) else {
+        return Err(GenerationMissing);
+    };
+    let parse = |value: &OsStr| {
+        value
+            .to_str()
+            .and_then(crate::canonical_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value >= 2)
+            .ok_or(GenerationMalformed)
+    };
+    let (first, second) = (parse(&first)?, parse(&second)?);
+    if first != second {
+        return Err(GenerationDisagree);
+    }
+    if generation != first {
+        return Err(GenerationMismatch);
+    }
+    if let Some(cause) = deferred {
+        return Err(cause);
+    }
     Ok((generation, true))
 }
 
