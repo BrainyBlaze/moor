@@ -81,6 +81,17 @@ check() {
         flag "retired dual-carrier ancestry surface:" "$hits"
     fi
 
+    # 8. Windows now has one narrowly lexical root-relative `-T` leaf while
+    #    POSIX and every absolute operand keep the exact absolute-path rule.
+    #    Refuse only the old UNIVERSAL spellings and the abandoned `.prepare`
+    #    reservation name; platform-qualified absolute-path prose stays legal.
+    if hits=$(grep -nE '[Tt]he caller-supplied event path must be a fully qualified absolute native path|the fully qualified absolute `?-T`? event path is used exactly as supplied|OB-10.*-T.*fully qualified absolute native path' $docs); then
+        flag "retired universal absolute-only event target:" "$hits"
+    fi
+    if hits=$(grep -nF 'companion(marker, ".prepare")' $docs); then
+        flag "retired preparation reservation name:" "$hits"
+    fi
+
     return $clean
 }
 
@@ -113,7 +124,11 @@ current falls back to the legacy carrier
 the holder writes both carriers on every session
 The holder dual-writes the legacy value
 OB-6: Dual-write the legacy ancestry plus the versioned carrier
-diagnostic: ancestry carriers disagree"
+diagnostic: ancestry carriers disagree
+the caller-supplied event path must be a fully qualified absolute native path
+the fully qualified absolute -T event path is used exactly as supplied
+OB-10: -T names a fully qualified absolute native path
+companion(marker, \".prepare\")"
 
 total=0
 caught=0
