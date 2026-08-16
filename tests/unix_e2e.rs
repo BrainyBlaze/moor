@@ -2265,6 +2265,32 @@ fn deeply_nested_socket_path_uses_a_directory_relative_address() {
 }
 
 #[test]
+fn malformed_supervised_selector_uses_exact_cause() {
+    let dir = temp();
+    let session = dir.join("malformed-supervised-selector");
+    let invoked = Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap();
+    let generation = environment_key(invoked, "_GENERATION");
+    let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+        .env(
+            environment_key(invoked, "_LAUNCH_CHANNEL"),
+            "not-a-selector",
+        )
+        .env(generation, "2")
+        .env("MOOR_SESSION_GENERATION", "2")
+        .args(["run", session.to_str().unwrap(), true_program()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        output.stderr, b"moor: supervised launch rejected (selector-invalid)\n",
+        "{output:?}"
+    );
+    assert!(fs::symlink_metadata(&session).is_err(), "{output:?}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn legal_stage_like_session_names_remain_visible_and_untouched() {
     let dir = temp();
     let alias = dir.file_name().unwrap().to_str().unwrap();

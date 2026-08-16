@@ -1,17 +1,19 @@
 use moor::runtime::private::{
-    ArtifactConfig, SessionState, age, await_launch, await_launch_probe, clear_store, companion,
-    decode_launch_record, decode_launch_result, discover_sessions, environment_key,
-    holder_artifacts, instrument_ack, instrument_stage, launch_result, lifecycle_running,
-    monotonic, now, parse_boot_uuid, random_array, session_name, supervised_generation,
+    ArtifactConfig, SessionState, SupervisedLaunchCause, age, await_launch, await_launch_probe,
+    clear_store, companion, decode_launch_record, decode_launch_result, discover_sessions,
+    environment_key, holder_artifacts, instrument_ack, instrument_stage, launch_result,
+    lifecycle_running, monotonic, now, parse_boot_uuid, random_array,
+    read_supervised_launch_record_with, session_name, supervised_generation,
     validate_instrument_ack,
 };
 use moor::runtime::storage::SessionStorage;
 use moor::store::{Kind, Store};
 use moor::wire::{get_wide, put_wide};
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -227,29 +229,231 @@ fn discovery_applies_one_deadline_to_the_complete_listing() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn supervised_generation_validates_and_sanitizes_environment_carriers() {
-    let invoked = std::ffi::OsStr::new("moor-private-generation-test");
+fn supervised_case(
+    selector: Option<&str>,
+    first: Option<&str>,
+    second: Option<&str>,
+    record: Result<u32, SupervisedLaunchCause>,
+    deferred: Option<SupervisedLaunchCause>,
+) -> Result<(u32, bool), SupervisedLaunchCause> {
+    let invoked = std::ffi::OsStr::new("moor-private-supervised-launch-test");
     let key = environment_key(invoked, "_GENERATION");
     let launch = environment_key(invoked, "_LAUNCH_CHANNEL");
     unsafe {
-        std::env::set_var(&launch, "channel");
-        std::env::set_var(&key, "42");
-        std::env::set_var("MOOR_SESSION_GENERATION", "42");
+        for (key, value) in [
+            (launch.as_os_str(), selector),
+            (key.as_os_str(), first),
+            (std::ffi::OsStr::new("MOOR_SESSION_GENERATION"), second),
+        ] {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
     }
-    let result = supervised_generation(invoked, true, "invalid launch", |selector| {
-        assert_eq!(selector, "channel");
-        let mut bytes = [0; 32];
-        bytes[..8].copy_from_slice(b"MOORLCH3");
-        bytes[8] = 1;
-        bytes[12..16].copy_from_slice(&42u32.to_le_bytes());
-        bytes[16..].fill(7);
-        decode_launch_record(&bytes).ok_or_else(|| "decode failed".to_string())
+    let result = supervised_generation(invoked, true, deferred, |value| {
+        assert_eq!(value, "channel");
+        record
     });
-    assert_eq!(result.unwrap(), (42, true));
-    assert!(std::env::var_os(launch).is_none());
-    assert!(std::env::var_os(key).is_none());
+    assert!(std::env::var_os(&launch).is_none());
+    assert!(std::env::var_os(&key).is_none());
     assert!(std::env::var_os("MOOR_SESSION_GENERATION").is_none());
+    result
+}
+
+#[test]
+fn supervised_launch_causes_are_typed_ordered_and_exact() {
+    use SupervisedLaunchCause::{
+        ChannelTimeout, GenerationDisagree, GenerationMalformed, GenerationMismatch,
+        GenerationMissing, IoError, PreparationFailed, RecordMalformed, RecordWrongLength,
+        SelectorInvalid,
+    };
+
+    assert_eq!(
+        supervised_case(None, Some("poison"), Some("poison"), Ok(42), None),
+        Ok((1, false))
+    );
+    assert_eq!(
+        supervised_case(Some("channel"), None, Some("malformed"), Ok(42), None),
+        Err(GenerationMissing),
+        "a missing carrier wins over a malformed present carrier"
+    );
+    for value in ["0", "1", "02", "4294967296", "not-a-generation"] {
+        assert_eq!(
+            supervised_case(Some("channel"), Some(value), Some(value), Ok(42), None),
+            Err(GenerationMalformed),
+            "accepted malformed/range-invalid carrier {value:?}"
+        );
+    }
+    assert_eq!(
+        supervised_case(Some("channel"), Some("41"), Some("42"), Ok(42), None),
+        Err(GenerationDisagree)
+    );
+    assert_eq!(
+        supervised_case(Some("channel"), Some("42"), Some("42"), Ok(43), None),
+        Err(GenerationMismatch)
+    );
+    assert_eq!(
+        supervised_case(Some("channel"), Some("42"), Some("42"), Ok(42), None),
+        Ok((42, true))
+    );
+
+    for cause in [
+        SelectorInvalid,
+        ChannelTimeout,
+        RecordWrongLength,
+        RecordMalformed,
+        IoError,
+    ] {
+        assert_eq!(
+            supervised_case(
+                Some("channel"),
+                Some("42"),
+                Some("42"),
+                Err(cause),
+                Some(PreparationFailed),
+            ),
+            Err(cause),
+            "selector/channel/record cause lost precedence"
+        );
+    }
+    assert_eq!(
+        supervised_case(
+            Some("channel"),
+            None,
+            Some("42"),
+            Ok(42),
+            Some(PreparationFailed),
+        ),
+        Err(GenerationMissing),
+        "carrier failure lost precedence over deferred preparation"
+    );
+    assert_eq!(
+        supervised_case(
+            Some("channel"),
+            Some("42"),
+            Some("42"),
+            Ok(42),
+            Some(PreparationFailed),
+        ),
+        Err(PreparationFailed)
+    );
+    assert_eq!(
+        launch_result(3, 1, 42).and_then(|bytes| decode_launch_result(&bytes)),
+        Some((3, 1, 42)),
+        "preparation-failed must use MORR state 3 result 1"
+    );
+
+    for (cause, text) in [
+        (GenerationMissing, "generation-missing"),
+        (GenerationMalformed, "generation-malformed"),
+        (GenerationDisagree, "generation-disagree"),
+        (SelectorInvalid, "selector-invalid"),
+        (ChannelTimeout, "channel-timeout"),
+        (RecordWrongLength, "record-wrong-length"),
+        (RecordMalformed, "record-malformed"),
+        (GenerationMismatch, "generation-mismatch"),
+        (PreparationFailed, "preparation-failed"),
+        (IoError, "io-error"),
+    ] {
+        assert_eq!(cause.as_str(), text);
+        assert_eq!(
+            cause.rejection(),
+            format!("supervised launch rejected ({text})")
+        );
+    }
+}
+
+enum PollStep {
+    Available(usize),
+    Eof,
+    Error,
+}
+
+fn supervised_record_case(
+    bytes: Vec<u8>,
+    remaining: Vec<Duration>,
+    polls: Vec<PollStep>,
+) -> Result<u32, SupervisedLaunchCause> {
+    let mut input = Cursor::new(bytes);
+    let mut remaining = VecDeque::from(remaining);
+    let mut polls = VecDeque::from(polls);
+    read_supervised_launch_record_with(
+        &mut input,
+        || remaining.pop_front().unwrap_or(Duration::from_secs(1)),
+        |_| match polls.pop_front().unwrap_or(PollStep::Eof) {
+            PollStep::Available(count) => Ok(Some(count)),
+            PollStep::Eof => Ok(None),
+            PollStep::Error => Err(io::Error::other("injected poll failure")),
+        },
+    )
+}
+
+#[test]
+fn supervised_launch_record_boundaries_are_typed_without_sleeping() {
+    use SupervisedLaunchCause::{ChannelTimeout, IoError, RecordMalformed, RecordWrongLength};
+
+    let mut record = [0; 32];
+    record[..8].copy_from_slice(b"MOORLCH3");
+    record[8] = 1;
+    record[12..16].copy_from_slice(&42u32.to_le_bytes());
+    record[16..].fill(7);
+
+    for length in 0..32 {
+        let polls = if length == 0 {
+            vec![PollStep::Eof]
+        } else {
+            vec![PollStep::Available(length), PollStep::Eof]
+        };
+        assert_eq!(
+            supervised_record_case(record[..length].to_vec(), vec![], polls),
+            Err(RecordWrongLength),
+            "accepted clean EOF after {length} bytes"
+        );
+    }
+
+    let mut long = record.to_vec();
+    long.push(0xaa);
+    assert_eq!(
+        supervised_record_case(
+            long,
+            vec![],
+            vec![PollStep::Available(33), PollStep::Available(1)],
+        ),
+        Err(RecordWrongLength),
+        "byte 33 must reject immediately"
+    );
+    assert_eq!(
+        supervised_record_case(
+            record.to_vec(),
+            vec![Duration::from_secs(1), Duration::ZERO],
+            vec![PollStep::Available(32)],
+        ),
+        Err(ChannelTimeout),
+        "exact bytes without EOF must time out"
+    );
+    assert_eq!(
+        supervised_record_case(vec![], vec![], vec![PollStep::Error]),
+        Err(IoError)
+    );
+    assert_eq!(
+        supervised_record_case(
+            record.to_vec(),
+            vec![],
+            vec![PollStep::Available(32), PollStep::Eof],
+        ),
+        Ok(42)
+    );
+    record[9] = 1;
+    assert_eq!(
+        supervised_record_case(
+            record.to_vec(),
+            vec![],
+            vec![PollStep::Available(32), PollStep::Eof],
+        ),
+        Err(RecordMalformed)
+    );
 }
 
 #[test]

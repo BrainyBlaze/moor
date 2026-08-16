@@ -1181,6 +1181,31 @@ mod launch_paths {
     }
 
     #[test]
+    fn malformed_supervised_selector_uses_exact_cause() {
+        let session = format!("malformed-supervised-selector-{}", std::process::id());
+        let marker = invoked_root().join(&session);
+        let invoked = Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap();
+        let generation = moor::runtime::private::environment_key(invoked, "_GENERATION");
+        let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .env(
+                moor::runtime::private::environment_key(invoked, "_LAUNCH_CHANNEL"),
+                "not-a-handle",
+            )
+            .env(generation, "2")
+            .env("MOOR_SESSION_GENERATION", "2")
+            .args(["run", &session, "cmd.exe", "/d", "/s", "/c", "exit 0"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(
+            output.stderr, b"moor: supervised launch rejected (selector-invalid)\n",
+            "{output:?}"
+        );
+        assert!(std::fs::symlink_metadata(marker).is_err(), "{output:?}");
+    }
+
+    #[test]
     fn normal_retirement_deletes_only_the_published_marker_identity() {
         let root = invoked_root();
         let _ = moor(&["list"]);
