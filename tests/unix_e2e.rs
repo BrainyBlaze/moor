@@ -310,6 +310,35 @@ fn inert_instrumentation(dir: &Path) -> PathBuf {
     library
 }
 
+fn chatty_exiting_program(dir: &Path) -> PathBuf {
+    // Writes to its terminal and exits at once: the shape whose teardown used
+    // to deadlock on macOS when the launch failed after the child had already
+    // queued output (a session leader exiting with an undrained pty blocks in
+    // the kernel until the master hangs up).
+    let source = dir.join("chatty-child.c");
+    let program = dir.join("chatty-child");
+    fs::write(
+        &source,
+        r#"#include <stdio.h>
+int main(void) {
+  printf("chatty\n");
+  fflush(stdout);
+  return 7;
+}"#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-o"])
+            .arg(&program)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    program
+}
+
 fn instrumentable_program(dir: &Path) -> PathBuf {
     let source = dir.join("instrument-child.c");
     let program = dir.join("instrument-child");
@@ -2968,6 +2997,51 @@ fn unacknowledged_instrumentation_uses_the_frozen_row_with_the_operand() {
         ),
         "{out:?}"
     );
+    let _ = fs::remove_dir_all(&root);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn unacknowledged_instrumentation_of_an_exited_chatty_child_fails_closed_promptly() {
+    // Regression: the child loads an inert object (no ACK), writes to its
+    // terminal, and exits before the acknowledgement deadline. The launch must
+    // still fail closed with the frozen row — promptly. Before the fix the
+    // holder's teardown waited on the exited child while the child sat in the
+    // kernel waiting for its queued output to drain, so `start` only returned
+    // after the launcher's own ten-second deadline with a generic diagnostic.
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let object = inert_instrumentation(&dir);
+    let program = chatty_exiting_program(&dir);
+    let socket = dir.join("chatty");
+    let started = Instant::now();
+    let out = invoked(
+        alias,
+        &[
+            "start",
+            socket.to_str().unwrap(),
+            "-S",
+            object.to_str().unwrap(),
+            program.to_str().unwrap(),
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "{alias}: instrumentation rejected: {} (load-unacknowledged)\n",
+            object.display()
+        ),
+        "{out:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "failed launch took {elapsed:?}: teardown waited on its own child"
+    );
+    assert!(!socket.exists(), "a failed launch published a rendezvous");
     let _ = fs::remove_dir_all(&root);
     fs::remove_dir_all(dir).unwrap();
 }
