@@ -593,11 +593,6 @@ mod native {
     const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
     const OPEN_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, SHARE_RW);
     const OPEN_RB: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES | DELETE, SHARE_ALL);
-    const OPEN_DIRECTORY_GUARD: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES, SHARE_ALL);
-    const OPEN_DIRECTORY_ACCESS: OpenPolicy = OpenPolicy(
-        GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
-        SHARE_ALL,
-    );
     const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
         GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
         SHARE_ALL,
@@ -643,17 +638,6 @@ mod native {
     fn reopen(file: &File, policy: OpenPolicy) -> Result<File> {
         let raw = unsafe { ReOpenFile(file.as_raw_handle(), policy.0, policy.1, NO_FOLLOW) };
         Handle::checked(raw, "reopen exact Windows object").map(Handle::into_file)
-    }
-    fn reopen_directory(file: &File, policy: OpenPolicy) -> Result<File> {
-        let raw = unsafe {
-            ReOpenFile(
-                file.as_raw_handle(),
-                policy.0,
-                policy.1,
-                NO_FOLLOW | FILE_FLAG_BACKUP_SEMANTICS,
-            )
-        };
-        Handle::checked(raw, "reopen exact Windows directory").map(Handle::into_file)
     }
     fn directory_cause(error: &io::Error) -> DirectoryCause {
         match error.raw_os_error().map(|code| code as u32) {
@@ -1030,6 +1014,13 @@ mod native {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
     }
+    fn directory_guard(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
     pub(crate) fn store_directory(path: &Path, delete: bool) -> io::Result<File> {
         directory_handle(path, delete, true)
     }
@@ -1181,8 +1172,12 @@ mod native {
             validate_exact_handle(&access, user, "FA", true).map_err(io::Error::other)?;
             let identity =
                 unsafe { file_identity(access.as_raw_handle()) }.map_err(io::Error::other)?;
-            let guard =
-                reopen_directory(&access, OPEN_DIRECTORY_GUARD).map_err(io::Error::other)?;
+            let guard = directory_guard(path)?;
+            if unsafe { file_identity(guard.as_raw_handle()) }.map_err(io::Error::other)?
+                != identity
+            {
+                return Err(io::Error::other("prepared directory identity changed"));
+            }
             return Ok((guard, access, None, identity, false));
         }
         if let Some(Err(error)) = existing
@@ -1196,8 +1191,13 @@ mod native {
         let prepared = (|| -> Result<_> {
             validate_exact_handle(&delete, sid()?, "FA", true)?;
             let identity = unsafe { file_identity(delete.as_raw_handle())? };
-            let guard = reopen_directory(&delete, OPEN_DIRECTORY_GUARD)?;
-            let access = reopen_directory(&delete, OPEN_DIRECTORY_ACCESS)?;
+            let guard = directory_guard(path).map_err(string)?;
+            let access = store_directory(path, false).map_err(string)?;
+            require(
+                unsafe { file_identity(guard.as_raw_handle())? } == identity
+                    && unsafe { file_identity(access.as_raw_handle())? } == identity,
+                "prepared directory identity changed",
+            )?;
             Ok((guard, access, identity))
         })();
         match prepared {
