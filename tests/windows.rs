@@ -1555,6 +1555,7 @@ mod launch_paths {
             ("stdin-new", "new", "stdin-v1", false, false),
             ("stdin-run", "run", "stdin-v1", false, false),
         ];
+        let mut failures = Vec::new();
 
         for (at, (label, mode, value, with_native, mixed_case)) in cases.into_iter().enumerate() {
             let session = format!("launch-source-{at}-{}", std::process::id());
@@ -1613,16 +1614,37 @@ mod launch_paths {
                 let _ = std::fs::remove_dir_all(path);
             }
 
-            assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
-            assert!(output.stdout.is_empty(), "{label}: {output:?}");
-            assert_eq!(output.stderr, expected.as_bytes(), "{label}: {output:?}");
-            assert!(!child_started, "{label}: requested child started");
-            assert!(residue.is_empty(), "{label}: launch residue {residue:?}");
-            assert!(
-                stages.is_empty(),
-                "{label}: staged launch residue {stages:?}"
-            );
+            let mut case = Vec::new();
+            if output.status.code() != Some(1) {
+                case.push(format!("status was {:?}", output.status.code()));
+            }
+            if !output.stdout.is_empty() {
+                case.push(format!("stdout was {:?}", output.stdout));
+            }
+            if output.stderr != expected.as_bytes() {
+                case.push(format!(
+                    "stderr was {:?}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            if child_started {
+                case.push("requested child started".to_owned());
+            }
+            if !residue.is_empty() {
+                case.push(format!("launch residue {residue:?}"));
+            }
+            if !stages.is_empty() {
+                case.push(format!("staged launch residue {stages:?}"));
+            }
+            if !case.is_empty() {
+                failures.push(format!("{label}: {}", case.join("; ")));
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "launch-source matrix failures:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
