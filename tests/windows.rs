@@ -3,7 +3,7 @@ use moor::runtime::private::{
 };
 use moor::windows::{
     BootstrapRecord, Marker, accept_bootstrap_command, bootstrap_command, cim_boot_identity,
-    wtf8_decode, wtf8_encode,
+    valid_event_leaf, wtf8_decode, wtf8_encode,
 };
 
 fn exit_records(
@@ -174,6 +174,96 @@ fn windows_native_paths_round_trip_through_canonical_wtf8() {
         wtf8_decode(b"\xed\xa0\0").is_err(),
         "validator acceptance alone is insufficient"
     );
+}
+
+#[test]
+fn windows_event_leaf_grammar_is_exact() {
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().collect()
+    }
+
+    let valid = [
+        "0123456789abcdef0123456789abcdef.2.events",
+        "a",
+        "9",
+        "a.b-c_d9",
+        "COM0",
+        "COM10",
+        "console",
+    ];
+    for value in valid {
+        let units = wide(value);
+        let original = units.clone();
+        let accepted: bool = valid_event_leaf(&units);
+        assert!(accepted, "rejected valid leaf {value:?}");
+        assert_eq!(units, original, "rewrote valid leaf {value:?}");
+    }
+
+    let max = vec![u16::from(b'a'); 255];
+    assert!(valid_event_leaf(&max));
+    let overlong = vec![u16::from(b'a'); 256];
+    assert!(!valid_event_leaf(&overlong));
+    assert!(!valid_event_leaf(&[]));
+
+    let invalid = [
+        ".",
+        "..",
+        "a/b",
+        r"a\b",
+        "C:leaf",
+        "a b",
+        ".leaf",
+        "leaf.",
+        "-leaf",
+        "leaf-",
+        "_leaf",
+        "leaf_",
+        r"nested\leaf",
+        r"\rooted",
+        r"C:relative",
+        r"\\server\share",
+        "é",
+    ];
+    for value in invalid {
+        let units = wide(value);
+        let original = units.clone();
+        assert!(!valid_event_leaf(&units), "accepted invalid leaf {value:?}");
+        assert_eq!(units, original, "rewrote invalid leaf {value:?}");
+    }
+
+    for units in [vec![0xd800], vec![u16::from(b'a'), 0xdc00]] {
+        let original = units.clone();
+        assert!(!valid_event_leaf(&units));
+        assert_eq!(units, original);
+    }
+
+    for reserved in ["CON", "PRN", "AUX", "NUL", "CLOCK$"] {
+        for value in [
+            reserved.to_owned(),
+            format!("{}.events", reserved.to_ascii_lowercase()),
+        ] {
+            assert!(
+                !valid_event_leaf(&wide(&value)),
+                "accepted device {value:?}"
+            );
+        }
+    }
+    for prefix in ["COM", "LPT"] {
+        for number in 1..=9 {
+            for value in [
+                format!("{prefix}{number}"),
+                format!(
+                    "{}.events",
+                    format!("{prefix}{number}").to_ascii_lowercase()
+                ),
+            ] {
+                assert!(
+                    !valid_event_leaf(&wide(&value)),
+                    "accepted device {value:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

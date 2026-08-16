@@ -16,6 +16,52 @@ pub fn wtf8_decode(bytes: &[u8]) -> Result<Vec<u16>> {
     Ok(wide)
 }
 
+#[doc(hidden)]
+pub fn valid_event_leaf(units: &[u16]) -> bool {
+    fn alphanumeric(unit: u16) -> bool {
+        matches!(unit, 0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a)
+    }
+
+    fn equals_ascii_case_insensitive(units: &[u16], expected: &[u8]) -> bool {
+        units.len() == expected.len()
+            && units.iter().zip(expected).all(|(&unit, &byte)| {
+                unit <= u16::from(u8::MAX) && (unit as u8).eq_ignore_ascii_case(&byte)
+            })
+    }
+
+    if !(1..=255).contains(&units.len())
+        || !alphanumeric(units[0])
+        || !alphanumeric(units[units.len() - 1])
+        || !units.iter().all(|&unit| {
+            alphanumeric(unit)
+                || unit == u16::from(b'.')
+                || unit == u16::from(b'_')
+                || unit == u16::from(b'-')
+        })
+    {
+        return false;
+    }
+
+    let basename = &units[..units
+        .iter()
+        .position(|&unit| unit == u16::from(b'.'))
+        .unwrap_or(units.len())];
+    if [b"CON".as_slice(), b"PRN", b"AUX", b"NUL", b"CLOCK$"]
+        .iter()
+        .any(|name| equals_ascii_case_insensitive(basename, name))
+    {
+        return false;
+    }
+    if basename.len() == 4
+        && (equals_ascii_case_insensitive(&basename[..3], b"COM")
+            || equals_ascii_case_insensitive(&basename[..3], b"LPT"))
+        && matches!(basename[3], 0x31..=0x39)
+    {
+        return false;
+    }
+    true
+}
+
 pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
     use time::{PrimitiveDateTime, UtcOffset, macros::format_description};
     crate::return_if!(value.len() != 25, None);
