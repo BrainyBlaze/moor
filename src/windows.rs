@@ -617,6 +617,12 @@ mod native {
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
+    const OPEN_SLOT_WRITER: RelativePolicy = RelativePolicy(
+        GENERIC_READ | GENERIC_WRITE,
+        SHARE_RW,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
     unsafe fn open_handle(
         path: &Path,
         policy: OpenPolicy,
@@ -1238,15 +1244,18 @@ mod native {
             rollback_created();
             return Err(io::Error::other("prepared slot identity changed"));
         }
+        let writer = relative_file(directory, OsStr::new(name), user, OPEN_SLOT_WRITER)
+            .inspect_err(|_| rollback_created())
+            .map_err(io::Error::other)?;
+        let writer_identity = unsafe { unique_file_identity(writer.as_raw_handle()) }
+            .inspect_err(|_| rollback_created())
+            .map_err(io::Error::other)?;
+        if writer_identity != identity {
+            rollback_created();
+            return Err(io::Error::other("prepared slot identity changed"));
+        }
         drop(created);
-        let writer = reopen(&guard, OPEN_STORE).inspect_err(|_| {
-            if let Ok(delete) = reopen(&guard, OPEN_RB) {
-                delete_file(&delete);
-            }
-        });
-        writer
-            .map(|writer| (guard, writer, identity))
-            .map_err(io::Error::other)
+        Ok((guard, writer, identity))
     }
 
     #[repr(C)]
