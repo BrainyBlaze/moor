@@ -1557,7 +1557,7 @@ mod native {
     crate::schema!(struct Instrument fields; path: PathBuf, file: File, identity: [u8; 24], digest: [u8; 32], read: Pipe, write: Pipe);
     crate::schema!(struct Staged fields; path: PathBuf, file: File, identity: [u8; 24]);
     crate::schema!(struct Bootstrap derive [Default] fields; child: Option<Child>, control: Pipe, result: Pipe, nonce: [u8; 16]);
-    crate::schema!(struct EventTarget fields; path: PathBuf, present: bool, created: bool, guards: Vec<File>);
+    crate::schema!(struct EventTarget fields; operand: PathBuf, target: PathBuf, present: bool, created: bool, guards: Vec<File>);
     crate::schema!(struct Native derive [Default] fields; marker: PathBuf, stage_root: PathBuf, sid: String, generation: u32, options: Options, incarnation: [u8; 16], semantic_token: [u8; 16], synthetic: u8, geometry: (u16, u16), conpty: Pseudo, job: Option<Job>, bootstrap: Bootstrap, process: Handle, pid: u32, child_released: bool, early_exit: Option<u32>, birth: [u8; 16], input: Pipe, output: Pipe, stage: Option<Staged>, instrument: Option<Instrument>, stderr: Handle, ready: LaunchReporter<File>, identity: [u8; 25], event: Option<EventTarget>, artifacts: Option<PreparedArtifacts>);
     impl Bootstrap {
         fn exchange(&self, kind: u8) -> Result<()> {
@@ -1599,7 +1599,7 @@ mod native {
         fn prepare_storage(&mut self, marker_identity: [u8; 24]) -> Result<()> {
             self.identity = session_identity(marker_identity);
             let start = (now(), unsafe { GetTickCount64() }, boot_identity());
-            let event_path = self.event.as_ref().map(|target| target.path.as_path());
+            let event_path = self.event.as_ref().map(|target| target.target.as_path());
             let event_directory = self.event.as_ref().and_then(|target| target.guards.last());
             let event_identity = event_path.map(|path| os_bytes(path.as_os_str()));
             let instrument_identity = self
@@ -2096,7 +2096,22 @@ mod native {
     }
     fn event_target(operand: &Path, root: &Path) -> Result<EventTarget> {
         let reject = |cause| event_rejection(operand, cause);
-        let event = absolute(operand).map_err(|_| reject("io-error"))?;
+        let event = if operand.is_absolute() {
+            absolute(operand).map_err(|_| reject("io-error"))?
+        } else {
+            let units = operand.as_os_str().encode_wide().collect::<Vec<_>>();
+            crate::ensure!(valid_event_leaf(&units), reject("not-absolute"));
+            let mut components = operand.components();
+            let Some(Component::Normal(name)) = components.next() else {
+                return Err(reject("not-absolute"));
+            };
+            crate::ensure!(components.next().is_none(), reject("not-absolute"));
+            crate::ensure!(
+                name.encode_wide().eq(units.iter().copied()),
+                reject("not-absolute")
+            );
+            root.join(operand)
+        };
         let root_handle = event_component(root)
             .map_err(|error| reject(CAUSES[directory_cause(&error) as usize]))?;
         let root_identity = unsafe { file_identity(root_handle.as_raw_handle()) }
@@ -2157,7 +2172,8 @@ mod native {
             guards.push(handle);
         }
         Ok(EventTarget {
-            path: operand.to_owned(),
+            operand: operand.to_owned(),
+            target: event,
             present,
             created: false,
             guards,
@@ -2165,7 +2181,7 @@ mod native {
     }
     fn validate_event(target: &EventTarget, user: &str) -> Result<()> {
         crate::return_if!(!target.present, Ok(()));
-        let reject = |cause| event_rejection(&target.path, cause);
+        let reject = |cause| event_rejection(&target.operand, cause);
         let selector = SecurityInformation::Owner | SecurityInformation::Dacl;
         let actual = wrappers::GetSecurityInfo(
             target.guards.last().unwrap(),
@@ -2193,11 +2209,11 @@ mod native {
         after_create: impl FnOnce(&Path),
     ) -> Result<()> {
         crate::return_if!(target.present, validate_event(target, user));
-        let rejected = event_rejection(&target.path, "identity-changed");
-        let name = target.path.file_name().ok_or_else(|| rejected.clone())?;
+        let rejected = event_rejection(&target.operand, "identity-changed");
+        let name = target.target.file_name().ok_or_else(|| rejected.clone())?;
         let handle = relative_file(target.guards.last().unwrap(), name, user, CREATE_DIRECTORY)
             .map_err(|_| rejected.clone())?;
-        after_create(&target.path);
+        after_create(&target.target);
         target.guards.push(handle);
         target.created = true;
         let verified = (|| {
@@ -3388,9 +3404,6 @@ mod native {
         invoked: &OsStr,
     ) -> Result<PathBuf> {
         if let Some(event) = options.events.as_deref() {
-            if !event.is_absolute() {
-                return Err(event_rejection(event, "not-absolute"));
-            }
             event_target(event, &root(invoked)?)?;
         }
         resolve(session, invoked)
