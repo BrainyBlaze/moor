@@ -13,6 +13,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  EVIDENCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   native-posix:
@@ -35,6 +36,7 @@ jobs:
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install stable Rust
@@ -46,10 +48,12 @@ jobs:
         env:
           LANE: ${{ matrix.lane }}
         run: |
+          actual_commit="$(git rev-parse HEAD)"
+          test "$actual_commit" = "$EVIDENCE_COMMIT"
           out="ci-output/$LANE"
           mkdir -p "$out"
           {
-            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'commit=%s\n' "$actual_commit"
             printf 'runner=%s\n' "$RUNNER_NAME"
             printf 'os=%s\n' "$RUNNER_OS"
             printf 'arch=%s\n' "$RUNNER_ARCH"
@@ -94,7 +98,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: native-${{ matrix.lane }}-${{ github.sha }}
+          name: native-${{ matrix.lane }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: ci-output/${{ matrix.lane }}
           if-no-files-found: error
           retention-days: 14
@@ -115,6 +119,7 @@ jobs:
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Install stable Rust
@@ -126,10 +131,15 @@ jobs:
       - name: Initialize the evidence directory
         shell: pwsh
         run: |
+          $actualCommit = (git rev-parse HEAD).Trim()
+          if ($actualCommit -ne $env:EVIDENCE_COMMIT) {
+            Write-Error "checked out $actualCommit instead of $env:EVIDENCE_COMMIT"
+            exit 1
+          }
           $out = "ci-output/${{ matrix.lane }}"
           New-Item -ItemType Directory -Force $out | Out-Null
           @(
-            "commit=$env:GITHUB_SHA"
+            "commit=$actualCommit"
             "runner=$env:RUNNER_NAME"
             "os=$env:RUNNER_OS"
             "arch=$env:RUNNER_ARCH"
@@ -216,7 +226,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: native-${{ matrix.lane }}-${{ github.sha }}
+          name: native-${{ matrix.lane }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: ci-output
           if-no-files-found: error
           retention-days: 14
@@ -237,14 +247,20 @@ jobs:
       - name: Check out the exact commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Verify the exact commit
+        run: |
+          actual_commit="$(git rev-parse HEAD)"
+          test "$actual_commit" = "$EVIDENCE_COMMIT"
 
       - name: Build, hash, smoke, and test inside Alpine 3.20
         env:
           LANE: ${{ matrix.lane }}
         run: |
           docker run --rm \
-            -e GITHUB_SHA \
+            -e EVIDENCE_COMMIT \
             -e LANE \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace \
@@ -258,7 +274,7 @@ jobs:
               out="ci-output/$LANE"
               mkdir -p "$out"
               {
-                printf "commit=%s\n" "$GITHUB_SHA"
+                printf "commit=%s\n" "$EVIDENCE_COMMIT"
                 printf "alpine=%s\n" "$(cat /etc/alpine-release)"
                 printf "arch=%s\n" "$(uname -m)"
                 uname -a
@@ -278,7 +294,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: native-${{ matrix.lane }}-${{ github.sha }}
+          name: native-${{ matrix.lane }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: ci-output/${{ matrix.lane }}
           if-no-files-found: error
           retention-days: 14
