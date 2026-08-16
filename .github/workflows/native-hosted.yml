@@ -204,6 +204,16 @@ jobs:
           cargo test --test windows launch_paths::authenticated_status_probe_reports_event_identity -- --exact --nocapture *>&1 | Tee-Object -FilePath "$out/focused-authenticated-status-probe.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Run exact Moor-root-relative event-target witnesses
+        id: focused_relative_event
+        if: matrix.lane == 'windows-2022-x64'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          cargo test --test windows relative_event -- --nocapture *>&1 | Tee-Object -FilePath "$out/focused-relative-event.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run all applicable real-process tests
         id: full_release_tests
         continue-on-error: true
@@ -220,6 +230,7 @@ jobs:
           LANE: ${{ matrix.lane }}
           FOCUSED_SUPERVISED_LAUNCH_DIAGNOSTIC: ${{ steps.focused_supervised_launch_diagnostic.outcome }}
           FOCUSED_AUTHENTICATED_STATUS_PROBE: ${{ steps.focused_authenticated_status_probe.outcome }}
+          FOCUSED_RELATIVE_EVENT: ${{ steps.focused_relative_event.outcome }}
           FULL_RELEASE_TESTS: ${{ steps.full_release_tests.outcome }}
         run: |
           $failed = $false
@@ -233,6 +244,10 @@ jobs:
           }
           if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_AUTHENTICATED_STATUS_PROBE -ne "success") {
             Write-Error "authenticated-status probe outcome was $env:FOCUSED_AUTHENTICATED_STATUS_PROBE"
+            $failed = $true
+          }
+          if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_RELATIVE_EVENT -ne "success") {
+            Write-Error "relative-event outcome was $env:FOCUSED_RELATIVE_EVENT"
             $failed = $true
           }
           if ($failed) { exit 1 }

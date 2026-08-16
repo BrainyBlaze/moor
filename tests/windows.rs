@@ -1671,11 +1671,10 @@ mod launch_paths {
     }
 
     #[test]
-    fn non_absolute_event_operands_preserve_spelling_and_precede_cleanup_or_child_start() {
+    fn relative_event_drive_and_root_relative_operands_preserve_spelling_and_precede_mutation() {
         let root = invoked_root();
         let _ = moor(&["list"]);
         let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
-        let relative = PathBuf::from(format!("relative-events-{}", std::process::id()));
         let current = std::env::current_dir().unwrap();
         let drive = current
             .components()
@@ -1689,10 +1688,7 @@ mod launch_paths {
             std::process::id()
         ));
         let root_relative = PathBuf::from(format!("\\root-relative-events-{}", std::process::id()));
-        for (at, operand) in [relative, drive_relative, root_relative]
-            .into_iter()
-            .enumerate()
-        {
+        for (at, operand) in [drive_relative, root_relative].into_iter().enumerate() {
             assert!(
                 !operand.is_absolute(),
                 "fixture became absolute: {operand:?}"
@@ -1725,6 +1721,169 @@ mod launch_paths {
             );
             std::fs::remove_file(stale).unwrap();
         }
+    }
+
+    #[test]
+    fn relative_event_invalid_leaves_preserve_spelling_and_precede_cleanup_or_child_start() {
+        let root = invoked_root();
+        let listed = moor(&["list"]);
+        assert!(listed.status.success(), "{listed:?}");
+        let program = moor::name::program(Path::new(env!("CARGO_BIN_EXE_moor")).as_os_str());
+        let invalid = [
+            ("empty", OsString::new()),
+            ("dot", OsString::from(".")),
+            ("dot-dot", OsString::from("..")),
+            ("backslash", OsString::from("nested\\leaf")),
+            ("slash", OsString::from("nested/leaf")),
+            ("dot-component", OsString::from("leaf\\.\\child")),
+            ("dot-dot-component", OsString::from("leaf\\..\\child")),
+            ("reserved-con", OsString::from("CON")),
+            ("reserved-con-extension", OsString::from("con.txt")),
+            ("reserved-prn", OsString::from("PRN")),
+            ("reserved-aux", OsString::from("AUX")),
+            ("reserved-nul", OsString::from("NUL")),
+            ("reserved-clock", OsString::from("CLOCK$")),
+            ("reserved-com", OsString::from("COM1.log")),
+            ("reserved-lpt", OsString::from("lpt9")),
+            ("leading-dot", OsString::from(".leaf")),
+            ("trailing-dot", OsString::from("leaf.")),
+            ("leading-underscore", OsString::from("_leaf")),
+            ("trailing-underscore", OsString::from("leaf_")),
+            ("leading-hyphen", OsString::from("-leaf")),
+            ("trailing-hyphen", OsString::from("leaf-")),
+            ("trailing-space", OsString::from("leaf ")),
+            ("colon", OsString::from("leaf:stream")),
+            ("non-ascii", OsString::from("leaf\u{e9}")),
+            ("too-long", OsString::from("a".repeat(256))),
+        ];
+
+        for (at, (label, operand)) in invalid.into_iter().enumerate() {
+            let operand = PathBuf::from(operand);
+            assert!(
+                !operand.is_absolute(),
+                "fixture became absolute: {label}: {operand:?}"
+            );
+            let session = format!("relative-event-invalid-{at}-{}", std::process::id());
+            let stale = root.join(&session);
+            std::fs::write(&stale, b"foreign stale marker").unwrap();
+            let child_proof = root.join(format!("{session}-child-proof"));
+            let _ = std::fs::remove_file(&child_proof);
+            let output = Command::new(env!("CARGO_BIN_EXE_moor"))
+                .args(["start", &session, "-T"])
+                .arg(&operand)
+                .args(["cmd.exe", "/d", "/c", "type nul >"])
+                .arg(&child_proof)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+            assert!(output.stdout.is_empty(), "{label}: {output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                format!(
+                    "{program}: event store rejected: {} (not-absolute)\n",
+                    moor::name::render(operand.as_os_str())
+                ),
+                "{label}: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read(&stale).unwrap(),
+                b"foreign stale marker",
+                "{label}: preflight rejection cleaned stale state"
+            );
+            assert!(
+                !child_proof.exists(),
+                "{label}: child started despite preflight refusal"
+            );
+            std::fs::remove_file(stale).unwrap();
+        }
+    }
+
+    #[test]
+    fn relative_event_leaf_resolves_under_invoked_root_and_reports_exact_identity() {
+        use base64::Engine;
+        use moor::store::{Kind, Store};
+
+        let root = invoked_root();
+        let listed = moor(&["list"]);
+        assert!(listed.status.success(), "{listed:?}");
+        let nonce = moor::runtime::private::now();
+        let session = format!("relative-event-valid-{}-{nonce}", std::process::id());
+        let leaf = PathBuf::from(format!("relative-events-{}-{nonce}", std::process::id()));
+        let marker = root.join(&session);
+        let event = root.join(&leaf);
+        let release = companion(&marker, ".release");
+        let _ = std::fs::remove_file(&release);
+        let _ = std::fs::remove_dir_all(&event);
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["run", &session, "-T"])
+            .arg(&leaf)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!("relative event child exited before publication: {status:?}: {output:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "relative event publication timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let event_materialized = event.is_dir();
+        let observed = moor::windows::authenticated_status_probe(&marker);
+        let lifecycle = Store::read_only(&companion(&marker, ".exit"), Kind::Exit, 1);
+        std::fs::write(&release, b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_file(&release);
+        let removed = moor(&["rm", "-q", &session]);
+        let event_survived_removal = event.exists();
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            event_materialized,
+            "resolved event target was never created: {event:?}"
+        );
+        assert!(removed.status.success(), "{removed:?}");
+        assert!(
+            !event_survived_removal,
+            "rm did not remove the exact resolved event target: {event:?}"
+        );
+
+        let expected_identity =
+            moor::windows::wtf8_encode(&event.as_os_str().encode_wide().collect::<Vec<_>>());
+        let observed = observed.expect("authenticated status probe is unavailable");
+        assert_eq!(observed.generation, 1);
+        assert_ne!(observed.incarnation, [0; 16]);
+        assert_eq!(observed.event_layout, 2);
+        assert_eq!(observed.event_identity, expected_identity);
+        assert_eq!(observed.event_path, event);
+
+        let (_, lifecycle) = lifecycle.expect("running lifecycle store is unavailable");
+        let lifecycle: serde_json::Value =
+            serde_json::from_slice(&lifecycle).expect("running lifecycle is not JSON");
+        assert_eq!(lifecycle["path_encoding"].as_str(), Some("windows-wtf8"));
+        let lifecycle_identity = base64::engine::general_purpose::STANDARD
+            .decode(
+                lifecycle["event_path"]
+                    .as_str()
+                    .expect("running lifecycle omitted the event target"),
+            )
+            .expect("running lifecycle event target is not canonical base64");
+        assert_eq!(lifecycle_identity, expected_identity);
+        let lifecycle_path = moor::windows::wtf8_decode(&lifecycle_identity)
+            .map(|wide| OsString::from_wide(&wide))
+            .map(PathBuf::from)
+            .expect("running lifecycle event target is not canonical WTF-8");
+        assert_eq!(lifecycle_path, event);
     }
 
     #[test]
