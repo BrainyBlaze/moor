@@ -611,6 +611,12 @@ mod native {
         FILE_OPEN,
         FILE_NON_DIRECTORY_FILE,
     );
+    const OPEN_SLOT_GUARD: RelativePolicy = RelativePolicy(
+        FILE_READ_ATTRIBUTES,
+        SHARE_ALL,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE,
+    );
     unsafe fn open_handle(
         path: &Path,
         policy: OpenPolicy,
@@ -1222,9 +1228,16 @@ mod native {
         let identity = unsafe { unique_file_identity(created.as_raw_handle()) }
             .inspect_err(|_| rollback_created())
             .map_err(io::Error::other)?;
-        let guard = reopen(&created, OPEN_SLOT)
+        let guard = relative_file(directory, OsStr::new(name), user, OPEN_SLOT_GUARD)
             .inspect_err(|_| rollback_created())
             .map_err(io::Error::other)?;
+        let guard_identity = unsafe { unique_file_identity(guard.as_raw_handle()) }
+            .inspect_err(|_| rollback_created())
+            .map_err(io::Error::other)?;
+        if guard_identity != identity {
+            rollback_created();
+            return Err(io::Error::other("prepared slot identity changed"));
+        }
         drop(created);
         let writer = reopen(&guard, OPEN_STORE).inspect_err(|_| {
             if let Ok(delete) = reopen(&guard, OPEN_RB) {
@@ -1297,6 +1310,10 @@ mod native {
         Handle::checked(copy, "duplicate Windows handle selector")
             .map(Handle::into_file)
             .map_err(io::Error::other)
+    }
+
+    pub(crate) fn reopen_prepared_writer(file: &File) -> io::Result<File> {
+        reopen(file, OPEN_STORE).map_err(io::Error::other)
     }
 
     pub(crate) fn valid_prepared_directory_handle(
@@ -3758,9 +3775,10 @@ pub(crate) use native::{
     attach, classify, cleanup, clock, connect, create, create_preparation_reservation,
     create_store_directory, create_store_file, create_store_path, current_paths,
     duplicate_raw_file, exact_delete, exact_delete_directory, preflight_create,
-    prepare_store_directory, prepare_store_slot, protected_store_path, resolve, rollback_store,
-    sessions, valid_preparation_reservation, valid_prepared_directory_handle,
-    valid_prepared_slot_handle, valid_store_directory, valid_store_slots,
+    prepare_store_directory, prepare_store_slot, protected_store_path, reopen_prepared_writer,
+    resolve, rollback_store, sessions, valid_preparation_reservation,
+    valid_prepared_directory_handle, valid_prepared_slot_handle, valid_store_directory,
+    valid_store_slots,
 };
 #[cfg(windows)]
 pub use native::{authenticated_status_probe, bootstrap};

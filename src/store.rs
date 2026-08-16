@@ -721,7 +721,13 @@ impl WindowsPreparedStoreTransfer {
             ))?;
         }
         let slots = four(|at| {
-            let file = crate::windows::duplicate_raw_file(selectors.slots[at])?;
+            let selected = crate::windows::duplicate_raw_file(selectors.slots[at])?;
+            require(crate::windows::valid_prepared_slot_handle(
+                &selectors.metadata.path.join(NAMES[at]),
+                &selected,
+                selectors.metadata.slot_identities[at],
+            ))?;
+            let file = crate::windows::reopen_prepared_writer(&selected)?;
             require(crate::windows::valid_prepared_slot_handle(
                 &selectors.metadata.path.join(NAMES[at]),
                 &file,
