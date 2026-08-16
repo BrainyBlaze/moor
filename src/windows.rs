@@ -82,17 +82,43 @@ pub enum WindowsLaunchSource {
 }
 
 #[doc(hidden)]
-pub fn parse_windows_launch_selector(_selector: &std::ffi::OsStr) -> Option<usize> {
-    None
+pub fn parse_windows_launch_selector(selector: &std::ffi::OsStr) -> Option<usize> {
+    let text = selector.to_str()?;
+    (!text.is_empty()
+        && text.len() <= 16
+        && !text.starts_with('0')
+        && crate::runtime::private::lowercase_hex(text.as_bytes()))
+    .then(|| usize::from_str_radix(text, 16).ok())
+    .flatten()
+    .filter(|raw| *raw != 0)
 }
 
 #[doc(hidden)]
 pub fn windows_launch_source_policy(
-    _adapter: Option<&std::ffi::OsStr>,
-    _native_selector: Option<&std::ffi::OsStr>,
-    _mode: crate::cli::CreateMode,
+    adapter: Option<&std::ffi::OsStr>,
+    native_selector: Option<&std::ffi::OsStr>,
+    mode: crate::cli::CreateMode,
 ) -> std::result::Result<WindowsLaunchSource, crate::runtime::private::SupervisedLaunchCause> {
-    Err(crate::runtime::private::SupervisedLaunchCause::SelectorInvalid)
+    use crate::cli::CreateMode;
+    use crate::runtime::private::SupervisedLaunchCause::SelectorInvalid;
+
+    if adapter.is_some() && native_selector.is_some() {
+        return Err(SelectorInvalid);
+    }
+    if let Some(adapter) = adapter {
+        return (adapter == std::ffi::OsStr::new("stdin-v1") && matches!(mode, CreateMode::Start))
+            .then_some(WindowsLaunchSource::StdinForwarding)
+            .ok_or(SelectorInvalid);
+    }
+    let Some(selector) = native_selector else {
+        return Ok(WindowsLaunchSource::Unsupervised);
+    };
+    let raw = parse_windows_launch_selector(selector).ok_or(SelectorInvalid)?;
+    Ok(if matches!(mode, CreateMode::Run) {
+        WindowsLaunchSource::NativeDirect(raw)
+    } else {
+        WindowsLaunchSource::NativeForwarding(raw)
+    })
 }
 
 pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
@@ -3114,13 +3140,39 @@ mod native {
             );
         });
     }
-    fn detached(geometry: (u16, u16)) -> Result<i32> {
+    fn background_launch_selector(
+        source: WindowsLaunchSource,
+    ) -> std::result::Result<Option<usize>, SupervisedLaunchCause> {
+        let raw = match source {
+            WindowsLaunchSource::Unsupervised => return Ok(None),
+            WindowsLaunchSource::NativeForwarding(raw) => raw,
+            WindowsLaunchSource::StdinForwarding => {
+                (unsafe { GetStdHandle(STD_INPUT_HANDLE) }) as usize
+            }
+            WindowsLaunchSource::NativeDirect(_) => {
+                return Err(SupervisedLaunchCause::SelectorInvalid);
+            }
+        };
+        validate_supervised_pipe(raw as HANDLE)?;
+        Ok(Some(raw))
+    }
+    fn detached(
+        geometry: (u16, u16),
+        launch_channel_key: &OsStr,
+        launch_adapter_key: &OsStr,
+        selector: Option<usize>,
+    ) -> Result<i32> {
         let mut command = SpawnCommand::new(std::env::current_exe().map_err(string)?);
         command
             .args(std::env::args_os().skip(1))
+            .env_remove(launch_adapter_key)
+            .env_remove(launch_channel_key)
             .env(DETACHED_HOLDER, "1")
             .env(DETACHED_GEOMETRY, format!("{}:{}", geometry.0, geometry.1))
             .stdout(SpawnStdio::piped());
+        if let Some(selector) = selector {
+            command.env(launch_channel_key, format!("{selector:x}"));
+        }
         let flags = CreationFlags::DETACHED_PROCESS | CreationFlags::NEW_PROCESS_GROUP;
         let mut child = win(
             command.spawn_with(SpawnOptions::new().creation_flags(flags)),
@@ -3292,8 +3344,30 @@ mod native {
     ) -> CommandResult<i32> {
         let foreground = matches!(mode, CreateMode::Run);
         let interactive = matches!(mode, CreateMode::Bare | CreateMode::New);
+        let launch_channel_key = environment_key(invoked, "_LAUNCH_CHANNEL");
+        let launch_adapter_key = environment_key(invoked, "_LAUNCH_ADAPTER");
+        let adapter = std::env::var_os(&launch_adapter_key);
+        let native_selector = std::env::var_os(&launch_channel_key);
         let selected = std::env::var_os(DETACHED_HOLDER).as_deref() == Some(OsStr::new("1"));
         unsafe { std::env::remove_var(DETACHED_HOLDER) };
+        let source = if selected {
+            unsafe { std::env::remove_var(&launch_adapter_key) };
+            if adapter.is_some() {
+                unsafe { std::env::remove_var(&launch_channel_key) };
+                return Err(SupervisedLaunchCause::SelectorInvalid.rejection().into());
+            }
+            None
+        } else {
+            let source =
+                windows_launch_source_policy(adapter.as_deref(), native_selector.as_deref(), mode);
+            unsafe {
+                std::env::remove_var(&launch_adapter_key);
+                if !matches!(source, Ok(WindowsLaunchSource::NativeDirect(_))) {
+                    std::env::remove_var(&launch_channel_key);
+                }
+            }
+            Some(source.map_err(SupervisedLaunchCause::rejection)?)
+        };
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
         let output =
             (selected && !handle.is_null() && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE)
@@ -3304,7 +3378,19 @@ mod native {
         };
         let child = ready.output.is_some();
         let geometry = creation_geometry(interactive, interactive || foreground, child)?;
-        crate::return_if!(!foreground && !child, Ok(detached(geometry)?));
+        if !foreground && !child {
+            let source = source.ok_or_else(|| {
+                CommandError::from("detached holder launch result pipe is unavailable".to_owned())
+            })?;
+            let selector =
+                background_launch_selector(source).map_err(SupervisedLaunchCause::rejection)?;
+            return Ok(detached(
+                geometry,
+                &launch_channel_key,
+                &launch_adapter_key,
+                selector,
+            )?);
+        }
         SHUTDOWN.store(0, Ordering::Release);
         check(
             unsafe {
@@ -3327,17 +3413,7 @@ mod native {
         let stage_root = root(invoked)?;
         let random = random_array::<64>()?;
         let generation = supervised_generation(invoked, false, None, |selector| {
-            let text = selector
-                .to_str()
-                .ok_or(SupervisedLaunchCause::SelectorInvalid)?;
-            let raw = usize::from_str_radix(text, 16)
-                .ok()
-                .filter(|raw| {
-                    *raw != 0
-                        && text.len() <= 16
-                        && !text.starts_with('0')
-                        && lowercase_hex(text.as_bytes())
-                })
+            let raw = parse_windows_launch_selector(selector)
                 .ok_or(SupervisedLaunchCause::SelectorInvalid)?;
             let channel = unsafe { Handle::owned(raw as HANDLE) };
             validate_supervised_pipe(channel.raw())?;
