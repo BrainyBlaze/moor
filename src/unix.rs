@@ -165,17 +165,23 @@ crate::schema!(struct PreparedInstrument fields; source: File, stage: File, pare
 crate::schema!(struct EventTarget fields; operand: PathBuf, target: StoreTarget);
 crate::schema!(struct StoreTarget fields; parent: File, leaf: OsString, directory: File, identity: (u64, u64), prepared: PreparedStore, validator: Option<Store>, exact_selection: bool, owned: bool, armed: bool);
 struct RawTerminal(ViewerTerminal);
-struct ChildGuard(Option<Child>);
+// The requested child together with the pseudo-terminal master it was
+// spawned under: a teardown must hang the terminal up before it reaps.
+struct ChildGuard(Option<(Child, File)>);
 struct PendingEvent(PathBuf, File, OsString, Option<File>);
 struct Stage(File, OsString, (u64, u64), bool);
 struct SetupError(String, bool);
 
 impl ChildGuard {
     fn child(&mut self) -> &mut Child {
-        self.0.as_mut().unwrap()
+        &mut self.0.as_mut().unwrap().0
     }
 
-    fn release(mut self) -> Child {
+    fn master(&self) -> &File {
+        &self.0.as_ref().unwrap().1
+    }
+
+    fn release(mut self) -> (Child, File) {
         self.0.take().unwrap()
     }
 }
@@ -229,7 +235,7 @@ impl Config<'_> {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let Some(child) = self.0.as_mut() else {
+        let Some((mut child, master)) = self.0.take() else {
             return;
         };
         let group = i32::try_from(child.id()).unwrap_or_default();
@@ -237,6 +243,17 @@ impl Drop for ChildGuard {
             unsafe { libc::kill(-group, libc::SIGKILL) };
         }
         let _ = child.kill();
+        // Hang the pseudo-terminal up BEFORE reaping. The child is the session
+        // leader of that terminal, and on macOS a session leader that exits
+        // while output is still queued in the slave blocks inside the kernel's
+        // tty close path until every master descriptor is closed or the queue
+        // is drained; nothing here reads the master, so waiting first would
+        // deadlock a failed launch against its own child (observed as a
+        // launcher that only reports "holder failed before launch" ten seconds
+        // later). Every other master clone belongs to locals declared after
+        // this guard, so it is already gone by the time this runs and closing
+        // this descriptor is the hangup.
+        drop(master);
         let _ = child.wait();
     }
 }
@@ -999,15 +1016,15 @@ fn holder_setup(
             true,
         )
     })?;
-    let mut child = ChildGuard(Some(child));
+    let mut child = ChildGuard(Some((child, master)));
     instrument_ack(
         instrument,
         child.child().id(),
         generation,
         options.instrument.as_deref(),
     )?;
-    let reader = master.try_clone().text()?;
-    let pty = Duplex::tracked(reader, master.try_clone().text()?, 1 << 20);
+    let reader = child.master().try_clone().text()?;
+    let pty = Duplex::tracked(reader, child.master().try_clone().text()?, 1 << 20);
     let cwd = absolute(options.directory.as_deref().unwrap_or(Path::new(".")))?;
     let pid = child.child().id();
     crate::wire::put_wide(&mut artifacts.status, cwd.as_os_str().as_bytes())
@@ -1019,6 +1036,7 @@ fn holder_setup(
         .extend_from_slice(&shared::random_array::<16>()?);
     let exited = child.child().try_wait().text()?.map(native_exit);
     let running = std::mem::take(&mut artifacts.running);
+    let (child, master) = child.release();
     let mut holder = artifacts.runtime(
         pty,
         (
@@ -1026,7 +1044,7 @@ fn holder_setup(
             UnixNative {
                 control: master,
                 group: pid as i32,
-                child: child.release(),
+                child,
             },
         ),
     );
