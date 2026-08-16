@@ -2,6 +2,8 @@ use crate::{events::Stored, wire::crc32c};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
 use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -126,6 +128,11 @@ pub struct PreparedStore(Slots);
 pub struct PreparedStore {
     metadata: WindowsPreparedStoreMetadata,
     inventory: Vec<WindowsPreparedHandleInfo>,
+    directory_guard: File,
+    directory_access: File,
+    directory_delete: Option<File>,
+    slot_guards: Slots,
+    slot_writers: Slots,
 }
 
 #[cfg(windows)]
@@ -144,7 +151,28 @@ pub struct WindowsPreparedStoreMetadata {
 impl WindowsPreparedStoreMetadata {
     #[doc(hidden)]
     pub fn recompute_digest(&mut self) {
-        self.capability_digest = [0; 32];
+        let mut hash = Sha256::new();
+        hash.update(b"MOORPSC1\x01");
+        let path = self.path.as_os_str().encode_wide().collect::<Vec<_>>();
+        hash.update((path.len() as u64).to_le_bytes());
+        for unit in path {
+            hash.update(unit.to_le_bytes());
+        }
+        hash.update([
+            u8::from(self.directory_created),
+            u8::from(self.directory_delete_present),
+        ]);
+        hash.update(self.directory_identity);
+        for identity in self.slot_identities {
+            hash.update(identity);
+        }
+        self.capability_digest = hash.finalize().into();
+    }
+
+    fn valid_digest(&self) -> bool {
+        let mut expected = self.clone();
+        expected.recompute_digest();
+        self.capability_digest == expected.capability_digest
     }
 }
 
@@ -177,36 +205,114 @@ pub struct WindowsPreparedStoreSelectors {
 pub struct WindowsPreparationReservation {
     path: PathBuf,
     record: [u8; 32],
+    generation: u32,
     identity: [u8; 24],
     inventory: Vec<WindowsPreparedHandleInfo>,
+    guard: File,
+    delete: File,
 }
 
 #[cfg(windows)]
 #[doc(hidden)]
 pub struct WindowsPreparedDirectory {
+    path: PathBuf,
+    identity: [u8; 24],
+    created: bool,
     inventory: Vec<WindowsPreparedHandleInfo>,
+    guard: File,
+    access: File,
+    delete: Option<File>,
 }
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub struct WindowsPreparedStoreRollback;
+pub struct WindowsPreparedStoreRollback {
+    directory_guard: File,
+    directory_delete: Option<File>,
+    directory_created: bool,
+    slot_guards: Slots,
+}
 
 #[cfg(windows)]
 #[doc(hidden)]
 pub struct WindowsPreparedStoreTransfer {
     inventory: Vec<WindowsPreparedHandleInfo>,
     selectors: WindowsPreparedStoreSelectors,
+    _directory: File,
+    _directory_delete: Option<File>,
+    _slots: Slots,
 }
 
 #[cfg(windows)]
 #[doc(hidden)]
-pub struct WindowsHolderPreparedStore;
+pub struct WindowsHolderPreparedStore {
+    metadata: WindowsPreparedStoreMetadata,
+    directory: File,
+    slots: Option<Slots>,
+}
+
+#[cfg(windows)]
+fn windows_raw(file: &File) -> usize {
+    file.as_raw_handle() as usize
+}
+
+#[cfg(windows)]
+fn windows_handle_info(
+    file: &File,
+    identity: [u8; 24],
+    group: u32,
+    holder_access: bool,
+    delete_access: bool,
+    directory_origin: bool,
+    share_delete: bool,
+) -> WindowsPreparedHandleInfo {
+    WindowsPreparedHandleInfo {
+        raw: windows_raw(file),
+        identity,
+        group,
+        owning: true,
+        holder_access,
+        delete_access,
+        directory_origin,
+        share_delete,
+    }
+}
+
+#[cfg(windows)]
+fn rollback_windows_directory(delete: Option<&File>) {
+    let Some(delete) = delete else { return };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while !crate::windows::exact_delete_directory(delete) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 
 #[cfg(windows)]
 impl WindowsPreparationReservation {
     #[doc(hidden)]
-    pub fn create(_marker: &Path, _generation: u32, _nonce: [u8; 16]) -> Result<Self> {
-        Err(StoreError::Corrupt)
+    pub fn create(marker: &Path, generation: u32, nonce: [u8; 16]) -> Result<Self> {
+        require(generation != 0 && nonce != [0; 16])?;
+        let path = crate::runtime::private::companion(marker, ".exit.instrument");
+        let mut record = [0; 32];
+        record[..8].copy_from_slice(b"MOORPRE1");
+        record[8] = 1;
+        record[12..16].copy_from_slice(&generation.to_le_bytes());
+        record[16..].copy_from_slice(&nonce);
+        let (guard, delete, identity) =
+            crate::windows::create_preparation_reservation(&path, &record)?;
+        let inventory = vec![
+            windows_handle_info(&guard, identity, 0, false, false, false, true),
+            windows_handle_info(&delete, identity, 0, false, true, false, true),
+        ];
+        Ok(Self {
+            path,
+            record,
+            generation,
+            identity,
+            inventory,
+            guard,
+            delete,
+        })
     }
 
     #[doc(hidden)]
@@ -231,22 +337,36 @@ impl WindowsPreparationReservation {
 
     #[doc(hidden)]
     pub fn validate_exact(&self) -> bool {
-        false
+        crate::windows::valid_preparation_reservation(
+            &self.path,
+            &self.delete,
+            self.identity,
+            &self.record,
+        )
     }
 
     #[doc(hidden)]
-    pub fn validate_event_target(_marker: &Path, _event: &Path) -> Result<()> {
-        Err(StoreError::Corrupt)
+    pub fn validate_event_target(marker: &Path, event: &Path) -> Result<()> {
+        require(event != crate::runtime::private::companion(marker, ".exit.instrument"))
     }
 
     #[doc(hidden)]
     pub fn rollback_after_first_failed(
         self,
-        _proof: crate::runtime::private::FirstFailedRecordDeathProof,
-        _stores: Vec<WindowsPreparedStoreRollback>,
-        _directories: Vec<WindowsPreparedDirectory>,
+        proof: crate::runtime::private::FirstFailedRecordDeathProof,
+        stores: Vec<WindowsPreparedStoreRollback>,
+        directories: Vec<WindowsPreparedDirectory>,
     ) -> Result<()> {
-        Err(StoreError::Corrupt)
+        require(proof.generation() == self.generation)?;
+        for store in stores {
+            store.rollback();
+        }
+        for directory in directories {
+            directory.rollback();
+        }
+        require(crate::windows::exact_delete_directory(&self.delete))?;
+        drop(self.guard);
+        Ok(())
     }
 }
 
@@ -254,21 +374,47 @@ impl WindowsPreparationReservation {
 impl WindowsPreparedDirectory {
     #[doc(hidden)]
     pub fn prepare(
-        _reservation: &WindowsPreparationReservation,
-        _path: &Path,
-        _allow_existing: bool,
+        reservation: &WindowsPreparationReservation,
+        path: &Path,
+        allow_existing: bool,
     ) -> Result<Self> {
-        Err(StoreError::Corrupt)
+        require(reservation.validate_exact())?;
+        let (guard, access, delete, identity, created) =
+            crate::windows::prepare_store_directory(path, allow_existing)?;
+        let mut inventory = vec![
+            windows_handle_info(&guard, identity, 0, false, false, true, true),
+            windows_handle_info(&access, identity, 0, true, false, true, true),
+        ];
+        if let Some(delete) = &delete {
+            inventory.push(windows_handle_info(
+                delete, identity, 0, false, true, true, true,
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            identity,
+            created,
+            inventory,
+            guard,
+            access,
+            delete,
+        })
     }
 
     #[doc(hidden)]
     pub fn access_raw(&self) -> usize {
-        0
+        windows_raw(&self.access)
     }
 
     #[doc(hidden)]
     pub fn windows_inventory(&self) -> &[WindowsPreparedHandleInfo] {
         &self.inventory
+    }
+
+    fn rollback(self) {
+        drop(self.access);
+        drop(self.guard);
+        rollback_windows_directory(self.delete.as_ref());
     }
 }
 
@@ -276,19 +422,46 @@ impl WindowsPreparedDirectory {
 impl PreparedStore {
     #[doc(hidden)]
     pub fn prepare_windows_owned(
-        _reservation: &WindowsPreparationReservation,
-        _path: &Path,
-        _allow_existing: bool,
+        reservation: &WindowsPreparationReservation,
+        path: &Path,
+        allow_existing: bool,
     ) -> Result<Self> {
-        Err(StoreError::Corrupt)
+        let directory = WindowsPreparedDirectory::prepare(reservation, path, allow_existing)?;
+        Self::prepare_windows_in(directory, None)
     }
 
     #[doc(hidden)]
     pub fn prepare_windows_borrowed(
-        _reservation: &WindowsPreparationReservation,
-        _directory: &WindowsPreparedDirectory,
+        reservation: &WindowsPreparationReservation,
+        directory: &WindowsPreparedDirectory,
     ) -> Result<Self> {
-        Err(StoreError::Corrupt)
+        require(reservation.validate_exact())?;
+        require(crate::windows::valid_prepared_directory_handle(
+            &directory.path,
+            &directory.access,
+            directory.identity,
+            false,
+        ))?;
+        let borrowed = WindowsPreparedHandleInfo {
+            raw: windows_raw(&directory.access),
+            identity: directory.identity,
+            group: 0,
+            owning: false,
+            holder_access: true,
+            delete_access: false,
+            directory_origin: true,
+            share_delete: true,
+        };
+        let cloned = WindowsPreparedDirectory {
+            path: directory.path.clone(),
+            identity: directory.identity,
+            created: false,
+            inventory: Vec::new(),
+            guard: directory.guard.try_clone()?,
+            access: directory.access.try_clone()?,
+            delete: None,
+        };
+        Self::prepare_windows_in(cloned, Some(borrowed))
     }
 
     #[doc(hidden)]
@@ -305,7 +478,190 @@ impl PreparedStore {
     pub fn into_windows_transfer(
         self,
     ) -> Result<(WindowsPreparedStoreRollback, WindowsPreparedStoreTransfer)> {
-        Err(StoreError::Corrupt)
+        let Self {
+            metadata,
+            inventory: _,
+            directory_guard,
+            directory_access,
+            directory_delete,
+            slot_guards,
+            slot_writers,
+        } = self;
+        let transfer_delete = directory_delete.as_ref().map(File::try_clone).transpose()?;
+        let mut inventory = vec![windows_handle_info(
+            &directory_access,
+            metadata.directory_identity,
+            0,
+            true,
+            false,
+            true,
+            true,
+        )];
+        if let Some(delete) = &transfer_delete {
+            inventory.push(windows_handle_info(
+                delete,
+                metadata.directory_identity,
+                0,
+                false,
+                true,
+                true,
+                true,
+            ));
+        }
+        for (at, writer) in slot_writers.iter().enumerate() {
+            inventory.push(windows_handle_info(
+                writer,
+                metadata.slot_identities[at],
+                (at + 1) as u32,
+                true,
+                false,
+                false,
+                false,
+            ));
+        }
+        let selectors = WindowsPreparedStoreSelectors {
+            directory: windows_raw(&directory_access),
+            directory_delete: transfer_delete.as_ref().map(windows_raw),
+            slots: std::array::from_fn(|at| windows_raw(&slot_writers[at])),
+            metadata: metadata.clone(),
+        };
+        Ok((
+            WindowsPreparedStoreRollback {
+                directory_guard,
+                directory_delete,
+                directory_created: metadata.directory_created,
+                slot_guards,
+            },
+            WindowsPreparedStoreTransfer {
+                inventory,
+                selectors,
+                _directory: directory_access,
+                _directory_delete: transfer_delete,
+                _slots: slot_writers,
+            },
+        ))
+    }
+
+    fn prepare_windows_in(
+        directory: WindowsPreparedDirectory,
+        borrowed: Option<WindowsPreparedHandleInfo>,
+    ) -> Result<Self> {
+        let WindowsPreparedDirectory {
+            path,
+            identity: directory_identity,
+            created,
+            inventory: _,
+            guard: directory_guard,
+            access: directory_access,
+            delete: directory_delete,
+        } = directory;
+        let mut created_slots = Vec::with_capacity(4);
+        for name in NAMES {
+            match crate::windows::prepare_store_slot(&directory_access, name) {
+                Ok(slot) => created_slots.push(slot),
+                Err(error) => {
+                    for (guard, writer, _) in created_slots {
+                        drop(writer);
+                        let _ = crate::windows::exact_delete(&guard);
+                    }
+                    drop(directory_access);
+                    drop(directory_guard);
+                    rollback_windows_directory(directory_delete.as_ref());
+                    return Err(error.into());
+                }
+            }
+        }
+        let mut guards = Vec::with_capacity(4);
+        let mut writers = Vec::with_capacity(4);
+        let mut identities = [[0; 24]; 4];
+        for (at, (guard, writer, identity)) in created_slots.into_iter().enumerate() {
+            guards.push(guard);
+            writers.push(writer);
+            identities[at] = identity;
+        }
+        require(
+            identities.iter().all(|identity| *identity != [0; 24])
+                && identities
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == 4
+                && !identities.contains(&directory_identity),
+        )?;
+        let slot_guards: Slots = guards.try_into().unwrap();
+        let slot_writers: Slots = writers.try_into().unwrap();
+        let mut metadata = WindowsPreparedStoreMetadata {
+            path,
+            directory_created: created,
+            directory_delete_present: directory_delete.is_some(),
+            directory_identity,
+            slot_identities: identities,
+            capability_digest: [0; 32],
+        };
+        metadata.recompute_digest();
+        let mut inventory = Vec::with_capacity(3 + usize::from(borrowed.is_some()) + 8);
+        if let Some(borrowed) = borrowed {
+            inventory.push(borrowed);
+        }
+        inventory.push(windows_handle_info(
+            &directory_guard,
+            directory_identity,
+            0,
+            false,
+            false,
+            true,
+            true,
+        ));
+        inventory.push(windows_handle_info(
+            &directory_access,
+            directory_identity,
+            0,
+            true,
+            false,
+            true,
+            true,
+        ));
+        if let Some(delete) = &directory_delete {
+            inventory.push(windows_handle_info(
+                delete,
+                directory_identity,
+                0,
+                false,
+                true,
+                true,
+                true,
+            ));
+        }
+        for at in 0..4 {
+            inventory.push(windows_handle_info(
+                &slot_guards[at],
+                identities[at],
+                (at + 1) as u32,
+                false,
+                false,
+                false,
+                true,
+            ));
+            inventory.push(windows_handle_info(
+                &slot_writers[at],
+                identities[at],
+                (at + 1) as u32,
+                true,
+                false,
+                false,
+                false,
+            ));
+        }
+        Ok(Self {
+            metadata,
+            inventory,
+            directory_guard,
+            directory_access,
+            directory_delete,
+            slot_guards,
+            slot_writers,
+        })
     }
 }
 
@@ -324,9 +680,61 @@ impl WindowsPreparedStoreTransfer {
     #[doc(hidden)]
     pub fn reconstruct(
         &self,
-        _selectors: &WindowsPreparedStoreSelectors,
+        selectors: &WindowsPreparedStoreSelectors,
     ) -> Result<WindowsHolderPreparedStore> {
-        Err(StoreError::Corrupt)
+        require(
+            selectors.metadata == self.selectors.metadata
+                && selectors.metadata.valid_digest()
+                && selectors.metadata.directory_created
+                    == selectors.metadata.directory_delete_present
+                && selectors.directory_delete.is_some()
+                    == selectors.metadata.directory_delete_present,
+        )?;
+        let mut raw = Vec::with_capacity(6);
+        raw.push(selectors.directory);
+        raw.extend(selectors.directory_delete);
+        raw.extend(selectors.slots);
+        require(
+            raw.iter().all(|raw| *raw != 0)
+                && raw
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == raw.len(),
+        )?;
+
+        let directory = crate::windows::duplicate_raw_file(selectors.directory)?;
+        require(crate::windows::valid_prepared_directory_handle(
+            &selectors.metadata.path,
+            &directory,
+            selectors.metadata.directory_identity,
+            false,
+        ))?;
+        if let Some(raw) = selectors.directory_delete {
+            let delete = crate::windows::duplicate_raw_file(raw)?;
+            require(crate::windows::valid_prepared_directory_handle(
+                &selectors.metadata.path,
+                &delete,
+                selectors.metadata.directory_identity,
+                true,
+            ))?;
+        }
+        let slots = four(|at| {
+            let file = crate::windows::duplicate_raw_file(selectors.slots[at])?;
+            require(crate::windows::valid_prepared_slot_handle(
+                &selectors.metadata.path.join(NAMES[at]),
+                &file,
+                selectors.metadata.slot_identities[at],
+            ))?;
+            Ok(file)
+        })?;
+        try_lease(&slots[2])?;
+        Ok(WindowsHolderPreparedStore {
+            metadata: selectors.metadata.clone(),
+            directory,
+            slots: Some(slots),
+        })
     }
 }
 
@@ -335,13 +743,50 @@ impl WindowsHolderPreparedStore {
     #[doc(hidden)]
     pub fn initialize(
         &mut self,
-        _kind: Kind,
-        _generation: u32,
-        _initial: &[u8],
-        _start: u64,
-        _end: u64,
+        kind: Kind,
+        generation: u32,
+        initial: &[u8],
+        start: u64,
+        end: u64,
     ) -> Result<Store> {
-        Err(StoreError::Corrupt)
+        let (selected, hash) = initial_commit(kind, generation, initial, start..end)?;
+        let slots = self.slots.take().ok_or(StoreError::Corrupt)?;
+        require(crate::windows::valid_prepared_directory_handle(
+            &self.metadata.path,
+            &self.directory,
+            self.metadata.directory_identity,
+            false,
+        ))?;
+        for at in 0..4 {
+            require(crate::windows::valid_prepared_slot_handle(
+                &self.metadata.path.join(NAMES[at]),
+                &slots[at],
+                self.metadata.slot_identities[at],
+            ))?;
+        }
+        self.directory.sync_all()?;
+        durable(&slots[0], 0, initial)?;
+        durable(&slots[2], 0, &selected.encode())?;
+        Ok(Store::from_parts(slots, selected, hash))
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPreparedStoreRollback {
+    fn rollback(self) {
+        let Self {
+            directory_guard,
+            directory_delete,
+            directory_created,
+            slot_guards,
+        } = self;
+        for guard in slot_guards {
+            let _ = crate::windows::exact_delete(&guard);
+        }
+        drop(directory_guard);
+        if directory_created {
+            rollback_windows_directory(directory_delete.as_ref());
+        }
     }
 }
 

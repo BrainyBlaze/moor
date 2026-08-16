@@ -323,7 +323,7 @@ mod native {
     use smallvec::SmallVec;
     use std::collections::VecDeque;
     use std::fs::{self, File, OpenOptions};
-    use std::io::{self, Read, Write};
+    use std::io::{self, Read, Seek, Write};
     use std::os::windows::{ffi::*, fs::*, io::*};
     use std::sync::{OnceLock, atomic::*, mpsc};
     use std::{ffi::*, mem::*, path::*, ptr, thread, time::*};
@@ -593,9 +593,14 @@ mod native {
     const OPEN_MARKER: OpenPolicy = OpenPolicy(GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
     const OPEN_STORE: OpenPolicy = OpenPolicy(GENERIC_READ | GENERIC_WRITE, SHARE_RW);
     const OPEN_RB: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES | DELETE, SHARE_ALL);
+    const OPEN_DIRECTORY_GUARD: OpenPolicy = OpenPolicy(FILE_READ_ATTRIBUTES, SHARE_ALL);
+    const OPEN_DIRECTORY_ACCESS: OpenPolicy = OpenPolicy(
+        GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL,
+        SHARE_ALL,
+    );
     const CREATE_DIRECTORY: RelativePolicy = RelativePolicy(
         GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE,
-        SHARE_RW,
+        SHARE_ALL,
         FILE_CREATE,
         FILE_DIRECTORY_FILE,
     );
@@ -638,6 +643,17 @@ mod native {
     fn reopen(file: &File, policy: OpenPolicy) -> Result<File> {
         let raw = unsafe { ReOpenFile(file.as_raw_handle(), policy.0, policy.1, NO_FOLLOW) };
         Handle::checked(raw, "reopen exact Windows object").map(Handle::into_file)
+    }
+    fn reopen_directory(file: &File, policy: OpenPolicy) -> Result<File> {
+        let raw = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                policy.0,
+                policy.1,
+                NO_FOLLOW | FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        Handle::checked(raw, "reopen exact Windows directory").map(Handle::into_file)
     }
     fn directory_cause(error: &io::Error) -> DirectoryCause {
         match error.raw_os_error().map(|code| code as u32) {
@@ -1108,6 +1124,231 @@ mod native {
         reopen(&guard, OPEN_STORE)
             .map(|file| (file, identity))
             .map_err(|error| (io::Error::other(error), Some((guard, identity))))
+    }
+    pub(crate) type PreparationReservationFacets = (File, File, [u8; 24]);
+    pub(crate) type PreparedDirectoryFacets = (File, File, Option<File>, [u8; 24], bool);
+    pub(crate) type PreparedSlotFacets = (File, File, [u8; 24]);
+
+    pub(crate) fn create_preparation_reservation(
+        path: &Path,
+        record: &[u8; 32],
+    ) -> io::Result<PreparationReservationFacets> {
+        let user = sid().map_err(io::Error::other)?;
+        let (delete, identity, ()) = stage_file(
+            path,
+            user,
+            "FA",
+            "create Windows preparation reservation",
+            |file| file.write_all(record).map_err(string),
+        )
+        .map_err(io::Error::other)?;
+        let guard = reopen(&delete, OPEN_SLOT).map_err(io::Error::other)?;
+        Ok((guard, delete, identity))
+    }
+
+    pub(crate) fn valid_preparation_reservation(
+        path: &Path,
+        exact: &File,
+        identity: [u8; 24],
+        record: &[u8; 32],
+    ) -> bool {
+        let validated = (|| -> Result<bool> {
+            validate_exact_handle(exact, sid()?, "FA", false)?;
+            require(
+                unsafe { unique_file_identity(exact.as_raw_handle())? } == identity,
+                "preparation reservation identity changed",
+            )?;
+            require(
+                unsafe { store_file_identity(path)? } == identity,
+                "preparation reservation path changed",
+            )?;
+            let mut observed = Vec::with_capacity(record.len());
+            let mut reader = exact.try_clone().map_err(string)?;
+            reader.rewind().map_err(string)?;
+            reader.read_to_end(&mut observed).map_err(string)?;
+            Ok(observed == record)
+        })();
+        validated == Ok(true)
+    }
+
+    pub(crate) fn prepare_store_directory(
+        path: &Path,
+        allow_existing: bool,
+    ) -> io::Result<PreparedDirectoryFacets> {
+        let existing = allow_existing.then(|| store_directory(path, false));
+        if let Some(Ok(access)) = existing {
+            let user = sid().map_err(io::Error::other)?;
+            validate_exact_handle(&access, user, "FA", true).map_err(io::Error::other)?;
+            let identity =
+                unsafe { file_identity(access.as_raw_handle()) }.map_err(io::Error::other)?;
+            let guard =
+                reopen_directory(&access, OPEN_DIRECTORY_GUARD).map_err(io::Error::other)?;
+            return Ok((guard, access, None, identity, false));
+        }
+        if let Some(Err(error)) = existing
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            return Err(error);
+        }
+
+        let (delete, created) = create_store_directory(path, false)?;
+        debug_assert!(created);
+        let prepared = (|| -> Result<_> {
+            validate_exact_handle(&delete, sid()?, "FA", true)?;
+            let identity = unsafe { file_identity(delete.as_raw_handle())? };
+            let guard = reopen_directory(&delete, OPEN_DIRECTORY_GUARD)?;
+            let access = reopen_directory(&delete, OPEN_DIRECTORY_ACCESS)?;
+            Ok((guard, access, identity))
+        })();
+        match prepared {
+            Ok((guard, access, identity)) => Ok((guard, access, Some(delete), identity, true)),
+            Err(error) => {
+                delete_file(&delete);
+                Err(io::Error::other(error))
+            }
+        }
+    }
+
+    pub(crate) fn prepare_store_slot(
+        directory: &File,
+        name: &str,
+    ) -> io::Result<PreparedSlotFacets> {
+        let user = sid().map_err(io::Error::other)?;
+        let created = relative_file(directory, OsStr::new(name), user, CREATE_SLOT)
+            .map_err(io::Error::other)?;
+        let rollback_created = || {
+            delete_file(&created);
+        };
+        let identity = unsafe { unique_file_identity(created.as_raw_handle()) }
+            .inspect_err(|_| rollback_created())
+            .map_err(io::Error::other)?;
+        let guard = reopen(&created, OPEN_SLOT)
+            .inspect_err(|_| rollback_created())
+            .map_err(io::Error::other)?;
+        drop(created);
+        let writer = reopen(&guard, OPEN_STORE).inspect_err(|_| {
+            if let Ok(delete) = reopen(&guard, OPEN_RB) {
+                delete_file(&delete);
+            }
+        });
+        writer
+            .map(|writer| (guard, writer, identity))
+            .map_err(io::Error::other)
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct QueriedObjectBasicInformation {
+        attributes: u32,
+        granted_access: u32,
+        handle_count: u32,
+        pointer_count: u32,
+        reserved: [u32; 10],
+    }
+
+    fn granted_access(file: &File) -> Result<u32> {
+        let mut info = QueriedObjectBasicInformation::default();
+        let mut returned = 0;
+        let status = unsafe {
+            NtQueryObject(
+                file.as_raw_handle(),
+                ObjectBasicInformation,
+                (&mut info as *mut QueriedObjectBasicInformation).cast(),
+                size_of::<QueriedObjectBasicInformation>() as u32,
+                &mut returned,
+            )
+        };
+        require(
+            status == STATUS_SUCCESS
+                && returned as usize >= size_of::<QueriedObjectBasicInformation>(),
+            "inspect Windows handle access",
+        )?;
+        Ok(info.granted_access)
+    }
+
+    fn exact_access(file: &File, required: u32, forbidden: u32) -> Result<()> {
+        let access = granted_access(file)?;
+        require(
+            access & required == required && access & forbidden == 0,
+            "unexpected Windows handle access",
+        )
+    }
+
+    pub(crate) fn duplicate_raw_file(raw: usize) -> io::Result<File> {
+        if raw == 0 || raw == INVALID_HANDLE_VALUE as usize {
+            return Err(io::Error::other("invalid Windows handle selector"));
+        }
+        let mut copy = ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe {
+            DuplicateHandle(
+                current,
+                raw as HANDLE,
+                current,
+                &mut copy,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Handle::checked(copy, "duplicate Windows handle selector")
+            .map(Handle::into_file)
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn valid_prepared_directory_handle(
+        path: &Path,
+        file: &File,
+        identity: [u8; 24],
+        delete: bool,
+    ) -> bool {
+        (|| -> Result<()> {
+            validate_exact_handle(file, sid()?, "FA", true)?;
+            require(
+                unsafe { file_identity(file.as_raw_handle())? } == identity,
+                "prepared directory identity changed",
+            )?;
+            require(
+                store_directory(path, false)
+                    .map_err(string)
+                    .and_then(|current| unsafe { file_identity(current.as_raw_handle()) })?
+                    == identity,
+                "prepared directory path changed",
+            )?;
+            if delete {
+                exact_access(file, DELETE, 0)
+            } else {
+                exact_access(file, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, DELETE)
+            }
+        })()
+        .is_ok()
+    }
+
+    pub(crate) fn valid_prepared_slot_handle(path: &Path, file: &File, identity: [u8; 24]) -> bool {
+        (|| -> Result<()> {
+            validate_exact_handle(file, sid()?, "FA", false)?;
+            require(
+                unsafe { unique_file_identity(file.as_raw_handle())? } == identity,
+                "prepared slot identity changed",
+            )?;
+            require(
+                unsafe { store_file_identity(path)? } == identity,
+                "prepared slot path changed",
+            )?;
+            exact_access(file, FILE_READ_DATA | FILE_WRITE_DATA, DELETE)
+        })()
+        .is_ok()
+    }
+
+    pub(crate) fn exact_delete(file: &File) -> bool {
+        reopen(file, OPEN_RB).is_ok_and(|delete| delete_file(&delete))
+    }
+
+    pub(crate) fn exact_delete_directory(file: &File) -> bool {
+        delete_file(file)
     }
     pub(crate) fn valid_store_directory(path: &Path, directory: &File) -> bool {
         store_directory(path, false)
@@ -3514,9 +3755,12 @@ mod native {
 
 #[cfg(windows)]
 pub(crate) use native::{
-    attach, classify, cleanup, clock, connect, create, create_store_directory, create_store_file,
-    create_store_path, current_paths, preflight_create, protected_store_path, resolve,
-    rollback_store, sessions, valid_store_directory, valid_store_slots,
+    attach, classify, cleanup, clock, connect, create, create_preparation_reservation,
+    create_store_directory, create_store_file, create_store_path, current_paths,
+    duplicate_raw_file, exact_delete, exact_delete_directory, preflight_create,
+    prepare_store_directory, prepare_store_slot, protected_store_path, resolve, rollback_store,
+    sessions, valid_preparation_reservation, valid_prepared_directory_handle,
+    valid_prepared_slot_handle, valid_store_directory, valid_store_slots,
 };
 #[cfg(windows)]
 pub use native::{authenticated_status_probe, bootstrap};

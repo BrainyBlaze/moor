@@ -176,6 +176,18 @@ pub fn test_never_resumed_death_proof() -> NeverResumedDeathProof {
 }
 
 #[doc(hidden)]
+pub fn test_first_failed_record_death_proof(generation: u32) -> FirstFailedRecordDeathProof {
+    FirstFailedRecordDeathProof { generation }
+}
+
+impl FirstFailedRecordDeathProof {
+    #[cfg(windows)]
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+#[doc(hidden)]
 pub struct CreatorRollbackAuthority<T> {
     generation: u32,
     capability: T,

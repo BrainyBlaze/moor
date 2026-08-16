@@ -1,5 +1,5 @@
 use moor::runtime::private::{
-    LaunchRecordObservation, companion, first_failed_record, session_name,
+    companion, session_name, test_first_failed_record_death_proof,
 };
 use moor::store::{
     PreparedStore, WindowsPreparationReservation, WindowsPreparedDirectory,
@@ -57,12 +57,7 @@ fn reservation_record(generation: u32, nonce: [u8; 16]) -> [u8; 32] {
 fn exact_failed_proof(
     generation: u32,
 ) -> moor::runtime::private::FirstFailedRecordDeathProof {
-    first_failed_record(
-        &LaunchRecordObservation::Complete(3, 1, generation),
-        generation,
-    )
-    .expect("complete first failure record")
-    .test_confirm_exact_holder_death()
+    test_first_failed_record_death_proof(generation)
 }
 
 fn assert_blank_uncommitted(path: &PathBuf) {
