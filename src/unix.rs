@@ -9,7 +9,7 @@ use crate::store::{Kind, PreparedStore, Store, StoreError};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{
-    GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions, Name,
+    GenericFilePath, Listener as LocalListener, ListenerNonblockingMode, ListenerOptions,
     Stream as LocalStream,
 };
 #[cfg(not(target_os = "macos"))]
@@ -92,6 +92,19 @@ impl Drop for ThreadDirectory {
             }
         }
     }
+}
+
+/// Run `operation` with the calling thread's working directory set to `parent`
+/// and restored afterwards. /dev/fd entries are not traversable directories on
+/// macOS, so the bare leaf is resolved through Darwin's per-thread working
+/// directory (`pthread_fchdir_np`), never the process-wide directory that
+/// schema section 2.2 forbids changing; other threads observe no change.
+#[cfg(target_os = "macos")]
+fn in_directory<T>(parent: &File, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let directory = ThreadDirectory::enter(parent.as_raw_fd())?;
+    let result = operation();
+    directory.restore()?;
+    result
 }
 
 #[cfg(target_os = "macos")]
@@ -276,6 +289,16 @@ pub(crate) fn preflight_create(
     if let Some(event) = options.events.as_deref() {
         crate::ensure!(event.is_absolute(), event_rejection(event, "not-absolute"));
     }
+    // §2.2: parents may be arbitrarily deep, but a final component that cannot
+    // fit a local socket address is refused here, before any effect — the
+    // per-user root is not created and nothing is published under a name no
+    // address can reach. The diagnostic still names the resolved path.
+    let marker = resolve_without_effect(session, invoked)?;
+    let leaf = marker.file_name().map_or(0, |leaf| leaf.len());
+    crate::ensure!(
+        leaf <= socket_address_capacity(),
+        rejected("rendezvous", &marker, "too-long")
+    );
     let marker = resolve(session, invoked)?;
     if let Some(event) = options.events.as_deref() {
         let resolved = absolute(event).map_err(|_| event_rejection(event, "io-error"))?;
@@ -351,18 +374,7 @@ pub(crate) fn create(
     let leaf = OsString::from(format!(".moor-{}.stage", hex(shared::random_array()?)));
     // A restrictive temporary umask gives the unpredictable staged name its
     // exact mode at bind time, even when the caller supplied a stricter mask.
-    let listener = with_umask(0o177, || {
-        socket_name(&parent, &leaf, |stage_name| {
-            let options = ListenerOptions::new()
-                .name(stage_name)
-                .reclaim_name(false)
-                .nonblocking(ListenerNonblockingMode::Accept);
-            #[cfg(not(target_os = "macos"))]
-            let options = options.mode(0o600);
-            options.create_sync()
-        })
-    });
-    let listener = listener?;
+    let listener = with_umask(0o177, || bind_leaf(&parent, &leaf)).text()?;
     let identity = entry_identity(&parent, &leaf, SFlag::S_IFSOCK, Some(0o600))
         .text()?
         .ok_or_else(|| "staged rendezvous identity changed".to_string())?;
@@ -1243,7 +1255,20 @@ pub(crate) fn resolve(session: &OsStr, invoked: &OsStr) -> Result<PathBuf> {
     }
 }
 
-fn root(invoked: &OsStr) -> Result<PathBuf> {
+/// The resolved absolute path `resolve` would produce, computed without
+/// creating or validating the per-user root, for decisions that must precede
+/// every effect. A relative TMPDIR still yields the absolute spelling §13.3
+/// requires of the diagnostic.
+fn resolve_without_effect(session: &OsStr, invoked: &OsStr) -> Result<PathBuf> {
+    let path = PathBuf::from(session);
+    if session.as_bytes().contains(&b'/') {
+        absolute(&path)
+    } else {
+        absolute(&root_path(invoked).join(path))
+    }
+}
+
+fn root_path(invoked: &OsStr) -> PathBuf {
     let base = Path::new(invoked)
         .file_name()
         .filter(|name| !name.is_empty())
@@ -1251,7 +1276,11 @@ fn root(invoked: &OsStr) -> Result<PathBuf> {
     let mut directory = OsString::from(".");
     directory.push(base);
     directory.push(format!("-{}", uid()));
-    let root = std::env::temp_dir().join(directory);
+    std::env::temp_dir().join(directory)
+}
+
+fn root(invoked: &OsStr) -> Result<PathBuf> {
+    let root = root_path(invoked);
     let private = crate::store::private_directory(&root, true)
         .map_err(|_| rejected("session root", &root, "io-error"))?;
     if !private {
@@ -1834,39 +1863,103 @@ fn socket_parent(path: &Path) -> Result<File> {
     open_directory(parent).text()
 }
 
-fn socket_name<T, E: std::fmt::Display>(
-    parent: &File,
-    leaf: &OsStr,
-    open: impl FnOnce(Name<'_>) -> std::result::Result<T, E>,
-) -> Result<T> {
+/// The longest final component a local socket address can carry: `sun_path`
+/// less its terminating NUL (107 bytes on Linux, 103 on macOS). Both
+/// platforms address the bare leaf from the verified parent directory (below),
+/// so this is exactly the §2.2 bound on the final component. A zeroed
+/// `sockaddr_un` is a valid value, so the array length is read, not hard-coded.
+fn socket_address_capacity() -> usize {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 1
+}
+
+/// Bind a listener at the bare final component relative to the verified parent
+/// directory: an owner-only node with a non-blocking accept queue that is never
+/// unlinked on drop (the stage is published by rename and withdrawn under its
+/// own identity fence). The process-wide working directory never changes (§2.2).
+fn bind_leaf(parent: &File, leaf: &OsStr) -> io::Result<LocalListener> {
     #[cfg(target_os = "macos")]
     {
-        // /dev/fd entries are not traversable directories on macOS. Resolve
-        // the short leaf using Darwin's per-thread working directory, never
-        // mutating the process-wide directory forbidden by schema section 2.2.
-        let directory = ThreadDirectory::enter(parent.as_raw_fd()).text()?;
-        let result = Path::new(leaf)
-            .to_fs_name::<GenericFilePath>()
-            .text()
-            .and_then(|name| open(name).text());
-        directory.restore().text()?;
-        result
+        in_directory(parent, || {
+            ListenerOptions::new()
+                .name(Path::new(leaf).to_fs_name::<GenericFilePath>()?)
+                .reclaim_name(false)
+                .nonblocking(ListenerNonblockingMode::Accept)
+                .create_sync()
+        })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let alias = descriptor_path(parent).join(leaf);
-        let name = alias.as_os_str().to_fs_name::<GenericFilePath>().text()?;
-        open(name).text()
+        // The staged leaf is short and fixed-length, so spelling it through the
+        // parent's descriptor alias always fits; the caller's final component
+        // only ever arrives by rename and is never bound by name.
+        let alias = descriptor_path(parent.as_raw_fd()).join(leaf);
+        let name = alias.as_os_str().to_fs_name::<GenericFilePath>()?;
+        ListenerOptions::new()
+            .name(name)
+            .reclaim_name(false)
+            .nonblocking(ListenerNonblockingMode::Accept)
+            .mode(0o600)
+            .create_sync()
+    }
+}
+
+/// Connect to the rendezvous named by the bare final component relative to the
+/// verified parent directory, retrying an interrupted connect until `deadline`.
+/// The whole `sun_path` capacity stays available to the final component and the
+/// process-wide working directory never changes (§2.2).
+fn connect_leaf(parent: &File, leaf: &OsStr, deadline: Instant) -> io::Result<LocalStream> {
+    #[cfg(target_os = "macos")]
+    {
+        in_directory(parent, || {
+            let name = Path::new(leaf).to_fs_name::<GenericFilePath>()?;
+            retry_interrupted(deadline, Instant::now, || {
+                LocalStream::connect(name.clone())
+            })
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux has no per-thread working directory, container seccomp
+        // profiles refuse unshare(CLONE_FS), and spelling the leaf through the
+        // parent's alias would spend the leaf's own address budget. Instead the
+        // final component is opened relative to the parent with
+        // O_PATH|O_NOFOLLOW, pinned as an owner-private socket node, and
+        // connected through /proc/self/fd/<node> while that descriptor stays
+        // open: the alias names the exact inode and is at most 24 bytes long
+        // (a positive c_int spelling), far below sun_path.
+        let node = openat(
+            parent,
+            leaf,
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let meta = fs::metadata(descriptor_path(node.as_raw_fd()))?;
+        if !meta.file_type().is_socket() || !owned(&meta) {
+            // Not an owner-private socket: neither live nor positively absent,
+            // so the answer stays indeterminate rather than claiming staleness.
+            return Err(io::Error::other(
+                "rendezvous is not an owner-private socket",
+            ));
+        }
+        let alias = descriptor_path(node.as_raw_fd());
+        let name = alias.as_os_str().to_fs_name::<GenericFilePath>()?;
+        let stream = retry_interrupted(deadline, Instant::now, || {
+            LocalStream::connect(name.clone())
+        });
+        drop(node);
+        stream
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn descriptor_path(file: &File) -> PathBuf {
+fn descriptor_path(fd: libc::c_int) -> PathBuf {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let root = "/proc/self/fd";
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let root = "/dev/fd";
-    Path::new(root).join(file.as_raw_fd().to_string())
+    Path::new(root).join(fd.to_string())
 }
 
 fn native_name(name: &OsStr) -> Result<CString> {
@@ -1970,19 +2063,11 @@ fn socket_stream(
     let leaf = path
         .file_name()
         .ok_or_else(|| ("rendezvous has no name".into(), false))?;
-    let mut refused = false;
-    let stream = socket_name(&parent, leaf, |name| {
-        // The io::Error survives here, where the refusal decision is made; the
-        // caller's boundary stays the same bool, so no production output,
-        // shared type, or platform beyond this function sees any change.
-        retry_interrupted(deadline, Instant::now, || {
-            LocalStream::connect(name.clone())
-        })
-        .inspect_err(|error| {
-            refused = connect_refused(error);
-        })
-    })
-    .map_err(|error| (error, refused))?;
+    // The io::Error survives here, where the refusal decision is made; the
+    // caller's boundary stays the same bool, so no production output, shared
+    // type, or platform beyond this function sees any change.
+    let stream = connect_leaf(&parent, leaf, deadline)
+        .map_err(|error| (error.to_string(), connect_refused(&error)))?;
     Ok((parent, stream))
 }
 
