@@ -14,7 +14,7 @@ use crate::unix as platform;
 #[cfg(windows)]
 use crate::windows as platform;
 use crate::wire::{
-    Codec, InputReceipt, Message, Profile, StatusTail, controller_hello,
+    Codec, InputReceipt, Message, Profile, StatusIdentity, StatusTail, controller_hello,
     decode_controller_hello_ack, decode_error_payload, decode_log_clear_result,
     decode_terminate_result, input_payload, resize_payload, terminate_request_payload,
 };
@@ -222,6 +222,10 @@ impl Client {
                 .ok()
             })
             .is_some_and(|status| status.viewers)
+    }
+
+    pub fn authenticated_status_descriptor(&mut self) -> Result<(StatusIdentity, StatusTail)> {
+        Err("unsupported".into())
     }
 
     pub fn terminate(&mut self, force: bool) -> Result<(u8, u8, u8, Vec<u8>)> {

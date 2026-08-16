@@ -194,6 +194,16 @@ jobs:
           cargo test --test windows launch_paths::malformed_supervised_selector_uses_exact_cause -- --exact --nocapture *>&1 | Tee-Object -FilePath "$out/focused-supervised-launch-diagnostic.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Run exact authenticated-status probe witness
+        id: focused_authenticated_status_probe
+        if: matrix.lane == 'windows-2022-x64'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          cargo test --test windows launch_paths::authenticated_status_probe_reports_event_identity -- --exact --nocapture *>&1 | Tee-Object -FilePath "$out/focused-authenticated-status-probe.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run all applicable real-process tests
         id: full_release_tests
         continue-on-error: true
@@ -209,6 +219,7 @@ jobs:
         env:
           LANE: ${{ matrix.lane }}
           FOCUSED_SUPERVISED_LAUNCH_DIAGNOSTIC: ${{ steps.focused_supervised_launch_diagnostic.outcome }}
+          FOCUSED_AUTHENTICATED_STATUS_PROBE: ${{ steps.focused_authenticated_status_probe.outcome }}
           FULL_RELEASE_TESTS: ${{ steps.full_release_tests.outcome }}
         run: |
           $failed = $false
@@ -218,6 +229,10 @@ jobs:
           }
           if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_SUPERVISED_LAUNCH_DIAGNOSTIC -ne "success") {
             Write-Error "supervised-launch diagnostic outcome was $env:FOCUSED_SUPERVISED_LAUNCH_DIAGNOSTIC"
+            $failed = $true
+          }
+          if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_AUTHENTICATED_STATUS_PROBE -ne "success") {
+            Write-Error "authenticated-status probe outcome was $env:FOCUSED_AUTHENTICATED_STATUS_PROBE"
             $failed = $true
           }
           if ($failed) { exit 1 }

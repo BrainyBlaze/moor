@@ -267,6 +267,30 @@ fn windows_event_leaf_grammar_is_exact() {
 }
 
 #[test]
+fn windows_status_event_identity_is_canonical() {
+    let units = [
+        u16::from(b'C'),
+        u16::from(b':'),
+        u16::from(b'\\'),
+        0xd800,
+        u16::from(b'x'),
+    ];
+    let encoded = wtf8_encode(&units);
+    let decoded = wtf8_decode(&encoded).unwrap();
+    assert_eq!(decoded, units);
+    assert_eq!(wtf8_encode(&decoded), encoded);
+
+    for malformed in [
+        &b"\xc0\xaf"[..],
+        &b"\xed\xa0"[..],
+        &b"\xed\xa0\x80\xed\xb0\x80"[..],
+        &b"\xf4\x90\x80\x80"[..],
+    ] {
+        assert!(wtf8_decode(malformed).is_err(), "accepted {malformed:?}");
+    }
+}
+
+#[test]
 fn holder_caused_windows_exits_carry_method_orthogonally_to_the_mechanism() {
     use moor::events::EventStream;
     // v4: the ending names the MECHANISM and stays `exited`; the mandatory
@@ -625,7 +649,7 @@ fn input_fidelity_floor_tracks_frozen_windows_builds() {
 #[cfg(windows)]
 mod launch_paths {
     use std::ffi::{OsStr, OsString};
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::sync::OnceLock;
@@ -1145,6 +1169,61 @@ mod launch_paths {
         let output = child.wait_with_output().unwrap();
         let _ = std::fs::remove_file(release);
         output
+    }
+
+    #[test]
+    fn authenticated_status_probe_reports_event_identity() {
+        let root = invoked_root();
+        let listed = moor(&["list"]);
+        assert!(listed.status.success(), "{listed:?}");
+        let session = format!("authenticated-status-{}", std::process::id());
+        let marker = root.join(&session);
+        let event = root.join(format!("{session}-events"));
+        let release = companion(&marker, ".release");
+        let _ = std::fs::remove_file(&release);
+        let _ = std::fs::remove_dir_all(&event);
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_moor"))
+            .args(["run", &session, "-T"])
+            .arg(&event)
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "launch_paths::publication_waiter", "--nocapture"])
+            .env(PUBLICATION_RELEASE, &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!("child exited before publication: {status:?}: {output:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "marker publication timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let observed = moor::windows::authenticated_status_probe(&marker);
+        std::fs::write(&release, b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_file(&release);
+        assert!(output.status.success(), "{output:?}");
+
+        let removed = moor(&["rm", "-q", &session]);
+        assert!(removed.status.success(), "{removed:?}");
+
+        let observed = observed.expect("authenticated status probe is unavailable");
+        assert_eq!(observed.generation, 1);
+        assert_ne!(observed.incarnation, [0; 16]);
+        assert_eq!(observed.event_layout, 2);
+        assert_eq!(
+            observed.event_identity,
+            moor::windows::wtf8_encode(&event.as_os_str().encode_wide().collect::<Vec<_>>())
+        );
+        assert_eq!(observed.event_path, event);
     }
 
     #[test]

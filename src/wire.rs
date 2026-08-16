@@ -566,11 +566,21 @@ impl StatusExtension {
 }
 
 schema!(struct pub ReplayDescriptor derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; first: u64, last: u64, start: u64, end: u64, complete: bool, modes_exact: bool);
+schema!(struct pub StatusIdentity derive [Clone, Debug, Eq, PartialEq] pub fields; generation: u32, incarnation: [u8; 16], event_layout: u8, event_identity: Vec<u8>);
 schema!(struct pub StatusTail derive [Clone, Debug, Eq, PartialEq] pub fields; columns: u16, rows: u16, replay: ReplayDescriptor, owns_lease: bool, viewers: bool, running: bool, event_writable: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: StatusExtension);
 schema!(struct TailRecord fields; first: u64, last: u64, start: u64, end: u64, flags: u8, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, extension: [u8; 29]);
 binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malformed; fixed {} fields { first: U64<LE>, last: U64<LE>, start: U64<LE>, end: U64<LE>, flags: u8, lease_epoch: U32<LE>, semantic_flags: u8, semantic_pending: U16<LE>, extension: [u8; 29] });
 
 impl StatusTail {
+    pub fn decode_descriptor_for(
+        _payload: &[u8],
+        _identity: &[u8],
+        _generation: u32,
+        _incarnation: [u8; 16],
+    ) -> Result<(StatusIdentity, Self), WireError> {
+        Err(WireError::Malformed)
+    }
+
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
         let range = replay.first == 0 && replay.last == 0 && replay.start == replay.end || replay.first != 0 && replay.first <= replay.last && replay.start < replay.end;
         range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0) && valid_size((this.rows, this.columns))

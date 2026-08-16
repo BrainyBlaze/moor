@@ -1,11 +1,12 @@
+use moor::runtime::client::Client;
 use moor::session::{
     LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, Request as PolicyRequest, ResultOutcome,
     ResultReason,
 };
 use moor::wire::{
     Codec, ControllerRequest, Heartbeat, InputReceipt, Message, Profile, Query, ReplayDescriptor,
-    StatusExtension, StatusTail, ViewerEvent, ViewerStream, WireError, controller_hello,
-    controller_hello_ack, crc32c, decode_controller, decode_controller_hello_ack,
+    StatusExtension, StatusIdentity, StatusTail, ViewerEvent, ViewerStream, WireError,
+    controller_hello, controller_hello_ack, crc32c, decode_controller, decode_controller_hello_ack,
     decode_log_clear_result, decode_query, decode_semantic, decode_terminate_result, decode_viewer,
     get_wide, input_payload, lease_token_payload, log_clear_payload, log_clear_result_payload,
     put_compact, put_wide, resize_payload, terminate_request_payload, terminate_result_payload,
@@ -638,6 +639,62 @@ fn decode_status(payload: &[u8]) -> Result<StatusTail, WireError> {
     StatusTail::decode_for(payload, b"\x01/tmp/session", 1, [1; 16])
 }
 
+fn status_with_identity(layout: u8, event_identity: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    put_wide(&mut payload, b"\x01/tmp/session\xff").unwrap();
+    payload.extend_from_slice(&7u32.to_le_bytes());
+    payload.extend_from_slice(&[3; 16]);
+    payload.push(layout);
+    put_wide(&mut payload, event_identity).unwrap();
+    if layout == 2 {
+        payload.push(0);
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[1; 32]);
+    } else {
+        payload.push(0xff);
+        payload.extend_from_slice(&[0; 48]);
+    }
+    payload.extend_from_slice(&[1; 32]);
+    put_wide(&mut payload, b"/tmp/\xff").unwrap();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&[2; 16]);
+    payload.extend_from_slice(&80u16.to_le_bytes());
+    payload.extend_from_slice(&24u16.to_le_bytes());
+    payload.extend_from_slice(
+        &StatusTail {
+            columns: 80,
+            rows: 24,
+            replay: ReplayDescriptor {
+                first: 0,
+                last: 0,
+                start: 0,
+                end: 0,
+                complete: true,
+                modes_exact: true,
+            },
+            owns_lease: false,
+            viewers: false,
+            running: true,
+            event_writable: true,
+            lease_epoch: 0,
+            semantic_flags: 0,
+            semantic_pending: 0,
+            extension: StatusExtension {
+                health: 0,
+                log_epoch: 0,
+                log_index: 0,
+                retained_start: 0,
+                retained_end: 0,
+            },
+        }
+        .encode()
+        .unwrap(),
+    );
+    payload
+}
+
 const V1: &str = "
 4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
 21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
@@ -767,6 +824,41 @@ fn status_tail_round_trips_replay_and_health_as_one_shape() {
     malformed = payload;
     malformed[42] = 0;
     assert_eq!(decode_status(&malformed), Err(WireError::Malformed));
+}
+
+#[test]
+fn authenticated_status_identity_preserves_exact_bytes_and_rejects_contradictions() {
+    let event_identity = b"/tmp/\xff-events";
+    let payload = status_with_identity(2, event_identity);
+    let (identity, tail) =
+        StatusTail::decode_descriptor_for(&payload, b"\x01/tmp/session\xff", 7, [3; 16]).unwrap();
+    assert_eq!(
+        identity,
+        StatusIdentity {
+            generation: 7,
+            incarnation: [3; 16],
+            event_layout: 2,
+            event_identity: event_identity.to_vec(),
+        }
+    );
+    assert_eq!((tail.columns, tail.rows), (80, 24));
+
+    for payload in [
+        status_with_identity(0, event_identity),
+        status_with_identity(1, event_identity),
+        status_with_identity(2, b""),
+    ] {
+        assert_eq!(
+            StatusTail::decode_descriptor_for(&payload, b"\x01/tmp/session\xff", 7, [3; 16],),
+            Err(WireError::Malformed)
+        );
+    }
+
+    let client_method: fn(
+        &mut Client,
+    ) -> moor::runtime::client::Result<(StatusIdentity, StatusTail)> =
+        Client::authenticated_status_descriptor;
+    let _ = client_method;
 }
 
 #[test]

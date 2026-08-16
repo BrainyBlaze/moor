@@ -4,6 +4,16 @@ use zerocopy::byteorder::{LE, U32, U64};
 
 pub type Result<T> = std::result::Result<T, String>;
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedWindowsStatus {
+    pub generation: u32,
+    pub incarnation: [u8; 16],
+    pub event_layout: u8,
+    pub event_identity: Vec<u8>,
+    pub event_path: std::path::PathBuf,
+}
+
 pub fn wtf8_encode(wide: &[u16]) -> Vec<u8> {
     Wtf8Buf::from_wide(wide).into_bytes()
 }
@@ -2295,6 +2305,10 @@ mod native {
     pub(crate) fn connect(path: &Path) -> Result<Client> {
         controller(path, 2000)
     }
+    #[doc(hidden)]
+    pub fn authenticated_status_probe(_path: &Path) -> Result<AuthenticatedWindowsStatus> {
+        Err("unsupported".into())
+    }
     fn inspect(path: &Path, status: bool, timeout: u32) -> SessionState {
         probe_session(
             path,
@@ -3379,10 +3393,10 @@ mod native {
 }
 
 #[cfg(windows)]
-pub use native::bootstrap;
-#[cfg(windows)]
 pub(crate) use native::{
     attach, classify, cleanup, clock, connect, create, create_store_directory, create_store_file,
     create_store_path, current_paths, preflight_create, protected_store_path, resolve,
     rollback_store, sessions, valid_store_directory, valid_store_slots,
 };
+#[cfg(windows)]
+pub use native::{authenticated_status_probe, bootstrap};
