@@ -573,12 +573,12 @@ binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malf
 
 impl StatusTail {
     pub fn decode_descriptor_for(
-        _payload: &[u8],
-        _identity: &[u8],
-        _generation: u32,
-        _incarnation: [u8; 16],
+        payload: &[u8],
+        identity: &[u8],
+        generation: u32,
+        incarnation: [u8; 16],
     ) -> Result<(StatusIdentity, Self), WireError> {
-        Err(WireError::Malformed)
+        Self::decode_descriptor_with(payload, Some((identity, generation, incarnation)))
     }
 
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
@@ -589,27 +589,28 @@ impl StatusTail {
         let flags = u8::from(this.replay.complete) | u8::from(this.replay.modes_exact) << 1 | u8::from(this.owns_lease) << 4 | u8::from(this.viewers) << 5 | u8::from(this.running) << 6 | u8::from(this.event_writable) << 7;
         Ok(wire_rules!(value TailRecord; first = this.replay.first; last = this.replay.last; start = this.replay.start; end = this.replay.end; flags = flags; lease_epoch = this.lease_epoch; semantic_flags = this.semantic_flags; semantic_pending = this.semantic_pending; extension = this.extension.encode(this.extension.logging())?).encode_raw())
     });
-    wire_rules!(pure fn decode_with(payload: &[u8], expected: Option<(&[u8], u32, [u8; 16])>) -> Result<Self, WireError> = {
-        let mut input = Reader(payload); let (columns, rows) = validate_status_base(&mut input, expected)?;
+    wire_rules!(pure fn decode_descriptor_with(payload: &[u8], expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(StatusIdentity, Self), WireError> = {
+        let mut input = Reader(payload); let (identity, columns, rows) = validate_status_base(&mut input, expected)?;
         let record = TailRecord::decode_raw(input.rest())?; validate_status_flags(record.flags)?;
         let replay = wire_rules!(value ReplayDescriptor; first = record.first; last = record.last; start = record.start; end = record.end; complete = record.flags & 1 != 0; modes_exact = record.flags & 2 != 0);
         let extension = wire_rules!(checked StatusExtension::decode_raw(&record.extension)?; |value: &StatusExtension| value.valid(value.logging()))?;
         let value = wire_rules!(value Self; columns = columns; rows = rows; replay = replay; owns_lease = record.flags & 1 << 4 != 0; viewers = record.flags & 1 << 5 != 0; running = record.flags & 1 << 6 != 0; event_writable = record.flags & 1 << 7 != 0; lease_epoch = record.lease_epoch; semantic_flags = record.semantic_flags; semantic_pending = record.semantic_pending; extension = extension);
-        validated(value.valid(), value)
+        well_formed(value.valid())?; Ok((identity, value))
     });
+    wire_rules!(pure fn decode_with(payload: &[u8], expected: Option<(&[u8], u32, [u8; 16])>) -> Result<Self, WireError> = Self::decode_descriptor_with(payload, expected).map(|(_, tail)| tail));
     wire_rules!(pure pub fn decode_for(payload: &[u8], identity: &[u8], generation: u32, incarnation: [u8; 16]) -> Result<Self, WireError> = Self::decode_with(payload, Some((identity, generation, incarnation))));
 }
 
-wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(u16, u16), WireError> = {
-    wire_rules!(read input; identity = input.wide(); generation = input.positive(); incarnation = input.identifier::<16>(); layout = input.byte(); event_identity = input.wide(); slot = input.byte(); commit = input.u64(); body_length = input.u64(); body_hash = input.exact::<32>()); input.exact::<32>()?;
+wire_rules!(pure fn validate_status_base(input: &mut Reader<'_>, expected: Option<(&[u8], u32, [u8; 16])>) -> Result<(StatusIdentity, u16, u16), WireError> = {
+    wire_rules!(read input; controller_identity = input.wide(); generation = input.positive(); incarnation = input.identifier::<16>(); layout = input.byte(); event_identity = input.wide(); slot = input.byte(); commit = input.u64(); body_length = input.u64(); body_hash = input.exact::<32>()); input.exact::<32>()?;
     wire_rules!(read input; directory = input.wide(); _pid = input.positive(); _containment = input.positive(); _birth = input.identifier::<16>(); columns = input.u16(); rows = input.u16());
-    let identity_ok = matches!(identity, [1, b'/', ..]) || identity.len() == 25 && identity.first() == Some(&2);
+    let identity_ok = matches!(controller_identity, [1, b'/', ..]) || controller_identity.len() == 25 && controller_identity.first() == Some(&2);
     let commit_ok = if layout == 2 { slot <= 1 && commit != 0 && body_length != 0 && nonzero(&body_hash) } else { slot == 0xff && commit == 0 && body_length == 0 && !nonzero(&body_hash) };
     // Layout `01` is the superseded legacy layout: never emitted by any
     // holder (§5 — both platforms report `2`, disabled logging reports `0`),
     // so a descriptor carrying it is a forgery or corruption, not history.
-    well_formed(identity_ok && expected.is_none_or(|value| (identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))?;
-    Ok((columns, rows))
+    well_formed(identity_ok && expected.is_none_or(|value| (controller_identity, generation, incarnation) == value) && (layout == 0 || layout == 2) && event_identity.is_empty() == (layout == 0) && commit_ok && !directory.is_empty() && crate::wire::valid_size((rows, columns)))?;
+    Ok((wire_rules!(value StatusIdentity; generation = generation; incarnation = incarnation; event_layout = layout; event_identity = event_identity.to_vec()), columns, rows))
 });
 
 schema!(struct pub Heartbeat derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; monotonic_ms: u64, flags: u8);

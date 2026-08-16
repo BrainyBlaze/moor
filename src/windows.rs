@@ -2306,8 +2306,16 @@ mod native {
         controller(path, 2000)
     }
     #[doc(hidden)]
-    pub fn authenticated_status_probe(_path: &Path) -> Result<AuthenticatedWindowsStatus> {
-        Err("unsupported".into())
+    pub fn authenticated_status_probe(path: &Path) -> Result<AuthenticatedWindowsStatus> {
+        let (identity, _) = controller(path, 2000)?.authenticated_status_descriptor()?;
+        let event_path = PathBuf::from(os_string(&identity.event_identity)?);
+        Ok(AuthenticatedWindowsStatus {
+            generation: identity.generation,
+            incarnation: identity.incarnation,
+            event_layout: identity.event_layout,
+            event_identity: identity.event_identity,
+            event_path,
+        })
     }
     fn inspect(path: &Path, status: bool, timeout: u32) -> SessionState {
         probe_session(

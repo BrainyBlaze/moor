@@ -225,7 +225,14 @@ impl Client {
     }
 
     pub fn authenticated_status_descriptor(&mut self) -> Result<(StatusIdentity, StatusTail)> {
-        Err("unsupported".into())
+        let message = self.request(0x0d, &[], 0x0e)?;
+        StatusTail::decode_descriptor_for(
+            &message.payload,
+            &self.identity,
+            self.generation,
+            self.incarnation,
+        )
+        .map_err(crate::protocol)
     }
 
     pub fn terminate(&mut self, force: bool) -> Result<(u8, u8, u8, Vec<u8>)> {
