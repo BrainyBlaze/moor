@@ -4,7 +4,7 @@ use moor::events::{Cursor, canonical_header};
 use moor::runtime::private::{companion, environment_key, lifecycle_running, now};
 use moor::store::{Kind, Store};
 use std::fs::{self, DirBuilder, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -57,6 +57,21 @@ fn true_program() -> &'static str {
 
 fn stale_socket(path: &Path) {
     drop(UnixListener::bind(path).unwrap());
+    // Tests run in parallel and spawn processes constantly. A child forked by
+    // another test between the bind and the drop holds the listening
+    // descriptor until it execs, and a connect landing in that window is
+    // accepted instead of refused, which turns the intended stale residue into
+    // an indeterminate one. Settle on the positive refusal the callers rely on.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return,
+            _ if Instant::now() >= until => {
+                panic!("stale rendezvous {} never became refused", path.display())
+            }
+            _ => thread::sleep(Duration::from_millis(1)),
+        }
+    }
 }
 
 fn set_age(path: &Path, seconds: u64) {
@@ -2290,6 +2305,150 @@ fn deeply_nested_socket_path_uses_a_directory_relative_address() {
     let started = moor(&["start", name, "/bin/sh", "-c", "sleep 30"]);
     assert!(started.status.success(), "{started:?}");
     assert!(moor(&["kill", "-f", name]).status.success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn final_component_at_the_socket_address_capacity_works_and_one_more_byte_is_refused() {
+    // §2.2: only the final component must fit a local socket address; one
+    // that fits is reachable through the directory-relative address on every
+    // platform, and one that cannot fit fails loudly before publication with
+    // the frozen rendezvous-rejection row instead of being published under a
+    // name that no address can reach.
+    let capacity = {
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_path.len() - 1
+    };
+    let dir = temp();
+    let fitting = dir.join("f".repeat(capacity));
+    let overlong = dir.join("o".repeat(capacity + 1));
+
+    let out = moor(&[
+        "start",
+        overlong.to_str().unwrap(),
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "moor: rendezvous rejected: {} (too-long)\n",
+            overlong.display()
+        ),
+        "{out:?}"
+    );
+    assert!(
+        !overlong.exists(),
+        "an unreachable rendezvous was published"
+    );
+    assert!(
+        !companion(&overlong, ".log").exists(),
+        "companion left behind"
+    );
+    assert!(
+        !companion(&overlong, ".exit").exists(),
+        "companion left behind"
+    );
+
+    let started = moor(&[
+        "start",
+        fitting.to_str().unwrap(),
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+    ]);
+    assert!(started.status.success(), "{started:?}");
+    assert!(fitting.exists(), "a fitting rendezvous was not published");
+    // Reachability, not mere publication: the live-operation classification
+    // has to connect through the directory-relative address.
+    let killed = moor(&["kill", "-f", fitting.to_str().unwrap()]);
+    assert!(killed.status.success(), "{killed:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fitting.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!fitting.exists(), "killed rendezvous was not withdrawn");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn bare_final_component_over_capacity_is_refused_without_creating_the_root() {
+    // The bare form resolves inside the per-invocation root; the refusal must
+    // come before that root is even created, so an over-long name against an
+    // absent root leaves the root absent (§2.2: before any effect).
+    let capacity = {
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_path.len() - 1
+    };
+    let dir = temp();
+    let alias = dir.file_name().unwrap().to_str().unwrap();
+    let root = isolated_root(alias);
+    let _ = fs::remove_dir_all(&root);
+    assert!(!root.exists());
+    let name = "b".repeat(capacity + 1);
+    let out = invoked(alias, &["start", &name, "/bin/sh", "-c", "sleep 30"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "{alias}: rendezvous rejected: {} (too-long)\n",
+            root.join(&name).display()
+        ),
+        "{out:?}"
+    );
+    assert!(
+        !root.exists(),
+        "the refusal created the per-invocation root"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn bare_final_component_over_capacity_under_a_relative_tmpdir_still_names_the_absolute_path() {
+    // Rust accepts a relative TMPDIR; the pure resolver must still spell the
+    // §13.3 diagnostic as the resolved absolute rendezvous path, and the
+    // refusal must still precede root creation.
+    let capacity = {
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_path.len() - 1
+    };
+    let dir = temp();
+    let alias = format!("{}-rel", dir.file_name().unwrap().to_str().unwrap());
+    let relative = "relative-tmp";
+    fs::create_dir(dir.join(relative)).unwrap();
+    // The child resolves the relative TMPDIR against its working directory as
+    // the kernel spells it (macOS reports /private/var/... for /var/...), so
+    // the expectation is built from the canonical existing parent plus the
+    // still-absent root and name.
+    let root = fs::canonicalize(dir.join(relative))
+        .unwrap()
+        .join(format!(".{alias}-{}", unsafe { libc::geteuid() }));
+    assert!(!root.exists());
+    let name = "r".repeat(capacity + 1);
+    let out = invoked_command(&alias)
+        .args(["start", &name, "/bin/sh", "-c", "sleep 30"])
+        .current_dir(&dir)
+        .env("TMPDIR", relative)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "{alias}: rendezvous rejected: {} (too-long)\n",
+            root.join(&name).display()
+        ),
+        "{out:?}"
+    );
+    assert!(
+        !root.exists(),
+        "the refusal created the per-invocation root"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

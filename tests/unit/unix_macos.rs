@@ -2,7 +2,7 @@ use super::*;
 use std::sync::mpsc::sync_channel;
 
 #[test]
-fn descriptor_relative_socket_name_never_changes_process_cwd() {
+fn thread_directory_never_changes_process_cwd() {
     let before = std::env::current_dir().unwrap();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -18,7 +18,7 @@ fn descriptor_relative_socket_name_never_changes_process_cwd() {
         wait.recv().unwrap();
         observed.send(std::env::current_dir().unwrap()).unwrap();
     });
-    let during = socket_name(&parent, OsStr::new("probe"), move |_| {
+    let during = in_directory(&parent, move || {
         entered.send(()).unwrap();
         Ok::<_, io::Error>(receive.recv().unwrap())
     })
@@ -42,15 +42,8 @@ fn accepted_socket_is_blocking_before_runtime_io_starts() {
     fs::create_dir(&path).unwrap();
     let parent = open_directory(&path).unwrap();
     let leaf = OsStr::new("probe");
-    let listener = socket_name(&parent, leaf, |name| {
-        ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .nonblocking(ListenerNonblockingMode::Accept)
-            .create_sync()
-    })
-    .unwrap();
-    let client = socket_name(&parent, leaf, LocalStream::connect).unwrap();
+    let listener = bind_leaf(&parent, leaf).unwrap();
+    let client = connect_leaf(&parent, leaf, Instant::now() + Duration::from_secs(2)).unwrap();
     let accepted = accept_blocking(&listener).expect("pending local connection");
     let LocalStream::UdSocket(accepted) = accepted;
     let flags = fcntl(accepted.as_fd(), FcntlArg::F_GETFL).unwrap();
