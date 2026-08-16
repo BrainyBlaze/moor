@@ -1,9 +1,12 @@
+use moor::cli::CreateMode;
 use moor::runtime::private::{
-    exit_records as shared_exit_records, instrument_ack, lifecycle_running, validate_instrument_ack,
+    SupervisedLaunchCause, exit_records as shared_exit_records, instrument_ack, lifecycle_running,
+    validate_instrument_ack,
 };
 use moor::windows::{
-    BootstrapRecord, Marker, accept_bootstrap_command, bootstrap_command, cim_boot_identity,
-    valid_event_leaf, wtf8_decode, wtf8_encode,
+    BootstrapRecord, Marker, WindowsLaunchSource, accept_bootstrap_command, bootstrap_command,
+    cim_boot_identity, parse_windows_launch_selector, valid_event_leaf,
+    windows_launch_source_policy, wtf8_decode, wtf8_encode,
 };
 
 fn exit_records(
@@ -264,6 +267,161 @@ fn windows_event_leaf_grammar_is_exact() {
             }
         }
     }
+}
+
+#[test]
+fn windows_launch_selector_grammar_is_exact() {
+    use std::ffi::{OsStr, OsString};
+
+    let mut failures = Vec::new();
+    for length in 1..=16 {
+        let selector = "a".repeat(length);
+        let expected = usize::from_str_radix(&selector, 16).unwrap();
+        let actual = parse_windows_launch_selector(OsStr::new(&selector));
+        if actual != Some(expected) {
+            failures.push(format!(
+                "canonical selector length {length}: expected {expected:#x}, got {actual:?}"
+            ));
+        }
+    }
+
+    for invalid in [
+        "",
+        "0",
+        "01",
+        "aaaaaaaaaaaaaaaaa",
+        "g",
+        "A",
+        "0x1",
+        " 1",
+        "1 ",
+        "+1",
+        "-1",
+    ] {
+        assert_eq!(
+            parse_windows_launch_selector(OsStr::new(invalid)),
+            None,
+            "accepted noncanonical selector {invalid:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    let non_unicode = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let non_unicode = {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    };
+    assert_eq!(parse_windows_launch_selector(&non_unicode), None);
+    assert!(
+        failures.is_empty(),
+        "canonical selector failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn windows_launch_source_policy_is_exact() {
+    use std::ffi::OsStr;
+
+    let mut failures = Vec::new();
+    for mode in [
+        CreateMode::Bare,
+        CreateMode::New,
+        CreateMode::Start,
+        CreateMode::Run,
+    ] {
+        let actual = windows_launch_source_policy(None, None, mode);
+        let expected = Ok(WindowsLaunchSource::Unsupervised);
+        if actual != expected {
+            failures.push(format!(
+                "unsupervised {mode:?}: expected {expected:?}, got {actual:?}"
+            ));
+        }
+    }
+
+    let selector = OsStr::new("a");
+    for mode in [CreateMode::Bare, CreateMode::New, CreateMode::Start] {
+        let actual = windows_launch_source_policy(None, Some(selector), mode);
+        let expected = Ok(WindowsLaunchSource::NativeForwarding(0xa));
+        if actual != expected {
+            failures.push(format!(
+                "background native {mode:?}: expected {expected:?}, got {actual:?}"
+            ));
+        }
+    }
+    let actual = windows_launch_source_policy(None, Some(selector), CreateMode::Run);
+    let expected = Ok(WindowsLaunchSource::NativeDirect(0xa));
+    if actual != expected {
+        failures.push(format!(
+            "foreground native: expected {expected:?}, got {actual:?}"
+        ));
+    }
+    let actual =
+        windows_launch_source_policy(Some(OsStr::new("stdin-v1")), None, CreateMode::Start);
+    let expected = Ok(WindowsLaunchSource::StdinForwarding);
+    if actual != expected {
+        failures.push(format!(
+            "stdin forwarding: expected {expected:?}, got {actual:?}"
+        ));
+    }
+
+    let refused = Err(SupervisedLaunchCause::SelectorInvalid);
+    for adapter in ["", "STDIN-V1", "unknown"] {
+        for native in [None, Some(selector)] {
+            for mode in [
+                CreateMode::Bare,
+                CreateMode::New,
+                CreateMode::Start,
+                CreateMode::Run,
+            ] {
+                assert_eq!(
+                    windows_launch_source_policy(Some(OsStr::new(adapter)), native, mode),
+                    refused,
+                    "accepted adapter {adapter:?} with native selector {native:?} for {mode:?}"
+                );
+            }
+        }
+    }
+    for mode in [
+        CreateMode::Bare,
+        CreateMode::New,
+        CreateMode::Start,
+        CreateMode::Run,
+    ] {
+        assert_eq!(
+            windows_launch_source_policy(Some(OsStr::new("stdin-v1")), Some(selector), mode),
+            refused,
+            "accepted ambiguous launch sources for {mode:?}"
+        );
+    }
+    for mode in [CreateMode::Bare, CreateMode::New, CreateMode::Run] {
+        assert_eq!(
+            windows_launch_source_policy(Some(OsStr::new("stdin-v1")), None, mode),
+            refused,
+            "accepted stdin-v1 for {mode:?}"
+        );
+    }
+    for mode in [
+        CreateMode::Bare,
+        CreateMode::New,
+        CreateMode::Start,
+        CreateMode::Run,
+    ] {
+        assert_eq!(
+            windows_launch_source_policy(None, Some(OsStr::new("0")), mode),
+            refused,
+            "accepted a malformed native selector for {mode:?}"
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "launch-source policy failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -1373,6 +1531,98 @@ mod launch_paths {
         );
         assert_eq!(output.stderr, expected.as_bytes(), "{output:?}");
         assert!(std::fs::symlink_metadata(marker).is_err(), "{output:?}");
+    }
+
+    #[test]
+    fn invalid_launch_adapter_modes_are_rejected() {
+        let root = invoked_root();
+        let listed = moor(&["list"]);
+        assert!(listed.status.success(), "{listed:?}");
+        let invoked = Path::new(env!("CARGO_BIN_EXE_moor")).file_name().unwrap();
+        let adapter = moor::runtime::private::environment_key(invoked, "_LAUNCH_ADAPTER");
+        let mixed_case_adapter = OsString::from(adapter.to_string_lossy().to_ascii_lowercase());
+        assert_ne!(
+            mixed_case_adapter, adapter,
+            "adapter key fixture did not change case"
+        );
+        let native = moor::runtime::private::environment_key(invoked, "_LAUNCH_CHANNEL");
+        let program = moor::name::program(invoked);
+        let expected = format!("{program}: supervised launch rejected (selector-invalid)\n");
+        let cases = [
+            ("wrong-value-mixed-key", "start", "wrong-v1", false, true),
+            ("ambiguous", "start", "stdin-v1", true, false),
+            ("stdin-bare", "bare", "stdin-v1", false, false),
+            ("stdin-new", "new", "stdin-v1", false, false),
+            ("stdin-run", "run", "stdin-v1", false, false),
+        ];
+
+        for (at, (label, mode, value, with_native, mixed_case)) in cases.into_iter().enumerate() {
+            let session = format!("launch-source-{at}-{}", std::process::id());
+            let marker = root.join(&session);
+            let child_proof = root.join(format!("{session}-child-proof"));
+            let _ = std::fs::remove_file(&child_proof);
+            let mut command = Command::new(env!("CARGO_BIN_EXE_moor"));
+            match mode {
+                "bare" => {
+                    command.arg(&session);
+                }
+                _ => {
+                    command.args([mode, &session]);
+                }
+            }
+            command
+                .env(
+                    if mixed_case {
+                        &mixed_case_adapter
+                    } else {
+                        &adapter
+                    },
+                    value,
+                )
+                .args(["cmd.exe", "/d", "/c", "type nul >"])
+                .arg(&child_proof);
+            if with_native {
+                command.env(&native, "1");
+            }
+            let output = command.output().unwrap();
+            let child_started = child_proof.exists();
+            let residue = [
+                marker.clone(),
+                companion(&marker, ".log"),
+                companion(&marker, ".exit"),
+            ]
+            .into_iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok())
+            .collect::<Vec<_>>();
+            let stage_prefix = format!("{session}.stage-");
+            let stages = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(&stage_prefix))
+                })
+                .collect::<Vec<_>>();
+
+            let _ = moor(&["kill", "-f", "-q", &session]);
+            let _ = moor(&["rm", "-q", &session]);
+            let _ = std::fs::remove_file(&child_proof);
+            for path in residue.iter().chain(&stages) {
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_dir_all(path);
+            }
+
+            assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+            assert!(output.stdout.is_empty(), "{label}: {output:?}");
+            assert_eq!(output.stderr, expected.as_bytes(), "{label}: {output:?}");
+            assert!(!child_started, "{label}: requested child started");
+            assert!(residue.is_empty(), "{label}: launch residue {residue:?}");
+            assert!(
+                stages.is_empty(),
+                "{label}: staged launch residue {stages:?}"
+            );
+        }
     }
 
     #[test]

@@ -72,6 +72,29 @@ pub fn valid_event_leaf(units: &[u16]) -> bool {
     true
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsLaunchSource {
+    Unsupervised,
+    NativeForwarding(usize),
+    NativeDirect(usize),
+    StdinForwarding,
+}
+
+#[doc(hidden)]
+pub fn parse_windows_launch_selector(_selector: &std::ffi::OsStr) -> Option<usize> {
+    None
+}
+
+#[doc(hidden)]
+pub fn windows_launch_source_policy(
+    _adapter: Option<&std::ffi::OsStr>,
+    _native_selector: Option<&std::ffi::OsStr>,
+    _mode: crate::cli::CreateMode,
+) -> std::result::Result<WindowsLaunchSource, crate::runtime::private::SupervisedLaunchCause> {
+    Err(crate::runtime::private::SupervisedLaunchCause::SelectorInvalid)
+}
+
 pub fn cim_boot_identity(value: &str) -> Option<[u8; 16]> {
     use time::{PrimitiveDateTime, UtcOffset, macros::format_description};
     crate::return_if!(value.len() != 25, None);
