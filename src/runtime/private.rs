@@ -112,6 +112,197 @@ pub fn launch_result(state: u8, result: u16, generation: u32) -> Option<[u8; 12]
     Some(bytes)
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LaunchRecordObservation {
+    Complete(u8, u16, u32),
+    Eof(Vec<u8>),
+    Timeout(Vec<u8>),
+    ReadError(Vec<u8>),
+    Invalid([u8; 12]),
+}
+
+#[doc(hidden)]
+pub fn observe_launch_result_with(
+    _input: &mut impl Read,
+    _remaining: impl FnMut() -> Duration,
+    _poll: impl FnMut(Duration) -> io::Result<Option<usize>>,
+) -> LaunchRecordObservation {
+    LaunchRecordObservation::Timeout(Vec::new())
+}
+
+#[doc(hidden)]
+pub struct FirstFailedRecord {
+    generation: u32,
+    result: u16,
+}
+
+impl FirstFailedRecord {
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub fn result(&self) -> u16 {
+        self.result
+    }
+
+    #[doc(hidden)]
+    pub fn test_confirm_exact_holder_death(self) -> FirstFailedRecordDeathProof {
+        FirstFailedRecordDeathProof {
+            generation: self.generation,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn first_failed_record(
+    _observation: &LaunchRecordObservation,
+    _expected_generation: u32,
+) -> Option<FirstFailedRecord> {
+    None
+}
+
+#[doc(hidden)]
+pub struct NeverResumedDeathProof(());
+
+#[doc(hidden)]
+pub struct FirstFailedRecordDeathProof {
+    generation: u32,
+}
+
+#[doc(hidden)]
+pub fn test_never_resumed_death_proof() -> NeverResumedDeathProof {
+    NeverResumedDeathProof(())
+}
+
+#[doc(hidden)]
+pub struct CreatorRollbackAuthority<T> {
+    generation: u32,
+    capability: T,
+}
+
+#[doc(hidden)]
+pub struct NeverResumedRollbackAuthority<T>(CreatorRollbackAuthority<T>);
+
+#[doc(hidden)]
+pub struct RunningRollbackAuthority<T>(CreatorRollbackAuthority<T>);
+
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct AdoptedLaunchAuthority {
+    generation: u32,
+}
+
+#[doc(hidden)]
+pub fn test_creator_rollback_authority<T>(
+    generation: u32,
+    capability: T,
+) -> CreatorRollbackAuthority<T> {
+    CreatorRollbackAuthority {
+        generation,
+        capability,
+    }
+}
+
+impl<T> CreatorRollbackAuthority<T> {
+    pub fn process_created(self) -> NeverResumedRollbackAuthority<T> {
+        let _ = self.generation;
+        NeverResumedRollbackAuthority(self)
+    }
+}
+
+impl<T> NeverResumedRollbackAuthority<T> {
+    pub fn resume_attempted(self) -> RunningRollbackAuthority<T> {
+        RunningRollbackAuthority(self.0)
+    }
+
+    pub fn rollback_never_resumed(self, _proof: NeverResumedDeathProof) -> T {
+        self.0.capability
+    }
+}
+
+impl<T> RunningRollbackAuthority<T> {
+    pub fn accept_store_adopted(
+        self,
+        _observation: &LaunchRecordObservation,
+        _nonce: [u8; 16],
+    ) -> std::result::Result<(AdoptedLaunchAuthority, [u8; 32]), Self> {
+        Err(self)
+    }
+
+    pub fn rollback_after_first_failed(
+        self,
+        proof: FirstFailedRecordDeathProof,
+    ) -> std::result::Result<T, Self> {
+        let _ = proof.generation;
+        Err(self)
+    }
+}
+
+impl AdoptedLaunchAuthority {
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdoptedLaunchOutcome {
+    Ready,
+    Failed(u16),
+    Indeterminate,
+}
+
+#[doc(hidden)]
+pub fn classify_adopted_launch(
+    _authority: &AdoptedLaunchAuthority,
+    _observation: &LaunchRecordObservation,
+    _published: bool,
+) -> AdoptedLaunchOutcome {
+    AdoptedLaunchOutcome::Indeterminate
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdoptionReceiptError {
+    Timeout,
+    WrongLength,
+    Malformed,
+    IoError,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AdoptionReceiptAccepted {
+    generation: u32,
+}
+
+impl AdoptionReceiptAccepted {
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    pub fn continue_holder<T>(self, continuation: impl FnOnce() -> T) -> T {
+        continuation()
+    }
+}
+
+#[doc(hidden)]
+pub fn adoption_receipt(_generation: u32, _nonce: [u8; 16]) -> Option<[u8; 32]> {
+    None
+}
+
+#[doc(hidden)]
+pub fn read_adoption_receipt_with(
+    _input: &mut impl Read,
+    _remaining: impl FnMut() -> Duration,
+    _poll: impl FnMut(Duration) -> io::Result<Option<usize>>,
+    _generation: u32,
+    _nonce: [u8; 16],
+) -> std::result::Result<AdoptionReceiptAccepted, AdoptionReceiptError> {
+    Err(AdoptionReceiptError::Malformed)
+}
+
 pub struct LaunchReporter<W: Write> {
     pub output: Option<W>,
     pub generation: u32,
@@ -127,19 +318,14 @@ impl<W: Write> Default for LaunchReporter<W> {
 }
 
 impl<W: Write> LaunchReporter<W> {
-    pub fn notice(&mut self, state: u8, result: u16) {
-        if let Some(output) = self.output.as_mut() {
-            let _ = output.write_all(&launch_result(state, result, self.generation).unwrap());
-        }
-        if state != 1 {
-            self.output.take();
-        }
+    pub fn notice(&mut self, _state: u8, _result: u16) -> io::Result<()> {
+        Err(io::Error::other("launch reporter refusal stub"))
     }
 }
 
 impl<W: Write> Drop for LaunchReporter<W> {
     fn drop(&mut self) {
-        self.notice(3, 1);
+        let _ = self.notice(3, 1);
     }
 }
 

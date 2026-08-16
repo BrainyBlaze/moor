@@ -224,6 +224,16 @@ jobs:
           cargo test --test windows launch_paths::invalid_launch_adapter_modes_are_rejected -- --exact --nocapture *>&1 | Tee-Object -FilePath "$out/focused-launch-source-policy.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Run exact Windows prepared-store authority witnesses
+        id: focused_windows_prepared_store
+        if: matrix.lane == 'windows-2022-x64'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = "ci-output/${{ matrix.lane }}"
+          cargo test --test store windows_prepared_store -- --nocapture --test-threads=1 *>&1 | Tee-Object -FilePath "$out/focused-windows-prepared-store.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Run all applicable real-process tests
         id: full_release_tests
         continue-on-error: true
@@ -242,6 +252,7 @@ jobs:
           FOCUSED_AUTHENTICATED_STATUS_PROBE: ${{ steps.focused_authenticated_status_probe.outcome }}
           FOCUSED_RELATIVE_EVENT: ${{ steps.focused_relative_event.outcome }}
           FOCUSED_LAUNCH_SOURCE_POLICY: ${{ steps.focused_launch_source_policy.outcome }}
+          FOCUSED_WINDOWS_PREPARED_STORE: ${{ steps.focused_windows_prepared_store.outcome }}
           FULL_RELEASE_TESTS: ${{ steps.full_release_tests.outcome }}
         run: |
           $failed = $false
@@ -263,6 +274,10 @@ jobs:
           }
           if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_LAUNCH_SOURCE_POLICY -ne "success") {
             Write-Error "launch-source policy outcome was $env:FOCUSED_LAUNCH_SOURCE_POLICY"
+            $failed = $true
+          }
+          if ($env:LANE -eq "windows-2022-x64" -and $env:FOCUSED_WINDOWS_PREPARED_STORE -ne "success") {
+            Write-Error "Windows prepared-store outcome was $env:FOCUSED_WINDOWS_PREPARED_STORE"
             $failed = $true
           }
           if ($failed) { exit 1 }

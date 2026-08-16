@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 #[cfg(unix)]
 use fs2::FileExt as _;
@@ -118,6 +120,230 @@ schema!(struct pub Store fields; slots: Slots, selected: Commit, hash: Sha256, _
 
 #[cfg(unix)]
 pub struct PreparedStore(Slots);
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct PreparedStore {
+    metadata: WindowsPreparedStoreMetadata,
+    inventory: Vec<WindowsPreparedHandleInfo>,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPreparedStoreMetadata {
+    pub path: PathBuf,
+    pub directory_created: bool,
+    pub directory_delete_present: bool,
+    pub directory_identity: [u8; 24],
+    pub slot_identities: [[u8; 24]; 4],
+    pub capability_digest: [u8; 32],
+}
+
+#[cfg(windows)]
+impl WindowsPreparedStoreMetadata {
+    #[doc(hidden)]
+    pub fn recompute_digest(&mut self) {
+        self.capability_digest = [0; 32];
+    }
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsPreparedHandleInfo {
+    pub raw: usize,
+    pub identity: [u8; 24],
+    pub group: u32,
+    pub owning: bool,
+    pub holder_access: bool,
+    pub delete_access: bool,
+    pub directory_origin: bool,
+    pub share_delete: bool,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPreparedStoreSelectors {
+    pub directory: usize,
+    pub directory_delete: Option<usize>,
+    pub slots: [usize; 4],
+    pub metadata: WindowsPreparedStoreMetadata,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct WindowsPreparationReservation {
+    path: PathBuf,
+    record: [u8; 32],
+    identity: [u8; 24],
+    inventory: Vec<WindowsPreparedHandleInfo>,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct WindowsPreparedDirectory {
+    inventory: Vec<WindowsPreparedHandleInfo>,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct WindowsPreparedStoreRollback;
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct WindowsPreparedStoreTransfer {
+    inventory: Vec<WindowsPreparedHandleInfo>,
+    selectors: WindowsPreparedStoreSelectors,
+}
+
+#[cfg(windows)]
+#[doc(hidden)]
+pub struct WindowsHolderPreparedStore;
+
+#[cfg(windows)]
+impl WindowsPreparationReservation {
+    #[doc(hidden)]
+    pub fn create(_marker: &Path, _generation: u32, _nonce: [u8; 16]) -> Result<Self> {
+        Err(StoreError::Corrupt)
+    }
+
+    #[doc(hidden)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[doc(hidden)]
+    pub fn record(&self) -> [u8; 32] {
+        self.record
+    }
+
+    #[doc(hidden)]
+    pub fn identity(&self) -> [u8; 24] {
+        self.identity
+    }
+
+    #[doc(hidden)]
+    pub fn windows_inventory(&self) -> &[WindowsPreparedHandleInfo] {
+        &self.inventory
+    }
+
+    #[doc(hidden)]
+    pub fn validate_exact(&self) -> bool {
+        false
+    }
+
+    #[doc(hidden)]
+    pub fn validate_event_target(_marker: &Path, _event: &Path) -> Result<()> {
+        Err(StoreError::Corrupt)
+    }
+
+    #[doc(hidden)]
+    pub fn rollback_after_first_failed(
+        self,
+        _proof: crate::runtime::private::FirstFailedRecordDeathProof,
+        _stores: Vec<WindowsPreparedStoreRollback>,
+        _directories: Vec<WindowsPreparedDirectory>,
+    ) -> Result<()> {
+        Err(StoreError::Corrupt)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPreparedDirectory {
+    #[doc(hidden)]
+    pub fn prepare(
+        _reservation: &WindowsPreparationReservation,
+        _path: &Path,
+        _allow_existing: bool,
+    ) -> Result<Self> {
+        Err(StoreError::Corrupt)
+    }
+
+    #[doc(hidden)]
+    pub fn access_raw(&self) -> usize {
+        0
+    }
+
+    #[doc(hidden)]
+    pub fn windows_inventory(&self) -> &[WindowsPreparedHandleInfo] {
+        &self.inventory
+    }
+}
+
+#[cfg(windows)]
+impl PreparedStore {
+    #[doc(hidden)]
+    pub fn prepare_windows_owned(
+        _reservation: &WindowsPreparationReservation,
+        _path: &Path,
+        _allow_existing: bool,
+    ) -> Result<Self> {
+        Err(StoreError::Corrupt)
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_windows_borrowed(
+        _reservation: &WindowsPreparationReservation,
+        _directory: &WindowsPreparedDirectory,
+    ) -> Result<Self> {
+        Err(StoreError::Corrupt)
+    }
+
+    #[doc(hidden)]
+    pub fn windows_metadata(&self) -> &WindowsPreparedStoreMetadata {
+        &self.metadata
+    }
+
+    #[doc(hidden)]
+    pub fn windows_inventory(&self) -> &[WindowsPreparedHandleInfo] {
+        &self.inventory
+    }
+
+    #[doc(hidden)]
+    pub fn into_windows_transfer(
+        self,
+    ) -> Result<(WindowsPreparedStoreRollback, WindowsPreparedStoreTransfer)> {
+        Err(StoreError::Corrupt)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPreparedStoreTransfer {
+    #[doc(hidden)]
+    pub fn windows_inventory(&self) -> &[WindowsPreparedHandleInfo] {
+        &self.inventory
+    }
+
+    #[doc(hidden)]
+    pub fn selectors(&self) -> WindowsPreparedStoreSelectors {
+        self.selectors.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn reconstruct(
+        &self,
+        _selectors: &WindowsPreparedStoreSelectors,
+    ) -> Result<WindowsHolderPreparedStore> {
+        Err(StoreError::Corrupt)
+    }
+}
+
+#[cfg(windows)]
+impl WindowsHolderPreparedStore {
+    #[doc(hidden)]
+    pub fn initialize(
+        &mut self,
+        _kind: Kind,
+        _generation: u32,
+        _initial: &[u8],
+        _start: u64,
+        _end: u64,
+    ) -> Result<Store> {
+        Err(StoreError::Corrupt)
+    }
+}
 
 #[cfg(unix)]
 impl PreparedStore {

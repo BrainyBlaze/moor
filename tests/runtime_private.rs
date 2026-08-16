@@ -1,10 +1,12 @@
 use moor::runtime::private::{
-    ArtifactConfig, SessionState, SupervisedLaunchCause, age, await_launch, await_launch_probe,
-    clear_store, companion, decode_launch_record, decode_launch_result, discover_sessions,
-    environment_key, holder_artifacts, instrument_ack, instrument_stage, launch_result,
-    lifecycle_running, monotonic, now, parse_boot_uuid, random_array,
-    read_supervised_launch_record_with, session_name, supervised_generation,
-    validate_instrument_ack,
+    AdoptedLaunchOutcome, AdoptionReceiptError, ArtifactConfig, LaunchRecordObservation,
+    SessionState, SupervisedLaunchCause, adoption_receipt, age, await_launch, await_launch_probe,
+    classify_adopted_launch, clear_store, companion, decode_launch_record, decode_launch_result,
+    discover_sessions, environment_key, first_failed_record, holder_artifacts, instrument_ack,
+    instrument_stage, launch_result, lifecycle_running, monotonic, now, observe_launch_result_with,
+    parse_boot_uuid, random_array, read_adoption_receipt_with, read_supervised_launch_record_with,
+    session_name, supervised_generation, test_creator_rollback_authority,
+    test_never_resumed_death_proof, validate_instrument_ack,
 };
 use moor::runtime::storage::SessionStorage;
 use moor::store::{Kind, Store};
@@ -152,6 +154,352 @@ fn state_three_without_adoption_does_not_invoke_the_callback() {
         adoption_probe(failed.to_vec(), false),
         (Ok((127, 42)), None)
     );
+}
+
+fn launch_transaction_record_case(
+    bytes: Vec<u8>,
+    remaining: Vec<Duration>,
+    polls: Vec<PollStep>,
+) -> LaunchRecordObservation {
+    let mut input = Cursor::new(bytes);
+    let mut remaining = VecDeque::from(remaining);
+    let mut polls = VecDeque::from(polls);
+    observe_launch_result_with(
+        &mut input,
+        || remaining.pop_front().unwrap_or(Duration::from_secs(1)),
+        |_| match polls.pop_front().unwrap_or(PollStep::Eof) {
+            PollStep::Available(count) => Ok(Some(count)),
+            PollStep::Eof => Ok(None),
+            PollStep::Error => Err(io::Error::other("injected poll failure")),
+        },
+    )
+}
+
+#[test]
+fn launch_transaction_first_record_preserves_every_indeterminate_boundary() {
+    let failed = launch_result(3, 17, 42).unwrap();
+    let observed =
+        launch_transaction_record_case(failed.to_vec(), vec![], vec![PollStep::Available(12)]);
+    assert_eq!(observed, LaunchRecordObservation::Complete(3, 17, 42));
+    let pending = first_failed_record(&observed, 42).expect("exact failure was not classified");
+    assert_eq!((pending.generation(), pending.result()), (42, 17));
+    assert!(first_failed_record(&observed, 43).is_none());
+
+    for length in 0..12 {
+        let prefix = failed[..length].to_vec();
+        let polls = if length == 0 {
+            vec![PollStep::Eof]
+        } else {
+            vec![PollStep::Available(length), PollStep::Eof]
+        };
+        assert_eq!(
+            launch_transaction_record_case(prefix.clone(), vec![], polls),
+            LaunchRecordObservation::Eof(prefix),
+            "lost the exact EOF boundary after {length} bytes"
+        );
+    }
+
+    let prefix = failed[..7].to_vec();
+    assert_eq!(
+        launch_transaction_record_case(
+            prefix.clone(),
+            vec![Duration::from_secs(1), Duration::ZERO],
+            vec![PollStep::Available(prefix.len())],
+        ),
+        LaunchRecordObservation::Timeout(prefix.clone())
+    );
+    assert_eq!(
+        launch_transaction_record_case(
+            prefix.clone(),
+            vec![],
+            vec![PollStep::Available(prefix.len()), PollStep::Error],
+        ),
+        LaunchRecordObservation::ReadError(prefix)
+    );
+    let invalid = [0xa5; 12];
+    assert_eq!(
+        launch_transaction_record_case(invalid.to_vec(), vec![], vec![PollStep::Available(12)],),
+        LaunchRecordObservation::Invalid(invalid)
+    );
+}
+
+struct RollbackCapability {
+    dropped: Rc<Cell<u32>>,
+    deleted: Rc<Cell<bool>>,
+}
+
+impl RollbackCapability {
+    fn delete(self) {
+        self.deleted.set(true);
+    }
+}
+
+impl Drop for RollbackCapability {
+    fn drop(&mut self) {
+        self.dropped.set(self.dropped.get() + 1);
+    }
+}
+
+fn rollback_capability() -> (RollbackCapability, Rc<Cell<u32>>, Rc<Cell<bool>>) {
+    let dropped = Rc::new(Cell::new(0));
+    let deleted = Rc::new(Cell::new(false));
+    (
+        RollbackCapability {
+            dropped: dropped.clone(),
+            deleted: deleted.clone(),
+        },
+        dropped,
+        deleted,
+    )
+}
+
+#[test]
+fn launch_transaction_authority_is_one_way_and_exact_proof_gated() {
+    let nonce = [9; 16];
+    let adopted_record = LaunchRecordObservation::Complete(1, 0, 42);
+    let (capability, dropped, deleted) = rollback_capability();
+    let authority = test_creator_rollback_authority(42, capability);
+    let running = authority.process_created().resume_attempted();
+    let Ok((adopted, receipt)) = running.accept_store_adopted(&adopted_record, nonce) else {
+        panic!("exact state 1 did not consume pre-adoption authority");
+    };
+    assert_eq!(adopted.generation(), 42);
+    assert_eq!(receipt, adoption_receipt(42, nonce).unwrap());
+    assert_eq!(dropped.get(), 1, "rollback guards were not dropped once");
+    assert!(!deleted.get(), "adoption invoked rollback deletion");
+
+    assert_eq!(
+        classify_adopted_launch(
+            &adopted,
+            &LaunchRecordObservation::Complete(2, 0, 42),
+            false,
+        ),
+        AdoptedLaunchOutcome::Ready
+    );
+    assert_eq!(
+        classify_adopted_launch(
+            &adopted,
+            &LaunchRecordObservation::Complete(3, 23, 42),
+            false,
+        ),
+        AdoptedLaunchOutcome::Failed(23)
+    );
+    assert_eq!(
+        classify_adopted_launch(&adopted, &LaunchRecordObservation::Eof(Vec::new()), true,),
+        AdoptedLaunchOutcome::Ready,
+        "authenticated publication did not recover EOF after adoption"
+    );
+    assert_eq!(
+        classify_adopted_launch(&adopted, &LaunchRecordObservation::Complete(2, 0, 43), true,),
+        AdoptedLaunchOutcome::Indeterminate,
+        "a generation discontinuity was accepted"
+    );
+
+    let (capability, dropped, deleted) = rollback_capability();
+    let running = test_creator_rollback_authority(42, capability)
+        .process_created()
+        .resume_attempted();
+    let failed_record = LaunchRecordObservation::Complete(3, 17, 42);
+    let pending = first_failed_record(&failed_record, 42).unwrap();
+    assert_eq!(dropped.get(), 0);
+    assert!(!deleted.get());
+    let proof = pending.test_confirm_exact_holder_death();
+    let Ok(capability) = running.rollback_after_first_failed(proof) else {
+        panic!("exact first-failed/death proof did not release rollback capability");
+    };
+    capability.delete();
+    assert_eq!(dropped.get(), 1);
+    assert!(deleted.get());
+
+    let (capability, dropped, deleted) = rollback_capability();
+    let armed = test_creator_rollback_authority(42, capability).process_created();
+    let capability = armed.rollback_never_resumed(test_never_resumed_death_proof());
+    capability.delete();
+    assert_eq!(dropped.get(), 1);
+    assert!(deleted.get());
+
+    let failed = launch_result(3, 17, 42).unwrap();
+    for observation in [
+        LaunchRecordObservation::Eof(Vec::new()),
+        LaunchRecordObservation::Eof(failed[..7].to_vec()),
+        LaunchRecordObservation::Timeout(Vec::new()),
+        LaunchRecordObservation::ReadError(Vec::new()),
+        LaunchRecordObservation::Invalid([0; 12]),
+        LaunchRecordObservation::Complete(3, 17, 43),
+    ] {
+        assert!(
+            first_failed_record(&observation, 42).is_none(),
+            "indeterminate observation manufactured a death-proof precursor: {observation:?}"
+        );
+        let (capability, dropped, deleted) = rollback_capability();
+        let running = test_creator_rollback_authority(42, capability)
+            .process_created()
+            .resume_attempted();
+        drop(running);
+        assert_eq!(dropped.get(), 1);
+        assert!(!deleted.get(), "indeterminate observation deleted storage");
+    }
+}
+
+fn adoption_receipt_case(
+    bytes: Vec<u8>,
+    remaining: Vec<Duration>,
+    polls: Vec<PollStep>,
+    generation: u32,
+    nonce: [u8; 16],
+) -> Result<moor::runtime::private::AdoptionReceiptAccepted, AdoptionReceiptError> {
+    let mut input = Cursor::new(bytes);
+    let mut remaining = VecDeque::from(remaining);
+    let mut polls = VecDeque::from(polls);
+    read_adoption_receipt_with(
+        &mut input,
+        || remaining.pop_front().unwrap_or(Duration::from_secs(1)),
+        |_| match polls.pop_front().unwrap_or(PollStep::Eof) {
+            PollStep::Available(count) => Ok(Some(count)),
+            PollStep::Eof => Ok(None),
+            PollStep::Error => Err(io::Error::other("injected poll failure")),
+        },
+        generation,
+        nonce,
+    )
+}
+
+#[test]
+fn launch_transaction_receipt_is_exact_deadline_bound_and_gates_continuation() {
+    let nonce = [0x5a; 16];
+    let receipt = adoption_receipt(42, nonce).unwrap();
+    let mut expected = [0; 32];
+    expected[..8].copy_from_slice(b"MOORACK1");
+    expected[8] = 1;
+    expected[12..16].copy_from_slice(&42u32.to_le_bytes());
+    expected[16..].copy_from_slice(&nonce);
+    assert_eq!(receipt, expected);
+
+    let accepted = adoption_receipt_case(
+        receipt.to_vec(),
+        vec![],
+        vec![PollStep::Available(32), PollStep::Eof],
+        42,
+        nonce,
+    )
+    .unwrap();
+    let initialized = Rc::new(Cell::new(false));
+    let launched = Rc::new(Cell::new(false));
+    accepted.continue_holder({
+        let initialized = initialized.clone();
+        let launched = launched.clone();
+        move || {
+            initialized.set(true);
+            launched.set(true);
+        }
+    });
+    assert!(initialized.get() && launched.get());
+
+    for length in 0..32 {
+        let polls = if length == 0 {
+            vec![PollStep::Eof]
+        } else {
+            vec![PollStep::Available(length), PollStep::Eof]
+        };
+        assert_eq!(
+            adoption_receipt_case(receipt[..length].to_vec(), vec![], polls, 42, nonce)
+                .unwrap_err(),
+            AdoptionReceiptError::WrongLength,
+            "accepted EOF after {length} acknowledgement bytes"
+        );
+    }
+
+    let mut long = receipt.to_vec();
+    long.push(0xaa);
+    assert_eq!(
+        adoption_receipt_case(long, vec![], vec![PollStep::Available(33)], 42, nonce,).unwrap_err(),
+        AdoptionReceiptError::WrongLength
+    );
+
+    for index in 0..32 {
+        let mut malformed = receipt;
+        malformed[index] ^= 0xff;
+        assert_eq!(
+            adoption_receipt_case(
+                malformed.to_vec(),
+                vec![],
+                vec![PollStep::Available(32), PollStep::Eof],
+                42,
+                nonce,
+            )
+            .unwrap_err(),
+            AdoptionReceiptError::Malformed,
+            "accepted acknowledgement corruption at byte {index}"
+        );
+    }
+
+    assert_eq!(
+        adoption_receipt_case(
+            receipt.to_vec(),
+            vec![Duration::from_secs(1), Duration::ZERO],
+            vec![PollStep::Available(32)],
+            42,
+            nonce,
+        )
+        .unwrap_err(),
+        AdoptionReceiptError::Timeout,
+        "exact bytes without EOF did not time out"
+    );
+    assert_eq!(
+        adoption_receipt_case(
+            receipt.to_vec(),
+            vec![Duration::from_secs(1), Duration::ZERO],
+            vec![PollStep::Available(32), PollStep::Eof],
+            42,
+            nonce,
+        )
+        .unwrap_err(),
+        AdoptionReceiptError::Timeout,
+        "late EOF was accepted"
+    );
+    assert_eq!(
+        adoption_receipt_case(vec![], vec![], vec![PollStep::Error], 42, nonce).unwrap_err(),
+        AdoptionReceiptError::IoError
+    );
+
+    struct ReadFailure;
+    impl Read for ReadFailure {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected receipt read failure"))
+        }
+    }
+    assert_eq!(
+        read_adoption_receipt_with(
+            &mut ReadFailure,
+            || Duration::from_secs(1),
+            |_| Ok(Some(1)),
+            42,
+            nonce,
+        )
+        .unwrap_err(),
+        AdoptionReceiptError::IoError
+    );
+
+    let initialized = Rc::new(Cell::new(false));
+    let launched = Rc::new(Cell::new(false));
+    let invalid = adoption_receipt_case(
+        receipt[..31].to_vec(),
+        vec![],
+        vec![PollStep::Available(31), PollStep::Eof],
+        42,
+        nonce,
+    );
+    if let Ok(accepted) = invalid {
+        accepted.continue_holder({
+            let initialized = initialized.clone();
+            let launched = launched.clone();
+            move || {
+                initialized.set(true);
+                launched.set(true);
+            }
+        });
+    }
+    assert!(!initialized.get() && !launched.get());
 }
 
 #[test]

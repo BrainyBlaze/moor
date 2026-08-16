@@ -1155,3 +1155,10 @@ fn contended_reads_through_a_duplicated_handle_cannot_disturb_the_writer() {
     drop(store);
     fs::remove_dir_all(path).unwrap();
 }
+
+#[cfg(windows)]
+mod windows_prepared_store {
+    use super::*;
+
+    include!("unit/windows_launch.rs");
+}

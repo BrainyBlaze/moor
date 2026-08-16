@@ -551,7 +551,9 @@ fn holder(
     let mut handled = 0;
     let (mut state, running, early) = match holder_setup(&mut config, |generation| {
         ready.generation = generation;
-        ready.notice(1, 0);
+        ready
+            .notice(1, 0)
+            .map_err(|error| SetupError(error.to_string(), false))
     }) {
         Ok(setup) => setup,
         Err(SetupError(error, child)) => {
@@ -561,7 +563,7 @@ fn holder(
             } else if ready.output.is_some() {
                 eprintln!("{}: {error}", name::program(invoked));
             }
-            ready.notice(3, status);
+            let _ = ready.notice(3, status);
             return if child { Ok(127) } else { Err(error) };
         }
     };
@@ -585,7 +587,7 @@ fn holder(
         }
     };
     config.retain_artifacts();
-    ready.notice(2, 0);
+    let _ = ready.notice(2, 0);
     if daemon {
         let null = OpenOptions::new()
             .read(true)
@@ -644,7 +646,7 @@ fn finalize_unpublished_exit(
         "{}: child exited before session publication",
         name::program(config.invoked)
     );
-    ready.notice(3, 1);
+    let _ = ready.notice(3, 1);
     Ok(1)
 }
 
@@ -677,7 +679,7 @@ fn abort_unpublished(
     if diagnose && ready.output.is_some() {
         eprintln!("{}: {error}", name::program(config.invoked));
     }
-    ready.notice(3, 1);
+    let _ = ready.notice(3, 1);
     Err(error)
 }
 
@@ -804,7 +806,7 @@ fn enter_directory(directory: &Path) -> std::result::Result<OwnedFd, SetupError>
 
 fn holder_setup(
     config: &mut Config<'_>,
-    mut adopt: impl FnMut(u32),
+    mut adopt: impl FnMut(u32) -> std::result::Result<(), SetupError>,
 ) -> std::result::Result<(Runtime<UnixNative>, String, Option<NativeExit>), SetupError> {
     let (path, options, invoked) = (config.path, config.options, config.invoked);
     let generation = config.launch.generation;
@@ -906,7 +908,7 @@ fn holder_setup(
                 .map_err(|error| format!("store lease failed: {error:?}"))
         })
         .transpose()?;
-    adopt(generation);
+    adopt(generation)?;
     let mut initial = vec![InitialStore(
         &config.lifecycle,
         &lifecycle_store,

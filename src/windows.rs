@@ -1988,7 +1988,7 @@ mod native {
             let staged_identity = self.stage.as_ref().unwrap().identity;
             self.prepare_storage(staged_identity)?;
             self.prepublication_alive()?;
-            self.ready.notice(1, 0);
+            self.ready.notice(1, 0).map_err(|error| error.to_string())?;
             publish_marker_stage(
                 self.stage.as_ref().unwrap(),
                 &self.marker,
@@ -3224,7 +3224,7 @@ mod native {
         runtime.set_geometry(geometry.0, geometry.1);
         let Some(NativeExit::Code(code)) = runtime.drive(
             |pending, overflow| {
-                ready.notice(2, 0);
+                let _ = ready.notice(2, 0);
                 while let Ok((exhausted, client)) = clients.try_recv() {
                     if exhausted {
                         overflow_authenticating = false;
@@ -3331,7 +3331,7 @@ mod native {
             "{}: child exited before session publication",
             name::program(invoked)
         );
-        ready.notice(3, 1);
+        let _ = ready.notice(3, 1);
         Ok(1)
     }
 
@@ -3470,7 +3470,7 @@ mod native {
                             .identity;
                         if let Err(error) = host.prepare_storage(marker_identity) {
                             host.rollback_unpublished();
-                            host.ready.notice(3, 1);
+                            let _ = host.ready.notice(3, 1);
                             return Err(error.into());
                         }
                     }
@@ -3482,7 +3482,7 @@ mod native {
                 } else {
                     1
                 };
-                host.ready.notice(3, result);
+                let _ = host.ready.notice(3, result);
                 return if result == 127 {
                     // 127 returns Ok, bypassing the common run()->report()
                     // layer, so this path owns its single diagnostic.

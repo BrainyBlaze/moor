@@ -21,6 +21,7 @@ use moor::runtime::private::{
 use moor::store::{Commit, Kind};
 use moor::windows::Marker;
 use moor::wire::crc32c;
+use std::io::{self, Write};
 
 fn hex(s: &str) -> Vec<u8> {
     let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
@@ -2887,8 +2888,8 @@ fn v31_reporter_emits_the_success_sequence_and_never_fails_after_ready() {
             output: Some(&mut sink),
             generation: 7,
         };
-        reporter.notice(1, 0);
-        reporter.notice(2, 0);
+        reporter.notice(1, 0).unwrap();
+        reporter.notice(2, 0).unwrap();
         // Drop runs here: it reports loss, which must NOT follow ready.
     }
     let mut expected = hex(V31_ADOPTED);
@@ -2920,7 +2921,7 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
             output: Some(&mut after),
             generation: 7,
         };
-        reporter.notice(1, 0);
+        reporter.notice(1, 0).unwrap();
     }
     let mut expected = hex(V31_ADOPTED);
     expected.extend_from_slice(&loss);
@@ -2930,6 +2931,76 @@ fn v31_reporter_reports_loss_before_and_after_adoption() {
         Some((3, 1, 7)),
         "the reported loss is not a decodable failed record"
     );
+}
+
+struct AdoptionPrefixThenError {
+    remaining: usize,
+    bytes: Vec<u8>,
+}
+
+impl Write for AdoptionPrefixThenError {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::other("injected adoption report failure"));
+        }
+        let written = self.remaining.min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..written]);
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn v31_launch_transaction_poisoned_adoption_never_appends_failure_or_continues() {
+    let adopted = hex(V31_ADOPTED);
+    let failed = hex(V31_FAILED);
+    for prefix in 1..12 {
+        let mut writer = AdoptionPrefixThenError {
+            remaining: prefix,
+            bytes: Vec::new(),
+        };
+        let mut continued_to_ready = false;
+        let mut launched_requested_child = false;
+        {
+            let mut reporter = moor::runtime::private::LaunchReporter {
+                output: Some(&mut writer),
+                generation: 7,
+            };
+            let reported = reporter.notice(1, 0);
+            if reported.is_ok() {
+                continued_to_ready = true;
+                launched_requested_child = true;
+                reporter.notice(2, 0).unwrap();
+            }
+            // Drop must not append state 3 after write_all accepted a prefix
+            // and then failed.
+        }
+        assert!(!continued_to_ready, "prefix {prefix} reached ready");
+        assert!(
+            !launched_requested_child,
+            "prefix {prefix} reached requested-child launch"
+        );
+        assert_eq!(writer.bytes, adopted[..prefix], "prefix {prefix}");
+
+        if prefix == 8 {
+            let mut historical_splice = writer.bytes.clone();
+            historical_splice.extend_from_slice(&failed);
+            assert_eq!(
+                moor::runtime::private::decode_launch_result(&historical_splice[..12]),
+                Some((1, 0, 0x5252_4f4d)),
+                "the causal state-1/state-3 splice fixture stopped being valid"
+            );
+            assert_eq!(
+                writer.bytes.len(),
+                8,
+                "poisoned Drop appended the state-3 splice suffix"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------- V26 ----
