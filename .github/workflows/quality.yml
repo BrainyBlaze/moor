@@ -91,6 +91,34 @@ jobs:
           test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "moor") | .targets[] | select(.kind == ["bin"]) | .name')" = moor
           cargo build --release --bin moor
 
+  in-progress-artifact-canary:
+    name: In-progress artifact download canary
+    if: github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Create fixed canary bytes
+        run: printf '%s\n' 'moor-in-progress-artifact-v1' > in-progress-artifact-canary.txt
+      - name: Upload and finalize the canary artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: in-progress-artifact-canary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: in-progress-artifact-canary.txt
+          if-no-files-found: error
+          retention-days: 1
+      - name: Hold the run open for authenticated download proof
+        run: |
+          echo "artifact-id=${{ steps.upload.outputs.artifact-id }}"
+          echo "artifact-digest=${{ steps.upload.outputs.artifact-digest }}"
+          for second in $(seq 1 180); do
+            echo "canary-wait=$second"
+            sleep 1
+          done
+
   production-loc:
     name: Production source report
     runs-on: ubuntu-22.04
