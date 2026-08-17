@@ -246,6 +246,11 @@ def main():
         promotion.index("- name: Open the run-bound immutable-settings attestation gate") :
         promotion.index("- name: Create or verify the exact tag and draft release")
     ]
+    require(
+        attestation_step,
+        "QA run/attempt/artifact:",
+        "promotion gate-ready QA tuple disclosure",
+    )
     ordered(
         attestation_step,
         [

@@ -305,6 +305,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ATTESTATION_ISSUE_NUMBER: ${{ inputs.attestation_issue_number }}
           ATTESTATION_NONCE: ${{ inputs.attestation_nonce }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
         run: |
           case "$ATTESTATION_ISSUE_NUMBER" in ''|*[!0-9]*|0) exit 1 ;; esac
           test "${#ATTESTATION_NONCE}" = 64
@@ -321,12 +324,13 @@ jobs:
           ' promotion-run.json >/dev/null
           GATE_READY_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "GATE_READY_AT=$GATE_READY_AT" >> "$GITHUB_ENV"
-          echo "::notice title=Immutable-settings attestation gate ready::repository=${{ github.repository }} run=${{ github.run_id }}/${{ github.run_attempt }} nonce=$ATTESTATION_NONCE gateReadyAt=$GATE_READY_AT"
+          echo "::notice title=Immutable-settings attestation gate ready::repository=${{ github.repository }} run=${{ github.run_id }}/${{ github.run_attempt }} qa=$QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID nonce=$ATTESTATION_NONCE gateReadyAt=$GATE_READY_AT"
           {
             echo "## Immutable-settings admin attestation required"
             echo "- repository: \`${{ github.repository }}\`"
             echo "- promotion run/attempt: \`${{ github.run_id }}/${{ github.run_attempt }}\`"
             echo "- protected-main SHA: \`${{ github.sha }}\`"
+            echo "- QA run/attempt/artifact: \`$QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID\`"
             echo "- issue: \`$ATTESTATION_ISSUE_NUMBER\`"
             echo "- nonce: \`$ATTESTATION_NONCE\`"
             echo "- gate ready at: \`$GATE_READY_AT\`"
