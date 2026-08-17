@@ -42,6 +42,7 @@ env:
 jobs:
   validate:
     name: Validate candidate identity
+    if: github.run_attempt == 1
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -74,6 +75,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
+    if: github.run_attempt == 1
     needs: validate
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -207,6 +209,7 @@ jobs:
 
   verify:
     name: Verify ${{ matrix.target }} / ${{ matrix.gate }} / ${{ matrix.lane }}
+    if: github.run_attempt == 1
     needs: [validate, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -426,6 +429,7 @@ jobs:
 
   compat-alpine:
     name: Compatibility ${{ matrix.target }} / ${{ matrix.lane }}
+    if: github.run_attempt == 1
     needs: [validate, build]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -550,7 +554,8 @@ jobs:
     needs: [validate, build, verify, compat-alpine]
     # Everything mandatory must have succeeded outright.
     if: >-
-      always()
+      github.run_attempt == 1
+      && always()
       && needs.validate.result == 'success'
       && needs.build.result == 'success'
       && needs.verify.result == 'success'

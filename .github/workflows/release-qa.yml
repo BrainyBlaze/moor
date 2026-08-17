@@ -52,7 +52,7 @@ concurrency:
 jobs:
   record:
     name: Bind full manual QA to immutable candidate bytes
-    if: github.ref == 'refs/heads/main' && github.ref_protected
+    if: github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1
     environment: release
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -155,7 +155,10 @@ jobs:
             test "$(sha256sum "candidate-assets/$asset" | cut -d' ' -f1)" = "$sha"
           done
           (cd candidate-assets && sha256sum --check --strict ../candidate-metadata/SHA256SUMS)
-          test "$(candidate-assets/moor-0.1.0-linux-x64 --version)" = "moor-0.1.0-linux-x64 0.1.0"
+          VERSION="$(jq -r '.version | ltrimstr("v")' candidate-metadata/moor-release-manifest-v1.json)"
+          ASSET="$(jq -r '.targets["x86_64-unknown-linux-musl"].asset' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          test "$("candidate-assets/$ASSET" --version)" = "$ASSET $VERSION"
 
       - name: Authenticate the exact hosted candidate-QA evidence artifact
         env:
@@ -265,6 +268,8 @@ jobs:
             --candidate-qa-run-id "$CANDIDATE_QA_RUN_ID"
             --candidate-qa-run-attempt "$CANDIDATE_QA_RUN_ATTEMPT"
             --candidate-qa-evidence-artifact-id "$CANDIDATE_QA_EVIDENCE_ID"
+            --qa-run-id "${{ github.run_id }}"
+            --qa-run-attempt "${{ github.run_attempt }}"
             --desk-commit "$(jq -r .candidateQa.deskCommit candidate-qa-evidence/manual-qa-evidence.json)"
             --evidence-file approval/manual-qa-evidence.txt
             --evidence-url "$EVIDENCE_URL"

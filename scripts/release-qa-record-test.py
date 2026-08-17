@@ -28,6 +28,8 @@ RECORD_ID = "701"
 CANDIDATE_QA_RUN_ID = "800"
 CANDIDATE_QA_RUN_ATTEMPT = "1"
 CANDIDATE_QA_EVIDENCE_ID = "801"
+QA_RUN_ID = "900"
+QA_RUN_ATTEMPT = "1"
 DESK_COMMIT = "b" * 40
 APPROVED_BY = "levi770"
 APPROVED_ASSOCIATION = "MEMBER"
@@ -223,6 +225,10 @@ def command(fixture, verb):
         CANDIDATE_QA_RUN_ATTEMPT,
         "--candidate-qa-evidence-artifact-id",
         CANDIDATE_QA_EVIDENCE_ID,
+        "--qa-run-id",
+        QA_RUN_ID,
+        "--qa-run-attempt",
+        QA_RUN_ATTEMPT,
         "--desk-commit",
         DESK_COMMIT,
         "--evidence-file",
@@ -296,6 +302,7 @@ def main():
             "commit",
             "candidate",
             "candidateQa",
+            "qaRun",
             "coverage",
             "targets",
             "manualQa",
@@ -308,6 +315,10 @@ def main():
             "evidenceArtifactId": CANDIDATE_QA_EVIDENCE_ID,
             "evidenceArtifactName": "moor-release-candidate-qa-evidence",
             "deskCommit": DESK_COMMIT,
+        }
+        assert qa["qaRun"] == {
+            "workflowRunId": QA_RUN_ID,
+            "workflowRunAttempt": 1,
         }
         assert qa["candidate"]["manifestSha256"] == hashlib.sha256(
             open(fixture["manifest_path"], "rb").read()
@@ -418,9 +429,10 @@ def main():
     expect_reject("wrong metadata artifact input", metadata_artifact_id="999")
     expect_reject("wrong record artifact input", candidate_record_artifact_id="999")
     expect_reject("wrong candidate QA run input", candidate_qa_run_id="999")
+    expect_reject("QA rerun attempt", qa_run_attempt="2")
     expect_reject("wrong Desk commit input", desk_commit="c" * 40)
 
-    print("release QA record tests: deterministic acceptance and 22 rejection cases passed")
+    print("release QA record tests: deterministic acceptance and 23 rejection cases passed")
 
 
 if __name__ == "__main__":

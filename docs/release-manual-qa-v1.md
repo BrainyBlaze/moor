@@ -168,6 +168,9 @@ exactly:
 - `manual-qa-evidence.txt`.
 
 Record the resulting QA run ID, attempt `1`, and immutable QA artifact ID.
+The canonical QA record embeds that same run ID and attempt; promotion requires
+both embedded values to equal its dispatched QA run inputs before reconstructing
+and accepting the record.
 
 Dispatch `release-promote.yml` with those three values. Promotion re-fetches
 the QA artifact and evidence comment, re-downloads the candidate artifacts by
@@ -201,8 +204,10 @@ and validates all four immediately before publication and immediately after
 publication. Its explicit concurrency group prevents two promotion runs, but
 trusted repository administrators remain able to mutate repository state in
 the API interval. The release transaction assumes those trusted repository
-administrators do not race it; either surrounding check detecting a mutation
-fails closed.
+administrators do not race it. The prepublication check detects a mutation
+before publication and fails closed.
+A postpublication mismatch instead reports an irreversible publication failure
+after the release has become immutable; it cannot roll back or repair that release.
 
 Publication is followed in the same delivery sweep by Desk’s pin schema 3 PR.
 That PR copies the manifest’s full-matrix coverage and four target tuples

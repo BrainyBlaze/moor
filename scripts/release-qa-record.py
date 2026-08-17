@@ -354,6 +354,12 @@ def build_record(args):
     candidate_qa_evidence_id = decimal(
         args.candidate_qa_evidence_artifact_id, "candidate-QA evidence artifact ID"
     )
+    qa_run_id = decimal(args.qa_run_id, "QA run ID")
+    if not DECIMAL.fullmatch(args.qa_run_attempt):
+        reject("QA run attempt is not a nonzero decimal string")
+    qa_run_attempt = positive_int(int(args.qa_run_attempt), "QA run attempt")
+    if qa_run_attempt != 1:
+        reject("release QA v1 accepts only QA producer attempt 1")
     if not HEX40.fullmatch(args.desk_commit):
         reject("Desk commit is not 40 lowercase hex")
     manifest, manifest_body = read_json(args.manifest, "manifest", require_canonical=True)
@@ -435,6 +441,10 @@ def build_record(args):
             "evidenceArtifactName": "moor-release-candidate-qa-evidence",
             "deskCommit": args.desk_commit,
         },
+        "qaRun": {
+            "workflowRunId": qa_run_id,
+            "workflowRunAttempt": qa_run_attempt,
+        },
         "coverage": manifest["coverage"],
         "targets": targets,
         "manualQa": {
@@ -471,6 +481,8 @@ def parser():
         command.add_argument("--candidate-qa-run-id", required=True)
         command.add_argument("--candidate-qa-run-attempt", required=True)
         command.add_argument("--candidate-qa-evidence-artifact-id", required=True)
+        command.add_argument("--qa-run-id", required=True)
+        command.add_argument("--qa-run-attempt", required=True)
         command.add_argument("--desk-commit", required=True)
         command.add_argument("--evidence-file", required=True)
         command.add_argument("--evidence-url", required=True)

@@ -306,8 +306,10 @@ jobs:
           npm run fetch:moor
           ASSET="$(jq -r --arg target "$TARGET" '.targets[$target].asset' \
             ../candidate-metadata/moor-release-manifest-v1.json)"
+          EXPECTED_VERSION="$(jq -r '.version | ltrimstr("v")' \
+            ../candidate-metadata/moor-release-manifest-v1.json)"
           cmp "../candidate-assets/$ASSET" libexec/moor
-          test "$(./libexec/moor --version)" = "moor 0.1.0"
+          test "$(./libexec/moor --version)" = "moor $EXPECTED_VERSION"
 
       - name: Type-check the exact Desk tree
         working-directory: desk

@@ -315,7 +315,8 @@ with a URL from that exact candidate-QA run for each. The read-only QA workflow
 snapshots that comment and emits a canonical
 `moor-release-qa-v1.json` which binds the source commit, run/attempt, metadata
 and candidate-record artifact IDs, candidate-QA run/attempt, evidence artifact
-ID/name, exact Desk commit, every target's artifact ID/name/size/hash, the
+ID/name, exact Desk commit, the QA producer run/attempt, every target's
+artifact ID/name/size/hash, the
 platform/checklist verdicts, approver, approval time, evidence URL/comment ID,
 and the exact evidence-body size and SHA-256. Promotion reconstructs that record
 from freshly retrieved candidate, candidate-QA artifact, and comment bytes and

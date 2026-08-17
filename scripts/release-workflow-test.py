@@ -38,12 +38,17 @@ def pinned_actions(text, what):
 
 
 def main():
+    candidate = read(".github/workflows/release-candidate.yml")
     candidate_qa = read(".github/workflows/release-candidate-qa.yml")
     qa = read(".github/workflows/release-qa.yml")
     promotion = read(".github/workflows/release-promote.yml")
     quality = read(".github/workflows/quality.yml")
     guide = read("docs/release-manual-qa-v1.md")
     manifest_contract = read("docs/release-manifest-v1.md")
+
+    assert candidate.count("github.run_attempt == 1") == 5, (
+        "candidate immutable producer attempt: every job must reject reruns"
+    )
 
     require(candidate_qa, "workflow_dispatch:", "candidate QA workflow")
     for name in (
@@ -72,6 +77,7 @@ def main():
     require(candidate_qa, "DESK_MOOR_RELEASE_BASE_URL", "candidate QA local candidate origin")
     require(candidate_qa, "npm run fetch:moor", "candidate QA installer path")
     require(candidate_qa, "DESK_MOOR_NATIVE_BIN", "candidate QA exact holder path")
+    forbid(candidate_qa, '"moor 0.1.0"', "candidate QA manifest-derived version")
     for suite in (
         "tests/moor-native-e2e.test.ts",
         "tests/restore-attach-retention.test.ts",
@@ -108,12 +114,20 @@ def main():
     require(qa, "environment: release", "QA environment")
     require(qa, "github.ref == 'refs/heads/main'", "QA main gate")
     require(qa, "github.ref_protected", "QA protected-ref gate")
+    require(
+        qa,
+        "if: github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1",
+        "QA immutable producer attempt",
+    )
+    require(qa, '--qa-run-id "${{ github.run_id }}"', "QA record producer run binding")
+    require(qa, '--qa-run-attempt "${{ github.run_attempt }}"', "QA record producer attempt binding")
     require(qa, "actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT", "QA run identity")
     require(qa, "actions/artifacts/$METADATA_ID", "QA metadata by ID")
     require(qa, "actions/artifacts/$RECORD_ID", "QA record by ID")
     require(qa, "actions/runs/$QA_RUN_ID/attempts/$QA_RUN_ATTEMPT", "QA candidate-QA run identity")
     require(qa, "actions/artifacts/$EVIDENCE_ARTIFACT_ID", "QA evidence by ID")
     require(qa, 'path == ".github/workflows/release-candidate-qa.yml"', "QA candidate-QA workflow")
+    forbid(qa, "moor-0.1.0-linux-x64", "QA manifest-derived binary smoke")
     require(qa, "moor-release-candidate-qa-evidence", "QA evidence artifact name")
     require(qa, "candidate-qa-evidence/manual-qa-evidence.json", "QA evidence artifact bytes")
     require(qa, "--candidate-qa-run-id", "QA record candidate-QA binding")
@@ -147,6 +161,9 @@ def main():
     require(promotion, 'path == ".github/workflows/release-candidate-qa.yml"', "promotion candidate-QA workflow")
     require(promotion, "moor-release-candidate-qa-evidence", "promotion evidence artifact name")
     require(promotion, "candidate-qa-evidence/manual-qa-evidence.json", "promotion evidence artifact bytes")
+    require(promotion, ".qaRun.workflowRunId == $run", "promotion QA producer run binding")
+    require(promotion, ".qaRun.workflowRunAttempt == $attempt", "promotion QA producer attempt binding")
+    require(promotion, ".qaRun.workflowRunId", "promotion QA record reconstruction")
     require(promotion, "release-qa-record.py verify", "promotion QA verification")
     require(promotion, "release-asset-transaction.py plan", "promotion asset planner")
     require(promotion, "release-asset-transaction.py verify-complete", "promotion asset verifier")
@@ -234,8 +251,14 @@ def main():
     require(guide, "never rebuilds or overwrites", "promotion boundary")
     require(guide, "single permitted deletion", "promotion starter exception")
     require(guide, "trusted repository administrators", "promotion trusted-admin boundary")
+    require(
+        guide,
+        "A postpublication mismatch instead reports an irreversible publication failure",
+        "postpublication detection semantics",
+    )
     require(manifest_contract, "moor-release-qa-v1.json", "manifest QA record contract")
     require(manifest_contract, "candidate-QA evidence artifact", "manifest candidate-QA contract")
+    require(manifest_contract, "QA producer run/attempt", "manifest QA producer identity")
     require(manifest_contract, "repository `admin` permission", "manifest evidence authority")
     require(manifest_contract, "`starter`", "manifest starter exception")
     require(manifest_contract, "pin schema version is `3`", "manifest Desk pin schema")

@@ -79,6 +79,10 @@ jobs:
           python3 scripts/candidate-verify.py zip-inventory qa.zip moor-release-qa-v1.json manual-qa-evidence.txt
           mkdir approval
           (cd approval && unzip -q ../qa.zip)
+          jq -e --arg run "$QA_RUN_ID" --argjson attempt "$QA_RUN_ATTEMPT" '
+            .qaRun.workflowRunId == $run
+            and .qaRun.workflowRunAttempt == $attempt
+          ' approval/moor-release-qa-v1.json >/dev/null
 
       - name: Re-download candidate metadata and record by QA-bound IDs
         env:
@@ -219,6 +223,8 @@ jobs:
             --candidate-qa-run-id "$(jq -r .candidateQa.workflowRunId approval/moor-release-qa-v1.json)"
             --candidate-qa-run-attempt "$(jq -r .candidateQa.workflowRunAttempt approval/moor-release-qa-v1.json)"
             --candidate-qa-evidence-artifact-id "$(jq -r .candidateQa.evidenceArtifactId approval/moor-release-qa-v1.json)"
+            --qa-run-id "$(jq -r .qaRun.workflowRunId approval/moor-release-qa-v1.json)"
+            --qa-run-attempt "$(jq -r .qaRun.workflowRunAttempt approval/moor-release-qa-v1.json)"
             --desk-commit "$(jq -r .candidateQa.deskCommit approval/moor-release-qa-v1.json)"
             --evidence-file approval/manual-qa-evidence.txt
             --evidence-url "$(jq -r .html_url evidence-comment.json)"
