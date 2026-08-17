@@ -5,6 +5,7 @@ import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DESK_RELEASE_QA_COMMIT = "d0916974cb48f8c8b41147bed4e0e236cae89ca8"
 
 
 def read(relative):
@@ -56,9 +57,13 @@ def main():
         "candidate_run_attempt",
         "metadata_artifact_id",
         "candidate_record_artifact_id",
-        "desk_commit",
     ):
         require(candidate_qa, name, "candidate QA inputs")
+    forbid(candidate_qa, "inputs.desk_commit", "candidate QA protected Desk pin")
+    forbid(candidate_qa, "desk_commit:", "candidate QA dispatch inputs")
+    assert candidate_qa.count(f"DESK_COMMIT: {DESK_RELEASE_QA_COMMIT}") == 1, (
+        "candidate QA must define the exact reviewed Desk commit once in protected workflow bytes"
+    )
     require(candidate_qa, "actions: read", "candidate QA permissions")
     require(candidate_qa, "contents: read", "candidate QA permissions")
     forbid(candidate_qa, "contents: write", "candidate QA permissions")
@@ -71,7 +76,7 @@ def main():
     require(candidate_qa, "actions/artifacts/$RECORD_ID", "candidate QA record by ID")
     require(candidate_qa, "actions/artifacts/$ARTIFACT_ID", "candidate QA binary by ID")
     require(candidate_qa, "repository: BrainyBlaze/desk", "candidate QA Desk checkout")
-    require(candidate_qa, "ref: ${{ inputs.desk_commit }}", "candidate QA exact Desk commit")
+    require(candidate_qa, "ref: ${{ env.DESK_COMMIT }}", "candidate QA exact Desk commit")
     require(candidate_qa, "git -C desk rev-parse HEAD", "candidate QA checked-out Desk identity")
     require(candidate_qa, "scripts/project-moor-pin.mjs", "candidate QA pin projection")
     require(candidate_qa, "DESK_MOOR_RELEASE_BASE_URL", "candidate QA local candidate origin")

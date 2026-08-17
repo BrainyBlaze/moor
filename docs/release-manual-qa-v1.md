@@ -52,11 +52,14 @@ The four platform verdicts, in this exact order, are:
 4. `aarch64-apple-darwin`
 
 Dispatch `release-candidate-qa.yml` from protected Moor `main` with the exact
-candidate run/attempt, metadata and candidate-record artifact IDs, and the
-exact reviewed Desk commit. The workflow checks out that Desk SHA, projects the
-candidate manifest into Desk pin schema 3, exercises `fetch:moor` against the
-downloaded candidate asset without rebuilding it, and runs the product suites
-on `ubuntu-22.04`, `ubuntu-24.04-arm`, `macos-15-intel`, and `macos-15`.
+candidate run/attempt and metadata and candidate-record artifact IDs. The exact
+reviewed Desk commit is pinned in the protected workflow rather than accepted
+as a dispatch input, so changing executable Desk bytes requires the same
+reviewed-main transaction as changing the release tooling. The workflow checks
+out that pinned Desk SHA, projects the candidate manifest into Desk pin schema
+3, exercises `fetch:moor` against the downloaded candidate asset without
+rebuilding it, and runs the product suites on `ubuntu-22.04`,
+`ubuntu-24.04-arm`, `macos-15-intel`, and `macos-15`.
 
 Each verdict must be `passed` and cite that exact hosted Moor candidate-QA
 Actions run or one of its job URLs. An unrelated Actions run, issue, pull

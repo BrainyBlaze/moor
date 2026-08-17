@@ -19,17 +19,16 @@ on:
         description: Immutable moor-release-candidate-record artifact ID
         required: true
         type: string
-      desk_commit:
-        description: Exact reviewed BrainyBlaze/desk commit used for product QA
-        required: true
-        type: string
 
 permissions:
   actions: read
   contents: read
 
+env:
+  DESK_COMMIT: d0916974cb48f8c8b41147bed4e0e236cae89ca8
+
 concurrency:
-  group: release-candidate-qa-${{ inputs.candidate_run_id }}-${{ inputs.desk_commit }}
+  group: release-candidate-qa-${{ inputs.candidate_run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -54,7 +53,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.candidate_run_id }}
           RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
-          DESK_COMMIT: ${{ inputs.desk_commit }}
         run: |
           test "${{ github.ref }}" = refs/heads/main
           test "${{ github.ref_protected }}" = true
@@ -173,13 +171,11 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: BrainyBlaze/desk
-          ref: ${{ inputs.desk_commit }}
+          ref: ${{ env.DESK_COMMIT }}
           path: desk
           persist-credentials: false
 
       - name: Verify the checked-out Desk identity
-        env:
-          DESK_COMMIT: ${{ inputs.desk_commit }}
         run: test "$(git -C desk rev-parse HEAD)" = "$DESK_COMMIT"
 
       - name: Install the frozen Desk Node runtime
@@ -412,7 +408,6 @@ jobs:
           RECORD_ID: ${{ inputs.candidate_record_artifact_id }}
           CANDIDATE_QA_RUN_ID: ${{ github.run_id }}
           CANDIDATE_QA_RUN_ATTEMPT: ${{ github.run_attempt }}
-          DESK_COMMIT: ${{ inputs.desk_commit }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir evidence
@@ -510,5 +505,5 @@ jobs:
           (cd evidence-roundtrip && unzip -q ../evidence.zip)
           cmp evidence/manual-qa-evidence.json evidence-roundtrip/manual-qa-evidence.json
           echo "Candidate-QA run: ${{ github.run_id }}/1" >> "$GITHUB_STEP_SUMMARY"
-          echo "Desk commit: ${{ inputs.desk_commit }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Desk commit: $DESK_COMMIT" >> "$GITHUB_STEP_SUMMARY"
           echo "Evidence artifact ID: $EVIDENCE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"

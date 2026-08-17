@@ -294,10 +294,11 @@ proposed `version`. It checks out that commit and performs this sequence:
    artifact ID in the workflow output and manual-QA record.
 
 Full manual QA downloads the metadata artifact and all four binary artifacts by
-those exact IDs. A four-host candidate-QA workflow checks out one exact reviewed
-Desk commit, projects the manifest into Desk's consumer pin, installs each
-native candidate through Desk's acquisition path, and runs the product suites
-without rebuilding Moor. Its candidate-QA evidence artifact records the
+those exact IDs. A four-host candidate-QA workflow checks out the exact reviewed
+Desk commit pinned in its protected workflow bytes (never a dispatch-selected
+revision), projects the manifest into Desk's consumer pin, installs each native
+candidate through Desk's acquisition path, and runs the product suites without
+rebuilding Moor. Its candidate-QA evidence artifact records the
 candidate identity, exact Desk commit, four green platform verdicts, and all
 checklist verdicts. The QA record identifies that run/attempt and immutable
 evidence artifact ID in addition to the repository, source commit, candidate
