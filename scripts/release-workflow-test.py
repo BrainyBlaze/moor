@@ -82,6 +82,7 @@ def main():
         require(candidate_qa, suite, "candidate QA integration suite")
     require(candidate_qa, "manual-qa-evidence.json", "candidate QA evidence artifact")
     require(candidate_qa, "moor-release-candidate-qa-evidence", "candidate QA evidence artifact")
+    forbid(candidate_qa, 'handle.write("\\n")', "candidate QA comment-stable evidence bytes")
     require(candidate_qa, "github.run_attempt == 1", "candidate QA immutable attempt")
     require(candidate_qa, 'path == ".github/workflows/release-candidate.yml"', "candidate QA source run")
     for command in ("npm run build:moor", "cargo build", "cargo install", "cargo package"):

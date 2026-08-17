@@ -476,7 +476,6 @@ jobs:
           }
           with open("evidence/manual-qa-evidence.json", "w", encoding="ascii", newline="\n") as handle:
               json.dump(evidence, handle, indent=2, ensure_ascii=True)
-              handle.write("\n")
           PY
 
       - name: Upload the candidate-QA evidence artifact
