@@ -5,7 +5,7 @@ import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DESK_RELEASE_QA_COMMIT = "d0916974cb48f8c8b41147bed4e0e236cae89ca8"
+DESK_RELEASE_QA_COMMIT = "14e727bafe11a41e87a81a068c3ecbd3151fd2c8"
 
 
 def read(relative):

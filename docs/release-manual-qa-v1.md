@@ -124,7 +124,7 @@ duplicate, failed, or reordered entries are rejected.
   "candidateQa": {
     "workflowRunId": "CANDIDATE_QA_RUN_ID",
     "workflowRunAttempt": 1,
-    "deskCommit": "d0916974cb48f8c8b41147bed4e0e236cae89ca8"
+    "deskCommit": "14e727bafe11a41e87a81a068c3ecbd3151fd2c8"
   },
   "platforms": [
     {"target": "x86_64-unknown-linux-musl", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
