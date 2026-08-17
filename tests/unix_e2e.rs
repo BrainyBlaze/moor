@@ -2050,13 +2050,28 @@ fn foreground_run_returns_the_child_status() {
 fn headless_child_gets_sane_default_geometry_and_termios() {
     let dir = temp();
     let socket = dir.join("terminal-defaults");
+    // The child must outlive session publication deterministically: a child
+    // that exits first is, by design, refused as "child exited before session
+    // publication", and the two `stty` calls finish in milliseconds. So the
+    // child prints its evidence and then waits for a release marker that this
+    // test creates only after `moor start` has reported publication. The
+    // marker path travels as a positional parameter, never as script bytes,
+    // and deliberately carries an apostrophe and a space so that any future
+    // interpolation into the script breaks this test instead of a TMPDIR.
+    let release = dir.join("release the child's marker");
     let output = moor(&[
         "start",
         socket.to_str().unwrap(),
         "/bin/sh",
         "-c",
-        "stty size; stty -a",
+        "stty size; stty -a; while [ ! -e \"$1\" ]; do sleep 0.02; done",
+        "sh",
+        release.to_str().unwrap(),
     ]);
+    // Release the child before judging the launch, so a failed launch that
+    // left the child alive cannot leak a shell spinning on a marker that this
+    // test would never write.
+    fs::write(&release, b"").unwrap();
     assert!(output.status.success(), "{output:?}");
     let until = Instant::now() + Duration::from_secs(5);
     while socket.exists() && Instant::now() < until {
