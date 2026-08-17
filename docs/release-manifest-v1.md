@@ -217,7 +217,7 @@ provenance fields are intentionally excluded from the consumer pin, but they
 must have been validated before the projection was made.
 
 `schemaVersion` is the one key the projection **sets** rather than copies: the
-manifest states `1`, its own schema, and the pin states `2`, the consumer
+manifest states `1`, its own schema, and the pin states `3`, the consumer
 schema described below. The two documents version independently, so copying
 that number would claim the pin is something it is not. Every other projected
 value — `repository`, `version`, `commit`, `coverage`, and each target's
@@ -238,17 +238,13 @@ next field added here into the pin, and the consumer rejects unknown keys, so
 the leak would surface as a fail-closed refusal at install time rather than at
 build time.
 
-The consumer's pin schema version is `2`. A pin at version `1` predates
+The consumer's pin schema version is `3`. A pin at version `1` predates
 `coverage` and is refused with a diagnostic that says so, rather than being
 read as fully covered — the whole point of carrying the field is defeated if a
-document that lacks it is treated as if it claimed completeness. A narrowed
-closure that names no lane is refused for the same reason: an assertion that
-cannot be checked is worse than none.
-
-Installing a narrowed candidate is then an explicit operator decision rather
-than a default. The consumer refuses a pin whose closure is not `"full-matrix"`
-unless the operator opts in, and the refusal names each unverified lane, so the
-decision is made against the facts instead of the label.
+document that lacks it is treated as if it claimed completeness. Every earlier
+schema is refused rather than upgraded in place. Schema 3 accepts exactly the
+ratified four-target matrix with `requiredClosure == "full-matrix"`; a narrowed
+closure is not a production-install option and must fail closed.
 
 Desk may exercise the pinned candidate bytes through an explicit candidate base
 URL during integration and manual QA. Its production default is enabled only
@@ -298,10 +294,34 @@ proposed `version`. It checks out that commit and performs this sequence:
    artifact ID in the workflow output and manual-QA record.
 
 Full manual QA downloads the metadata artifact and all four binary artifacts by
-those exact IDs. The QA record identifies the repository, source commit,
-candidate run and attempt, metadata artifact ID, four binary artifact IDs,
-sizes, and hashes. Testing a locally rebuilt binary, a same-named artifact, or
-bytes copied from another run does not satisfy the gate.
+those exact IDs. A four-host candidate-QA workflow checks out the exact reviewed
+Desk commit pinned in its protected workflow bytes (never a dispatch-selected
+revision), projects the manifest into Desk's consumer pin, installs each native
+candidate through Desk's acquisition path, and runs the product suites without
+rebuilding Moor. Its candidate-QA evidence artifact records the
+candidate identity, exact Desk commit, four green platform verdicts, and all
+checklist verdicts. The QA record identifies that run/attempt and immutable
+evidence artifact ID in addition to the repository, source commit, candidate
+run and attempt, metadata artifact ID, four binary artifact IDs, sizes, and
+hashes. Testing a locally rebuilt binary, a same-named artifact, or bytes copied
+from another run does not satisfy the gate.
+
+The exact evidence and record schema is defined by
+[`release-manual-qa-v1.md`](release-manual-qa-v1.md). The unedited evidence
+comment is posted by the QA actor while that actor has live repository `admin` permission;
+GitHub's author association is recorded but is not an authorization
+substitute. The comment is byte-identical to the candidate-QA evidence artifact
+and records `passed` verdicts for the four targets and every checklist item,
+with a URL from that exact candidate-QA run for each. The read-only QA workflow
+snapshots that comment and emits a canonical
+`moor-release-qa-v1.json` which binds the source commit, run/attempt, metadata
+and candidate-record artifact IDs, candidate-QA run/attempt, evidence artifact
+ID/name, exact Desk commit, the QA producer run/attempt, every target's
+artifact ID/name/size/hash, the
+platform/checklist verdicts, approver, approval time, evidence URL/comment ID,
+and the exact evidence-body size and SHA-256. Promotion reconstructs that record
+from freshly retrieved candidate, candidate-QA artifact, and comment bytes and
+requires exact byte equality with the approved QA artifact.
 
 ## Immutable promotion
 
@@ -327,6 +347,23 @@ Promotion must:
    to the GitHub Release for the exact `manifest.version` tag.
 7. Download the published release assets again and verify their byte length and
    SHA-256 before reporting promotion success.
+
+The implementation may use a draft release as its crash-resume boundary. A
+retry keeps an already-uploaded asset only after downloading it by asset ID and
+matching its exact expected size and digest; it uploads only missing final-name
+assets and never overwrites or substitutes one. The sole deletion exception is
+an expected-name asset in GitHub state `starter`, which denotes an interrupted
+upload rather than valid release bytes. The planner may request that cleanup
+only on the transaction-bound draft; immediately before deletion the workflow
+must freshly verify the same release ID and `draft == true`, then the same asset
+ID/name and `state == "starter"`. It replans from a fresh inventory afterward
+and permits at most two such deletions per name in one run. An uploaded asset,
+an unexpected name, or any asset on a published release is never deleted.
+Unexpected names, duplicate names or IDs, other states, conflicting bytes, or
+an exhausted starter bound fail closed. Only a complete six-asset draft (the
+four binaries plus the unchanged manifest and `SHA256SUMS`) may be published,
+and repository immutable releases must be enabled before the tag or draft is
+created.
 
 An expired or missing candidate artifact, an artifact ID/name/run mismatch, a
 changed byte, a non-green or missing provenance job, a tag/source mismatch, an

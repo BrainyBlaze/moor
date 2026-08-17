@@ -1,0 +1,509 @@
+name: Release candidate product QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Exact successful release-candidate run ID
+        required: true
+        type: string
+      candidate_run_attempt:
+        description: Exact candidate run attempt (v1 requires 1)
+        required: true
+        type: string
+      metadata_artifact_id:
+        description: Immutable moor-release-candidate-v1 artifact ID
+        required: true
+        type: string
+      candidate_record_artifact_id:
+        description: Immutable moor-release-candidate-record artifact ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  DESK_COMMIT: d0916974cb48f8c8b41147bed4e0e236cae89ca8
+
+concurrency:
+  group: release-candidate-qa-${{ inputs.candidate_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate candidate and Desk identities
+    if: github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1
+    environment: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Check out the protected Moor release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: moor-tooling
+          persist-credentials: false
+
+      - name: Verify the exact successful candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+        run: |
+          test "${{ github.ref }}" = refs/heads/main
+          test "${{ github.ref_protected }}" = true
+          test "${{ github.run_attempt }}" = 1
+          case "$RUN_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          test "$RUN_ATTEMPT" = 1
+          echo "$DESK_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" > candidate-run.json
+          jq -e --argjson id "$RUN_ID" '
+            .id == $id
+            and .run_attempt == 1
+            and .event == "workflow_dispatch"
+            and .status == "completed"
+            and .conclusion == "success"
+            and .head_branch == "main"
+            and .path == ".github/workflows/release-candidate.yml"
+            and (.head_sha | test("^[0-9a-f]{40}$"))
+          ' candidate-run.json >/dev/null
+
+      - name: Download and validate candidate metadata by immutable ID
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          METADATA_ID: ${{ inputs.metadata_artifact_id }}
+          RECORD_ID: ${{ inputs.candidate_record_artifact_id }}
+        run: |
+          case "$METADATA_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          case "$RECORD_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          COMMIT="$(jq -r .head_sha candidate-run.json)"
+
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID" > metadata-artifact.json
+          jq -e --argjson id "$METADATA_ID" --argjson run "$RUN_ID" --arg commit "$COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-v1"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' metadata-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID/zip" > metadata.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            metadata.zip moor-release-manifest-v1.json SHA256SUMS
+          mkdir candidate-metadata
+          (cd candidate-metadata && unzip -q ../metadata.zip)
+
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID" > record-artifact.json
+          jq -e --argjson id "$RECORD_ID" --argjson run "$RUN_ID" --arg commit "$COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-record"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' record-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID/zip" > record.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            record.zip moor-release-candidate-record.json
+          mkdir candidate-record
+          (cd candidate-record && unzip -q ../record.zip)
+
+          MOOR_TOOLING="$PWD/moor-tooling" METADATA_ID="$METADATA_ID" python3 - <<'PY'
+          import importlib.util
+          import os
+
+          path = os.path.join(os.environ["MOOR_TOOLING"], "scripts", "release-qa-record.py")
+          spec = importlib.util.spec_from_file_location("release_qa_record", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          manifest, _ = module.read_json(
+              "candidate-metadata/moor-release-manifest-v1.json", "manifest", require_canonical=True
+          )
+          module.validate_manifest(manifest)
+          record, _ = module.read_json(
+              "candidate-record/moor-release-candidate-record.json",
+              "candidate record",
+              require_canonical=True,
+          )
+          module.validate_candidate_record(record, manifest, os.environ["METADATA_ID"])
+          with open("candidate-metadata/SHA256SUMS", "rb") as handle:
+              module.validate_sums(handle.read(), manifest)
+          PY
+          jq -e --arg run "$RUN_ID" --arg commit "$COMMIT" '
+            .candidate.workflowRunId == $run
+            and .candidate.workflowRunAttempt == 1
+            and .commit == $commit
+          ' candidate-metadata/moor-release-manifest-v1.json >/dev/null
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version candidate-metadata/moor-release-manifest-v1.json)" >> "$GITHUB_OUTPUT"
+
+  product-qa:
+    name: Product QA ${{ matrix.target }}
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1
+    environment: release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - name: Check out the protected Moor release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: moor-tooling
+          persist-credentials: false
+
+      - name: Check out the exact reviewed Desk commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: BrainyBlaze/desk
+          ref: ${{ env.DESK_COMMIT }}
+          path: desk
+          persist-credentials: false
+
+      - name: Verify the checked-out Desk identity
+        run: test "$(git -C desk rev-parse HEAD)" = "$DESK_COMMIT"
+
+      - name: Install the frozen Desk Node runtime
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+
+      - name: Re-download the candidate metadata and binary by immutable ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          METADATA_ID: ${{ inputs.metadata_artifact_id }}
+          RECORD_ID: ${{ inputs.candidate_record_artifact_id }}
+          TARGET: ${{ matrix.target }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" > candidate-run.json
+          jq -e --argjson id "$RUN_ID" --arg commit "$EXPECTED_COMMIT" '
+            .id == $id
+            and .run_attempt == 1
+            and .status == "completed"
+            and .conclusion == "success"
+            and .head_sha == $commit
+            and .path == ".github/workflows/release-candidate.yml"
+          ' candidate-run.json >/dev/null
+
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID" > metadata-artifact.json
+          jq -e --argjson id "$METADATA_ID" --argjson run "$RUN_ID" --arg commit "$EXPECTED_COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-v1"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' metadata-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID/zip" > metadata.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            metadata.zip moor-release-manifest-v1.json SHA256SUMS
+          mkdir candidate-metadata
+          (cd candidate-metadata && unzip -q ../metadata.zip)
+
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID" > record-artifact.json
+          jq -e --argjson id "$RECORD_ID" --argjson run "$RUN_ID" --arg commit "$EXPECTED_COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-record"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' record-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID/zip" > record.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            record.zip moor-release-candidate-record.json
+          mkdir candidate-record
+          (cd candidate-record && unzip -q ../record.zip)
+
+          MOOR_TOOLING="$PWD/moor-tooling" METADATA_ID="$METADATA_ID" python3 - <<'PY'
+          import importlib.util
+          import os
+
+          path = os.path.join(os.environ["MOOR_TOOLING"], "scripts", "release-qa-record.py")
+          spec = importlib.util.spec_from_file_location("release_qa_record", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          manifest, _ = module.read_json(
+              "candidate-metadata/moor-release-manifest-v1.json", "manifest", require_canonical=True
+          )
+          module.validate_manifest(manifest)
+          record, _ = module.read_json(
+              "candidate-record/moor-release-candidate-record.json",
+              "candidate record",
+              require_canonical=True,
+          )
+          module.validate_candidate_record(record, manifest, os.environ["METADATA_ID"])
+          with open("candidate-metadata/SHA256SUMS", "rb") as handle:
+              module.validate_sums(handle.read(), manifest)
+          PY
+
+          ARTIFACT_ID="$(jq -r --arg target "$TARGET" '.targets[$target].artifactId' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          ARTIFACT_NAME="$(jq -r --arg target "$TARGET" '.targets[$target].artifactName' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          ASSET="$(jq -r --arg target "$TARGET" '.targets[$target].asset' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          SIZE="$(jq -r --arg target "$TARGET" '.targets[$target].size' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          SHA="$(jq -r --arg target "$TARGET" '.targets[$target].sha256' \
+            candidate-metadata/moor-release-manifest-v1.json)"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID" > binary-artifact.json
+          jq -e --argjson id "$ARTIFACT_ID" --argjson run "$RUN_ID" \
+            --arg name "$ARTIFACT_NAME" --arg commit "$EXPECTED_COMMIT" '
+              .id == $id
+              and .name == $name
+              and .expired == false
+              and .workflow_run.id == $run
+              and .workflow_run.head_sha == $commit
+            ' binary-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID/zip" > candidate.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory candidate.zip "$ASSET"
+          mkdir candidate-assets
+          (cd candidate-assets && unzip -q ../candidate.zip)
+          chmod +x "candidate-assets/$ASSET"
+          test "$(wc -c < "candidate-assets/$ASSET" | tr -d ' ')" = "$SIZE"
+          ASSET_PATH="candidate-assets/$ASSET" EXPECTED_SHA="$SHA" python3 - <<'PY'
+          import hashlib
+          import os
+
+          with open(os.environ["ASSET_PATH"], "rb") as handle:
+              actual = hashlib.sha256(handle.read()).hexdigest()
+          if actual != os.environ["EXPECTED_SHA"]:
+              raise SystemExit(f"candidate digest {actual} differs from {os.environ['EXPECTED_SHA']}")
+          PY
+
+      - name: Install the exact candidate through Desk's schema-3 acquisition path
+        working-directory: desk
+        env:
+          DESK_MOOR_RELEASE_BASE_URL: file://${{ github.workspace }}/candidate-assets
+          TARGET: ${{ matrix.target }}
+        run: |
+          npm ci
+          node scripts/project-moor-pin.mjs \
+            ../candidate-metadata/moor-release-manifest-v1.json
+          npm run fetch:moor
+          ASSET="$(jq -r --arg target "$TARGET" '.targets[$target].asset' \
+            ../candidate-metadata/moor-release-manifest-v1.json)"
+          EXPECTED_VERSION="$(jq -r '.version | ltrimstr("v")' \
+            ../candidate-metadata/moor-release-manifest-v1.json)"
+          cmp "../candidate-assets/$ASSET" libexec/moor
+          test "$(./libexec/moor --version)" = "moor $EXPECTED_VERSION"
+
+      - name: Type-check the exact Desk tree
+        working-directory: desk
+        run: npm run check
+
+      - name: Run the native product and authority suites against the installed bytes
+        working-directory: desk
+        env:
+          RUN_REAL_JOIN: '1'
+          DESK_MOOR_NATIVE_BIN: ${{ github.workspace }}/desk/libexec/moor
+        run: |
+          npx vitest run --reporter=verbose \
+            tests/moor-native-e2e.test.ts \
+            tests/restore-attach-retention.test.ts \
+            tests/controller-link-recovery.test.ts \
+            tests/terminalDaemon.test.ts \
+            tests/terminalDaemonMain.test.ts \
+            tests/provider-session-binding.test.ts \
+            tests/provider-session-evidence.test.ts \
+            tests/provider-session-rebind.test.ts \
+            tests/channels-delivery-strategy.test.ts \
+            tests/channels-native-delivery.test.ts \
+            tests/session-geometry-store.test.ts
+
+  evidence:
+    name: Bind the four green hosts into one evidence artifact
+    needs: [validate, product-qa]
+    if: github.ref == 'refs/heads/main' && github.ref_protected && github.run_attempt == 1
+    environment: release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the protected Moor release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: moor-tooling
+          persist-credentials: false
+
+      - name: Re-fetch and validate the exact candidate metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          METADATA_ID: ${{ inputs.metadata_artifact_id }}
+          RECORD_ID: ${{ inputs.candidate_record_artifact_id }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID" > metadata-artifact.json
+          jq -e --argjson id "$METADATA_ID" --argjson run "$RUN_ID" --arg commit "$EXPECTED_COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-v1"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' metadata-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$METADATA_ID/zip" > metadata.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            metadata.zip moor-release-manifest-v1.json SHA256SUMS
+          mkdir candidate-metadata
+          (cd candidate-metadata && unzip -q ../metadata.zip)
+
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID" > record-artifact.json
+          jq -e --argjson id "$RECORD_ID" --argjson run "$RUN_ID" --arg commit "$EXPECTED_COMMIT" '
+            .id == $id
+            and .name == "moor-release-candidate-record"
+            and .expired == false
+            and .workflow_run.id == $run
+            and .workflow_run.head_sha == $commit
+          ' record-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$RECORD_ID/zip" > record.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            record.zip moor-release-candidate-record.json
+          mkdir candidate-record
+          (cd candidate-record && unzip -q ../record.zip)
+
+          MOOR_TOOLING="$PWD/moor-tooling" METADATA_ID="$METADATA_ID" python3 - <<'PY'
+          import importlib.util
+          import os
+
+          path = os.path.join(os.environ["MOOR_TOOLING"], "scripts", "release-qa-record.py")
+          spec = importlib.util.spec_from_file_location("release_qa_record", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          manifest, _ = module.read_json(
+              "candidate-metadata/moor-release-manifest-v1.json", "manifest", require_canonical=True
+          )
+          module.validate_manifest(manifest)
+          record, _ = module.read_json(
+              "candidate-record/moor-release-candidate-record.json",
+              "candidate record",
+              require_canonical=True,
+          )
+          module.validate_candidate_record(record, manifest, os.environ["METADATA_ID"])
+          with open("candidate-metadata/SHA256SUMS", "rb") as handle:
+              module.validate_sums(handle.read(), manifest)
+          PY
+
+      - name: Create the canonical hosted manual-QA evidence bytes
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          METADATA_ID: ${{ inputs.metadata_artifact_id }}
+          RECORD_ID: ${{ inputs.candidate_record_artifact_id }}
+          CANDIDATE_QA_RUN_ID: ${{ github.run_id }}
+          CANDIDATE_QA_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir evidence
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open("candidate-metadata/moor-release-manifest-v1.json", encoding="ascii") as handle:
+              manifest = json.load(handle)
+          targets = [
+              "x86_64-unknown-linux-musl",
+              "aarch64-unknown-linux-musl",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+          ]
+          checklist = [
+              "candidate-install",
+              "binary-identity",
+              "v4-dialect",
+              "session-create",
+              "provider-identity",
+              "resume-argv",
+              "resume-continuity",
+              "resume-mismatch",
+              "rebind",
+              "channel-delivery",
+              "input-path",
+              "restart-geometry",
+              "restart-adoption",
+          ]
+          run_url = os.environ["RUN_URL"]
+          evidence = {
+              "schemaVersion": 1,
+              "repository": "https://github.com/BrainyBlaze/moor",
+              "version": manifest["version"],
+              "commit": manifest["commit"],
+              "candidate": {
+                  "workflowRunId": os.environ["CANDIDATE_RUN_ID"],
+                  "workflowRunAttempt": int(os.environ["CANDIDATE_RUN_ATTEMPT"]),
+                  "metadataArtifactId": os.environ["METADATA_ID"],
+                  "candidateRecordArtifactId": os.environ["RECORD_ID"],
+              },
+              "candidateQa": {
+                  "workflowRunId": os.environ["CANDIDATE_QA_RUN_ID"],
+                  "workflowRunAttempt": int(os.environ["CANDIDATE_QA_RUN_ATTEMPT"]),
+                  "deskCommit": os.environ["DESK_COMMIT"],
+              },
+              "platforms": [
+                  {"target": target, "verdict": "passed", "evidence": run_url}
+                  for target in targets
+              ],
+              "checklist": [
+                  {"id": item, "verdict": "passed", "evidence": run_url}
+                  for item in checklist
+              ],
+              "confirmation": (
+                  f"APPROVE MOOR {manifest['version']} {manifest['commit']} "
+                  f"{os.environ['CANDIDATE_RUN_ID']}/{os.environ['CANDIDATE_RUN_ATTEMPT']} "
+                  f"{os.environ['METADATA_ID']} {os.environ['RECORD_ID']} full-matrix"
+              ),
+          }
+          with open("evidence/manual-qa-evidence.json", "w", encoding="ascii", newline="\n") as handle:
+              json.dump(evidence, handle, indent=2, ensure_ascii=True)
+          PY
+
+      - name: Upload the candidate-QA evidence artifact
+        id: evidence-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moor-release-candidate-qa-evidence
+          path: evidence/manual-qa-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Round-trip the immutable evidence artifact ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_ARTIFACT_ID: ${{ steps.evidence-upload.outputs.artifact-id }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts/$EVIDENCE_ARTIFACT_ID" \
+            > evidence-artifact.json
+          jq -e --argjson id "$EVIDENCE_ARTIFACT_ID" --argjson run "${{ github.run_id }}" \
+            --arg commit "${{ github.sha }}" '
+              .id == $id
+              and .name == "moor-release-candidate-qa-evidence"
+              and .expired == false
+              and .workflow_run.id == $run
+              and .workflow_run.head_sha == $commit
+            ' evidence-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$EVIDENCE_ARTIFACT_ID/zip" \
+            > evidence.zip
+          python3 moor-tooling/scripts/candidate-verify.py zip-inventory \
+            evidence.zip manual-qa-evidence.json
+          mkdir evidence-roundtrip
+          (cd evidence-roundtrip && unzip -q ../evidence.zip)
+          cmp evidence/manual-qa-evidence.json evidence-roundtrip/manual-qa-evidence.json
+          echo "Candidate-QA run: ${{ github.run_id }}/1" >> "$GITHUB_STEP_SUMMARY"
+          echo "Desk commit: $DESK_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Evidence artifact ID: $EVIDENCE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"

@@ -66,6 +66,12 @@ jobs:
       - name: Run all-target tests
         run: cargo test --all-targets --all-features
 
+      - name: Verify release QA and promotion safety contracts
+        run: |
+          python3 scripts/release-qa-record-test.py
+          python3 scripts/release-asset-transaction-test.py
+          python3 scripts/release-workflow-test.py
+
       - name: Verify the reviewed handoff hashes
         run: |
           cd spec
