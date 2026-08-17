@@ -802,6 +802,78 @@ fn hello_mismatches_and_trailing_codec_faults_are_encoded_before_close() {
 }
 
 #[test]
+fn a_foreign_wire_version_closes_only_its_own_connection_and_leaves_the_session_unchanged() {
+    // OB-43 leans on this: a controller of a retired dialect meets a live v4
+    // holder and must be refused deterministically without disturbing anything
+    // the holder already serves or will serve to a compatible controller.
+    let (mut runtime, root) = fixture();
+
+    // An incumbent compatible controller is already adopted.
+    let mut incumbent = connect(&mut runtime);
+    incumbent.send(0, 1, &wire::controller_hello(b"session").unwrap());
+    let before = incumbent.recv(&mut runtime);
+    assert_eq!(before.kind, 2);
+    let (generation, incarnation) =
+        wire::decode_controller_hello_ack(before.scope, &before.payload, b"session").unwrap();
+    assert_eq!(generation, 7);
+    assert_eq!(incarnation, [1; 16]);
+
+    // A foreign peer speaks the retired header version 03 over an otherwise
+    // well-formed v4 HELLO, with the checksum recomputed so only the version
+    // byte is wrong.
+    let mut foreign = connect(&mut runtime);
+    let mut sender = Codec::new(Profile::Controller);
+    let mut bytes = Vec::new();
+    sender
+        .encode(
+            0,
+            1,
+            &wire::controller_hello(b"session").unwrap(),
+            &mut bytes,
+        )
+        .unwrap();
+    assert_eq!(bytes[4], 4, "the frozen v4 header version byte moved");
+    bytes[4] = 3;
+    let checksum = wire::crc32c(&bytes[..20]);
+    bytes[20..24].copy_from_slice(&checksum.to_le_bytes());
+    foreign.raw(&bytes);
+
+    // The refusal is framed in the holder's own v4 dialect (this peer's v4
+    // codec decodes it; a real v3 peer could not) and names UNKNOWN_VERSION.
+    let error = foreign.recv_kind(&mut runtime, 0x13);
+    let (code, text) = wire::decode_error_payload(&error.payload).unwrap();
+    assert_eq!(code, 1, "controller error code 1 is UNKNOWN_VERSION");
+    assert_eq!(text, b"unknown wire version");
+    assert!(
+        foreign.closed(&mut runtime),
+        "the foreign connection stays open"
+    );
+
+    // The incumbent is untouched: still open and still answered on its
+    // generation, here by a STATUS exchange.
+    incumbent.send(generation, 13, &[]);
+    let status = incumbent.recv(&mut runtime);
+    assert_eq!(
+        status.kind, 14,
+        "the incumbent controller lost its connection"
+    );
+    assert_eq!(status.scope, generation);
+
+    // A later compatible controller sees exactly the same session identity.
+    let mut later = connect(&mut runtime);
+    later.send(0, 1, &wire::controller_hello(b"session").unwrap());
+    let after = later.recv(&mut runtime);
+    assert_eq!(after.kind, 2);
+    assert_eq!(
+        wire::decode_controller_hello_ack(after.scope, &after.payload, b"session"),
+        Some((generation, incarnation))
+    );
+
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn invalid_query_reply_does_not_refresh_the_lease() {
     let (mut runtime, root) = fixture();
     let mut peer = connect(&mut runtime);
