@@ -70,6 +70,7 @@ jobs:
         run: |
           python3 scripts/release-qa-record-test.py
           python3 scripts/release-asset-transaction-test.py
+          python3 scripts/release-admin-attestation-test.py
           python3 scripts/release-workflow-test.py
 
       - name: Verify the reviewed handoff hashes
