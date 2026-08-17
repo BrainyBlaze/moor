@@ -808,15 +808,33 @@ fn a_foreign_wire_version_closes_only_its_own_connection_and_leaves_the_session_
     // the holder already serves or will serve to a compatible controller.
     let (mut runtime, root) = fixture();
 
-    // An incumbent compatible controller is already adopted.
+    // An incumbent compatible controller is adopted on its exact allocated
+    // generation, attaches, and holds a fresh viewer lease.
     let mut incumbent = connect(&mut runtime);
-    incumbent.send(0, 1, &wire::controller_hello(b"session").unwrap());
-    let before = incumbent.recv(&mut runtime);
-    assert_eq!(before.kind, 2);
+    incumbent.send(7, 1, &wire::controller_hello(b"session").unwrap());
+    let ack = incumbent.recv(&mut runtime);
+    assert_eq!(ack.kind, 2);
     let (generation, incarnation) =
-        wire::decode_controller_hello_ack(before.scope, &before.payload, b"session").unwrap();
-    assert_eq!(generation, 7);
-    assert_eq!(incarnation, [1; 16]);
+        wire::decode_controller_hello_ack(ack.scope, &ack.payload, b"session").unwrap();
+    assert_eq!((generation, incarnation), (7, [1; 16]));
+    incumbent.send(generation, 3, &[0, 0, 0, 0, 1]);
+    incumbent.recv_kind(&mut runtime, 4);
+    incumbent.recv_kind(&mut runtime, 5);
+    let lease = LeaseResult::decode_wire(&incumbent.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(lease.outcome, ResultOutcome::Granted);
+    incumbent.send(generation, 13, &[]);
+    let before = incumbent.recv_kind(&mut runtime, 14).payload;
+    // Fixture status base is empty, so the tail flags sit at 36 and the lease
+    // epoch at 37..41 (see the fixture note above).
+    assert_eq!(
+        before[36] & 0x30,
+        0x30,
+        "incumbent owns the lease and is a viewer"
+    );
+    assert_eq!(
+        u32::from_le_bytes(before[37..41].try_into().unwrap()),
+        lease.epoch
+    );
 
     // A foreign peer speaks the retired header version 03 over an otherwise
     // well-formed v4 HELLO, with the checksum recomputed so only the version
@@ -849,25 +867,54 @@ fn a_foreign_wire_version_closes_only_its_own_connection_and_leaves_the_session_
         "the foreign connection stays open"
     );
 
-    // The incumbent is untouched: still open and still answered on its
-    // generation, here by a STATUS exchange.
+    // The incumbent is untouched: the same connection still holds the same
+    // lease (a keepalive on the granted epoch/token is accepted, not refused),
+    // stays fully attached, and reports a byte-identical status descriptor.
+    let ticket = [lease.epoch.to_le_bytes().as_slice(), lease.token.as_slice()].concat();
+    incumbent.send(generation, 0x18, &ticket);
+    for _ in 0..5 {
+        runtime.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
     incumbent.send(generation, 13, &[]);
-    let status = incumbent.recv(&mut runtime);
+    let after = incumbent.recv(&mut runtime);
     assert_eq!(
-        status.kind, 14,
+        after.kind, 14,
         "the incumbent controller lost its connection"
     );
-    assert_eq!(status.scope, generation);
+    assert_eq!(after.scope, generation);
+    assert_eq!(
+        after.payload, before,
+        "the session's status descriptor changed"
+    );
 
-    // A later compatible controller sees exactly the same session identity.
+    // A later compatible controller sees exactly the same session identity and
+    // the incumbent's viewer still present, on the same lease epoch.
     let mut later = connect(&mut runtime);
     later.send(0, 1, &wire::controller_hello(b"session").unwrap());
-    let after = later.recv(&mut runtime);
-    assert_eq!(after.kind, 2);
+    let probe = later.recv(&mut runtime);
+    assert_eq!(probe.kind, 2);
     assert_eq!(
-        wire::decode_controller_hello_ack(after.scope, &after.payload, b"session"),
+        wire::decode_controller_hello_ack(probe.scope, &probe.payload, b"session"),
         Some((generation, incarnation))
     );
+    later.send(generation, 13, &[]);
+    let seen = later.recv_kind(&mut runtime, 14).payload;
+    assert_eq!(
+        seen[36] & 0x30,
+        0x20,
+        "probe sees the viewer but owns no lease"
+    );
+    assert_eq!(
+        u32::from_le_bytes(seen[37..41].try_into().unwrap()),
+        lease.epoch
+    );
+
+    // The lease is still the incumbent's to release.
+    incumbent.send(generation, 0x17, &ticket);
+    let released =
+        LeaseResult::decode_wire(&incumbent.recv_kind(&mut runtime, 0x16).payload).unwrap();
+    assert_eq!(released.outcome, ResultOutcome::Released);
 
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
