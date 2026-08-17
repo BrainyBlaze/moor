@@ -126,6 +126,63 @@ jobs:
           mkdir candidate-record
           (cd candidate-record && unzip -q ../record.zip)
 
+      - name: Re-authenticate the QA-bound candidate-QA evidence artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          QA_RUN_ID="$(jq -r .candidateQa.workflowRunId approval/moor-release-qa-v1.json)"
+          QA_RUN_ATTEMPT="$(jq -r .candidateQa.workflowRunAttempt approval/moor-release-qa-v1.json)"
+          EVIDENCE_ARTIFACT_ID="$(jq -r .candidateQa.evidenceArtifactId approval/moor-release-qa-v1.json)"
+          DESK_COMMIT="$(jq -r .candidateQa.deskCommit approval/moor-release-qa-v1.json)"
+          case "$QA_RUN_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          test "$QA_RUN_ATTEMPT" = 1
+          case "$EVIDENCE_ARTIFACT_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          echo "$DESK_COMMIT" | grep -Eq '^[0-9a-f]{40}$'
+          gh api "repos/${{ github.repository }}/actions/runs/$QA_RUN_ID/attempts/$QA_RUN_ATTEMPT" \
+            > candidate-qa-run.json
+          jq -e --argjson id "$QA_RUN_ID" '
+            .id == $id
+            and .run_attempt == 1
+            and .event == "workflow_dispatch"
+            and .status == "completed"
+            and .conclusion == "success"
+            and .head_branch == "main"
+            and .path == ".github/workflows/release-candidate-qa.yml"
+            and (.head_sha | test("^[0-9a-f]{40}$"))
+          ' candidate-qa-run.json >/dev/null
+          QA_HEAD="$(jq -r .head_sha candidate-qa-run.json)"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$EVIDENCE_ARTIFACT_ID" \
+            > candidate-qa-evidence-artifact.json
+          jq -e --argjson id "$EVIDENCE_ARTIFACT_ID" --argjson run "$QA_RUN_ID" \
+            --arg commit "$QA_HEAD" '
+              .id == $id
+              and .name == "moor-release-candidate-qa-evidence"
+              and .expired == false
+              and .workflow_run.id == $run
+              and .workflow_run.head_sha == $commit
+            ' candidate-qa-evidence-artifact.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$EVIDENCE_ARTIFACT_ID/zip" \
+            > candidate-qa-evidence.zip
+          python3 scripts/candidate-verify.py zip-inventory \
+            candidate-qa-evidence.zip manual-qa-evidence.json
+          mkdir candidate-qa-evidence
+          (cd candidate-qa-evidence && unzip -q ../candidate-qa-evidence.zip)
+          cmp approval/manual-qa-evidence.txt candidate-qa-evidence/manual-qa-evidence.json
+          jq -e --arg qaRun "$QA_RUN_ID" --arg desk "$DESK_COMMIT" \
+            --arg candidateRun "$(jq -r .candidate.workflowRunId approval/moor-release-qa-v1.json)" \
+            --arg metadata "$(jq -r .candidate.metadataArtifactId approval/moor-release-qa-v1.json)" \
+            --arg record "$(jq -r .candidate.candidateRecordArtifactId approval/moor-release-qa-v1.json)" \
+            --arg commit "$(jq -r .commit approval/moor-release-qa-v1.json)" '
+              .candidateQa.workflowRunId == $qaRun
+              and .candidateQa.workflowRunAttempt == 1
+              and .candidateQa.deskCommit == $desk
+              and .candidate.workflowRunId == $candidateRun
+              and .candidate.workflowRunAttempt == 1
+              and .candidate.metadataArtifactId == $metadata
+              and .candidate.candidateRecordArtifactId == $record
+              and .commit == $commit
+            ' candidate-qa-evidence/manual-qa-evidence.json >/dev/null
+
       - name: Re-fetch the authenticated evidence and verify the QA record
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,14 +191,22 @@ jobs:
           gh api "repos/${{ github.repository }}/issues/comments/$COMMENT_ID" > evidence-comment.json
           jq -e --arg url "$(jq -r .manualQa.evidence.url approval/moor-release-qa-v1.json)" \
             --arg author "$(jq -r .manualQa.approvedBy approval/moor-release-qa-v1.json)" \
+            --arg actor "${{ github.actor }}" \
             --arg created "$(jq -r .manualQa.evidence.createdAt approval/moor-release-qa-v1.json)" \
             --arg updated "$(jq -r .manualQa.evidence.updatedAt approval/moor-release-qa-v1.json)" '
               .html_url == $url
               and .user.login == $author
-              and .author_association == "OWNER"
+              and .user.login == $actor
               and .created_at == $created
               and .updated_at == $updated
             ' evidence-comment.json >/dev/null
+          EVIDENCE_AUTHOR="$(jq -r .user.login evidence-comment.json)"
+          case "$EVIDENCE_AUTHOR" in ''|*[!A-Za-z0-9-]*) exit 1 ;; esac
+          gh api "repos/${{ github.repository }}/collaborators/$EVIDENCE_AUTHOR/permission" \
+            > evidence-permission.json
+          jq -e --arg author "$EVIDENCE_AUTHOR" '
+            .user.login == $author and .permission == "admin"
+          ' evidence-permission.json >/dev/null
           jq -j .body evidence-comment.json > current-evidence.txt
           cmp approval/manual-qa-evidence.txt current-evidence.txt
 
@@ -151,11 +216,16 @@ jobs:
             --candidate-record candidate-record/moor-release-candidate-record.json
             --metadata-artifact-id "$(jq -r .candidate.metadataArtifactId approval/moor-release-qa-v1.json)"
             --candidate-record-artifact-id "$(jq -r .candidate.candidateRecordArtifactId approval/moor-release-qa-v1.json)"
+            --candidate-qa-run-id "$(jq -r .candidateQa.workflowRunId approval/moor-release-qa-v1.json)"
+            --candidate-qa-run-attempt "$(jq -r .candidateQa.workflowRunAttempt approval/moor-release-qa-v1.json)"
+            --candidate-qa-evidence-artifact-id "$(jq -r .candidateQa.evidenceArtifactId approval/moor-release-qa-v1.json)"
+            --desk-commit "$(jq -r .candidateQa.deskCommit approval/moor-release-qa-v1.json)"
             --evidence-file approval/manual-qa-evidence.txt
             --evidence-url "$(jq -r .html_url evidence-comment.json)"
             --evidence-comment-id "$(jq -r '.id|tostring' evidence-comment.json)"
             --evidence-author "$(jq -r .user.login evidence-comment.json)"
             --evidence-author-association "$(jq -r .author_association evidence-comment.json)"
+            --evidence-repository-permission "$(jq -r .permission evidence-permission.json)"
             --evidence-created-at "$(jq -r .created_at evidence-comment.json)"
             --evidence-updated-at "$(jq -r .updated_at evidence-comment.json)"
           )
@@ -262,77 +332,175 @@ jobs:
       - name: Resume the no-overwrite draft asset transaction to completeness
         env:
           GH_TOKEN: ${{ github.token }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
         run: |
           COMPLETE=false
-          for iteration in 1 2 3 4 5 6 7; do
+          printf '{}\n' > starter-deletions.json
+          for iteration in $(seq 1 20); do
             gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-              | jq '[.[][] | {id, name, state}]' > "assets-$iteration.json"
+              | jq '[.[][] | {id, name, state, size}]' > "assets-$iteration.json"
             mkdir "downloads-$iteration"
-            jq -r '.[].id' "assets-$iteration.json" | while read -r id; do
+            jq -r '.[] | select(.state == "uploaded") | .id' "assets-$iteration.json" | while read -r id; do
               gh api -H 'Accept: application/octet-stream' \
                 "repos/${{ github.repository }}/releases/assets/$id" > "downloads-$iteration/$id"
             done
             python3 scripts/release-asset-transaction.py plan \
               --release-files release-files --expected expected-assets.json \
-              --assets "assets-$iteration.json" --downloads "downloads-$iteration" > plan.json
+              --assets "assets-$iteration.json" --downloads "downloads-$iteration" \
+              --release-draft "$RELEASE_DRAFT" \
+              --starter-deletions starter-deletions.json > plan.json
             if jq -e '.complete == true' plan.json >/dev/null; then
               COMPLETE=true
               FINAL_ITERATION="$iteration"
               break
             fi
             test "$RELEASE_DRAFT" = true
-            test "$(jq -r .action.kind plan.json)" = upload
+            KIND="$(jq -r .action.kind plan.json)"
             NAME="$(jq -r .action.name plan.json)"
-            gh release upload "$VERSION" "release-files/$NAME" --repo "${{ github.repository }}"
+            if test "$KIND" = upload; then
+              gh release upload "$VERSION" "release-files/$NAME" --repo "${{ github.repository }}"
+              continue
+            fi
+            test "$KIND" = delete-starter
+            STARTER_ID="$(jq -r .action.id plan.json)"
+            RELEASE_NAME="Moor $VERSION"
+            COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
+            RELEASE_BODY="$(printf '%s\n%s\n%s' \
+              "Source-Commit: $COMMIT" \
+              "Candidate-Run: $(jq -r '.candidate.workflowRunId|tostring' approval/moor-release-qa-v1.json)/$(jq -r .candidate.workflowRunAttempt approval/moor-release-qa-v1.json)" \
+              "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID")"
+            gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > release-before-delete.json
+            jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
+              --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
+                .id == $id
+                and .tag_name == $tag
+                and .target_commitish == $commit
+                and .name == $name
+                and .body == $body
+                and .draft == true
+                and .prerelease == false
+              ' release-before-delete.json >/dev/null
+            gh api "repos/${{ github.repository }}/releases/assets/$STARTER_ID" > asset-before-delete.json
+            jq -e --argjson id "$STARTER_ID" --arg name "$NAME" '
+              .id == $id and .name == $name and .state == "starter"
+            ' asset-before-delete.json >/dev/null
+            gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$STARTER_ID"
+            jq --arg name "$NAME" '.[$name] = ((.[$name] // 0) + 1)' \
+              starter-deletions.json > starter-deletions.next.json
+            mv starter-deletions.next.json starter-deletions.json
+            continue
           done
           test "$COMPLETE" = true
           python3 scripts/release-asset-transaction.py verify-complete \
             --release-files release-files --expected expected-assets.json \
-            --assets "assets-$FINAL_ITERATION.json" --downloads "downloads-$FINAL_ITERATION"
+            --assets "assets-$FINAL_ITERATION.json" --downloads "downloads-$FINAL_ITERATION" \
+            --release-draft "$RELEASE_DRAFT" \
+            --starter-deletions starter-deletions.json
 
       - name: Publish the complete draft exactly once
         env:
           GH_TOKEN: ${{ github.token }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
         run: |
+          COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
+          RELEASE_NAME="Moor $VERSION"
+          RELEASE_BODY="$(printf '%s\n%s\n%s' \
+            "Source-Commit: $COMMIT" \
+            "Candidate-Run: $(jq -r '.candidate.workflowRunId|tostring' approval/moor-release-qa-v1.json)/$(jq -r .candidate.workflowRunAttempt approval/moor-release-qa-v1.json)" \
+            "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID")"
+          gh api "repos/${{ github.repository }}/git/ref/tags/$VERSION" > prepublish-tag.json
+          jq -e --arg ref "refs/tags/$VERSION" --arg commit "$COMMIT" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $commit
+          ' prepublish-tag.json >/dev/null
+          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > prepublish-release.json
+          jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
+            --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
+              .id == $id
+              and .tag_name == $tag
+              and .target_commitish == $commit
+              and .name == $name
+              and .body == $body
+              and .prerelease == false
+              and (.draft == true or (.draft == false and .immutable == true))
+            ' prepublish-release.json >/dev/null
+          gh api "repos/${{ github.repository }}/immutable-releases" > prepublish-settings.json
+          jq -e '.enabled == true' prepublish-settings.json >/dev/null
+          PREPUBLISH_DRAFT="$(jq -r .draft prepublish-release.json)"
           gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-            | jq '[.[][] | {id, name, state}]' > prepublish-assets.json
+            | jq '[.[][] | {id, name, state, size}]' > prepublish-assets.json
           mkdir prepublish-downloads
-          jq -r '.[].id' prepublish-assets.json | while read -r id; do
+          jq -r '.[] | select(.state == "uploaded") | .id' prepublish-assets.json | while read -r id; do
             gh api -H 'Accept: application/octet-stream' \
               "repos/${{ github.repository }}/releases/assets/$id" > "prepublish-downloads/$id"
           done
           python3 scripts/release-asset-transaction.py verify-complete \
             --release-files release-files --expected expected-assets.json \
-            --assets prepublish-assets.json --downloads prepublish-downloads
-          if test "$RELEASE_DRAFT" = true; then
+            --assets prepublish-assets.json --downloads prepublish-downloads \
+            --release-draft "$PREPUBLISH_DRAFT" \
+            --starter-deletions starter-deletions.json
+          if test "$PREPUBLISH_DRAFT" = true; then
             jq -n '{"draft": false}' > publish-release.json
             gh api --method PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" \
               --input publish-release.json > published-release.json
           else
             gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > published-release.json
           fi
-          jq -e --arg version "$VERSION" --arg commit "$(jq -r .commit approval/moor-release-qa-v1.json)" '
+          jq -e --arg version "$VERSION" --arg commit "$COMMIT" '
             .tag_name == $version
             and .target_commitish == $commit
             and .draft == false
             and .prerelease == false
             and .immutable == true
           ' published-release.json >/dev/null
+          gh api "repos/${{ github.repository }}/git/ref/tags/$VERSION" > postpublish-tag.json
+          jq -e --arg ref "refs/tags/$VERSION" --arg commit "$COMMIT" '
+            .ref == $ref and .object.type == "commit" and .object.sha == $commit
+          ' postpublish-tag.json >/dev/null
+          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > postpublish-release.json
+          jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
+            --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
+              .id == $id
+              and .tag_name == $tag
+              and .target_commitish == $commit
+              and .name == $name
+              and .body == $body
+              and .draft == false
+              and .prerelease == false
+              and .immutable == true
+            ' postpublish-release.json >/dev/null
+          gh api "repos/${{ github.repository }}/immutable-releases" > postpublish-settings.json
+          jq -e '.enabled == true' postpublish-settings.json >/dev/null
+          gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq '[.[][] | {id, name, state, size}]' > postpublish-assets.json
+          mkdir postpublish-downloads
+          jq -r '.[] | select(.state == "uploaded") | .id' postpublish-assets.json | while read -r id; do
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${{ github.repository }}/releases/assets/$id" > "postpublish-downloads/$id"
+          done
+          python3 scripts/release-asset-transaction.py verify-complete \
+            --release-files release-files --expected expected-assets.json \
+            --assets postpublish-assets.json --downloads postpublish-downloads \
+            --release-draft false --starter-deletions starter-deletions.json
 
       - name: re-download the published release assets and verify exact bytes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-            | jq '[.[][] | {id, name, state}]' > published-assets.json
+            | jq '[.[][] | {id, name, state, size}]' > published-assets.json
           mkdir published-downloads
-          jq -r '.[].id' published-assets.json | while read -r id; do
+          jq -r '.[] | select(.state == "uploaded") | .id' published-assets.json | while read -r id; do
             gh api -H 'Accept: application/octet-stream' \
               "repos/${{ github.repository }}/releases/assets/$id" > "published-downloads/$id"
           done
           python3 scripts/release-asset-transaction.py verify-complete \
             --release-files release-files --expected expected-assets.json \
-            --assets published-assets.json --downloads published-downloads
+            --assets published-assets.json --downloads published-downloads \
+            --release-draft false --starter-deletions starter-deletions.json
           gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > final-release.json
           jq -e '.draft == false and .immutable == true' final-release.json >/dev/null
           echo "Published immutable release: $(jq -r .html_url final-release.json)" >> "$GITHUB_STEP_SUMMARY"

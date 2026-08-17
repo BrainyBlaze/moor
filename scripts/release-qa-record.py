@@ -38,10 +38,16 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 VERSION = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 AUTHOR = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
-HOSTED_EVIDENCE = re.compile(
-    r"^https://github\.com/BrainyBlaze/(?:moor|desk)/actions/runs/[1-9][0-9]*"
-    r"(?:/job/[1-9][0-9]*)?$"
-)
+AUTHOR_ASSOCIATIONS = {
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIMER",
+    "FIRST_TIME_CONTRIBUTOR",
+    "MANNEQUIN",
+    "MEMBER",
+    "NONE",
+    "OWNER",
+}
 
 
 class Invalid(Exception):
@@ -240,10 +246,28 @@ def validate_sums(body, manifest):
         reject("SHA256SUMS bytes differ from the manifest")
 
 
-def validate_evidence(value, manifest, metadata_id, record_id):
+def validate_evidence(
+    value,
+    manifest,
+    metadata_id,
+    record_id,
+    candidate_qa_run_id,
+    candidate_qa_attempt,
+    desk_commit,
+):
     exact_keys(
         value,
-        ["schemaVersion", "repository", "version", "commit", "candidate", "platforms", "checklist", "confirmation"],
+        [
+            "schemaVersion",
+            "repository",
+            "version",
+            "commit",
+            "candidate",
+            "candidateQa",
+            "platforms",
+            "checklist",
+            "confirmation",
+        ],
         "manual QA evidence",
     )
     for key, expected in (
@@ -267,6 +291,22 @@ def validate_evidence(value, manifest, metadata_id, record_id):
         "candidateRecordArtifactId": record_id,
     }:
         reject("manual QA candidate identity differs")
+    exact_keys(
+        value["candidateQa"],
+        ["workflowRunId", "workflowRunAttempt", "deskCommit"],
+        "manual QA candidateQa",
+    )
+    if value["candidateQa"] != {
+        "workflowRunId": candidate_qa_run_id,
+        "workflowRunAttempt": candidate_qa_attempt,
+        "deskCommit": desk_commit,
+    }:
+        reject("manual QA candidate-QA identity differs")
+    hosted_evidence = re.compile(
+        r"^https://github\.com/BrainyBlaze/moor/actions/runs/"
+        + re.escape(candidate_qa_run_id)
+        + r"(?:/job/[1-9][0-9]*)?$"
+    )
     if not isinstance(value["platforms"], list) or len(value["platforms"]) != 4:
         reject("manual QA platforms are not the exact four targets")
     platform_by_target = {}
@@ -278,8 +318,8 @@ def validate_evidence(value, manifest, metadata_id, record_id):
         if item["verdict"] != "passed":
             reject(f"manual QA platform {target} did not pass")
         evidence = ascii_text(item["evidence"], f"platform {target} evidence")
-        if not HOSTED_EVIDENCE.fullmatch(evidence):
-            reject(f"platform {target} evidence is not a hosted Actions run or job URL")
+        if not hosted_evidence.fullmatch(evidence):
+            reject(f"platform {target} evidence is not from the bound candidate-QA run")
         platform_by_target[target] = item
     if not isinstance(value["checklist"], list) or len(value["checklist"]) != len(CHECKLIST):
         reject("manual QA checklist has a missing or extra item")
@@ -290,8 +330,8 @@ def validate_evidence(value, manifest, metadata_id, record_id):
         if item["verdict"] != "passed":
             reject(f"manual QA checklist item {item['id']} did not pass")
         evidence = ascii_text(item["evidence"], f"checklist {item['id']} evidence")
-        if not HOSTED_EVIDENCE.fullmatch(evidence):
-            reject(f"checklist {item['id']} evidence is not a hosted Actions run or job URL")
+        if not hosted_evidence.fullmatch(evidence):
+            reject(f"checklist {item['id']} evidence is not from the bound candidate-QA run")
     expected_confirmation = (
         f"APPROVE MOOR {manifest['version']} {manifest['commit']} "
         f"{candidate['workflowRunId']}/{candidate['workflowRunAttempt']} "
@@ -305,6 +345,17 @@ def validate_evidence(value, manifest, metadata_id, record_id):
 def build_record(args):
     metadata_id = decimal(args.metadata_artifact_id, "metadata artifact ID")
     record_id = decimal(args.candidate_record_artifact_id, "candidate-record artifact ID")
+    candidate_qa_run_id = decimal(args.candidate_qa_run_id, "candidate-QA run ID")
+    if not DECIMAL.fullmatch(args.candidate_qa_run_attempt):
+        reject("candidate-QA run attempt is not a nonzero decimal string")
+    candidate_qa_attempt = positive_int(int(args.candidate_qa_run_attempt), "candidate-QA run attempt")
+    if candidate_qa_attempt != 1:
+        reject("release QA v1 accepts only candidate-QA attempt 1")
+    candidate_qa_evidence_id = decimal(
+        args.candidate_qa_evidence_artifact_id, "candidate-QA evidence artifact ID"
+    )
+    if not HEX40.fullmatch(args.desk_commit):
+        reject("Desk commit is not 40 lowercase hex")
     manifest, manifest_body = read_json(args.manifest, "manifest", require_canonical=True)
     validate_manifest(manifest)
     candidate_record, _ = read_json(args.candidate_record, "candidate record", require_canonical=True)
@@ -316,10 +367,20 @@ def build_record(args):
         reject(f"cannot read SHA256SUMS: {error}")
     validate_sums(sums_body, manifest)
     evidence, evidence_body = read_json(args.evidence_file, "manual QA evidence")
-    platforms = validate_evidence(evidence, manifest, metadata_id, record_id)
+    platforms = validate_evidence(
+        evidence,
+        manifest,
+        metadata_id,
+        record_id,
+        candidate_qa_run_id,
+        candidate_qa_attempt,
+        args.desk_commit,
+    )
 
-    if args.evidence_author_association != "OWNER":
-        reject("manual QA evidence author is not repository OWNER")
+    if args.evidence_author_association not in AUTHOR_ASSOCIATIONS:
+        reject("manual QA evidence author association is not a GitHub association")
+    if args.evidence_repository_permission != "admin":
+        reject("manual QA evidence author did not have repository admin permission")
     if not AUTHOR.fullmatch(args.evidence_author):
         reject("manual QA evidence author is invalid")
     if not TIMESTAMP.fullmatch(args.evidence_created_at) or not TIMESTAMP.fullmatch(
@@ -367,6 +428,13 @@ def build_record(args):
             "manifestSha256": hashlib.sha256(manifest_body).hexdigest(),
             "sha256sumsSha256": hashlib.sha256(sums_body).hexdigest(),
         },
+        "candidateQa": {
+            "workflowRunId": candidate_qa_run_id,
+            "workflowRunAttempt": candidate_qa_attempt,
+            "evidenceArtifactId": candidate_qa_evidence_id,
+            "evidenceArtifactName": "moor-release-candidate-qa-evidence",
+            "deskCommit": args.desk_commit,
+        },
         "coverage": manifest["coverage"],
         "targets": targets,
         "manualQa": {
@@ -379,6 +447,8 @@ def build_record(args):
                 "commentId": args.evidence_comment_id,
                 "createdAt": args.evidence_created_at,
                 "updatedAt": args.evidence_updated_at,
+                "authorAssociation": args.evidence_author_association,
+                "repositoryPermission": args.evidence_repository_permission,
                 "file": "manual-qa-evidence.txt",
                 "size": len(evidence_body),
                 "sha256": hashlib.sha256(evidence_body).hexdigest(),
@@ -398,11 +468,16 @@ def parser():
         command.add_argument("--candidate-record", required=True)
         command.add_argument("--metadata-artifact-id", required=True)
         command.add_argument("--candidate-record-artifact-id", required=True)
+        command.add_argument("--candidate-qa-run-id", required=True)
+        command.add_argument("--candidate-qa-run-attempt", required=True)
+        command.add_argument("--candidate-qa-evidence-artifact-id", required=True)
+        command.add_argument("--desk-commit", required=True)
         command.add_argument("--evidence-file", required=True)
         command.add_argument("--evidence-url", required=True)
         command.add_argument("--evidence-comment-id", required=True)
         command.add_argument("--evidence-author", required=True)
         command.add_argument("--evidence-author-association", required=True)
+        command.add_argument("--evidence-repository-permission", required=True)
         command.add_argument("--evidence-created-at", required=True)
         command.add_argument("--evidence-updated-at", required=True)
         if verb == "create":

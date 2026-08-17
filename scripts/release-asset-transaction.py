@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Plan or verify a no-delete, no-overwrite draft release asset transaction."""
+"""Plan or verify a no-overwrite release asset transaction.
+
+The only delete plan this tool can emit is for an expected-name GitHub asset
+whose freshly observed state is ``starter`` on the transaction's draft. Such
+an asset is an incomplete upload record, never accepted release bytes.
+"""
 
 import argparse
 import hashlib
@@ -91,14 +96,29 @@ def expected_inventory(path, release_files):
     return result
 
 
-def release_inventory(path, expected_names, downloads):
+def starter_deletion_counts(path, expected_names):
+    value = read_json(path, "starter deletion counts")
+    if not isinstance(value, dict):
+        reject("starter deletion counts are not an object")
+    counts = {}
+    for name, count in value.items():
+        valid_name(name, "starter deletion count name")
+        if name not in expected_names:
+            reject(f"starter deletion count names unexpected asset {name}")
+        if not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= 2:
+            reject(f"starter deletion count for {name} is outside 0..2")
+        counts[name] = count
+    return counts
+
+
+def release_inventory(path, expected_by_name, downloads):
     value = read_json(path, "release asset inventory")
     if not isinstance(value, list):
         reject("release asset inventory is not an array")
     by_name = {}
     ids = set()
     for index, entry in enumerate(value):
-        if not isinstance(entry, dict) or list(entry) != ["id", "name", "state"]:
+        if not isinstance(entry, dict) or list(entry) != ["id", "name", "state", "size"]:
             reject(f"release asset {index} has the wrong keys")
         asset_id = entry["id"]
         if not isinstance(asset_id, int) or isinstance(asset_id, bool) or asset_id <= 0:
@@ -109,22 +129,58 @@ def release_inventory(path, expected_names, downloads):
         name = valid_name(entry["name"], f"release asset {index}.name")
         if name in by_name:
             reject(f"duplicate release asset name {name}")
-        if name not in expected_names:
+        if name not in expected_by_name:
             reject(f"unexpected release asset {name}")
-        if entry["state"] != "uploaded":
-            reject(f"release asset {name} is not uploaded")
-        download = os.path.join(downloads, str(asset_id))
-        if not os.path.isfile(download) or os.path.islink(download):
-            reject(f"downloaded bytes are missing for release asset {name}")
-        by_name[name] = {"id": asset_id, "download": download}
+        size = entry["size"]
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            reject(f"release asset {name} has invalid API size")
+        state = entry["state"]
+        if state == "uploaded":
+            expectation = expected_by_name[name]
+            if size != expectation["size"]:
+                reject(f"existing release asset {name} API size conflicts")
+            download = os.path.join(downloads, str(asset_id))
+            if not os.path.isfile(download) or os.path.islink(download):
+                reject(f"downloaded bytes are missing for release asset {name}")
+            by_name[name] = {
+                "id": asset_id,
+                "state": state,
+                "size": size,
+                "download": download,
+            }
+        elif state == "starter":
+            by_name[name] = {"id": asset_id, "state": state, "size": size}
+        else:
+            reject(f"release asset {name} has unknown state {state!r}")
     return by_name
 
 
 def evaluate(args):
     expected = expected_inventory(args.expected, args.release_files)
     expected_by_name = {entry["name"]: entry for entry in expected}
-    existing = release_inventory(args.assets, set(expected_by_name), args.downloads)
+    if args.release_draft not in ("true", "false"):
+        reject("release draft state must be literal true or false")
+    is_draft = args.release_draft == "true"
+    deletion_counts = starter_deletion_counts(args.starter_deletions, set(expected_by_name))
+    existing = release_inventory(args.assets, expected_by_name, args.downloads)
+    for entry in expected:
+        name = entry["name"]
+        asset = existing.get(name)
+        if asset is None or asset["state"] != "starter":
+            continue
+        if args.verb == "verify-complete":
+            reject(f"release asset {name} is an incomplete starter")
+        if not is_draft:
+            reject(f"published release asset {name} is an incomplete starter")
+        if deletion_counts.get(name, 0) >= 2:
+            reject(f"starter deletion bound exhausted for release asset {name}")
+        return {
+            "complete": False,
+            "action": {"kind": "delete-starter", "name": name, "id": asset["id"]},
+        }
     for name, asset in existing.items():
+        if asset["state"] != "uploaded":
+            reject(f"release asset {name} did not resolve to uploaded bytes")
         expectation = expected_by_name[name]
         if os.path.getsize(asset["download"]) != expectation["size"]:
             reject(f"existing release asset {name} size conflicts")
@@ -145,6 +201,8 @@ def parser():
     root.add_argument("--expected", required=True)
     root.add_argument("--assets", required=True)
     root.add_argument("--downloads", required=True)
+    root.add_argument("--release-draft", required=True)
+    root.add_argument("--starter-deletions", required=True)
     return root
 
 

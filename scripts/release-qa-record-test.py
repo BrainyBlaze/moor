@@ -25,11 +25,17 @@ RUN_ID = "500"
 RUN_ATTEMPT = 1
 METADATA_ID = "700"
 RECORD_ID = "701"
+CANDIDATE_QA_RUN_ID = "800"
+CANDIDATE_QA_RUN_ATTEMPT = "1"
+CANDIDATE_QA_EVIDENCE_ID = "801"
+DESK_COMMIT = "b" * 40
 APPROVED_BY = "levi770"
+APPROVED_ASSOCIATION = "MEMBER"
+APPROVED_PERMISSION = "admin"
 EVIDENCE_URL = "https://github.com/BrainyBlaze/moor/issues/1#issuecomment-1234567890"
 EVIDENCE_COMMENT_ID = "1234567890"
 EVIDENCE_TIME = "2026-08-17T09:30:00Z"
-EVIDENCE_LINK = "https://github.com/BrainyBlaze/desk/actions/runs/600"
+EVIDENCE_LINK = f"https://github.com/BrainyBlaze/moor/actions/runs/{CANDIDATE_QA_RUN_ID}"
 
 CHECKLIST = [
     "candidate-install",
@@ -148,6 +154,11 @@ def make_evidence():
             "metadataArtifactId": METADATA_ID,
             "candidateRecordArtifactId": RECORD_ID,
         },
+        "candidateQa": {
+            "workflowRunId": CANDIDATE_QA_RUN_ID,
+            "workflowRunAttempt": 1,
+            "deskCommit": DESK_COMMIT,
+        },
         "platforms": [
             {"target": target, "verdict": "passed", "evidence": EVIDENCE_LINK}
             for target in candidate_manifest.TARGETS
@@ -206,6 +217,14 @@ def command(fixture, verb):
         METADATA_ID,
         "--candidate-record-artifact-id",
         RECORD_ID,
+        "--candidate-qa-run-id",
+        CANDIDATE_QA_RUN_ID,
+        "--candidate-qa-run-attempt",
+        CANDIDATE_QA_RUN_ATTEMPT,
+        "--candidate-qa-evidence-artifact-id",
+        CANDIDATE_QA_EVIDENCE_ID,
+        "--desk-commit",
+        DESK_COMMIT,
         "--evidence-file",
         fixture["evidence_path"],
         "--evidence-url",
@@ -215,7 +234,9 @@ def command(fixture, verb):
         "--evidence-author",
         APPROVED_BY,
         "--evidence-author-association",
-        "OWNER",
+        APPROVED_ASSOCIATION,
+        "--evidence-repository-permission",
+        APPROVED_PERMISSION,
         "--evidence-created-at",
         EVIDENCE_TIME,
         "--evidence-updated-at",
@@ -274,12 +295,20 @@ def main():
             "version",
             "commit",
             "candidate",
+            "candidateQa",
             "coverage",
             "targets",
             "manualQa",
         ]
         assert qa["candidate"]["metadataArtifactId"] == METADATA_ID
         assert qa["candidate"]["candidateRecordArtifactId"] == RECORD_ID
+        assert qa["candidateQa"] == {
+            "workflowRunId": CANDIDATE_QA_RUN_ID,
+            "workflowRunAttempt": 1,
+            "evidenceArtifactId": CANDIDATE_QA_EVIDENCE_ID,
+            "evidenceArtifactName": "moor-release-candidate-qa-evidence",
+            "deskCommit": DESK_COMMIT,
+        }
         assert qa["candidate"]["manifestSha256"] == hashlib.sha256(
             open(fixture["manifest_path"], "rb").read()
         ).hexdigest()
@@ -293,6 +322,8 @@ def main():
         assert [item["id"] for item in qa["manualQa"]["checklist"]] == CHECKLIST
         assert qa["manualQa"]["approvedBy"] == APPROVED_BY
         assert qa["manualQa"]["approvedAt"] == EVIDENCE_TIME
+        assert qa["manualQa"]["evidence"]["authorAssociation"] == APPROVED_ASSOCIATION
+        assert qa["manualQa"]["evidence"]["repositoryPermission"] == APPROVED_PERMISSION
         assert qa["manualQa"]["confirmation"] == confirmation()
         assert qa["manualQa"]["evidence"]["sha256"] == hashlib.sha256(
             open(fixture["evidence_path"], "rb").read()
@@ -337,6 +368,15 @@ def main():
         ),
     )
     expect_reject(
+        "platform evidence cites another candidate QA run",
+        lambda f: rewrite(
+            f["evidence_path"],
+            lambda value: value["platforms"][0].update(
+                evidence="https://github.com/BrainyBlaze/moor/actions/runs/999"
+            ),
+        ),
+    )
+    expect_reject(
         "platform missing",
         lambda f: rewrite(f["evidence_path"], lambda value: value["platforms"].pop()),
     )
@@ -372,12 +412,15 @@ def main():
         lambda f: rewrite(f["evidence_path"], lambda value: value.update(confirmation="APPROVE")),
     )
     expect_reject("foreign evidence URL", evidence_url="https://example.com/qa")
-    expect_reject("non-owner evidence", evidence_author_association="MEMBER")
+    expect_reject("unknown author association", evidence_author_association="ALIEN")
+    expect_reject("non-admin evidence", evidence_repository_permission="write")
     expect_reject("edited evidence", evidence_updated_at="2026-08-17T09:31:00Z")
     expect_reject("wrong metadata artifact input", metadata_artifact_id="999")
     expect_reject("wrong record artifact input", candidate_record_artifact_id="999")
+    expect_reject("wrong candidate QA run input", candidate_qa_run_id="999")
+    expect_reject("wrong Desk commit input", desk_commit="c" * 40)
 
-    print("release QA record tests: deterministic acceptance and 18 rejection cases passed")
+    print("release QA record tests: deterministic acceptance and 22 rejection cases passed")
 
 
 if __name__ == "__main__":

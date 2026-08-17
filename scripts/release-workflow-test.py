@@ -38,11 +38,54 @@ def pinned_actions(text, what):
 
 
 def main():
+    candidate_qa = read(".github/workflows/release-candidate-qa.yml")
     qa = read(".github/workflows/release-qa.yml")
     promotion = read(".github/workflows/release-promote.yml")
     quality = read(".github/workflows/quality.yml")
     guide = read("docs/release-manual-qa-v1.md")
     manifest_contract = read("docs/release-manifest-v1.md")
+
+    require(candidate_qa, "workflow_dispatch:", "candidate QA workflow")
+    for name in (
+        "candidate_run_id",
+        "candidate_run_attempt",
+        "metadata_artifact_id",
+        "candidate_record_artifact_id",
+        "desk_commit",
+    ):
+        require(candidate_qa, name, "candidate QA inputs")
+    require(candidate_qa, "actions: read", "candidate QA permissions")
+    require(candidate_qa, "contents: read", "candidate QA permissions")
+    forbid(candidate_qa, "contents: write", "candidate QA permissions")
+    require(candidate_qa, "environment: release", "candidate QA environment")
+    require(candidate_qa, "github.ref == 'refs/heads/main'", "candidate QA main gate")
+    require(candidate_qa, "github.ref_protected", "candidate QA protected-ref gate")
+    for runner in ("ubuntu-22.04", "ubuntu-24.04-arm", "macos-15-intel", "macos-15"):
+        require(candidate_qa, runner, "candidate QA four-host matrix")
+    require(candidate_qa, "actions/artifacts/$METADATA_ID", "candidate QA metadata by ID")
+    require(candidate_qa, "actions/artifacts/$RECORD_ID", "candidate QA record by ID")
+    require(candidate_qa, "actions/artifacts/$ARTIFACT_ID", "candidate QA binary by ID")
+    require(candidate_qa, "repository: BrainyBlaze/desk", "candidate QA Desk checkout")
+    require(candidate_qa, "ref: ${{ inputs.desk_commit }}", "candidate QA exact Desk commit")
+    require(candidate_qa, "git -C desk rev-parse HEAD", "candidate QA checked-out Desk identity")
+    require(candidate_qa, "scripts/project-moor-pin.mjs", "candidate QA pin projection")
+    require(candidate_qa, "DESK_MOOR_RELEASE_BASE_URL", "candidate QA local candidate origin")
+    require(candidate_qa, "npm run fetch:moor", "candidate QA installer path")
+    require(candidate_qa, "DESK_MOOR_NATIVE_BIN", "candidate QA exact holder path")
+    for suite in (
+        "tests/moor-native-e2e.test.ts",
+        "tests/restore-attach-retention.test.ts",
+        "tests/controller-link-recovery.test.ts",
+        "tests/terminalDaemon.test.ts",
+        "tests/terminalDaemonMain.test.ts",
+    ):
+        require(candidate_qa, suite, "candidate QA integration suite")
+    require(candidate_qa, "manual-qa-evidence.json", "candidate QA evidence artifact")
+    require(candidate_qa, "moor-release-candidate-qa-evidence", "candidate QA evidence artifact")
+    require(candidate_qa, "github.run_attempt == 1", "candidate QA immutable attempt")
+    require(candidate_qa, 'path == ".github/workflows/release-candidate.yml"', "candidate QA source run")
+    for command in ("npm run build:moor", "cargo build", "cargo install", "cargo package"):
+        forbid(candidate_qa, command, "candidate QA zero-build boundary")
 
     require(qa, "workflow_dispatch:", "QA workflow")
     for name in (
@@ -50,6 +93,9 @@ def main():
         "candidate_run_attempt",
         "metadata_artifact_id",
         "candidate_record_artifact_id",
+        "candidate_qa_run_id",
+        "candidate_qa_run_attempt",
+        "candidate_qa_evidence_artifact_id",
         "evidence_issue_number",
         "evidence_comment_id",
     ):
@@ -64,6 +110,16 @@ def main():
     require(qa, "actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT", "QA run identity")
     require(qa, "actions/artifacts/$METADATA_ID", "QA metadata by ID")
     require(qa, "actions/artifacts/$RECORD_ID", "QA record by ID")
+    require(qa, "actions/runs/$QA_RUN_ID/attempts/$QA_RUN_ATTEMPT", "QA candidate-QA run identity")
+    require(qa, "actions/artifacts/$EVIDENCE_ARTIFACT_ID", "QA evidence by ID")
+    require(qa, 'path == ".github/workflows/release-candidate-qa.yml"', "QA candidate-QA workflow")
+    require(qa, "moor-release-candidate-qa-evidence", "QA evidence artifact name")
+    require(qa, "candidate-qa-evidence/manual-qa-evidence.json", "QA evidence artifact bytes")
+    require(qa, "--candidate-qa-run-id", "QA record candidate-QA binding")
+    require(qa, "--candidate-qa-evidence-artifact-id", "QA record evidence binding")
+    require(qa, "--desk-commit", "QA record Desk binding")
+    require(qa, "collaborators/$EVIDENCE_AUTHOR/permission", "QA admin permission proof")
+    require(qa, 'permission == "admin"', "QA admin permission proof")
     require(qa, "release-qa-record.py create", "QA record construction")
     require(qa, "moor-release-qa-v1", "QA artifact")
     forbid(qa, "gh release", "QA mutation boundary")
@@ -83,15 +139,29 @@ def main():
     require(promotion, "github.ref_protected", "promotion protected-ref gate")
     require(promotion, "repos/${{ github.repository }}/immutable-releases", "immutable release gate")
     require(promotion, ".enabled == true", "immutable release gate")
+    require(promotion, "collaborators/$EVIDENCE_AUTHOR/permission", "promotion admin permission proof")
+    require(promotion, 'permission == "admin"', "promotion admin permission proof")
+    require(promotion, ".candidateQa.workflowRunId", "promotion candidate-QA run binding")
+    require(promotion, ".candidateQa.evidenceArtifactId", "promotion evidence artifact binding")
+    require(promotion, 'path == ".github/workflows/release-candidate-qa.yml"', "promotion candidate-QA workflow")
+    require(promotion, "moor-release-candidate-qa-evidence", "promotion evidence artifact name")
+    require(promotion, "candidate-qa-evidence/manual-qa-evidence.json", "promotion evidence artifact bytes")
     require(promotion, "release-qa-record.py verify", "promotion QA verification")
     require(promotion, "release-asset-transaction.py plan", "promotion asset planner")
     require(promotion, "release-asset-transaction.py verify-complete", "promotion asset verifier")
+    require(promotion, "--release-draft", "promotion draft-state binding")
+    require(promotion, "--starter-deletions", "promotion starter deletion bound")
+    require(promotion, "delete-starter", "promotion starter cleanup action")
+    require(promotion, "starter-deletions.json", "promotion starter deletion counter")
+    require(promotion, "release-before-delete.json", "promotion fresh draft fence")
+    require(promotion, "asset-before-delete.json", "promotion fresh starter fence")
+    require(promotion, '.state == "starter"', "promotion starter state fence")
+    require(promotion, "--method DELETE", "promotion exact starter cleanup")
     require(promotion, "refs/tags/$VERSION", "exact tag")
     require(promotion, '"draft": true', "draft release")
     require(promotion, '"draft": false', "release publication")
     require(promotion, "re-download the published release assets", "post-publication verification")
     forbid(promotion, "--clobber", "no overwrite")
-    forbid(promotion, "--method DELETE", "no delete")
     for command in ("cargo build", "cargo install", "cargo package", "candidate-manifest.py"):
         forbid(promotion, command, "promotion zero-build boundary")
     ordered(
@@ -110,9 +180,15 @@ def main():
     ordered(
         publish_step,
         [
+            "prepublish-tag.json",
+            "prepublish-release.json",
+            "prepublish-settings.json",
             "prepublish-assets.json",
             "release-asset-transaction.py verify-complete",
             '{"draft": false}',
+            "postpublish-tag.json",
+            "postpublish-release.json",
+            "postpublish-settings.json",
         ],
         "promotion prepublish fence",
     )
@@ -124,6 +200,7 @@ def main():
     ):
         require(quality, test, "hosted quality")
 
+    pinned_actions(candidate_qa, "candidate QA workflow")
     pinned_actions(qa, "QA workflow")
     pinned_actions(promotion, "promotion workflow")
     for target in (
@@ -151,8 +228,17 @@ def main():
         require(guide, item, "manual QA guide checklist")
     require(guide, "four binaries plus `moor-release-manifest-v1.json` and `SHA256SUMS`", "release assets")
     require(guide, "hosted Actions run or job URL", "manual QA evidence boundary")
-    require(guide, "never rebuilds, deletes, or overwrites", "promotion boundary")
+    require(guide, "pin schema 3", "Desk pin schema")
+    forbid(guide, "schema-2 pin", "retired Desk pin schema")
+    require(guide, "never rebuilds or overwrites", "promotion boundary")
+    require(guide, "single permitted deletion", "promotion starter exception")
+    require(guide, "trusted repository administrators", "promotion trusted-admin boundary")
     require(manifest_contract, "moor-release-qa-v1.json", "manifest QA record contract")
+    require(manifest_contract, "candidate-QA evidence artifact", "manifest candidate-QA contract")
+    require(manifest_contract, "repository `admin` permission", "manifest evidence authority")
+    require(manifest_contract, "`starter`", "manifest starter exception")
+    require(manifest_contract, "pin schema version is `3`", "manifest Desk pin schema")
+    forbid(manifest_contract, "pin schema version is `2`", "retired manifest Desk pin schema")
     print("release workflow safety contract: OK")
 
 

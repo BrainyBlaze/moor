@@ -23,11 +23,20 @@ def expected_entries():
     ]
 
 
-def asset(asset_id, name, state="uploaded"):
-    return {"id": asset_id, "name": name, "state": state}
+def asset(asset_id, name, state="uploaded", size=None):
+    if size is None:
+        size = len(FILES.get(name, b"foreign\n"))
+    return {"id": asset_id, "name": name, "state": state, "size": size}
 
 
-def invoke(command, assets, downloads=None, expected=None):
+def invoke(
+    command,
+    assets,
+    downloads=None,
+    expected=None,
+    release_draft=True,
+    starter_deletions=None,
+):
     downloads = downloads or {}
     expected = expected if expected is not None else expected_entries()
     with tempfile.TemporaryDirectory(prefix="release-assets-") as root:
@@ -46,6 +55,10 @@ def invoke(command, assets, downloads=None, expected=None):
         with open(assets_path, "w", encoding="ascii", newline="") as handle:
             json.dump(assets, handle)
             handle.write("\n")
+        starter_deletions_path = os.path.join(root, "starter-deletions.json")
+        with open(starter_deletions_path, "w", encoding="ascii", newline="") as handle:
+            json.dump(starter_deletions or {}, handle)
+            handle.write("\n")
         for asset_id, body in downloads.items():
             with open(os.path.join(boundary, str(asset_id)), "wb") as handle:
                 handle.write(body)
@@ -62,20 +75,45 @@ def invoke(command, assets, downloads=None, expected=None):
                 assets_path,
                 "--downloads",
                 boundary,
+                "--release-draft",
+                "true" if release_draft else "false",
+                "--starter-deletions",
+                starter_deletions_path,
             ],
             capture_output=True,
             text=True,
         )
 
 
-def plan(assets, downloads=None):
-    result = invoke("plan", assets, downloads)
+def plan(assets, downloads=None, release_draft=True, starter_deletions=None):
+    result = invoke(
+        "plan",
+        assets,
+        downloads,
+        release_draft=release_draft,
+        starter_deletions=starter_deletions,
+    )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
 
-def reject(label, assets, downloads=None, expected=None, command="plan"):
-    result = invoke(command, assets, downloads, expected)
+def reject(
+    label,
+    assets,
+    downloads=None,
+    expected=None,
+    command="plan",
+    release_draft=True,
+    starter_deletions=None,
+):
+    result = invoke(
+        command,
+        assets,
+        downloads,
+        expected,
+        release_draft,
+        starter_deletions,
+    )
     assert result.returncode != 0, f"{label}: unexpectedly accepted"
     assert result.stderr.strip(), f"{label}: no diagnostic"
 
@@ -94,6 +132,11 @@ def main():
     assert verified.returncode == 0, verified.stderr
     assert json.loads(verified.stdout) == {"complete": True}
 
+    assert plan([asset(19, first, "starter", size=999)]) == {
+        "complete": False,
+        "action": {"kind": "delete-starter", "name": first, "id": 19},
+    }
+
     reject("wrong existing bytes", [asset(20, first)], {20: b"wrong\n"})
     reject("missing existing download", [asset(21, first)])
     reject("unexpected asset", [asset(22, "foreign")], {22: b"foreign\n"})
@@ -107,7 +150,23 @@ def main():
         [asset(25, first), asset(25, second)],
         {25: FILES[first]},
     )
-    reject("non-uploaded asset", [asset(26, first, "starter")])
+    reject("unexpected starter asset", [asset(26, "foreign", "starter", size=999)])
+    reject(
+        "starter asset on published release",
+        [asset(27, first, "starter", size=999)],
+        release_draft=False,
+    )
+    reject(
+        "third starter deletion exceeds the per-run bound",
+        [asset(28, first, "starter", size=999)],
+        starter_deletions={first: 2},
+    )
+    reject(
+        "starter asset is never complete",
+        [asset(29, first, "starter", size=999), asset(30, second)],
+        {30: FILES[second]},
+        command="verify-complete",
+    )
     reject(
         "expected metadata lies about local bytes",
         [],
@@ -120,12 +179,12 @@ def main():
     )
     reject(
         "partial inventory is not complete",
-        [asset(27, first)],
-        {27: FILES[first]},
+        [asset(31, first)],
+        {31: FILES[first]},
         command="verify-complete",
     )
 
-    print("release asset transaction tests: 4 resume states and 9 rejection cases passed")
+    print("release asset transaction tests: 5 resume states and 12 rejection cases passed")
 
 
 if __name__ == "__main__":
