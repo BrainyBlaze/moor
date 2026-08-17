@@ -48,6 +48,181 @@ TARGETS = [
     ("x86_64-apple-darwin", "moor-0.1.0-macos-x64"),
     ("aarch64-apple-darwin", "moor-0.1.0-macos-arm64"),
 ]
+CHECKLIST = [
+    "candidate-install",
+    "binary-identity",
+    "v4-dialect",
+    "session-create",
+    "provider-identity",
+    "resume-argv",
+    "resume-continuity",
+    "resume-mismatch",
+    "rebind",
+    "channel-delivery",
+    "input-path",
+    "restart-geometry",
+    "restart-adoption",
+]
+
+EXPECTED_REFUSAL_DIAGNOSTICS = {
+    "promotion rerun": b"promotion run attempt must be decimal string 1",
+    "release QA rerun": b"release QA run attempt must be decimal string 1",
+    "reordered release QA producer keys": b"release QA record keys are",
+    "incomplete root manual QA": b"manual-QA checklist has a missing or extra item",
+    "reordered root manual QA producer keys": b"release QA manual QA keys are",
+    "foreign root manual QA evidence URL": b"manual-QA evidence URL is foreign or mismatched",
+    "wrong root manual QA confirmation": b"manual-QA confirmation differs",
+    "foreign target manual QA evidence": b"evidence is not from the bound candidate-QA run",
+    "candidate rerun": b"candidate run attempt must be integer 1",
+    "candidate-QA rerun": b"candidate-QA run attempt must be integer 1",
+    "foreign QA target key": b"release QA record target set/order differs",
+    "foreign target artifact name": b"release QA target x86_64-unknown-linux-musl artifact name differs",
+    "cross-role target artifact name": b"release QA target x86_64-unknown-linux-musl artifact name differs",
+    "non-object manual QA": b"release QA manual QA keys are list",
+    "non-object target manual QA": b"release QA target x86_64-unknown-linux-musl manual QA keys are list",
+    "boolean artifact ID": b"candidate metadata artifact ID is not a nonzero decimal string",
+    "boolean asset size": b"expected asset 0 size is not a nonnegative integer",
+    "malformed asset digest": b"expected asset 0 SHA-256 is not lowercase SHA-256",
+    "missing asset": b"expected assets must contain exactly six entries",
+    "extra asset": b"expected assets must contain exactly six entries",
+    "duplicate asset": b"expected asset names are not unique",
+    "foreign asset": b"expected asset names differ from the QA-approved six files",
+    "unsorted assets": b"expected assets are not sorted by ASCII name",
+    "hostile asset name": b"expected asset 0 name is a hostile name",
+    "non-ASCII asset name": b"expected asset 0 name is not printable ASCII",
+    "wrong candidate tuple": b"release QA record cites another producer run",
+    "noncanonical expected-assets input": b"expected assets bytes are not canonical",
+    "release body with a final LF": b"release body differs from the deterministic three-line body",
+    "malformed artifact API digest": b"API digest is not canonical sha256:<64-lowercase-hex>",
+    "tampered manifest wrong candidate tuple": b"promotion manifest differs from the exact reconstructed manifest",
+    "tampered manifest boolean manifest attempt": b"manifest promotion run attempt must be integer 1",
+    "tampered manifest unsorted manifest assets": b"manifest assets are not sorted by ASCII name",
+    "tampered manifest extra manifest key": b"promotion manifest keys are",
+    "noncanonical promotion manifest": b"promotion manifest is not canonical sorted compact JSON with one LF",
+    "duplicate promotion manifest key": b"duplicate JSON key 'schemaVersion'",
+    "missing preflight": b"WAIT: no matching preflight comment yet",
+    "non-JSON constant in comments": b"invalid preflight comments: non-JSON constant 'NaN'",
+    "unrelated nonce": b"WAIT: no matching preflight comment yet",
+    "same-nonce duplicate": b"expected exactly one matching preflight comment, found 2",
+    "matching wrong author": b"preflight comment author differs",
+    "edited preflight": b"preflight comment was edited",
+    "boolean comment ID": b"preflight comment ID is not a positive integer",
+    "foreign issue URL": b"preflight comment belongs to another issue",
+    "foreign comment URL": b"preflight comment URL is not canonical for its ID",
+    "matching malformed preflight": b"invalid preflight comment body:",
+    "matching markerless preflight with escaped kind": b"does not begin with its exact marker at byte zero",
+    "unrelated markerless same-nonce comment": b"WAIT: no matching preflight comment yet",
+    "byte before marker": b"does not begin with its exact marker at byte zero",
+    "wrong marker case": b"does not begin with its exact marker at byte zero",
+    "wrong marker case with escaped kind": b"does not begin with its exact marker at byte zero",
+    "missing final LF": b"is not canonical sorted compact JSON with one LF",
+    "extra final LF": b"is not canonical sorted compact JSON with one LF",
+    "pretty body": b"is not canonical sorted compact JSON with one LF",
+    "non-ASCII body": b"preflight comment body is invalid:",
+    "duplicate JSON key": b"duplicate JSON key 'schemaVersion'",
+    "promotion run": b"record source cites another promotion run",
+    "promotion head": b"preflight record differs from the exact reconstructed record",
+    "release-QA tuple": b"preflight record differs from the exact reconstructed record",
+    "candidate tuple": b"preflight record differs from the exact reconstructed record",
+    "source tuple": b"preflight record differs from the exact reconstructed record",
+    "manifest digest": b"preflight record differs from the exact reconstructed record",
+    "dispatcher": b"preflight administrator differs from dispatcher",
+    "administrator": b"preflight administrator differs from dispatcher",
+    "helper commit": b"preflight record differs from the exact reconstructed record",
+    "extra key": b"preflight record keys are",
+    "settings exact bytes": b"preflight record differs from the exact reconstructed record",
+    "comment before gate boundary": b"preflight comment was created before the gate was ready",
+    "comment freshness boundary": b"preflight comment is stale",
+    "comment future boundary": b"preflight comment is in the future",
+    "settings/comment skew boundary": b"preflight settings check is later than the comment",
+    "settings freshness boundary": b"preflight settings check is stale",
+    "final recheck missing identity": b"final recheck requires accepted comment ID and body SHA-256",
+    "final recheck ID changed": b"preflight comment ID changed",
+    "final recheck body changed": b"preflight comment body SHA-256 changed",
+    "final recheck still rejects edits": b"preflight comment was edited",
+    "final recheck still rejects author changes": b"preflight comment author differs",
+    "final recheck still rejects future comments": b"preflight comment is in the future",
+    "settings-before-gate boundary": b"immutable settings were checked before the gate was ready",
+    "GitHub clock-skew boundary": b"GitHub server time and settings check differ beyond clock skew",
+    "missing completion": b"WAIT: no matching completion comment yet",
+    "matching markerless completion with escaped kind": b"does not begin with its exact marker at byte zero",
+    "duplicate completion": b"expected exactly one matching completion comment, found 2",
+    "completion preflight digest": b"completion record differs from the exact reconstructed record",
+    "completion tag": b"completion tag targets another candidate",
+    "completion release": b"completion record differs from the exact reconstructed record",
+    "completion boolean release ID": b"completion release ID is not a positive integer",
+    "completion source": b"completion record differs from the exact reconstructed record",
+    "completion asset": b"completion record differs from the exact reconstructed record",
+    "completion boolean asset ID": b"completion asset 0 ID is not a positive integer",
+    "completion assets unsorted": b"completion assets are not sorted by ASCII name",
+    "completion evidence digest": b"completion record differs from the exact reconstructed record",
+    "completion authority phase": b"completion authority phase is invalid",
+    "completion public flags": b"completion release is not public and immutable",
+    "completion freshness boundary": b"completion comment is stale",
+    "completion future boundary": b"completion comment is in the future",
+    "invalid completion authority phase input": b"completion authority phase is invalid",
+    "mutable completion input": b"completion requires a public immutable release",
+    "draft completion input": b"completion requires a public immutable release",
+    "QA reconstruction optional-field soup": b"qa-reconstruction source cannot carry run-bundle fields",
+    "boolean run-bundle artifact ID": b"run-bundle artifact ID is not a nonzero decimal string",
+    "symlink file": b"transaction evidence link is a symlink",
+    "symlink directory": b"transaction evidence linked-directory is a symlink",
+    "symlink evidence output": b"transaction evidence output is a symlink",
+    "FIFO entry": b"transaction evidence pipe is not a regular file",
+    "non-ASCII filesystem path": b"transaction evidence path is not ASCII",
+    "hostile filesystem path": b"transaction evidence path component is not printable ASCII",
+    "existing hard-linked evidence output": b"transaction evidence output has multiple hard links",
+    "hard-linked evidence output alias": b"transaction evidence output has multiple hard links",
+    "symlink transaction root": b"transaction root is a symlink",
+}
+
+EXPECTED_INVALID_DIAGNOSTICS = {
+    "canonical NaN": "value is not strict JSON",
+    "decoded NaN": "non-JSON constant 'NaN'",
+    "canonical positive infinity": "value is not strict JSON",
+    "decoded positive infinity": "non-JSON constant 'Infinity'",
+    "canonical negative infinity": "value is not strict JSON",
+    "decoded negative infinity": "non-JSON constant '-Infinity'",
+    "byte before marker": "does not begin with its exact marker at byte zero",
+    "wrong marker case": "does not begin with its exact marker at byte zero",
+    "missing trailing LF": "is not canonical sorted compact JSON with one LF",
+    "extra final LF": "is not canonical sorted compact JSON with one LF",
+    "pretty JSON": "is not canonical sorted compact JSON with one LF",
+    "duplicate keys": "duplicate JSON key 'nonce'",
+    "Unicode/non-ASCII": "invalid record:",
+    "empty settings": "immutable settings response has an invalid byte length",
+    "disabled settings": "immutable releases were not enabled",
+    "missing settings key": "immutable settings response keys are",
+    "extra settings key": "immutable settings response keys are",
+    "nonboolean enabled": "immutable releases were not enabled",
+    "nonboolean owner": "immutable settings owner enforcement is not boolean",
+    "duplicate settings key": "duplicate JSON key 'enabled'",
+    "non-ASCII settings": "invalid immutable settings response:",
+    "intrinsic manifest foreign candidate artifact role": "manifest candidate artifact role/name bindings differ",
+    "intrinsic manifest cross-role artifact ID collision": "manifest artifact IDs collide across provenance roles",
+    "intrinsic manifest QA artifact ID collision": "manifest artifact IDs collide across provenance roles",
+    "intrinsic preflight foreign candidate artifact role": "record candidate artifact role/name bindings differ",
+    "intrinsic preflight artifact ID collision": "record artifact IDs collide across provenance roles",
+    "intrinsic completion foreign candidate artifact role": "record candidate artifact role/name bindings differ",
+    "intrinsic completion artifact ID collision": "record artifact IDs collide across provenance roles",
+    "absolute path": "test path is absolute",
+    "dot component": "test path contains an empty, dot, or dotdot component",
+    "dotdot component": "test path contains an empty, dot, or dotdot component",
+    "empty component": "test path contains an empty, dot, or dotdot component",
+    "backslash": "test path contains a backslash",
+    "non-ASCII": "test path is not ASCII",
+    "hidden component": "test path component is a hostile name",
+    "unsorted inventory": "transaction evidence paths are not sorted by ASCII bytes",
+    "duplicate inventory path": "transaction evidence paths are not unique",
+    "boolean inventory size": "transaction evidence file 0 size is not a nonnegative integer",
+    "malformed inventory digest": "transaction evidence file 0 SHA-256 is not lowercase SHA-256",
+    "extra inventory field": "transaction evidence file 0 keys are",
+    "replaced evidence output parent": "transaction root is a symlink",
+    "evidence output appeared after inventory": "transaction evidence output appeared after inventory began",
+    "evidence output substituted after inventory": "transaction evidence output was substituted after inventory began",
+    "evidence output parent replaced by a real directory": "transaction root was replaced after inventory",
+    "external evidence output parent replaced by a real directory": "transaction evidence output parent was replaced after inventory",
+}
 
 
 def canonical(value):
@@ -85,6 +260,13 @@ def expect_invalid(label, operation):
         assert error.__class__.__name__ == "Invalid", (
             f"{label}: expected Invalid, got {type(error).__name__}: {error}"
         )
+        assert label in EXPECTED_INVALID_DIAGNOSTICS, (
+            f"{label}: test does not declare its intended Invalid diagnostic"
+        )
+        intended = EXPECTED_INVALID_DIAGNOSTICS[label]
+        assert intended in str(error), (
+            f"{label}: expected diagnostic {intended!r}, got {str(error)!r}"
+        )
     else:
         raise AssertionError(f"{label}: invalid value was accepted")
 
@@ -118,6 +300,11 @@ def make_qa_record():
                 ),
             },
         }
+    evidence_link = (
+        "https://github.com/BrainyBlaze/moor/actions/runs/" + CANDIDATE_QA_RUN_ID
+    )
+    evidence_comment_id = "5314000000"
+    evidence_time = "2026-08-17T09:30:00Z"
     return {
         "schemaVersion": 1,
         "repository": "https://github.com/BrainyBlaze/moor",
@@ -145,11 +332,30 @@ def make_qa_record():
         "targets": targets,
         "manualQa": {
             "verdict": "passed",
-            "checklist": [],
+            "checklist": [
+                {"id": item, "verdict": "passed", "evidence": evidence_link}
+                for item in CHECKLIST
+            ],
             "approvedBy": "levi770",
-            "approvedAt": "2026-08-17T09:30:00Z",
-            "evidence": {},
-            "confirmation": "fixture",
+            "approvedAt": evidence_time,
+            "evidence": {
+                "url": (
+                    "https://github.com/BrainyBlaze/moor/issues/1"
+                    f"#issuecomment-{evidence_comment_id}"
+                ),
+                "commentId": evidence_comment_id,
+                "createdAt": evidence_time,
+                "updatedAt": evidence_time,
+                "authorAssociation": "MEMBER",
+                "repositoryPermission": "admin",
+                "file": "manual-qa-evidence.txt",
+                "size": 1024,
+                "sha256": "9" * 64,
+            },
+            "confirmation": (
+                f"APPROVE MOOR {VERSION} {CANDIDATE_SHA} "
+                f"{CANDIDATE_RUN_ID}/1 9279394300 9279395137 full-matrix"
+            ),
         },
     }
 
@@ -255,32 +461,6 @@ def run_manifest(root, verb="create", qa=None, assets=None, body=None, **overrid
     return invoke(arguments), qa, assets, paths
 
 
-def manifest_reject(label, mutate=None, verb="create", **overrides):
-    with tempfile.TemporaryDirectory(prefix="release-promotion-manifest-reject-") as root:
-        qa = make_qa_record()
-        assets = make_expected_assets(qa)
-        body = release_body(qa)
-        if mutate is not None:
-            qa, assets, body = mutate(qa, assets, body)
-        if verb == "verify":
-            created, _, _, paths = run_manifest(root, qa=qa, assets=assets, body=body)
-            assert created.returncode == 0, created.stderr.decode(errors="replace")
-            if mutate is not None:
-                mutate(paths, None, None)
-            arguments = ["manifest", "verify"] + manifest_common(paths, qa, **overrides)
-            arguments += ["--manifest", paths["manifest"]]
-            result = invoke(arguments)
-        else:
-            result, _, _, _ = run_manifest(
-                root, qa=qa, assets=assets, body=body, **overrides
-            )
-        assert result.returncode == 1, (
-            f"{label}: expected exit 1, got {result.returncode}: "
-            f"{result.stderr.decode(errors='replace')}"
-        )
-        assert result.stderr.strip(), f"{label}: no diagnostic"
-
-
 def test_primitives(tool):
     assert tool.CLOCK_SKEW_SECONDS == 5
     assert tool.COMMENT_FRESHNESS_SECONDS == 15 * 60
@@ -293,12 +473,12 @@ def test_primitives(tool):
             "timestamp validation must use exact timedelta comparisons"
         )
 
-    value = {"z": 1, "a": {"nonce": "b" * 64}}
-    assert tool.canonical_json(value) == canonical(value)
+    sample = {"z": 1, "a": {"nonce": "b" * 64}}
+    assert tool.canonical_json(sample) == canonical(sample)
     for marker in (PREFLIGHT_MARKER, COMPLETION_MARKER):
-        body = tool.encode_comment(marker, value)
+        body = tool.encode_comment(marker, sample)
         assert_marker(body, marker)
-        assert tool.decode_comment(marker, body, "record") == value
+        assert tool.decode_comment(marker, body, "record") == sample
 
     valid = b'{"enabled":true,"enforced_by_owner":false}'
     assert tool.validate_settings_response(valid) == {
@@ -309,13 +489,14 @@ def test_primitives(tool):
         b'{"enforced_by_owner":true,"enabled":true}'
     ) == {"enforced_by_owner": True, "enabled": True}
 
-    for label, value in (
+    for label, constant_value in (
         ("NaN", float("nan")),
         ("positive infinity", float("inf")),
         ("negative infinity", float("-inf")),
     ):
         expect_invalid(
-            f"canonical {label}", lambda value=value: tool.canonical_json({"x": value})
+            f"canonical {label}",
+            lambda value=constant_value: tool.canonical_json({"x": value}),
         )
         constant = {
             "NaN": b"NaN",
@@ -332,14 +513,14 @@ def test_primitives(tool):
         )
 
     for label, body in (
-        ("byte before marker", b"x" + PREFLIGHT_MARKER + canonical(value)),
-        ("wrong marker case", b"<!-- Moor-release-preflight-v1 -->\n" + canonical(value)),
-        ("missing trailing LF", PREFLIGHT_MARKER + canonical(value)[:-1]),
-        ("extra final LF", PREFLIGHT_MARKER + canonical(value) + b"\n"),
+        ("byte before marker", b"x" + PREFLIGHT_MARKER + canonical(sample)),
+        ("wrong marker case", b"<!-- Moor-release-preflight-v1 -->\n" + canonical(sample)),
+        ("missing trailing LF", PREFLIGHT_MARKER + canonical(sample)[:-1]),
+        ("extra final LF", PREFLIGHT_MARKER + canonical(sample) + b"\n"),
         (
             "pretty JSON",
             PREFLIGHT_MARKER
-            + (json.dumps(value, indent=2, ensure_ascii=True) + "\n").encode("ascii"),
+            + (json.dumps(sample, indent=2, ensure_ascii=True) + "\n").encode("ascii"),
         ),
         (
             "duplicate keys",
@@ -419,6 +600,34 @@ def test_manifest(tool):
         assert "bundleArtifactId" not in first.decode("ascii")
         assert "bundleApiDigest" not in first.decode("ascii")
 
+        foreign_role = copy.deepcopy(manifest)
+        foreign_role["candidate"]["artifacts"][0]["name"] = (
+            "moor-candidate-foreign-role"
+        )
+        foreign_role["candidate"]["artifacts"].sort(
+            key=lambda item: item["name"].encode("ascii")
+        )
+        expect_invalid(
+            "intrinsic manifest foreign candidate artifact role",
+            lambda: tool.validate_manifest(foreign_role),
+        )
+        colliding_role = copy.deepcopy(manifest)
+        colliding_role["qa"]["candidateQa"]["artifactId"] = colliding_role[
+            "candidate"
+        ]["artifacts"][0]["id"]
+        expect_invalid(
+            "intrinsic manifest cross-role artifact ID collision",
+            lambda: tool.validate_manifest(colliding_role),
+        )
+        release_qa_collision = copy.deepcopy(manifest)
+        release_qa_collision["qa"]["releaseQa"]["artifactId"] = (
+            release_qa_collision["qa"]["candidateQa"]["artifactId"]
+        )
+        expect_invalid(
+            "intrinsic manifest QA artifact ID collision",
+            lambda: tool.validate_manifest(release_qa_collision),
+        )
+
         verified = invoke(
             ["manifest", "verify"]
             + manifest_common(paths, qa)
@@ -448,19 +657,47 @@ def test_manifest(tool):
             result, _, _, _ = run_manifest(
                 root, qa=qa, assets=assets, body=body, **overrides
             )
-            assert result.returncode == 1, (
-                f"{label}: expected exit 1, got {result.returncode}: "
-                f"{result.stderr.decode(errors='replace')}"
-            )
-            assert result.stderr.strip(), f"{label}: no diagnostic"
-            assert result.stderr.startswith(b"release-promotion-record: "), (
-                f"{label}: refusal did not use the tool diagnostic prefix: "
-                f"{result.stderr.decode(errors='replace')}"
-            )
-            assert b"Traceback" not in result.stderr, f"{label}: refusal crashed"
+            assert_record_rejected(label, result)
+
+    def reverse_release_qa_keys(qa, assets):
+        del assets
+        items = list(qa.items())
+        qa.clear()
+        qa.update(reversed(items))
+
+    def reverse_root_manual_qa_keys(qa, assets):
+        del assets
+        manual_qa = qa["manualQa"]
+        items = list(manual_qa.items())
+        manual_qa.clear()
+        manual_qa.update(reversed(items))
 
     reject_inputs("promotion rerun", promotion_run_attempt="2")
     reject_inputs("release QA rerun", qa_run_attempt="2")
+    reject_inputs("reordered release QA producer keys", reverse_release_qa_keys)
+    reject_inputs(
+        "incomplete root manual QA",
+        lambda qa, assets: qa["manualQa"].update(checklist=[]),
+    )
+    reject_inputs(
+        "reordered root manual QA producer keys", reverse_root_manual_qa_keys
+    )
+    reject_inputs(
+        "foreign root manual QA evidence URL",
+        lambda qa, assets: qa["manualQa"]["evidence"].update(
+            url="https://example.com/issues/1#issuecomment-5314000000"
+        ),
+    )
+    reject_inputs(
+        "wrong root manual QA confirmation",
+        lambda qa, assets: qa["manualQa"].update(confirmation="APPROVE SOMETHING"),
+    )
+    reject_inputs(
+        "foreign target manual QA evidence",
+        lambda qa, assets: next(iter(qa["targets"].values()))["manualQa"].update(
+            evidence="https://example.com/foreign-evidence"
+        ),
+    )
     reject_inputs(
         "candidate rerun",
         lambda qa, assets: qa["candidate"].update(workflowRunAttempt=2),
@@ -543,18 +780,14 @@ def test_manifest(tool):
             + manifest_common(paths, qa)
             + ["--out", paths["manifest"]]
         )
-        assert result.returncode == 1 and result.stderr.strip(), (
-            "pretty/noncanonical expected-assets input was accepted"
-        )
+        assert_record_rejected("noncanonical expected-assets input", result)
 
     with tempfile.TemporaryDirectory(
         prefix="release-promotion-manifest-bad-body-"
     ) as root:
         qa = make_qa_record()
         result, _, _, _ = run_manifest(root, qa=qa, body=release_body(qa) + b"\n")
-        assert result.returncode == 1 and result.stderr.strip(), (
-            "release body with a final LF was accepted"
-        )
+        assert_record_rejected("release body with a final LF", result)
 
     with tempfile.TemporaryDirectory(
         prefix="release-promotion-manifest-bad-api-digest-"
@@ -564,9 +797,7 @@ def test_manifest(tool):
         position = arguments.index("--artifact-api-digest") + 1
         arguments[position] = arguments[position].split("=", 1)[0] + "=sha256:BAD"
         result = invoke(arguments + ["--out", paths["manifest"]])
-        assert result.returncode == 1 and result.stderr.strip(), (
-            "malformed artifact API digest was accepted"
-        )
+        assert_record_rejected("malformed artifact API digest", result)
 
     with tempfile.TemporaryDirectory(
         prefix="release-promotion-manifest-tamper-"
@@ -594,18 +825,14 @@ def test_manifest(tool):
                 + manifest_common(paths, qa)
                 + ["--manifest", paths["manifest"]]
             )
-            assert result.returncode == 1 and result.stderr.strip(), (
-                f"{label}: tampered manifest was accepted"
-            )
+            assert_record_rejected(f"tampered manifest {label}", result)
         write_bytes(paths["manifest"], legacy_canonical(valid))
         result = invoke(
             ["manifest", "verify"]
             + manifest_common(paths, qa)
             + ["--manifest", paths["manifest"]]
         )
-        assert result.returncode == 1 and result.stderr.strip(), (
-            "pretty/noncanonical manifest was accepted"
-        )
+        assert_record_rejected("noncanonical promotion manifest", result)
         duplicate = canonical(valid).replace(
             b'{"assets":', b'{"schemaVersion":1,"assets":', 1
         )
@@ -615,9 +842,7 @@ def test_manifest(tool):
             + manifest_common(paths, qa)
             + ["--manifest", paths["manifest"]]
         )
-        assert result.returncode == 1 and result.stderr.strip(), (
-            "duplicate manifest key was accepted"
-        )
+        assert_record_rejected("duplicate promotion manifest key", result)
 
 
 def prepare_record_fixture(root, source_mode="run-bundle"):
@@ -655,6 +880,47 @@ def prepare_record_fixture(root, source_mode="run-bundle"):
         "manifestBody": manifest_body,
         "paths": paths,
         "sourceMode": source_mode,
+    }
+
+
+def prepare_zero_size_record_fixture(root):
+    os.makedirs(root, exist_ok=True)
+    qa = make_qa_record()
+    assets = make_expected_assets(qa)
+    next(item for item in assets if item["name"] == "SHA256SUMS")["size"] = 0
+    created, qa, assets, paths = run_manifest(root, qa=qa, assets=assets)
+    assert created.returncode == 0, created.stderr.decode(errors="replace")
+    with open(paths["manifest"], "rb") as handle:
+        manifest_body = handle.read()
+    manifest = json.loads(manifest_body)
+    paths.update(
+        {
+            "settings": os.path.join(root, "immutable-settings.json"),
+            "published_assets": os.path.join(root, "published-assets.json"),
+            "preflight": os.path.join(root, "preflight-comment.txt"),
+            "completion": os.path.join(root, "completion-comment.txt"),
+            "comments": os.path.join(root, "comments.json"),
+        }
+    )
+    write_bytes(paths["settings"], SETTINGS_RESPONSE)
+    published_assets = [
+        {
+            "id": 8100 + index,
+            "name": entry["name"],
+            "size": entry["size"],
+            "sha256": entry["sha256"],
+        }
+        for index, entry in enumerate(assets)
+    ]
+    write_bytes(paths["published_assets"], canonical(published_assets))
+    return {
+        "qa": qa,
+        "assets": assets,
+        "publishedAssets": published_assets,
+        "manifest": manifest,
+        "manifestBody": manifest_body,
+        "paths": paths,
+        "sourceMode": "run-bundle",
     }
 
 
@@ -815,12 +1081,20 @@ def assert_record_rejected(label, result, expected=1):
         f"{result.stderr.decode(errors='replace')}"
     )
     assert result.stderr.strip(), f"{label}: no diagnostic"
+    assert label in EXPECTED_REFUSAL_DIAGNOSTICS, (
+        f"{label}: test does not declare its intended refusal diagnostic"
+    )
+    intended = EXPECTED_REFUSAL_DIAGNOSTICS[label]
+    assert intended in result.stderr, (
+        f"{label}: expected diagnostic {intended!r}, got "
+        f"{result.stderr.decode(errors='replace')!r}"
+    )
+    assert b"Traceback" not in result.stderr, f"{label}: refusal crashed"
     if expected == 1:
         assert result.stderr.startswith(b"release-promotion-record: "), (
             f"{label}: refusal did not use the tool diagnostic prefix: "
             f"{result.stderr.decode(errors='replace')}"
         )
-        assert b"Traceback" not in result.stderr, f"{label}: refusal crashed"
 
 
 def mutate_record_body(marker, body, mutate):
@@ -832,6 +1106,34 @@ def mutate_record_body(marker, body, mutate):
 def test_preflight_completion(tool):
     skew = tool.CLOCK_SKEW_SECONDS
     freshness = tool.COMMENT_FRESHNESS_SECONDS
+    with tempfile.TemporaryDirectory(
+        prefix="release-promotion-zero-size-assets-"
+    ) as root:
+        zero_fixture = prepare_zero_size_record_fixture(root)
+        zero_preflight = preflight_create(zero_fixture)
+        assert zero_preflight.returncode == 0, zero_preflight.stderr.decode(
+            errors="replace"
+        )
+        zero_preflight_body = open(
+            zero_fixture["paths"]["preflight"], "rb"
+        ).read()
+        zero_completion = completion_create(zero_fixture, zero_preflight_body)
+        assert zero_completion.returncode == 0, zero_completion.stderr.decode(
+            errors="replace"
+        )
+        zero_completion_body = open(
+            zero_fixture["paths"]["completion"], "rb"
+        ).read()
+        zero_accepted = verify_record(
+            zero_fixture,
+            "completion",
+            [comment(zero_completion_body, completion=True)],
+            preflight_body=zero_preflight_body,
+        )
+        assert zero_accepted.returncode == 0, zero_accepted.stderr.decode(
+            errors="replace"
+        )
+
     with tempfile.TemporaryDirectory(prefix="release-promotion-comments-") as root:
         fixture = prepare_record_fixture(root)
         created = preflight_create(fixture)
@@ -956,6 +1258,30 @@ def test_preflight_completion(tool):
         ).hexdigest()
         assert completion_snapshot["record"] == completion
 
+        for record_name, validator, record in (
+            ("preflight", tool.validate_preflight, preflight),
+            ("completion", tool.validate_completion, completion),
+        ):
+            foreign_role = copy.deepcopy(record)
+            foreign_role["candidate"]["artifacts"][0]["name"] = (
+                "moor-candidate-foreign-role"
+            )
+            foreign_role["candidate"]["artifacts"].sort(
+                key=lambda item: item["name"].encode("ascii")
+            )
+            expect_invalid(
+                f"intrinsic {record_name} foreign candidate artifact role",
+                lambda validator=validator, value=foreign_role: validator(value),
+            )
+            collision = copy.deepcopy(record)
+            collision["qa"]["releaseQa"]["artifactId"] = collision["qa"][
+                "candidateQa"
+            ]["artifactId"]
+            expect_invalid(
+                f"intrinsic {record_name} artifact ID collision",
+                lambda validator=validator, value=collision: validator(value),
+            )
+
         recovered = completion_create(
             fixture, preflight_body, authority_phase="published-recovery"
         )
@@ -1064,10 +1390,39 @@ def test_preflight_completion(tool):
             "matching malformed preflight",
             verify_record(fixture, "preflight", [comment(malformed)]),
         )
+        markerless_escaped_kind = canonical(preflight).decode("ascii").replace(
+            "moor-release-preflight-v1", "moor-release-preflight-v\\u0031"
+        )
+        assert_record_rejected(
+            "matching markerless preflight with escaped kind",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(markerless_escaped_kind)],
+            ),
+        )
+        unrelated_markerless = copy.deepcopy(preflight)
+        unrelated_markerless["kind"] = "moor-release-unrelated-v1"
+        assert_record_rejected(
+            "unrelated markerless same-nonce comment",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(canonical(unrelated_markerless).decode("ascii"))],
+            ),
+            expected=75,
+        )
 
         byte_mutations = {
             "byte before marker": b"x" + preflight_body,
             "wrong marker case": preflight_body.replace(b"moor", b"Moor", 1),
+            "wrong marker case with escaped kind": preflight_body.replace(
+                b"<!-- moor", b"<!-- Moor", 1
+            ).replace(
+                b"moor-release-preflight-v1",
+                b"moor-release-preflight-v\\u0031",
+                1,
+            ),
             "missing final LF": preflight_body[:-1],
             "extra final LF": preflight_body + b"\n",
             "pretty body": PREFLIGHT_MARKER + legacy_canonical(preflight),
@@ -1400,6 +1755,19 @@ def test_preflight_completion(tool):
                 fixture, "completion", [], preflight_body=preflight_body
             ),
             expected=75,
+        )
+        completion_value = json.loads(completion_body[len(COMPLETION_MARKER) :])
+        markerless_completion = canonical(completion_value).decode("ascii").replace(
+            "moor-release-completion-v1", "moor-release-completion-v\\u0031"
+        )
+        assert_record_rejected(
+            "matching markerless completion with escaped kind",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(markerless_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
         )
         assert_record_rejected(
             "duplicate completion",
@@ -1747,6 +2115,32 @@ def test_evidence(tool):
 
     if hasattr(os, "link"):
         with tempfile.TemporaryDirectory(
+            prefix="release-promotion-evidence-existing-hardlink-"
+        ) as root:
+            transaction = os.path.join(root, "transaction")
+            os.makedirs(transaction)
+            write_bytes(os.path.join(transaction, "file"), b"evidence")
+            victim = os.path.join(root, "external-victim")
+            out = os.path.join(root, "transaction-evidence-manifest.json")
+            original = b"must-not-be-truncated"
+            write_bytes(victim, original)
+            os.link(victim, out)
+            result = invoke(
+                [
+                    "evidence",
+                    "create",
+                    "--transaction-root",
+                    transaction,
+                    "--out",
+                    out,
+                ]
+            )
+            assert_record_rejected("existing hard-linked evidence output", result)
+            assert open(victim, "rb").read() == original, (
+                "existing hard-linked evidence output modified its external victim"
+            )
+
+        with tempfile.TemporaryDirectory(
             prefix="release-promotion-evidence-output-hardlink-"
         ) as root:
             transaction = os.path.join(root, "transaction")
@@ -1765,6 +2159,131 @@ def test_evidence(tool):
                 ]
             )
             assert_record_rejected("hard-linked evidence output alias", result)
+
+        def evidence_race(label, setup, mutate, verify):
+            with tempfile.TemporaryDirectory(
+                prefix="release-promotion-evidence-race-"
+            ) as root:
+                transaction = os.path.join(root, "transaction")
+                os.makedirs(transaction)
+                write_bytes(os.path.join(transaction, "file"), b"evidence")
+                out = os.path.join(transaction, "transaction-evidence-manifest.json")
+                state = setup(root, transaction, out)
+
+                def operation():
+                    original_commit = tool._commit_evidence_output
+
+                    def injected(context, body):
+                        mutate(root, transaction, out, state)
+                        return original_commit(context, body)
+
+                    tool._commit_evidence_output = injected
+                    try:
+                        tool.create_evidence_manifest(transaction, out)
+                    finally:
+                        tool._commit_evidence_output = original_commit
+
+                expect_invalid(label, operation)
+                verify(root, transaction, out, state)
+
+        evidence_race(
+            "evidence output appeared after inventory",
+            lambda root, transaction, out: {"appeared": b"appeared-after-inventory"},
+            lambda root, transaction, out, state: write_bytes(
+                out, state["appeared"]
+            ),
+            lambda root, transaction, out, state: (
+                open(out, "rb").read() == state["appeared"]
+                or (_ for _ in ()).throw(
+                    AssertionError("appeared evidence output was overwritten")
+                )
+            ),
+        )
+
+        def setup_substitution(root, transaction, out):
+            original = b"original-output"
+            victim_body = b"substituted-output"
+            write_bytes(out, original)
+            displaced = os.path.join(root, "displaced-output")
+            return {
+                "original": original,
+                "victimBody": victim_body,
+                "displaced": displaced,
+            }
+
+        def substitute_output(root, transaction, out, state):
+            os.rename(out, state["displaced"])
+            write_bytes(out, state["victimBody"])
+
+        def verify_substitution(root, transaction, out, state):
+            assert open(out, "rb").read() == state["victimBody"], (
+                "substituted evidence output was overwritten"
+            )
+            assert open(state["displaced"], "rb").read() == state["original"]
+
+        evidence_race(
+            "evidence output substituted after inventory",
+            setup_substitution,
+            substitute_output,
+            verify_substitution,
+        )
+
+        def replace_parent(root, transaction, out, state):
+            os.rename(transaction, state["moved"])
+            os.makedirs(transaction)
+
+        def verify_parent_replacement(root, transaction, out, state):
+            assert not os.path.exists(out), (
+                "evidence output was redirected into the replacement directory"
+            )
+            assert not os.path.exists(
+                os.path.join(state["moved"], "transaction-evidence-manifest.json")
+            ), "evidence output was committed after its parent path changed"
+
+        evidence_race(
+            "evidence output parent replaced by a real directory",
+            lambda root, transaction, out: {
+                "moved": os.path.join(root, "moved-transaction")
+            },
+            replace_parent,
+            verify_parent_replacement,
+        )
+
+        with tempfile.TemporaryDirectory(
+            prefix="release-promotion-evidence-external-parent-race-"
+        ) as root:
+            transaction = os.path.join(root, "transaction")
+            output_parent = os.path.join(root, "output")
+            moved_parent = os.path.join(root, "moved-output")
+            os.makedirs(transaction)
+            os.makedirs(output_parent)
+            write_bytes(os.path.join(transaction, "file"), b"evidence")
+            out = os.path.join(output_parent, "transaction-evidence-manifest.json")
+
+            def external_parent_operation():
+                original_commit = tool._commit_evidence_output
+
+                def injected(context, body):
+                    os.rename(output_parent, moved_parent)
+                    os.makedirs(output_parent)
+                    return original_commit(context, body)
+
+                tool._commit_evidence_output = injected
+                try:
+                    tool.create_evidence_manifest(transaction, out)
+                finally:
+                    tool._commit_evidence_output = original_commit
+
+            expect_invalid(
+                "external evidence output parent replaced by a real directory",
+                external_parent_operation,
+            )
+            assert not os.path.exists(out), (
+                "evidence output was redirected into a replacement output parent"
+            )
+            assert not os.path.exists(
+                os.path.join(moved_parent, "transaction-evidence-manifest.json")
+            ), "evidence output was committed through a stale output-parent FD"
 
     if hasattr(os, "symlink"):
         with tempfile.TemporaryDirectory(
