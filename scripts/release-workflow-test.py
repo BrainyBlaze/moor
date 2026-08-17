@@ -77,6 +77,7 @@ def main():
     require(candidate_qa, "DESK_MOOR_RELEASE_BASE_URL", "candidate QA local candidate origin")
     require(candidate_qa, "npm run fetch:moor", "candidate QA installer path")
     require(candidate_qa, "DESK_MOOR_NATIVE_BIN", "candidate QA exact holder path")
+    forbid(candidate_qa, "cache: npm", "candidate QA untrusted Desk cache boundary")
     forbid(candidate_qa, '"moor 0.1.0"', "candidate QA manifest-derived version")
     for suite in (
         "tests/moor-native-e2e.test.ts",
