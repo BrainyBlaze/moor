@@ -3,6 +3,7 @@
 
 import os
 import re
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESK_RELEASE_QA_COMMIT = "14e727bafe11a41e87a81a068c3ecbd3151fd2c8"
@@ -46,6 +47,18 @@ def main():
     quality = read(".github/workflows/quality.yml")
     guide = read("docs/release-manual-qa-v1.md")
     manifest_contract = read("docs/release-manifest-v1.md")
+
+    workflow_paths = sorted(
+        list((Path(ROOT) / ".github" / "workflows").glob("*.yml"))
+        + list((Path(ROOT) / ".github" / "workflows").glob("*.yaml"))
+    )
+    assert workflow_paths, "release governance: no workflow files found"
+    for workflow_path in workflow_paths:
+        forbid(
+            workflow_path.read_text(encoding="utf-8"),
+            "immutable-releases",
+            f"workflow-token administration boundary ({workflow_path.name})",
+        )
 
     assert candidate.count("github.run_attempt == 1") == 5, (
         "candidate immutable producer attempt: every job must reject reruns"
@@ -152,14 +165,39 @@ def main():
     require(promotion, "qa_run_id", "promotion inputs")
     require(promotion, "qa_run_attempt", "promotion inputs")
     require(promotion, "qa_artifact_id", "promotion inputs")
+    require(promotion, "attestation_issue_number", "promotion inputs")
+    require(promotion, "attestation_nonce", "promotion inputs")
     require(promotion, "actions: read", "promotion permissions")
     require(promotion, "contents: write", "promotion permissions")
     require(promotion, "issues: read", "promotion permissions")
     require(promotion, "environment: release", "promotion environment")
     require(promotion, "github.ref == 'refs/heads/main'", "promotion main gate")
     require(promotion, "github.ref_protected", "promotion protected-ref gate")
-    require(promotion, "repos/${{ github.repository }}/immutable-releases", "immutable release gate")
-    require(promotion, ".enabled == true", "immutable release gate")
+    require(promotion, "attempt_one:", "promotion immutable attempt prerequisite")
+    require(promotion, 'test "${{ github.run_attempt }}" = 1', "promotion immutable attempt prerequisite")
+    require(promotion, "needs: attempt_one", "promotion immutable attempt prerequisite")
+    promote_job = promotion[promotion.index("  promote:") :]
+    ordered(
+        promote_job,
+        [
+            "Require attempt-one execution inside the promotion job",
+            "Check out the reviewed promotion tooling from protected main",
+        ],
+        "promotion failed-job rerun gate",
+    )
+    require(promotion, "release-admin-attestation.py verify", "promotion admin preflight gate")
+    require(promotion, "Open the run-bound immutable-settings attestation gate", "promotion gate-ready boundary")
+    require(promotion, "GATE_READY_AT", "promotion gate-ready boundary")
+    require(promotion, "GITHUB_STEP_SUMMARY", "promotion gate-ready disclosure")
+    require(promotion, "collaborators/$ATTESTATION_AUTHOR/permission", "promotion attestation admin proof")
+    require(promotion, 'permission == "admin"', "promotion attestation admin proof")
+    require(promotion, "for attempt in $(seq 1 60)", "promotion bounded attestation wait")
+    require(promotion, "sleep 10", "promotion bounded attestation wait")
+    require(promotion, "immutable settings attestation timed out before mutation", "promotion named timeout")
+    require(promotion, "ATTESTATION_STATUS", "promotion attestation refusal handling")
+    require(promotion, 'test "$ATTESTATION_STATUS" != 75', "promotion wait-only exit status")
+    require(promotion, "attestation-comment.json", "promotion attestation snapshot")
+    require(promotion, "final-attestation-comment.json", "promotion attestation final refetch")
     require(promotion, "collaborators/$EVIDENCE_AUTHOR/permission", "promotion admin permission proof")
     require(promotion, 'permission == "admin"', "promotion admin permission proof")
     require(promotion, ".candidateQa.workflowRunId", "promotion candidate-QA run binding")
@@ -185,6 +223,7 @@ def main():
     require(promotion, '"draft": true', "draft release")
     require(promotion, '"draft": false', "release publication")
     require(promotion, "re-download the published release assets", "post-publication verification")
+    require(promotion, 'test "$(jq length expected-assets.json)" = 6', "exact six-asset publication")
     forbid(promotion, "--clobber", "no overwrite")
     for command in ("cargo build", "cargo install", "cargo package", "candidate-manifest.py"):
         forbid(promotion, command, "promotion zero-build boundary")
@@ -192,6 +231,9 @@ def main():
         promotion,
         [
             "release-qa-record.py verify",
+            "Assemble the six byte-identical release files and expected inventory",
+            "Open the run-bound immutable-settings attestation gate",
+            "Require a fresh run-bound immutable-settings admin attestation",
             "refs/tags/$VERSION",
             '"draft": true',
             "release-asset-transaction.py plan",
@@ -200,26 +242,82 @@ def main():
         ],
         "promotion workflow",
     )
-    publish_step = promotion[promotion.index("- name: Publish the complete draft exactly once") :]
+    attestation_step = promotion[
+        promotion.index("- name: Open the run-bound immutable-settings attestation gate") :
+        promotion.index("- name: Create or verify the exact tag and draft release")
+    ]
+    ordered(
+        attestation_step,
+        [
+            "actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}",
+            "GATE_READY_AT",
+            "Require a fresh run-bound immutable-settings admin attestation",
+            "issues/${{ inputs.attestation_issue_number }}/comments?per_page=100",
+            "release-admin-attestation.py verify",
+            "mv immutable-settings-attestation.next.json immutable-settings-attestation.json",
+            "collaborators/$ATTESTATION_AUTHOR/permission",
+            'permission == "admin"',
+            "> attestation-comment.json",
+        ],
+        "promotion run-bound admin attestation gate",
+    )
+
+    publish_step = promotion[
+        promotion.index("- name: Publish the complete draft exactly once") :
+        promotion.index("- name: re-download the published release assets")
+    ]
     ordered(
         publish_step,
         [
             "prepublish-tag.json",
             "prepublish-release.json",
-            "prepublish-settings.json",
             "prepublish-assets.json",
             "release-asset-transaction.py verify-complete",
             '{"draft": false}',
-            "postpublish-tag.json",
-            "postpublish-release.json",
-            "postpublish-settings.json",
         ],
         "promotion prepublish fence",
+    )
+    postpublish = publish_step[publish_step.index('{"draft": false}') :]
+    ordered(
+        postpublish,
+        [
+            "published-release.json",
+            "postpublish-tag.json",
+            "postpublish-release.json",
+            "postpublish-assets.json",
+            "--assets postpublish-assets.json --downloads postpublish-downloads",
+        ],
+        "promotion postpublish release and asset proof",
+    )
+    require(
+        publish_step,
+        "and .immutable == true\n          ' published-release.json",
+        "promotion publish-response immutable proof",
+    )
+    require(
+        publish_step,
+        "and .immutable == true\n            ' postpublish-release.json",
+        "promotion fresh-release immutable proof",
+    )
+    final_step = promotion[promotion.index("- name: re-download the published release assets") :]
+    ordered(
+        final_step,
+        [
+            "published-assets.json",
+            "release-asset-transaction.py verify-complete",
+            "final-attestation-comment.json",
+            "release-admin-attestation.py verify",
+            "--postpublish-recheck",
+            "final-release.json",
+            ".draft == false and .immutable == true",
+        ],
+        "promotion independent published-byte and attestation proof",
     )
 
     for test in (
         "python3 scripts/release-qa-record-test.py",
         "python3 scripts/release-asset-transaction-test.py",
+        "python3 scripts/release-admin-attestation-test.py",
         "python3 scripts/release-workflow-test.py",
     ):
         require(quality, test, "hosted quality")
@@ -257,15 +355,23 @@ def main():
     require(guide, "never rebuilds or overwrites", "promotion boundary")
     require(guide, "single permitted deletion", "promotion starter exception")
     require(guide, "trusted repository administrators", "promotion trusted-admin boundary")
+    require(guide, "fresh nonce", "promotion run-bound admin attestation")
+    require(guide, "exact response bytes", "promotion run-bound admin attestation")
+    require(guide, "persistent but not immutable", "promotion attestation evidence boundary")
+    require(guide, "never rerun a failed promotion attempt", "promotion attempt recovery")
+    require(guide, "preflight-to-publication", "promotion trusted-admin race")
     require(
         guide,
-        "A postpublication mismatch instead reports an irreversible publication failure",
+        "detection, not prepublication fail-closed prevention",
         "postpublication detection semantics",
     )
     require(manifest_contract, "moor-release-qa-v1.json", "manifest QA record contract")
     require(manifest_contract, "candidate-QA evidence artifact", "manifest candidate-QA contract")
     require(manifest_contract, "QA producer run/attempt", "manifest QA producer identity")
     require(manifest_contract, "repository `admin` permission", "manifest evidence authority")
+    require(manifest_contract, "run-bound admin attestation", "manifest promotion settings authority")
+    require(manifest_contract, "exact response bytes", "manifest promotion settings authority")
+    require(manifest_contract, "new attempt-1 dispatch", "manifest promotion recovery")
     require(manifest_contract, "`starter`", "manifest starter exception")
     require(manifest_contract, "pin schema version is `3`", "manifest Desk pin schema")
     forbid(manifest_contract, "pin schema version is `2`", "retired manifest Desk pin schema")

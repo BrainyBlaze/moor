@@ -15,6 +15,14 @@ on:
         description: Immutable moor-release-qa-v1 artifact ID
         required: true
         type: string
+      attestation_issue_number:
+        description: Moor issue that will receive the run-bound admin attestation
+        required: true
+        type: string
+      attestation_nonce:
+        description: Fresh 64-lowercase-hex nonce for this promotion dispatch
+        required: true
+        type: string
 
 permissions:
   actions: read
@@ -26,26 +34,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  attempt_one:
+    name: Reject promotion workflow reruns
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Require a fresh attempt-one dispatch
+        run: test "${{ github.run_attempt }}" = 1
+
   promote:
     name: Promote the exact QA-approved candidate bytes
+    needs: attempt_one
     if: github.ref == 'refs/heads/main' && github.ref_protected
     environment: release
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
+      - name: Require attempt-one execution inside the promotion job
+        run: test "${{ github.run_attempt }}" = 1
+
       - name: Check out the reviewed promotion tooling from protected main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - name: Require protected main and immutable repository releases
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Require protected main
         run: |
           test "${{ github.ref }}" = refs/heads/main
           test "${{ github.ref_protected }}" = true
-          gh api "repos/${{ github.repository }}/immutable-releases" > immutable-releases.json
-          jq -e '.enabled == true' immutable-releases.json >/dev/null
 
       - name: Download the exact successful QA artifact by ID
         env:
@@ -284,6 +300,101 @@ jobs:
             ' > expected-assets.json
           test "$(jq length expected-assets.json)" = 6
 
+      - name: Open the run-bound immutable-settings attestation gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_ISSUE_NUMBER: ${{ inputs.attestation_issue_number }}
+          ATTESTATION_NONCE: ${{ inputs.attestation_nonce }}
+        run: |
+          case "$ATTESTATION_ISSUE_NUMBER" in ''|*[!0-9]*|0) exit 1 ;; esac
+          test "${#ATTESTATION_NONCE}" = 64
+          case "$ATTESTATION_NONCE" in *[!0-9a-f]*) exit 1 ;; esac
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
+            > promotion-run.json
+          jq -e --argjson id "${{ github.run_id }}" --arg head "${{ github.sha }}" '
+            .id == $id
+            and .run_attempt == 1
+            and .event == "workflow_dispatch"
+            and .head_branch == "main"
+            and .head_sha == $head
+            and .path == ".github/workflows/release-promote.yml"
+          ' promotion-run.json >/dev/null
+          GATE_READY_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "GATE_READY_AT=$GATE_READY_AT" >> "$GITHUB_ENV"
+          echo "::notice title=Immutable-settings attestation gate ready::repository=${{ github.repository }} run=${{ github.run_id }}/${{ github.run_attempt }} nonce=$ATTESTATION_NONCE gateReadyAt=$GATE_READY_AT"
+          {
+            echo "## Immutable-settings admin attestation required"
+            echo "- repository: \`${{ github.repository }}\`"
+            echo "- promotion run/attempt: \`${{ github.run_id }}/${{ github.run_attempt }}\`"
+            echo "- protected-main SHA: \`${{ github.sha }}\`"
+            echo "- issue: \`$ATTESTATION_ISSUE_NUMBER\`"
+            echo "- nonce: \`$ATTESTATION_NONCE\`"
+            echo "- gate ready at: \`$GATE_READY_AT\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require a fresh run-bound immutable-settings admin attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
+        run: |
+          ATTESTATION_ACCEPTED=false
+          for attempt in $(seq 1 60); do
+            gh api --paginate --slurp \
+              "repos/${{ github.repository }}/issues/${{ inputs.attestation_issue_number }}/comments?per_page=100" \
+              > attestation-comment-pages.json
+            jq '[.[][]]' attestation-comment-pages.json > attestation-comments.json
+            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            set +e
+            python3 scripts/release-admin-attestation.py verify \
+              --comments attestation-comments.json \
+              --expected-repository "${{ github.repository }}" \
+              --expected-head-sha "${{ github.sha }}" \
+              --expected-qa-run-id "$QA_RUN_ID" \
+              --expected-qa-run-attempt "$QA_RUN_ATTEMPT" \
+              --expected-qa-artifact-id "$QA_ARTIFACT_ID" \
+              --expected-run-id "${{ github.run_id }}" \
+              --expected-run-attempt "${{ github.run_attempt }}" \
+              --expected-nonce "${{ inputs.attestation_nonce }}" \
+              --expected-issue-number "${{ inputs.attestation_issue_number }}" \
+              --expected-actor "${{ github.actor }}" \
+              --gate-ready-at "$GATE_READY_AT" --now "$NOW" \
+              > immutable-settings-attestation.next.json
+            ATTESTATION_STATUS=$?
+            set -e
+            if test "$ATTESTATION_STATUS" = 0; then
+              mv immutable-settings-attestation.next.json immutable-settings-attestation.json
+              ATTESTATION_ACCEPTED=true
+              break
+            fi
+            if test "$ATTESTATION_STATUS" != 75; then
+              exit "$ATTESTATION_STATUS"
+            fi
+            if test "$attempt" != 60; then
+              sleep 10
+            fi
+          done
+          if test "$ATTESTATION_ACCEPTED" != true; then
+            echo "::error::immutable settings attestation timed out before mutation"
+            exit 1
+          fi
+          ATTESTATION_AUTHOR="$(jq -r .author immutable-settings-attestation.json)"
+          gh api "repos/${{ github.repository }}/collaborators/$ATTESTATION_AUTHOR/permission" \
+            > attestation-permission.json
+          jq -e --arg actor "${{ github.actor }}" '
+            .user.login == $actor and .permission == "admin"
+          ' attestation-permission.json >/dev/null
+          ATTESTATION_COMMENT_ID="$(jq -r .commentId immutable-settings-attestation.json)"
+          jq --argjson id "$ATTESTATION_COMMENT_ID" \
+            '[.[] | select(.id == $id)][0]' attestation-comments.json > attestation-comment.json
+          {
+            echo "- accepted attestation: $(jq -r .commentUrl immutable-settings-attestation.json)"
+            echo "- attestation body SHA-256: \`$(jq -r .bodySha256 immutable-settings-attestation.json)\`"
+            echo "- settings checked at: \`$(jq -r .attestation.immutableReleaseSettings.checkedAt immutable-settings-attestation.json)\`"
+            echo "- exact response SHA-256: \`$(jq -r .attestation.immutableReleaseSettings.responseSha256 immutable-settings-attestation.json)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create or verify the exact tag and draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -433,8 +544,6 @@ jobs:
               and .prerelease == false
               and (.draft == true or (.draft == false and .immutable == true))
             ' prepublish-release.json >/dev/null
-          gh api "repos/${{ github.repository }}/immutable-releases" > prepublish-settings.json
-          jq -e '.enabled == true' prepublish-settings.json >/dev/null
           PREPUBLISH_DRAFT="$(jq -r .draft prepublish-release.json)"
           gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
             | jq '[.[][] | {id, name, state, size}]' > prepublish-assets.json
@@ -478,8 +587,6 @@ jobs:
               and .prerelease == false
               and .immutable == true
             ' postpublish-release.json >/dev/null
-          gh api "repos/${{ github.repository }}/immutable-releases" > postpublish-settings.json
-          jq -e '.enabled == true' postpublish-settings.json >/dev/null
           gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
             | jq '[.[][] | {id, name, state, size}]' > postpublish-assets.json
           mkdir postpublish-downloads
@@ -495,6 +602,9 @@ jobs:
       - name: re-download the published release assets and verify exact bytes
         env:
           GH_TOKEN: ${{ github.token }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
         run: |
           gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
             | jq '[.[][] | {id, name, state, size}]' > published-assets.json
@@ -507,6 +617,28 @@ jobs:
             --release-files release-files --expected expected-assets.json \
             --assets published-assets.json --downloads published-downloads \
             --release-draft false --starter-deletions starter-deletions.json
+          ATTESTATION_COMMENT_ID="$(jq -r .commentId immutable-settings-attestation.json)"
+          ATTESTATION_BODY_SHA="$(jq -r .bodySha256 immutable-settings-attestation.json)"
+          gh api "repos/${{ github.repository }}/issues/comments/$ATTESTATION_COMMENT_ID" \
+            > final-attestation-comment.json
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 scripts/release-admin-attestation.py verify \
+            --comments final-attestation-comment.json \
+            --expected-repository "${{ github.repository }}" \
+            --expected-head-sha "${{ github.sha }}" \
+            --expected-qa-run-id "$QA_RUN_ID" \
+            --expected-qa-run-attempt "$QA_RUN_ATTEMPT" \
+            --expected-qa-artifact-id "$QA_ARTIFACT_ID" \
+            --expected-run-id "${{ github.run_id }}" \
+            --expected-run-attempt "${{ github.run_attempt }}" \
+            --expected-nonce "${{ inputs.attestation_nonce }}" \
+            --expected-issue-number "${{ inputs.attestation_issue_number }}" \
+            --expected-actor "${{ github.actor }}" \
+            --gate-ready-at "$GATE_READY_AT" --now "$NOW" \
+            --expected-comment-id "$ATTESTATION_COMMENT_ID" \
+            --expected-body-sha256 "$ATTESTATION_BODY_SHA" \
+            --postpublish-recheck > final-immutable-settings-attestation.json
+          cmp immutable-settings-attestation.json final-immutable-settings-attestation.json
           gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > final-release.json
           jq -e '.draft == false and .immutable == true' final-release.json >/dev/null
           echo "Published immutable release: $(jq -r .html_url final-release.json)" >> "$GITHUB_STEP_SUMMARY"

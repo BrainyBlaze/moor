@@ -8,7 +8,7 @@ item below requires an interactive keypress or an operator-only physical step.
 
 ## Governance preconditions
 
-Before either release workflow is dispatched:
+Before the release workflows are dispatched:
 
 1. `main` is protected, force-push and deletion are disabled, and the existing
    hosted checks are required. Zero pull-request approvals are required; the
@@ -16,12 +16,14 @@ Before either release workflow is dispatched:
    execution into an approval queue.
 2. The `release` environment exists. It has no required reviewer; it is the
    permission boundary used by both release workflows.
-3. immutable releases are enabled for the repository.
+3. A trusted repository administrator is available live during promotion to
+   read the immutable-release setting and post the run-bound attestation below.
 
 The candidate-QA and QA workflows have only read permissions. They cannot
 create a ref or release. The promotion workflow is the only workflow with
-`contents: write`, and it refuses to run unless protected main, the release
-environment, and immutable releases are all active.
+`contents: write`. It refuses to mutate unless protected main and the release
+environment are active and a fresh run-bound administrator attestation proves
+the repository returned an enabled immutable-release setting.
 
 ## Candidate identity
 
@@ -175,11 +177,84 @@ The canonical QA record embeds that same run ID and attempt; promotion requires
 both embedded values to equal its dispatched QA run inputs before reconstructing
 and accepting the record.
 
-Dispatch `release-promote.yml` with those three values. Promotion re-fetches
-the QA artifact and evidence comment, re-downloads the candidate artifacts by
-their QA-bound IDs, and verifies everything again before creating a tag. It
-then creates or resumes one draft release, uploads only missing final-name
-assets, and rejects any unexpected or conflicting asset. Promotion never rebuilds or overwrites
+Generate a fresh nonce with 32 random bytes encoded as 64 lowercase hex, then
+dispatch `release-promote.yml` with the QA run ID, QA attempt `1`, QA artifact
+ID, the Moor issue number that will hold the attestation, and that fresh nonce.
+Every promotion execution is attempt `1`: never rerun a failed promotion attempt.
+Recovery always uses a new workflow dispatch and a new nonce.
+
+Promotion first re-fetches the QA artifact and evidence comment, re-downloads
+the candidate artifacts by their QA-bound IDs, and verifies everything again.
+After the last read-only artifact check, it publishes the exact repository,
+promotion run/attempt, protected-main SHA, QA tuple, nonce, and `gateReadyAt`
+UTC second in the live log and step summary. Only then may the administrator
+perform the settings read:
+
+1. Save the exact response bytes from
+   `GET /repos/BrainyBlaze/moor/immutable-releases` without reserialization,
+   then record the current UTC second as `checkedAt`.
+2. From the same protected-main checkout, run
+   `scripts/release-admin-attestation.py create` with the displayed run,
+   attempt, head SHA, QA tuple, fresh nonce, `gateReadyAt`, `checkedAt`, and
+   exact response file. The helper emits strict canonical JSON containing the
+   response base64 and SHA-256; it accepts only the exact enabled-only JSON
+   object.
+3. Post those bytes unchanged as one issue comment from the actor who
+   dispatched promotion. Do not add a Markdown fence or prose.
+
+Use an administrator-authenticated local `gh` session, never the workflow's
+`GITHUB_TOKEN`. After copying the displayed values into the variables below,
+the exact operator sequence is:
+
+```bash
+set -euo pipefail
+ATTESTATION_TMP="$(mktemp -d)"
+gh api repos/BrainyBlaze/moor/immutable-releases \
+  > "$ATTESTATION_TMP/immutable-release-settings.json"
+ATTESTATION_CHECKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+python3 scripts/release-admin-attestation.py create \
+  --repository BrainyBlaze/moor \
+  --head-sha "$ATTESTATION_HEAD_SHA" \
+  --qa-run-id "$ATTESTATION_QA_RUN_ID" --qa-run-attempt 1 \
+  --qa-artifact-id "$ATTESTATION_QA_ARTIFACT_ID" \
+  --run-id "$ATTESTATION_PROMOTION_RUN_ID" --run-attempt 1 \
+  --nonce "$ATTESTATION_NONCE" \
+  --gate-ready-at "$ATTESTATION_GATE_READY_AT" \
+  --checked-at "$ATTESTATION_CHECKED_AT" \
+  --response "$ATTESTATION_TMP/immutable-release-settings.json" \
+  > "$ATTESTATION_TMP/attestation-comment.json"
+gh issue comment "$ATTESTATION_ISSUE_NUMBER" --repo BrainyBlaze/moor \
+  --body-file "$ATTESTATION_TMP/attestation-comment.json"
+```
+
+The workflow polls for at most ten minutes. Before the first tag or release
+mutation it requires exactly one matching comment, strict key order and
+canonical JSON, a canonical base64 round trip, the exact response digest and
+enabled-only object, `created_at == updated_at`, both the settings-read and
+comment times at or after `gateReadyAt` (with five seconds of clock-skew
+tolerance), and a non-future comment no more than fifteen minutes old. The
+settings read must also be non-future and no more than fifteen minutes old. The
+comment author must equal the dispatcher and the collaborator-permission API
+must still report live repository `admin` permission. Missing, duplicate,
+conflicting, edited, stale, future, mismatched, or timed-out evidence fails
+before any mutation.
+
+The accepted issue comment is the run-bound audit record: it binds repository,
+protected-main SHA, QA run/attempt/artifact, promotion run/attempt, fresh nonce,
+gate time, exact response bytes, and UTC check time. Its ID, URL, body digest,
+and response digest are recorded in the run summary. An issue comment is
+persistent but not immutable: a trusted repository administrator can later
+edit or delete it. Promotion therefore re-fetches the same comment after the
+published assets have been independently downloaded and verified, and requires
+the original ID, author, timestamps, canonical body hash, and bindings before
+final success. Later administrator tampering remains inside the explicitly
+trusted-administrator boundary; the comment is not described as immutable
+release evidence.
+
+After accepting the attestation, promotion creates or resumes one
+transaction-bound draft release, uploads only missing final-name assets, and
+rejects any unexpected or conflicting asset. The release body remains
+deterministic across fresh recovery dispatches. Promotion never rebuilds or overwrites
 a release asset.
 
 The single permitted deletion is an incomplete GitHub upload record whose
@@ -196,21 +271,31 @@ name may be deleted in one run; a third fails closed.
 
 The published release contains the four binaries plus `moor-release-manifest-v1.json` and `SHA256SUMS`.
 Promotion verifies all six while the release is still a draft, publishes it
-once, then downloads all six again and verifies their sizes and hashes. An
-exact rerun is idempotent. A
-conflict, expired artifact, edited evidence comment, or nonexact tag requires a
-new candidate and QA cycle; it is never repaired by substitution.
+once, then downloads all six again and verifies their sizes and hashes. A
+fresh attempt-1 dispatch may adopt only the same exact transaction-bound draft;
+it never resumes by rerunning a failed workflow attempt. A conflict, expired
+artifact, edited evidence comment, or nonexact tag requires a new candidate and
+QA cycle; it is never repaired by substitution.
 
 GitHub exposes no conditional “publish only if the tag, release, settings, and
-asset set still equal these values” operation. The workflow therefore re-reads
-and validates all four immediately before publication and immediately after
-publication. Its explicit concurrency group prevents two promotion runs, but
-trusted repository administrators remain able to mutate repository state in
-the API interval. The release transaction assumes those trusted repository
-administrators do not race it. The prepublication check detects a mutation
-before publication and fails closed.
-A postpublication mismatch instead reports an irreversible publication failure
-after the release has become immutable; it cannot roll back or repair that release.
+asset set still equal these values” operation. The workflow freshly validates
+the tag, release, and all six assets immediately before publication, requires
+the publish response and a fresh release read to report `immutable == true`,
+re-resolves the tag, and independently downloads and verifies all six published
+assets before one final immutable-release read. Its explicit concurrency group
+prevents two promotion runs, but trusted repository administrators remain able
+to mutate repository state in the API interval.
+
+The attestation deliberately leaves a trusted-administrator
+preflight-to-publication race. An administrator can disable immutable releases
+after the attested read; in that case a mutable public release can become
+visible before the workflow detects the mismatch. This is postpublication
+detection, not prepublication fail-closed prevention. Recovery is: freeze all
+release writers, confirm the failed run and exact repository state, delete the
+mutable release, prove the public release and assets are absent and record the
+exact tag state, restore and freshly attest the enabled setting, then use a NEW
+attempt-1 dispatch with a new nonce. Never rerun the failed attempt. A release
+that GitHub has already made immutable cannot be rolled back or repaired.
 
 Publication is followed in the same delivery sweep by Desk’s pin schema 3 PR.
 That PR copies the manifest’s full-matrix coverage and four target tuples

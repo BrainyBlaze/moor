@@ -363,7 +363,14 @@ Unexpected names, duplicate names or IDs, other states, conflicting bytes, or
 an exhausted starter bound fail closed. Only a complete six-asset draft (the
 four binaries plus the unchanged manifest and `SHA256SUMS`) may be published,
 and repository immutable releases must be enabled before the tag or draft is
-created.
+created. A fresh attempt-1 promotion proves that prerequisite with one
+run-bound admin attestation posted only after the final read-only artifact
+check. The strict record binds repository, protected-main SHA, QA tuple,
+promotion run/attempt, fresh nonce, gate-ready time, UTC settings-read time, and
+the exact response bytes and SHA-256. The workflow accepts it only from its own
+dispatcher with live repository `admin` permission and re-fetches the same
+unedited comment after published-asset verification. A failed promotion is
+never rerun; recovery is a new attempt-1 dispatch with a new attestation.
 
 An expired or missing candidate artifact, an artifact ID/name/run mismatch, a
 changed byte, a non-green or missing provenance job, a tag/source mismatch, an
