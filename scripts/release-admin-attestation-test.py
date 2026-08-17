@@ -29,7 +29,7 @@ GATE_READY_AT = "2026-08-17T12:30:00Z"
 CHECKED_AT = "2026-08-17T12:30:02Z"
 COMMENT_TIME = "2026-08-17T12:30:04Z"
 NOW = "2026-08-17T12:30:05Z"
-SETTINGS_RESPONSE = b'{"enabled":true}\n'
+SETTINGS_RESPONSE = b'{"enabled":true,"enforced_by_owner":false}'
 
 
 def canonical(value):
@@ -143,6 +143,7 @@ def shifted(timestamp, seconds):
 
 
 def main():
+    assert len(SETTINGS_RESPONSE) == 42
     with tempfile.TemporaryDirectory(prefix="release-admin-attestation-") as root:
         response_path = os.path.join(root, "immutable-settings-response.json")
         with open(response_path, "wb") as handle:
@@ -187,6 +188,22 @@ def main():
         assert snapshot["bodySha256"] == hashlib.sha256(body).hexdigest()
         assert snapshot["attestation"] == attestation
 
+        for response in (
+            b'{"enabled":true,"enforced_by_owner":true}',
+            b'{"enforced_by_owner":false,"enabled":true}',
+        ):
+            alternate_response_path = os.path.join(root, "alternate-response.json")
+            with open(alternate_response_path, "wb") as handle:
+                handle.write(response)
+            alternate_created = invoke(create_command(alternate_response_path))
+            assert alternate_created.returncode == 0, alternate_created.stderr.decode(
+                errors="replace"
+            )
+            alternate_accepted = verify(root, [comment(alternate_created.stdout)])
+            assert alternate_accepted.returncode == 0, alternate_accepted.stderr.decode(
+                errors="replace"
+            )
+
         unicode_comments_path = os.path.join(root, "unicode-comments.json")
         with open(unicode_comments_path, "wb") as handle:
             handle.write(
@@ -197,6 +214,15 @@ def main():
             )
         unicode_accepted = invoke(verify_command(unicode_comments_path))
         assert unicode_accepted.returncode == 0, unicode_accepted.stderr.decode(
+            errors="replace"
+        )
+        third_party_noise = dict(
+            valid_comment,
+            id=COMMENT_ID + 1,
+            user={"login": "other-admin"},
+        )
+        noise_accepted = verify(root, [third_party_noise, valid_comment])
+        assert noise_accepted.returncode == 0, noise_accepted.stderr.decode(
             errors="replace"
         )
 
@@ -215,8 +241,11 @@ def main():
             root,
             [dict(valid_comment, updated_at=shifted(COMMENT_TIME, 1))],
         )
-        reject(
-            "wrong author", root, [dict(valid_comment, user={"login": "other-admin"})]
+        wrong_author = verify(
+            root, [dict(valid_comment, user={"login": "other-admin"})]
+        )
+        assert wrong_author.returncode == 75, wrong_author.stderr.decode(
+            errors="replace"
         )
         reject(
             "wrong issue URL",
@@ -285,8 +314,19 @@ def main():
         )
 
         for label, response in (
-            ("disabled response", b'{"enabled":false}\n'),
-            ("extra response key", b'{"enabled":true,"other":1}\n'),
+            (
+                "disabled response",
+                b'{"enabled":false,"enforced_by_owner":false}\n',
+            ),
+            ("missing owner enforcement", b'{"enabled":true}\n'),
+            (
+                "invalid owner enforcement",
+                b'{"enabled":true,"enforced_by_owner":"false"}\n',
+            ),
+            (
+                "extra response key",
+                b'{"enabled":true,"enforced_by_owner":false,"other":1}\n',
+            ),
             ("malformed response", b'{"enabled":'),
         ):
             mutated = copy.deepcopy(attestation)
@@ -369,7 +409,7 @@ def main():
             expected_body_sha256="0" * 64,
         )
 
-    print("release admin attestation tests: create/accept plus 33 refusal cases passed")
+    print("release admin attestation tests: create/accept plus 34 refusal cases passed")
 
 
 if __name__ == "__main__":

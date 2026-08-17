@@ -140,9 +140,17 @@ def validate_settings_response(body):
     if not body or len(body) > 4096:
         reject("immutable settings response has an invalid byte length")
     value = parse_json_bytes(body, "immutable settings response")
-    exact_keys(value, ["enabled"], "immutable settings response")
+    expected_keys = {"enabled", "enforced_by_owner"}
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        actual = list(value) if isinstance(value, dict) else type(value).__name__
+        reject(
+            f"immutable settings response keys are {actual}, "
+            f"expected exactly {sorted(expected_keys)}"
+        )
     if value["enabled"] is not True:
         reject("immutable releases were not enabled")
+    if not isinstance(value["enforced_by_owner"], bool):
+        reject("immutable settings owner enforcement is not boolean")
 
 
 def build_attestation(args):
@@ -189,10 +197,13 @@ def loose_envelope(body):
         return None
 
 
-def candidate_comments(comments, expected_nonce):
+def candidate_comments(comments, expected_nonce, expected_actor):
     candidates = []
     for comment in comments:
         if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+            continue
+        user = comment.get("user")
+        if not isinstance(user, dict) or user.get("login") != expected_actor:
             continue
         body = comment["body"]
         envelope = loose_envelope(body)
@@ -335,7 +346,7 @@ def verify_comment(args):
         comments = [comments]
     if not isinstance(comments, list):
         reject("attestation comments are not an array or object")
-    matches = candidate_comments(comments, args.expected_nonce)
+    matches = candidate_comments(comments, args.expected_nonce, args.expected_actor)
     if not matches:
         raise Waiting("no matching attestation comment yet")
     if len(matches) != 1:

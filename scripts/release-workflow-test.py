@@ -362,6 +362,13 @@ def main():
     require(guide, "trusted repository administrators", "promotion trusted-admin boundary")
     require(guide, "fresh nonce", "promotion run-bound admin attestation")
     require(guide, "exact response bytes", "promotion run-bound admin attestation")
+    require(guide, "X-GitHub-Api-Version: 2026-03-10", "promotion pinned settings API")
+    require(guide, "application/vnd.github+json", "promotion pinned settings media type")
+    require(
+        guide,
+        '{"enabled":true,"enforced_by_owner":false}',
+        "promotion live settings response shape",
+    )
     require(guide, "persistent but not immutable", "promotion attestation evidence boundary")
     require(guide, "never rerun a failed promotion attempt", "promotion attempt recovery")
     require(guide, "preflight-to-publication", "promotion trusted-admin race")

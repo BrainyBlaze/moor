@@ -190,26 +190,30 @@ promotion run/attempt, protected-main SHA, QA tuple, nonce, and `gateReadyAt`
 UTC second in the live log and step summary. Only then may the administrator
 perform the settings read:
 
-1. Save the exact response bytes from
-   `GET /repos/BrainyBlaze/moor/immutable-releases` without reserialization,
-   then record the current UTC second as `checkedAt`.
+1. Save the exact response bytes from GitHub's
+   [`GET /repos/{owner}/{repo}/immutable-releases`](https://docs.github.com/en/rest/repos/repos?apiVersion=2026-03-10#check-if-immutable-releases-are-enabled-for-a-repository)
+   endpoint without reserialization, then record the current UTC second as
+   `checkedAt`.
 2. From the same protected-main checkout, run
    `scripts/release-admin-attestation.py create` with the displayed run,
    attempt, head SHA, QA tuple, fresh nonce, `gateReadyAt`, `checkedAt`, and
    exact response file. The helper emits strict canonical JSON containing the
-   response base64 and SHA-256; it accepts only the exact enabled-only JSON
-   object.
+   response base64 and SHA-256; it accepts only the documented two-field JSON
+   object with `enabled == true` and boolean `enforced_by_owner`.
 3. Post those bytes unchanged as one issue comment from the actor who
    dispatched promotion. Do not add a Markdown fence or prose.
 
 Use an administrator-authenticated local `gh` session, never the workflow's
 `GITHUB_TOKEN`. After copying the displayed values into the variables below,
-the exact operator sequence is:
+compare the local UTC clock with GitHub's HTTPS `Date` header and synchronize it
+if the absolute offset exceeds two seconds. The exact operator sequence is:
 
 ```bash
 set -euo pipefail
 ATTESTATION_TMP="$(mktemp -d)"
-gh api repos/BrainyBlaze/moor/immutable-releases \
+gh api -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  repos/BrainyBlaze/moor/immutable-releases \
   > "$ATTESTATION_TMP/immutable-release-settings.json"
 ATTESTATION_CHECKED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 python3 scripts/release-admin-attestation.py create \
@@ -227,12 +231,18 @@ gh issue comment "$ATTESTATION_ISSUE_NUMBER" --repo BrainyBlaze/moor \
   --body-file "$ATTESTATION_TMP/attestation-comment.json"
 ```
 
+The current direct-repository response is the exact 42-byte body
+`{"enabled":true,"enforced_by_owner":false}` with no trailing LF. An
+organization-enforced repository instead reports `enforced_by_owner` as
+`true`; both boolean values are valid while `enabled` must remain `true`.
+
 The workflow polls for at most ten minutes. Before the first tag or release
 mutation it requires exactly one matching comment, strict key order and
 canonical JSON, a canonical base64 round trip, the exact response digest and
-enabled-only object, `created_at == updated_at`, both the settings-read and
+documented two-field object, `created_at == updated_at`, both the settings-read and
 comment times at or after `gateReadyAt` (with five seconds of clock-skew
-tolerance), and a non-future comment no more than fifteen minutes old. The
+tolerance), the exact documented response shape with `enabled == true`, and a
+non-future comment no more than fifteen minutes old. The
 settings read must also be non-future and no more than fifteen minutes old. The
 comment author must equal the dispatcher and the collaborator-permission API
 must still report live repository `admin` permission. Missing, duplicate,
