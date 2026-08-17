@@ -303,6 +303,18 @@ candidate run and attempt, metadata artifact ID, four binary artifact IDs,
 sizes, and hashes. Testing a locally rebuilt binary, a same-named artifact, or
 bytes copied from another run does not satisfy the gate.
 
+The exact evidence and record schema is defined by
+[`release-manual-qa-v1.md`](release-manual-qa-v1.md). The owner-authored,
+unedited evidence comment records `passed` verdicts for the four targets and
+every checklist item, with a GitHub evidence URL for each. The read-only QA
+workflow snapshots that comment and emits a canonical
+`moor-release-qa-v1.json` which binds the source commit, run/attempt, metadata
+and candidate-record artifact IDs, every target's artifact ID/name/size/hash,
+the platform/checklist verdicts, approver, approval time, evidence URL/comment
+ID, and the exact evidence-body size and SHA-256. Promotion reconstructs that
+record from freshly retrieved candidate and comment bytes and requires exact
+byte equality with the approved QA artifact.
+
 ## Immutable promotion
 
 Promotion is allowed only after the operator records that full manual QA passed
@@ -327,6 +339,15 @@ Promotion must:
    to the GitHub Release for the exact `manifest.version` tag.
 7. Download the published release assets again and verify their byte length and
    SHA-256 before reporting promotion success.
+
+The implementation may use a draft release as its crash-resume boundary. A
+retry keeps an already-uploaded asset only after downloading it by asset ID and
+matching its exact expected size and digest; it uploads only missing final-name
+assets. It never deletes, overwrites, or substitutes an asset. Unexpected names,
+duplicate names or IDs, non-uploaded states, or conflicting bytes fail closed.
+Only a complete six-asset draft (the four binaries plus the unchanged manifest
+and `SHA256SUMS`) may be published, and repository immutable releases must be
+enabled before the tag or draft is created.
 
 An expired or missing candidate artifact, an artifact ID/name/run mismatch, a
 changed byte, a non-green or missing provenance job, a tag/source mismatch, an
