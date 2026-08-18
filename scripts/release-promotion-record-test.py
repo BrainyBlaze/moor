@@ -104,6 +104,7 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "missing preflight": b"WAIT: no matching preflight comment yet",
     "non-JSON constant in comments": b"invalid preflight comments: non-JSON constant 'NaN'",
     "unrelated nonce": b"WAIT: no matching preflight comment yet",
+    "unrelated escaped nonce": b"WAIT: no matching preflight comment yet",
     "same-nonce duplicate": b"expected exactly one matching preflight comment, found 2",
     "matching wrong author": b"preflight comment author differs",
     "edited preflight": b"preflight comment was edited",
@@ -112,6 +113,9 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "foreign comment URL": b"preflight comment URL is not canonical for its ID",
     "matching malformed preflight": b"invalid preflight comment body:",
     "deeply nested matching preflight": b"invalid preflight comment body:",
+    "malformed matching preflight with escaped nonce": b"invalid preflight comment body:",
+    "deeply nested matching preflight with escaped nonce": b"invalid preflight comment body:",
+    "matching oversized JSON number preflight": b"invalid preflight comment body:",
     "matching markerless preflight with escaped kind": b"does not begin with its exact marker at byte zero",
     "unrelated markerless same-nonce comment": b"WAIT: no matching preflight comment yet",
     "byte before marker": b"does not begin with its exact marker at byte zero",
@@ -148,6 +152,8 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "GitHub clock-skew boundary": b"GitHub server time and settings check differ beyond clock skew",
     "missing completion": b"WAIT: no matching completion comment yet",
     "matching markerless completion with escaped kind": b"does not begin with its exact marker at byte zero",
+    "malformed matching completion with escaped nonce": b"invalid completion comment body:",
+    "deeply nested matching completion with escaped nonce": b"invalid completion comment body:",
     "duplicate completion": b"expected exactly one matching completion comment, found 2",
     "completion preflight digest": b"completion record differs from the exact reconstructed record",
     "completion tag": b"completion tag targets another candidate",
@@ -184,6 +190,8 @@ EXPECTED_INVALID_DIAGNOSTICS = {
     "decoded deeply nested JSON": "invalid record:",
     "deeply nested settings": "invalid immutable settings response:",
     "deeply nested JSON file": "invalid deep JSON file:",
+    "decoded oversized JSON number": "invalid record:",
+    "oversized JSON number file": "invalid oversized JSON number file:",
     "canonical NaN": "value is not strict JSON",
     "decoded NaN": "non-JSON constant 'NaN'",
     "canonical positive infinity": "value is not strict JSON",
@@ -535,6 +543,31 @@ def test_primitives(tool):
             "deeply nested JSON file",
             lambda: tool.read_json_utf8(deep_path, "deep JSON file"),
         )
+
+    oversized_json_number = b"9" * 5000
+    expect_invalid(
+        "decoded oversized JSON number",
+        lambda: tool.decode_comment(
+            PREFLIGHT_MARKER,
+            PREFLIGHT_MARKER + b'{"number":' + oversized_json_number + b"}\n",
+            "record",
+        ),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="release-promotion-oversized-json-number-"
+    ) as root:
+        number_path = os.path.join(root, "number.json")
+        write_bytes(number_path, b'{"number":' + oversized_json_number + b"}")
+        expect_invalid(
+            "oversized JSON number file",
+            lambda: tool.read_json_utf8(
+                number_path, "oversized JSON number file"
+            ),
+        )
+    assert tool.loose_record(
+        '{"number":' + oversized_json_number.decode("ascii") + "}",
+        PREFLIGHT_MARKER,
+    ) is None
 
     for label, constant_value in (
         ("NaN", float("nan")),
@@ -1382,6 +1415,16 @@ def test_preflight_completion(tool):
             verify_record(fixture, "preflight", [comment(other_nonce)]),
             expected=75,
         )
+        escaped_other_nonce = other_nonce.decode("ascii").replace(
+            "f" * 64, "\\u0066" + "f" * 63, 1
+        )
+        assert_record_rejected(
+            "unrelated escaped nonce",
+            verify_record(
+                fixture, "preflight", [comment(escaped_other_nonce)]
+            ),
+            expected=75,
+        )
         assert_record_rejected(
             "same-nonce duplicate",
             verify_record(
@@ -1451,6 +1494,35 @@ def test_preflight_completion(tool):
         assert_record_rejected(
             "deeply nested matching preflight",
             verify_record(fixture, "preflight", [comment(deeply_nested)]),
+        )
+        escaped_nonce = "\\u0064" + NONCE[1:]
+        assert_record_rejected(
+            "malformed matching preflight with escaped nonce",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(malformed.replace(NONCE, escaped_nonce, 1))],
+            ),
+        )
+        assert_record_rejected(
+            "deeply nested matching preflight with escaped nonce",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(deeply_nested.replace(NONCE, escaped_nonce, 1))],
+            ),
+        )
+        oversized_number = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + '{"kind":"moor-release-preflight-v1","number":'
+            + "9" * 5000
+            + ',"promotion":{"nonce":"'
+            + NONCE
+            + '"}}\n'
+        )
+        assert_record_rejected(
+            "matching oversized JSON number preflight",
+            verify_record(fixture, "preflight", [comment(oversized_number)]),
         )
         markerless_escaped_kind = canonical(preflight).decode("ascii").replace(
             "moor-release-preflight-v1", "moor-release-preflight-v\\u0031"
@@ -1828,6 +1900,39 @@ def test_preflight_completion(tool):
                 fixture,
                 "completion",
                 [comment(markerless_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        escaped_nonce = "\\u0064" + NONCE[1:]
+        escaped_completion = completion_body.decode("ascii").replace(
+            NONCE, escaped_nonce, 1
+        )
+        assert_record_rejected(
+            "malformed matching completion with escaped nonce",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(escaped_completion[:-2], completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        completion_marker_text = COMPLETION_MARKER.decode("ascii")
+        completion_payload = escaped_completion[len(completion_marker_text) :]
+        deeply_nested_completion = (
+            completion_marker_text
+            + '{"deep":'
+            + "[" * 1200
+            + "0"
+            + "]" * 1200
+            + ","
+            + completion_payload[1:]
+        )
+        assert_record_rejected(
+            "deeply nested matching completion with escaped nonce",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(deeply_nested_completion, completion=True)],
                 preflight_body=preflight_body,
             ),
         )

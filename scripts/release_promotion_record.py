@@ -135,7 +135,7 @@ def parse_json_bytes(body: bytes, what: str):
                 f"invalid {what}: non-JSON constant {value!r}"
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
         reject(f"invalid {what}: {error}")
 
 
@@ -1622,7 +1622,7 @@ def read_json_utf8(path, what):
                 f"invalid {what}: non-JSON constant {value!r}"
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
         reject(f"invalid {what}: {error}")
 
 
@@ -1638,11 +1638,23 @@ def loose_record(body, marker):
     for payload in payloads:
         try:
             value = json.loads(payload)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (TypeError, ValueError, RecursionError):
             continue
         if isinstance(value, dict):
             return value
     return None
+
+
+def contains_nonce_json_string(body, expected_nonce):
+    # A validated nonce contains only lowercase ASCII hex, whose only semantic
+    # JSON escape alternative is the corresponding six-byte ``\\u00xx`` form.
+    alternatives = []
+    for character in expected_nonce:
+        literal = re.escape(character)
+        unicode_escape = re.escape(f"\\u{ord(character):04x}")
+        alternatives.append(f"(?:{literal}|{unicode_escape})")
+    pattern = '"' + "".join(alternatives) + '"'
+    return re.search(pattern, body) is not None
 
 
 def candidate_comments(comments, marker, kind, expected_nonce):
@@ -1661,7 +1673,10 @@ def candidate_comments(comments, marker, kind, expected_nonce):
                 and isinstance(promotion, dict)
                 and promotion.get("nonce") == expected_nonce
             )
-        text_matches = expected_nonce in body and (
+        nonce_text_matches = expected_nonce in body or contains_nonce_json_string(
+            body, expected_nonce
+        )
+        text_matches = nonce_text_matches and (
             kind in body or marker_text in body
         )
         if structurally_matches or text_matches:
