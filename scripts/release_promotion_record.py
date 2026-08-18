@@ -119,7 +119,7 @@ def canonical_json(value: object) -> bytes:
             ensure_ascii=True,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         reject(f"value is not strict JSON: {error}")
     return text.encode("ascii") + b"\n"
 
@@ -135,7 +135,7 @@ def parse_json_bytes(body: bytes, what: str):
                 f"invalid {what}: non-JSON constant {value!r}"
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         reject(f"invalid {what}: {error}")
 
 
@@ -158,7 +158,10 @@ def encode_comment(marker: bytes, value: dict) -> bytes:
         reject("unknown promotion comment marker")
     if not isinstance(value, dict):
         reject("promotion comment record is not an object")
-    _require_ascii_json(value, "promotion comment record")
+    try:
+        _require_ascii_json(value, "promotion comment record")
+    except RecursionError as error:
+        reject(f"value is not strict JSON: {error}")
     return marker + canonical_json(value)
 
 
@@ -170,7 +173,10 @@ def decode_comment(marker: bytes, body: bytes, what: str) -> dict:
     value = parse_json_bytes(body[len(marker) :], what)
     if not isinstance(value, dict):
         reject(f"{what} is not a JSON object")
-    _require_ascii_json(value, what)
+    try:
+        _require_ascii_json(value, what)
+    except RecursionError as error:
+        reject(f"invalid {what}: {error}")
     if body != marker + canonical_json(value):
         reject(f"{what} is not canonical sorted compact JSON with one LF")
     return value
@@ -179,7 +185,10 @@ def decode_comment(marker: bytes, body: bytes, what: str) -> dict:
 def decimal(value, what):
     if not isinstance(value, str) or not DECIMAL.fullmatch(value):
         reject(f"{what} is not a nonzero decimal string")
-    if int(value) > MAX_SAFE_INTEGER:
+    maximum = str(MAX_SAFE_INTEGER)
+    if len(value) > len(maximum) or (
+        len(value) == len(maximum) and value > maximum
+    ):
         reject(f"{what} exceeds 2**53-1")
     return value
 
@@ -1613,7 +1622,7 @@ def read_json_utf8(path, what):
                 f"invalid {what}: non-JSON constant {value!r}"
             ),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         reject(f"invalid {what}: {error}")
 
 
@@ -1629,7 +1638,7 @@ def loose_record(body, marker):
     for payload in payloads:
         try:
             value = json.loads(payload)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, RecursionError):
             continue
         if isinstance(value, dict):
             return value

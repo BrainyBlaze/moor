@@ -66,6 +66,7 @@ CHECKLIST = [
 
 EXPECTED_REFUSAL_DIAGNOSTICS = {
     "promotion rerun": b"promotion run attempt must be decimal string 1",
+    "oversized promotion run ID": b"promotion run ID exceeds 2**53-1",
     "release QA rerun": b"release QA run attempt must be decimal string 1",
     "reordered release QA producer keys": b"release QA record keys are",
     "incomplete root manual QA": b"manual-QA checklist has a missing or extra item",
@@ -110,6 +111,7 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "foreign issue URL": b"preflight comment belongs to another issue",
     "foreign comment URL": b"preflight comment URL is not canonical for its ID",
     "matching malformed preflight": b"invalid preflight comment body:",
+    "deeply nested matching preflight": b"invalid preflight comment body:",
     "matching markerless preflight with escaped kind": b"does not begin with its exact marker at byte zero",
     "unrelated markerless same-nonce comment": b"WAIT: no matching preflight comment yet",
     "byte before marker": b"does not begin with its exact marker at byte zero",
@@ -177,6 +179,11 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
 }
 
 EXPECTED_INVALID_DIAGNOSTICS = {
+    "canonical deeply nested JSON": "value is not strict JSON",
+    "encoded deeply nested comment": "value is not strict JSON",
+    "decoded deeply nested JSON": "invalid record:",
+    "deeply nested settings": "invalid immutable settings response:",
+    "deeply nested JSON file": "invalid deep JSON file:",
     "canonical NaN": "value is not strict JSON",
     "decoded NaN": "non-JSON constant 'NaN'",
     "canonical positive infinity": "value is not strict JSON",
@@ -489,6 +496,46 @@ def test_primitives(tool):
         b'{"enforced_by_owner":true,"enabled":true}'
     ) == {"enforced_by_owner": True, "enabled": True}
 
+    deeply_nested_value = 0
+    for _ in range(1200):
+        deeply_nested_value = [deeply_nested_value]
+    deeply_nested_bytes = b"[" * 1200 + b"0" + b"]" * 1200
+    expect_invalid(
+        "canonical deeply nested JSON",
+        lambda: tool.canonical_json({"deep": deeply_nested_value}),
+    )
+    expect_invalid(
+        "encoded deeply nested comment",
+        lambda: tool.encode_comment(
+            PREFLIGHT_MARKER, {"deep": deeply_nested_value}
+        ),
+    )
+    expect_invalid(
+        "decoded deeply nested JSON",
+        lambda: tool.decode_comment(
+            PREFLIGHT_MARKER,
+            PREFLIGHT_MARKER + b'{"deep":' + deeply_nested_bytes + b"}\n",
+            "record",
+        ),
+    )
+    expect_invalid(
+        "deeply nested settings",
+        lambda: tool.validate_settings_response(
+            b'{"deep":'
+            + deeply_nested_bytes
+            + b',"enabled":true,"enforced_by_owner":false}'
+        ),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="release-promotion-deep-json-"
+    ) as root:
+        deep_path = os.path.join(root, "deep.json")
+        write_bytes(deep_path, deeply_nested_bytes)
+        expect_invalid(
+            "deeply nested JSON file",
+            lambda: tool.read_json_utf8(deep_path, "deep JSON file"),
+        )
+
     for label, constant_value in (
         ("NaN", float("nan")),
         ("positive infinity", float("inf")),
@@ -673,6 +720,7 @@ def test_manifest(tool):
         manual_qa.update(reversed(items))
 
     reject_inputs("promotion rerun", promotion_run_attempt="2")
+    reject_inputs("oversized promotion run ID", promotion_run_id="9" * 5000)
     reject_inputs("release QA rerun", qa_run_attempt="2")
     reject_inputs("reordered release QA producer keys", reverse_release_qa_keys)
     reject_inputs(
@@ -1389,6 +1437,20 @@ def test_preflight_completion(tool):
         assert_record_rejected(
             "matching malformed preflight",
             verify_record(fixture, "preflight", [comment(malformed)]),
+        )
+        deeply_nested = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + '{"deep":'
+            + "[" * 1200
+            + "0"
+            + "]" * 1200
+            + ',"kind":"moor-release-preflight-v1","promotion":{"nonce":"'
+            + NONCE
+            + '"}}\n'
+        )
+        assert_record_rejected(
+            "deeply nested matching preflight",
+            verify_record(fixture, "preflight", [comment(deeply_nested)]),
         )
         markerless_escaped_kind = canonical(preflight).decode("ascii").replace(
             "moor-release-preflight-v1", "moor-release-preflight-v\\u0031"
