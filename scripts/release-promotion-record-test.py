@@ -105,6 +105,12 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "non-JSON constant in comments": b"invalid preflight comments: non-JSON constant 'NaN'",
     "unrelated nonce": b"WAIT: no matching preflight comment yet",
     "unrelated escaped nonce": b"WAIT: no matching preflight comment yet",
+    "unrelated nonce with raw decoy": b"WAIT: no matching preflight comment yet",
+    "unrelated nonce with escaped decoy": b"WAIT: no matching preflight comment yet",
+    "unrelated nonce with longer decoy": b"WAIT: no matching preflight comment yet",
+    "unrelated nonce with raw key decoy": b"WAIT: no matching preflight comment yet",
+    "unrelated nonce with escaped key decoy": b"WAIT: no matching preflight comment yet",
+    "matching nonce hidden by duplicate promotion": b"duplicate JSON key 'promotion'",
     "same-nonce duplicate": b"expected exactly one matching preflight comment, found 2",
     "matching wrong author": b"preflight comment author differs",
     "edited preflight": b"preflight comment was edited",
@@ -116,6 +122,7 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "malformed matching preflight with escaped nonce": b"invalid preflight comment body:",
     "deeply nested matching preflight with escaped nonce": b"invalid preflight comment body:",
     "matching oversized JSON number preflight": b"invalid preflight comment body:",
+    "malformed markerless preflight with escaped identity": b"does not begin with its exact marker at byte zero",
     "matching markerless preflight with escaped kind": b"does not begin with its exact marker at byte zero",
     "unrelated markerless same-nonce comment": b"WAIT: no matching preflight comment yet",
     "byte before marker": b"does not begin with its exact marker at byte zero",
@@ -152,8 +159,13 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "GitHub clock-skew boundary": b"GitHub server time and settings check differ beyond clock skew",
     "missing completion": b"WAIT: no matching completion comment yet",
     "matching markerless completion with escaped kind": b"does not begin with its exact marker at byte zero",
+    "unrelated completion nonce with raw decoy": b"WAIT: no matching completion comment yet",
+    "unrelated completion nonce with escaped decoy": b"WAIT: no matching completion comment yet",
+    "unrelated completion nonce with raw key decoy": b"WAIT: no matching completion comment yet",
+    "unrelated completion nonce with escaped key decoy": b"WAIT: no matching completion comment yet",
     "malformed matching completion with escaped nonce": b"invalid completion comment body:",
     "deeply nested matching completion with escaped nonce": b"invalid completion comment body:",
+    "malformed markerless completion with escaped identity": b"does not begin with its exact marker at byte zero",
     "duplicate completion": b"expected exactly one matching completion comment, found 2",
     "completion preflight digest": b"completion record differs from the exact reconstructed record",
     "completion tag": b"completion tag targets another candidate",
@@ -1425,6 +1437,56 @@ def test_preflight_completion(tool):
             ),
             expected=75,
         )
+        other_value = json.loads(other_nonce[len(PREFLIGHT_MARKER) :])
+        other_value["decoy"] = NONCE
+        raw_decoy = PREFLIGHT_MARKER + canonical(other_value)
+        escaped_expected_nonce = "\\u0064" * len(NONCE)
+        assert_record_rejected(
+            "unrelated nonce with raw decoy",
+            verify_record(fixture, "preflight", [comment(raw_decoy)]),
+            expected=75,
+        )
+        escaped_decoy = raw_decoy.decode("ascii").replace(
+            NONCE, escaped_expected_nonce, 1
+        )
+        assert_record_rejected(
+            "unrelated nonce with escaped decoy",
+            verify_record(fixture, "preflight", [comment(escaped_decoy)]),
+            expected=75,
+        )
+        longer_decoy_value = copy.deepcopy(other_value)
+        longer_decoy_value["decoy"] = "x" + NONCE
+        longer_decoy = PREFLIGHT_MARKER + canonical(longer_decoy_value)
+        assert_record_rejected(
+            "unrelated nonce with longer decoy",
+            verify_record(fixture, "preflight", [comment(longer_decoy)]),
+            expected=75,
+        )
+        key_decoy_value = json.loads(other_nonce[len(PREFLIGHT_MARKER) :])
+        key_decoy_value[NONCE] = "decoy"
+        raw_key_decoy = PREFLIGHT_MARKER + canonical(key_decoy_value)
+        assert_record_rejected(
+            "unrelated nonce with raw key decoy",
+            verify_record(fixture, "preflight", [comment(raw_key_decoy)]),
+            expected=75,
+        )
+        escaped_key_decoy = raw_key_decoy.decode("ascii").replace(
+            f'"{NONCE}"', f'"{escaped_expected_nonce}"', 1
+        )
+        assert_record_rejected(
+            "unrelated nonce with escaped key decoy",
+            verify_record(fixture, "preflight", [comment(escaped_key_decoy)]),
+            expected=75,
+        )
+        duplicate_promotion = other_nonce.replace(
+            b'"promotion":{',
+            b'"promotion":{"nonce":"' + NONCE.encode("ascii") + b'"},"promotion":{',
+            1,
+        )
+        assert_record_rejected(
+            "matching nonce hidden by duplicate promotion",
+            verify_record(fixture, "preflight", [comment(duplicate_promotion)]),
+        )
         assert_record_rejected(
             "same-nonce duplicate",
             verify_record(
@@ -1495,7 +1557,7 @@ def test_preflight_completion(tool):
             "deeply nested matching preflight",
             verify_record(fixture, "preflight", [comment(deeply_nested)]),
         )
-        escaped_nonce = "\\u0064" + NONCE[1:]
+        escaped_nonce = "\\u0064" * len(NONCE)
         assert_record_rejected(
             "malformed matching preflight with escaped nonce",
             verify_record(
@@ -1510,6 +1572,21 @@ def test_preflight_completion(tool):
                 fixture,
                 "preflight",
                 [comment(deeply_nested.replace(NONCE, escaped_nonce, 1))],
+            ),
+        )
+        markerless_malformed_escaped = malformed[
+            len(PREFLIGHT_MARKER.decode("ascii")) :
+        ].replace(
+            "moor-release-preflight-v1", "moor-release-preflight-v\\u0031", 1
+        ).replace(
+            NONCE, escaped_nonce, 1
+        )
+        assert_record_rejected(
+            "malformed markerless preflight with escaped identity",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(markerless_malformed_escaped)],
             ),
         )
         oversized_number = (
@@ -1903,7 +1980,64 @@ def test_preflight_completion(tool):
                 preflight_body=preflight_body,
             ),
         )
-        escaped_nonce = "\\u0064" + NONCE[1:]
+        unrelated_completion = copy.deepcopy(completion_value)
+        unrelated_completion["promotion"]["nonce"] = "f" * 64
+        unrelated_completion["decoy"] = NONCE
+        raw_completion_decoy = COMPLETION_MARKER + canonical(unrelated_completion)
+        escaped_expected_nonce = "\\u0064" * len(NONCE)
+        assert_record_rejected(
+            "unrelated completion nonce with raw decoy",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(raw_completion_decoy, completion=True)],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
+        escaped_completion_decoy = raw_completion_decoy.decode("ascii").replace(
+            NONCE, escaped_expected_nonce, 1
+        )
+        assert_record_rejected(
+            "unrelated completion nonce with escaped decoy",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(escaped_completion_decoy, completion=True)],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
+        completion_key_decoy = copy.deepcopy(completion_value)
+        completion_key_decoy["promotion"]["nonce"] = "f" * 64
+        completion_key_decoy[NONCE] = "decoy"
+        raw_completion_key_decoy = COMPLETION_MARKER + canonical(
+            completion_key_decoy
+        )
+        assert_record_rejected(
+            "unrelated completion nonce with raw key decoy",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(raw_completion_key_decoy, completion=True)],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
+        escaped_completion_key_decoy = raw_completion_key_decoy.decode(
+            "ascii"
+        ).replace(f'"{NONCE}"', f'"{escaped_expected_nonce}"', 1)
+        assert_record_rejected(
+            "unrelated completion nonce with escaped key decoy",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(escaped_completion_key_decoy, completion=True)],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
+        escaped_nonce = "\\u0064" * len(NONCE)
         escaped_completion = completion_body.decode("ascii").replace(
             NONCE, escaped_nonce, 1
         )
@@ -1933,6 +2067,22 @@ def test_preflight_completion(tool):
                 fixture,
                 "completion",
                 [comment(deeply_nested_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        markerless_malformed_completion = escaped_completion[
+            len(completion_marker_text) : -2
+        ].replace(
+            "moor-release-completion-v1",
+            "moor-release-completion-v\\u0031",
+            1,
+        )
+        assert_record_rejected(
+            "malformed markerless completion with escaped identity",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(markerless_malformed_completion, completion=True)],
                 preflight_body=preflight_body,
             ),
         )

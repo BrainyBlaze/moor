@@ -1629,57 +1629,221 @@ def read_json_utf8(path, what):
 def loose_record(body, marker):
     if not isinstance(body, str):
         return None
+    _, value = loose_record_status(body, marker)
+    return value if isinstance(value, dict) else None
+
+
+def comment_payloads(body, marker):
     marker_text = marker.decode("ascii")
     payloads = [body[len(marker_text) :]] if body.startswith(marker_text) else [body]
-    if body.startswith("<!--") and "\n" in body:
+    if "\n" in body:
         first_line, remainder = body.split("\n", 1)
-        if first_line.endswith("-->"):
+        if "<!--" in first_line and first_line.endswith("-->"):
             payloads.append(remainder)
+    return payloads
+
+
+def loose_record_status(body, marker):
+    if not isinstance(body, str):
+        return False, None
+    payloads = comment_payloads(body, marker)
     for payload in payloads:
         try:
-            value = json.loads(payload)
-        except (TypeError, ValueError, RecursionError):
+            value = json.loads(payload, object_pairs_hook=duplicate_guard)
+        except (TypeError, ValueError, RecursionError, Invalid):
             continue
-        if isinstance(value, dict):
-            return value
+        return True, value
+    return False, None
+
+
+JSON_NUMBER_TOKEN = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+)
+
+
+def partial_json_token(payload, offset):
+    """Read one JSON token without constructing nested values or integers."""
+
+    length = len(payload)
+    while offset < length and payload[offset] in " \t\r\n":
+        offset += 1
+    if offset == length:
+        return None
+    character = payload[offset]
+    if character in "{}[],:":
+        return character, character, offset + 1
+    if character == '"':
+        start = offset
+        offset += 1
+        while offset < length:
+            character = payload[offset]
+            if character == '"':
+                token = payload[start : offset + 1]
+                try:
+                    value = json.loads(token)
+                except (TypeError, ValueError, RecursionError):
+                    return None
+                if not isinstance(value, str):
+                    return None
+                return "string", value, offset + 1
+            if character == "\\":
+                offset += 1
+                if offset == length:
+                    return None
+            elif ord(character) < 0x20:
+                return None
+            offset += 1
+        return None
+
+    end = offset
+    while end < length and payload[end] not in " \t\r\n{}[],:\"":
+        end += 1
+    token = payload[offset:end]
+    if token in ("true", "false", "null") or JSON_NUMBER_TOKEN.fullmatch(token):
+        return "atom", token, end
     return None
 
 
-def contains_nonce_json_string(body, expected_nonce):
-    # A validated nonce contains only lowercase ASCII hex, whose only semantic
-    # JSON escape alternative is the corresponding six-byte ``\\u00xx`` form.
-    alternatives = []
-    for character in expected_nonce:
-        literal = re.escape(character)
-        unicode_escape = re.escape(f"\\u{ord(character):04x}")
-        alternatives.append(f"(?:{literal}|{unicode_escape})")
-    pattern = '"' + "".join(alternatives) + '"'
-    return re.search(pattern, body) is not None
+def partial_comment_identity(payload):
+    """Recover only direct root kind and promotion.nonce string values.
+
+    This deliberately iterative scanner is used only after strict JSON parsing
+    fails.  It can cross deeply nested or oversized-number fields without
+    recursion or integer conversion, while refusing to treat strings in
+    unrelated fields as promotion identity.
+    """
+
+    kinds = set()
+    nonces = set()
+    first = partial_json_token(payload, 0)
+    if first is None or first[0] != "{":
+        return kinds, nonces
+    stack = [
+        {
+            "type": "object",
+            "role": "root",
+            "state": "key_or_end",
+            "key": None,
+        }
+    ]
+    offset = first[2]
+
+    def finish_value(frame, token_type, token_value):
+        if token_type == "string":
+            if frame["role"] == "root" and frame["key"] == "kind":
+                kinds.add(token_value)
+            elif frame["role"] == "promotion" and frame["key"] == "nonce":
+                nonces.add(token_value)
+        frame["state"] = "comma_or_end"
+        frame["key"] = None
+
+    while stack:
+        token = partial_json_token(payload, offset)
+        if token is None:
+            break
+        token_type, token_value, offset = token
+        frame = stack[-1]
+
+        if frame["type"] == "object":
+            if frame["state"] == "key_or_end":
+                if token_type == "}":
+                    stack.pop()
+                elif token_type == "string":
+                    frame["key"] = token_value
+                    frame["state"] = "colon"
+                else:
+                    break
+            elif frame["state"] == "colon":
+                if token_type != ":":
+                    break
+                frame["state"] = "value"
+            elif frame["state"] == "value":
+                if token_type in ("string", "atom"):
+                    finish_value(frame, token_type, token_value)
+                elif token_type == "{":
+                    child_role = (
+                        "promotion"
+                        if frame["role"] == "root" and frame["key"] == "promotion"
+                        else "other"
+                    )
+                    finish_value(frame, token_type, token_value)
+                    stack.append(
+                        {
+                            "type": "object",
+                            "role": child_role,
+                            "state": "key_or_end",
+                            "key": None,
+                        }
+                    )
+                elif token_type == "[":
+                    finish_value(frame, token_type, token_value)
+                    stack.append({"type": "array", "state": "value_or_end"})
+                else:
+                    break
+            else:
+                if token_type == ",":
+                    frame["state"] = "key_or_end"
+                elif token_type == "}":
+                    stack.pop()
+                else:
+                    break
+        elif frame["state"] == "value_or_end":
+            if token_type == "]":
+                stack.pop()
+            elif token_type in ("string", "atom"):
+                frame["state"] = "comma_or_end"
+            elif token_type == "{":
+                frame["state"] = "comma_or_end"
+                stack.append(
+                    {
+                        "type": "object",
+                        "role": "other",
+                        "state": "key_or_end",
+                        "key": None,
+                    }
+                )
+            elif token_type == "[":
+                frame["state"] = "comma_or_end"
+                stack.append({"type": "array", "state": "value_or_end"})
+            else:
+                break
+        elif token_type == ",":
+            frame["state"] = "value_or_end"
+        elif token_type == "]":
+            stack.pop()
+        else:
+            break
+    return kinds, nonces
 
 
 def candidate_comments(comments, marker, kind, expected_nonce):
     candidates = []
-    marker_text = marker.decode("ascii").rstrip("\n")
+    marker_text = marker.decode("ascii")
     for comment in comments:
         if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
             continue
         body = comment["body"]
-        value = loose_record(body, marker)
-        structurally_matches = False
-        if isinstance(value, dict):
+        parsed, value = loose_record_status(body, marker)
+        if parsed:
+            if not isinstance(value, dict):
+                continue
             promotion = value.get("promotion")
-            structurally_matches = (
-                value.get("kind") == kind
-                and isinstance(promotion, dict)
+            matches = (
+                isinstance(promotion, dict)
                 and promotion.get("nonce") == expected_nonce
+                and (value.get("kind") == kind or body.startswith(marker_text))
             )
-        nonce_text_matches = expected_nonce in body or contains_nonce_json_string(
-            body, expected_nonce
-        )
-        text_matches = nonce_text_matches and (
-            kind in body or marker_text in body
-        )
-        if structurally_matches or text_matches:
+        else:
+            kinds = set()
+            nonces = set()
+            for payload in comment_payloads(body, marker):
+                payload_kinds, payload_nonces = partial_comment_identity(payload)
+                kinds.update(payload_kinds)
+                nonces.update(payload_nonces)
+            matches = expected_nonce in nonces and (
+                kind in kinds or body.startswith(marker_text)
+            )
+        if matches:
             candidates.append(comment)
     return candidates
 
