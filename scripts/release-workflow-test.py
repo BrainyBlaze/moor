@@ -162,14 +162,28 @@ def main():
         forbid(qa, command, "QA zero-build boundary")
 
     require(promotion, "workflow_dispatch:", "promotion workflow")
-    require(promotion, "qa_run_id", "promotion inputs")
-    require(promotion, "qa_run_attempt", "promotion inputs")
-    require(promotion, "qa_artifact_id", "promotion inputs")
-    require(promotion, "attestation_issue_number", "promotion inputs")
-    require(promotion, "attestation_nonce", "promotion inputs")
+    for name in (
+        "mode",
+        "qa_run_id",
+        "qa_run_attempt",
+        "qa_artifact_id",
+        "promotion_issue_number",
+        "promotion_nonce",
+        "original_promote_run_id",
+        "preflight_comment_id",
+        "completion_comment_id",
+    ):
+        require(promotion, name, "promotion inputs")
     require(promotion, "actions: read", "promotion permissions")
-    require(promotion, "contents: write", "promotion permissions")
+    require(promotion, "contents: read", "promotion permissions")
     require(promotion, "issues: read", "promotion permissions")
+    forbid(promotion, "contents: write", "promotion permissions")
+    forbid(promotion, "issues: write", "promotion permissions")
+    for malformed in ("${ github.", "${ inputs.", "${ steps."):
+        forbid(promotion, malformed, "malformed GitHub expression")
+    forbid(promotion, "attestation_issue_number", "retired attestation input")
+    forbid(promotion, "attestation_nonce", "retired attestation input")
+    forbid(promotion, "release-admin-attestation.py", "retired attestation protocol")
     require(promotion, "environment: release", "promotion environment")
     require(promotion, "github.ref == 'refs/heads/main'", "promotion main gate")
     require(promotion, "github.ref_protected", "promotion protected-ref gate")
@@ -185,21 +199,51 @@ def main():
         ],
         "promotion failed-job rerun gate",
     )
-    require(promotion, "release-admin-attestation.py verify", "promotion admin preflight gate")
-    require(promotion, "Open the run-bound immutable-settings attestation gate", "promotion gate-ready boundary")
+    require(promotion, "release_promotion_record.py manifest create", "canonical promotion manifest")
+    require(promotion, "promotion-manifest.json", "canonical promotion manifest")
+    require(promotion, "moor-release-promotion-v1", "promotion bundle")
+    require(promotion, "actions/upload-artifact@", "promotion bundle")
+    require(promotion, "artifact-digest", "promotion bundle digest")
+    require(promotion, ".digest == $digest", "promotion REST digest comparison")
+    require(promotion, "Open the local-administrator promotion gate", "promotion gate-ready boundary")
     require(promotion, "GATE_READY_AT", "promotion gate-ready boundary")
     require(promotion, "GITHUB_STEP_SUMMARY", "promotion gate-ready disclosure")
-    require(promotion, "collaborators/$ATTESTATION_AUTHOR/permission", "promotion attestation admin proof")
-    require(promotion, 'permission == "admin"', "promotion attestation admin proof")
-    require(promotion, "for attempt in $(seq 1 60)", "promotion bounded attestation wait")
-    require(promotion, "sleep 10", "promotion bounded attestation wait")
-    require(promotion, "immutable settings attestation timed out before mutation", "promotion named timeout")
-    require(promotion, "ATTESTATION_STATUS", "promotion attestation refusal handling")
-    require(promotion, 'test "$ATTESTATION_STATUS" != 75', "promotion wait-only exit status")
-    require(promotion, "attestation-comment.json", "promotion attestation snapshot")
-    require(promotion, "final-attestation-comment.json", "promotion attestation final refetch")
-    require(promotion, "collaborators/$EVIDENCE_AUTHOR/permission", "promotion admin permission proof")
-    require(promotion, 'permission == "admin"', "promotion admin permission proof")
+    require(promotion, "python3 scripts/release-admin-promote.py promote", "complete local command")
+    for option in (
+        "--repository",
+        "--promotion-run-id",
+        "--promotion-run-attempt",
+        "--head-sha",
+        "--source-artifact-id",
+        "--source-artifact-name",
+        "--source-api-digest",
+        "--issue-number",
+        "--dispatcher",
+        "--gate-ready-at",
+        "--nonce",
+        "--transaction-root",
+    ):
+        require(promotion, option, "complete local command")
+    require(promotion, "Wait for local administrator preflight", "named preflight wait")
+    require(promotion, "Wait for local administrator completion", "named completion wait")
+    require(promotion, "for attempt in $(seq 1 180)", "bounded preflight wait")
+    require(promotion, "for attempt in $(seq 1 360)", "bounded completion wait")
+    require(promotion, "sleep 10", "bounded local-administrator wait")
+    require(promotion, "preflight wait timed out", "promotion named timeout")
+    require(promotion, "completion wait timed out", "promotion named timeout")
+    require(promotion, "release_promotion_record.py preflight verify", "promotion preflight verifier")
+    require(promotion, "release_promotion_record.py completion verify", "promotion completion verifier")
+    assert promotion.count(".authority.immutableReleaseSettings.responseBase64") == 4, (
+        "promotion must verify the exact settings-response bytes from both records "
+        "in normal and recovery modes"
+    )
+    forbid(
+        promotion,
+        "printf '%s' '{\"enabled\":true,\"enforced_by_owner\":false}'",
+        "promotion must not synthesize settings-response evidence",
+    )
+    require(promotion, "collaborators/$COMMENT_AUTHOR/permission", "promotion live admin proof")
+    require(promotion, 'permission == "admin"', "promotion live admin proof")
     require(promotion, ".candidateQa.workflowRunId", "promotion candidate-QA run binding")
     require(promotion, ".candidateQa.evidenceArtifactId", "promotion evidence artifact binding")
     require(promotion, 'path == ".github/workflows/release-candidate-qa.yml"', "promotion candidate-QA workflow")
@@ -209,120 +253,55 @@ def main():
     require(promotion, ".qaRun.workflowRunAttempt == $attempt", "promotion QA producer attempt binding")
     require(promotion, ".qaRun.workflowRunId", "promotion QA record reconstruction")
     require(promotion, "release-qa-record.py verify", "promotion QA verification")
-    require(promotion, "release-asset-transaction.py plan", "promotion asset planner")
     require(promotion, "release-asset-transaction.py verify-complete", "promotion asset verifier")
-    require(promotion, "--release-draft", "promotion draft-state binding")
-    require(promotion, "--starter-deletions", "promotion starter deletion bound")
-    require(promotion, "delete-starter", "promotion starter cleanup action")
-    require(promotion, "starter-deletions.json", "promotion starter deletion counter")
-    require(promotion, "release-before-delete.json", "promotion fresh draft fence")
-    require(promotion, "asset-before-delete.json", "promotion fresh starter fence")
-    require(promotion, '.state == "starter"', "promotion starter state fence")
-    require(promotion, "--method DELETE", "promotion exact starter cleanup")
     require(promotion, "refs/tags/$VERSION", "exact tag")
-    require(promotion, '"draft": true', "draft release")
-    require(promotion, '"draft": false', "release publication")
-    require(promotion, "re-download the published release assets", "post-publication verification")
+    require(promotion, ".draft == false", "published release proof")
+    require(promotion, ".immutable == true", "immutable release proof")
+    require(promotion, "Independently verify the immutable published release", "independent proof")
+    require(promotion, "final-completion-comment.json", "same completion final refetch")
+    require(
+        promotion,
+        "cmp completion-comment.json final-completion-comment.json",
+        "same completion final refetch",
+    )
     require(promotion, 'test "$(jq length expected-assets.json)" = 6', "exact six-asset publication")
+    require(promotion, "inputs.mode == 'promote'", "promote-only human gates")
+    require(promotion, "inputs.mode == 'verify-published'", "read-only recovery mode")
+    require(promotion, "original_promote_run_id", "read-only recovery source")
+    require(promotion, "completion_comment_id", "read-only recovery receipt")
     forbid(promotion, "--clobber", "no overwrite")
-    for command in ("cargo build", "cargo install", "cargo package", "candidate-manifest.py"):
+    for command in (
+        "cargo build",
+        "cargo install",
+        "cargo package",
+        "candidate-manifest.py",
+        "gh release upload",
+        "--method POST",
+        "--method PATCH",
+        "--method DELETE",
+        "uploads.github.com",
+    ):
         forbid(promotion, command, "promotion zero-build boundary")
     ordered(
         promotion,
         [
             "release-qa-record.py verify",
             "Assemble the six byte-identical release files and expected inventory",
-            "Open the run-bound immutable-settings attestation gate",
-            "Require a fresh run-bound immutable-settings admin attestation",
-            "refs/tags/$VERSION",
-            '"draft": true',
-            "release-asset-transaction.py plan",
-            '"draft": false',
-            "re-download the published release assets",
+            "release_promotion_record.py manifest create",
+            "actions/upload-artifact@",
+            "Open the local-administrator promotion gate",
+            "Wait for local administrator preflight",
+            "Wait for local administrator completion",
+            "Independently verify the immutable published release",
         ],
         "promotion workflow",
-    )
-    attestation_step = promotion[
-        promotion.index("- name: Open the run-bound immutable-settings attestation gate") :
-        promotion.index("- name: Create or verify the exact tag and draft release")
-    ]
-    require(
-        attestation_step,
-        "QA run/attempt/artifact:",
-        "promotion gate-ready QA tuple disclosure",
-    )
-    ordered(
-        attestation_step,
-        [
-            "actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}",
-            "GATE_READY_AT",
-            "Require a fresh run-bound immutable-settings admin attestation",
-            "issues/${{ inputs.attestation_issue_number }}/comments?per_page=100",
-            "release-admin-attestation.py verify",
-            "mv immutable-settings-attestation.next.json immutable-settings-attestation.json",
-            "collaborators/$ATTESTATION_AUTHOR/permission",
-            'permission == "admin"',
-            "> attestation-comment.json",
-        ],
-        "promotion run-bound admin attestation gate",
-    )
-
-    publish_step = promotion[
-        promotion.index("- name: Publish the complete draft exactly once") :
-        promotion.index("- name: re-download the published release assets")
-    ]
-    ordered(
-        publish_step,
-        [
-            "prepublish-tag.json",
-            "prepublish-release.json",
-            "prepublish-assets.json",
-            "release-asset-transaction.py verify-complete",
-            '{"draft": false}',
-        ],
-        "promotion prepublish fence",
-    )
-    postpublish = publish_step[publish_step.index('{"draft": false}') :]
-    ordered(
-        postpublish,
-        [
-            "published-release.json",
-            "postpublish-tag.json",
-            "postpublish-release.json",
-            "postpublish-assets.json",
-            "--assets postpublish-assets.json --downloads postpublish-downloads",
-        ],
-        "promotion postpublish release and asset proof",
-    )
-    require(
-        publish_step,
-        "and .immutable == true\n          ' published-release.json",
-        "promotion publish-response immutable proof",
-    )
-    require(
-        publish_step,
-        "and .immutable == true\n            ' postpublish-release.json",
-        "promotion fresh-release immutable proof",
-    )
-    final_step = promotion[promotion.index("- name: re-download the published release assets") :]
-    ordered(
-        final_step,
-        [
-            "published-assets.json",
-            "release-asset-transaction.py verify-complete",
-            "final-attestation-comment.json",
-            "release-admin-attestation.py verify",
-            "--postpublish-recheck",
-            "final-release.json",
-            ".draft == false and .immutable == true",
-        ],
-        "promotion independent published-byte and attestation proof",
     )
 
     for test in (
         "python3 scripts/release-qa-record-test.py",
         "python3 scripts/release-asset-transaction-test.py",
-        "python3 scripts/release-admin-attestation-test.py",
+        "python3 scripts/release-promotion-record-test.py",
+        "python3 scripts/release-admin-promote-test.py",
         "python3 scripts/release-workflow-test.py",
     ):
         require(quality, test, "hosted quality")
@@ -359,9 +338,12 @@ def main():
     forbid(guide, "schema-2 pin", "retired Desk pin schema")
     require(guide, "never rebuilds or overwrites", "promotion boundary")
     require(guide, "single permitted deletion", "promotion starter exception")
-    require(guide, "trusted repository administrators", "promotion trusted-admin boundary")
-    require(guide, "fresh nonce", "promotion run-bound admin attestation")
-    require(guide, "exact response bytes", "promotion run-bound admin attestation")
+    require(guide, "authenticated local `gh` session", "promotion local authority")
+    require(guide, "sole release mutator", "promotion local authority")
+    require(guide, "one complete, pasteable command", "promotion operator surface")
+    require(guide, "canonical preflight and completion", "promotion record protocol")
+    require(guide, "fresh nonce", "promotion record freshness")
+    require(guide, "exact response bytes", "promotion settings authority")
     require(guide, "X-GitHub-Api-Version: 2026-03-10", "promotion pinned settings API")
     require(guide, "application/vnd.github+json", "promotion pinned settings media type")
     require(
@@ -369,8 +351,9 @@ def main():
         '{"enabled":true,"enforced_by_owner":false}',
         "promotion live settings response shape",
     )
-    require(guide, "persistent but not immutable", "promotion attestation evidence boundary")
+    require(guide, "persistent but not immutable", "promotion comment evidence boundary")
     require(guide, "never rerun a failed promotion attempt", "promotion attempt recovery")
+    require(guide, "`verify-published`", "read-only promotion recovery")
     require(guide, "preflight-to-publication", "promotion trusted-admin race")
     require(
         guide,
@@ -381,7 +364,8 @@ def main():
     require(manifest_contract, "candidate-QA evidence artifact", "manifest candidate-QA contract")
     require(manifest_contract, "QA producer run/attempt", "manifest QA producer identity")
     require(manifest_contract, "repository `admin` permission", "manifest evidence authority")
-    require(manifest_contract, "run-bound admin attestation", "manifest promotion settings authority")
+    require(manifest_contract, "read-only promotion workflow", "manifest workflow authority")
+    require(manifest_contract, "canonical preflight and completion records", "manifest record protocol")
     require(manifest_contract, "exact response bytes", "manifest promotion settings authority")
     require(manifest_contract, "new attempt-1 dispatch", "manifest promotion recovery")
     require(manifest_contract, "`starter`", "manifest starter exception")
