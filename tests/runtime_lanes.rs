@@ -564,8 +564,9 @@ fn an_atomically_issued_commit_may_finish_after_quarantine() {
 }
 
 #[test]
-fn quarantine_after_commit_mutation_publishes_an_unknown_frontier() {
+fn a_started_transaction_resolves_its_frontier_after_the_caller_deadline() {
     let (mut lane, path) = staged_lane("commit-written-before-issuance");
+    let base = frontier(&lane).index;
     let (announce, entered) = mpsc::channel();
     let (release, gate) = mpsc::channel();
     lane.submit(
@@ -583,14 +584,25 @@ fn quarantine_after_commit_mutation_publishes_an_unknown_frontier() {
     );
     drop(release);
     let deadline = Instant::now() + Duration::from_secs(2);
-    while lane.selected().is_some() && Instant::now() < deadline {
+    while lane
+        .selected()
+        .is_none_or(|selected| selected.index == base)
+        && Instant::now() < deadline
+    {
         std::thread::yield_now();
     }
     assert_eq!(
-        lane.selected(),
-        None,
-        "a possibly selectable commit was hidden"
+        lane.selected().map(|selected| (
+            selected.index,
+            selected.epoch,
+            selected.length,
+            selected.start,
+            selected.end,
+        )),
+        Some((base + 1, 2, 9, 0, 9)),
+        "the completed admitted transaction did not resolve the frontier"
     );
+    assert!(!lane.writable(), "the expired lane reopened for new work");
     let _ = fs::remove_dir_all(path);
 }
 

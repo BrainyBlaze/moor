@@ -56,17 +56,38 @@ impl State {
     }
 
     fn io(&self, deadline: Instant, step: StoreStep) -> Result<(), StoreError> {
-        self.deadline(deadline)?;
+        let phase = self.bits.load(Ordering::Acquire) & PHASE;
+        // Once commit mutation starts, stopping between its synchronous syscalls
+        // would leave the selected frontier permanently unknowable. Close the
+        // lane on expiry, but let this one candidate reach its durable flush.
+        if phase == DIRTY {
+            if Instant::now() >= deadline {
+                self.close();
+            }
+        } else {
+            self.deadline(deadline)?;
+        }
         let state = self.bits.load(Ordering::Acquire);
-        let (from, to) = match (step, state) {
+        let phase = state & PHASE;
+        if state & CLOSED != 0 && phase != DIRTY {
+            return Err(failure(ErrorKind::WouldBlock));
+        }
+        let (from, to) = match (step, phase) {
             (StoreStep::Body, BODY) | (StoreStep::Commit, DIRTY) => return Ok(()),
             (StoreStep::Commit, BODY) => (BODY, DIRTY),
             (StoreStep::Flush, DIRTY) => (DIRTY, COMMIT),
             _ => return Err(failure(ErrorKind::WouldBlock)),
         };
-        self.change(from, to)
+        self.change_phase(from, to)
             .map(|_| ())
             .map_err(|_| failure(ErrorKind::WouldBlock))
+    }
+
+    fn change_phase(&self, from: u8, to: u8) -> Result<u8, u8> {
+        self.bits
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & PHASE == from).then_some((state & !PHASE) | to)
+            })
     }
 
     fn change(&self, from: u8, to: u8) -> Result<u8, u8> {
