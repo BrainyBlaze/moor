@@ -326,54 +326,62 @@ requires exact byte equality with the approved QA artifact.
 ## Immutable promotion
 
 Promotion is allowed only after the operator records that full manual QA passed
-for the exact candidate identity above. Only then may the tag named by
-`manifest.version` be created. The promotion workflow performs no compilation,
-linking, packaging, or source-based reconstruction.
+for the exact candidate identity above. The read-only promotion workflow
+reconstructs the six approved files, creates a canonical promotion manifest,
+uploads a closed seven-file bundle, and discloses one complete local command. It
+performs no compilation, linking, packaging, tag, release, asset, or comment
+mutation.
 
-Promotion must:
+The administrator runs `scripts/release-admin-promote.py promote` from a clean
+checkout at the exact protected-main head. The helper authenticates the
+dispatcher, live repository `admin` permission, OAuth scopes, GitHub time,
+enabled immutable-release settings and their exact response bytes, promotion run, bundle artifact ID/API
+digest, canonical manifest, and all six file bytes before it posts the canonical
+preflight record.
 
-1. Resolve the tag named by `manifest.version` to a commit and require exact
-   equality with `manifest.commit`.
-2. Require the repository, candidate run ID and attempt, and metadata artifact
-   ID/name to equal the approved manual-QA record.
-3. Download each target artifact by the manifest's immutable artifact ID and
-   require GitHub metadata to match repository, candidate run/attempt, and
-   artifact name.
-4. Require each artifact to contain only its declared regular file, then verify
-   the filename, byte length, and SHA-256 before upload.
-5. Require the candidate manifest and `SHA256SUMS` to be byte-for-byte equal to
-   the files approved by manual QA.
-6. Upload the four verified raw binaries plus those two unchanged metadata files
-   to the GitHub Release for the exact `manifest.version` tag.
-7. Download the published release assets again and verify their byte length and
-   SHA-256 before reporting promotion success.
+The helper may then create or adopt only:
 
-The implementation may use a draft release as its crash-resume boundary. A
-retry keeps an already-uploaded asset only after downloading it by asset ID and
-matching its exact expected size and digest; it uploads only missing final-name
-assets and never overwrites or substitutes one. The sole deletion exception is
-an expected-name asset in GitHub state `starter`, which denotes an interrupted
-upload rather than valid release bytes. The planner may request that cleanup
-only on the transaction-bound draft; immediately before deletion the workflow
-must freshly verify the same release ID and `draft == true`, then the same asset
-ID/name and `state == "starter"`. It replans from a fresh inventory afterward
-and permits at most two such deletions per name in one run. An uploaded asset,
-an unexpected name, or any asset on a published release is never deleted.
-Unexpected names, duplicate names or IDs, other states, conflicting bytes, or
-an exhausted starter bound fail closed. Only a complete six-asset draft (the
-four binaries plus the unchanged manifest and `SHA256SUMS`) may be published,
-and repository immutable releases must be enabled before the tag or draft is
-created. A fresh attempt-1 promotion proves that prerequisite with one
-run-bound admin attestation posted only after the final read-only artifact
-check. The strict record binds repository, protected-main SHA, QA tuple,
-promotion run/attempt, fresh nonce, gate-ready time, UTC settings-read time, and
-the exact response bytes and SHA-256. The workflow accepts it only from its own
-dispatcher with live repository `admin` permission and re-fetches the same
-unedited comment after published-asset verification. A failed promotion is
-never rerun; recovery is a new attempt-1 dispatch with a new attestation.
+1. the lightweight tag named by `manifest.version` at `manifest.commit`;
+2. the exact deterministic draft release;
+3. the six manifest-bound assets selected by
+   `release-asset-transaction.py`; and
+4. one transition from the complete draft to a public immutable release.
 
-An expired or missing candidate artifact, an artifact ID/name/run mismatch, a
-changed byte, a non-green or missing provenance job, a tag/source mismatch, an
-already-populated conflicting release asset, or an unverifiable manual-QA
-record fails closed. The remedy is a new candidate run and a new full QA cycle;
-promotion never rebuilds or silently substitutes bytes.
+Promotion never moves or deletes a tag, deletes a release, edits a published
+release, rebuilds a candidate, overwrites an asset, or silently substitutes
+bytes. The single deletion exception is an expected-name asset in GitHub state
+`starter` on the exact draft after fresh release/asset identity fences. The
+helper replans from a fresh inventory and permits at most two such deletions per
+name in one execution.
+
+Before every release mutation the helper requires the named completion-wait
+step to remain live, re-fetches the accepted preflight, and reauthorizes the
+checkout, dispatcher, administrator permission, GitHub time, and immutable
+settings. Immediately before publication it also re-resolves the tag, exact
+draft metadata, and all six downloaded asset bytes. Publication succeeds only
+when a fresh release read reports `draft == false` and `immutable == true`.
+
+The canonical preflight and completion records bind repository,
+protected-main head, attempt-1 promotion run, issue, fresh nonce, complete
+candidate/QA/source tuple, promotion-manifest SHA-256, helper commit, exact
+settings-response SHA-256, administrator identity, and GitHub timestamps. The
+completion additionally binds the accepted preflight ID/body hash, exact tag
+and release, six asset IDs/sizes/hashes, final authority phase, and local
+transaction-evidence manifest SHA-256.
+
+Actions independently re-fetches the exact comments and live administrator
+permission, resolves the tag and deterministic release, downloads all six
+published assets, checks IDs/sizes/SHA-256 values, and re-fetches the same
+completion comment before reporting success. The comments are persistent but
+not immutable, so they are authorization and receipt records rather than the
+source of truth for live release state.
+
+A failed promotion is never rerun. Recovery uses a new attempt-1 dispatch and
+nonce. An exact partial tag/draft/asset state may be adopted after all fresh
+checks. An exact immutable release may receive a new zero-mutation completion
+record. `verify-published` authenticates a prior bundle and accepted records,
+then repeats the full proof with read-only permissions.
+
+An expired or missing artifact, ID/name/run/digest mismatch, changed byte,
+non-green provenance job, conflicting tag/release/asset/comment state, mutable
+published release, stale authority, or unverifiable QA record fails closed.

@@ -3,30 +3,50 @@ name: Promote QA-approved release
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: Promote locally or re-verify a prior immutable publication
+        required: true
+        default: promote
+        type: choice
+        options:
+          - promote
+          - verify-published
       qa_run_id:
         description: Exact successful release-qa run ID
-        required: true
+        required: false
         type: string
       qa_run_attempt:
         description: Exact QA run attempt (v1 requires 1)
-        required: true
+        required: false
         type: string
       qa_artifact_id:
         description: Immutable moor-release-qa-v1 artifact ID
-        required: true
+        required: false
         type: string
-      attestation_issue_number:
-        description: Moor issue that will receive the run-bound admin attestation
-        required: true
+      promotion_issue_number:
+        description: Moor issue that will receive canonical promotion records
+        required: false
         type: string
-      attestation_nonce:
+      promotion_nonce:
         description: Fresh 64-lowercase-hex nonce for this promotion dispatch
-        required: true
+        required: false
+        type: string
+      original_promote_run_id:
+        description: Prior attempt-1 promote run (verify-published only)
+        required: false
+        type: string
+      preflight_comment_id:
+        description: Accepted prior preflight comment ID (verify-published only)
+        required: false
+        type: string
+      completion_comment_id:
+        description: Accepted prior completion comment ID (verify-published only)
+        required: false
         type: string
 
 permissions:
   actions: read
-  contents: write
+  contents: read
   issues: read
 
 concurrency:
@@ -48,7 +68,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.ref_protected
     environment: release
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Require attempt-one execution inside the promotion job
         run: test "${{ github.run_attempt }}" = 1
@@ -63,7 +83,36 @@ jobs:
           test "${{ github.ref }}" = refs/heads/main
           test "${{ github.ref_protected }}" = true
 
+      - name: Validate the attempt-one dispatch mode and input surface
+        env:
+          MODE: ${{ inputs.mode }}
+          QA_RUN_ID: ${{ inputs.qa_run_id }}
+          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
+          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
+          ISSUE_NUMBER: ${{ inputs.promotion_issue_number }}
+          NONCE: ${{ inputs.promotion_nonce }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_promote_run_id }}
+          PREFLIGHT_COMMENT_ID: ${{ inputs.preflight_comment_id }}
+          COMPLETION_COMMENT_ID: ${{ inputs.completion_comment_id }}
+        run: |
+          if test "$MODE" = promote; then
+            for value in "$QA_RUN_ID" "$QA_ARTIFACT_ID" "$ISSUE_NUMBER"; do
+              case "$value" in ''|*[!0-9]*|0) exit 1 ;; esac
+            done
+            test "$QA_RUN_ATTEMPT" = 1
+            test "${#NONCE}" = 64
+            case "$NONCE" in *[!0-9a-f]*) exit 1 ;; esac
+            test -z "$ORIGINAL_RUN_ID$PREFLIGHT_COMMENT_ID$COMPLETION_COMMENT_ID"
+          else
+            test "$MODE" = verify-published
+            for value in "$ORIGINAL_RUN_ID" "$PREFLIGHT_COMMENT_ID" "$COMPLETION_COMMENT_ID"; do
+              case "$value" in ''|*[!0-9]*|0) exit 1 ;; esac
+            done
+            test -z "$QA_RUN_ID$QA_RUN_ATTEMPT$QA_ARTIFACT_ID$ISSUE_NUMBER$NONCE"
+          fi
+
       - name: Download the exact successful QA artifact by ID
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
           QA_RUN_ID: ${{ inputs.qa_run_id }}
@@ -101,6 +150,7 @@ jobs:
           ' approval/moor-release-qa-v1.json >/dev/null
 
       - name: Re-download candidate metadata and record by QA-bound IDs
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -147,6 +197,7 @@ jobs:
           (cd candidate-record && unzip -q ../record.zip)
 
       - name: Re-authenticate the QA-bound candidate-QA evidence artifact
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -204,6 +255,7 @@ jobs:
             ' candidate-qa-evidence/manual-qa-evidence.json >/dev/null
 
       - name: Re-fetch the authenticated evidence and verify the QA record
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -254,6 +306,7 @@ jobs:
           python3 scripts/release-qa-record.py verify "${COMMON[@]}" --qa-record approval/moor-release-qa-v1.json
 
       - name: Re-download the four QA-bound candidate binaries by ID
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -280,6 +333,7 @@ jobs:
           (cd candidate-assets && sha256sum --check --strict ../candidate-metadata/SHA256SUMS)
 
       - name: Assemble the six byte-identical release files and expected inventory
+        if: inputs.mode == 'promote'
         run: |
           mkdir release-files
           cp candidate-assets/* release-files/
@@ -289,7 +343,7 @@ jobs:
           MANIFEST_SHA="$(sha256sum release-files/moor-release-manifest-v1.json | cut -d' ' -f1)"
           SUMS_SIZE="$(wc -c < release-files/SHA256SUMS | tr -d ' ')"
           SUMS_SHA="$(sha256sum release-files/SHA256SUMS | cut -d' ' -f1)"
-          jq -n --slurpfile qa approval/moor-release-qa-v1.json \
+          jq -cS -n --slurpfile qa approval/moor-release-qa-v1.json \
             --argjson manifestSize "$MANIFEST_SIZE" --arg manifestSha "$MANIFEST_SHA" \
             --argjson sumsSize "$SUMS_SIZE" --arg sumsSha "$SUMS_SHA" '
               (($qa[0].targets | to_entries | map({name: .value.asset, size: .value.size, sha256: .value.sha256})) +
@@ -300,288 +354,527 @@ jobs:
             ' > expected-assets.json
           test "$(jq length expected-assets.json)" = 6
 
-      - name: Open the run-bound immutable-settings attestation gate
+      - name: Create the canonical promotion manifest and bundle
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
-          ATTESTATION_ISSUE_NUMBER: ${{ inputs.attestation_issue_number }}
-          ATTESTATION_NONCE: ${{ inputs.attestation_nonce }}
           QA_RUN_ID: ${{ inputs.qa_run_id }}
           QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
           QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
+          PROMOTION_NONCE: ${{ inputs.promotion_nonce }}
         run: |
-          case "$ATTESTATION_ISSUE_NUMBER" in ''|*[!0-9]*|0) exit 1 ;; esac
-          test "${#ATTESTATION_NONCE}" = 64
-          case "$ATTESTATION_NONCE" in *[!0-9a-f]*) exit 1 ;; esac
+          COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
+          CANDIDATE_RUN_ID="$(jq -r .candidate.workflowRunId approval/moor-release-qa-v1.json)"
+          printf '%s\n%s\n%s' \
+            "Source-Commit: $COMMIT" \
+            "Candidate-Run: $CANDIDATE_RUN_ID/1" \
+            "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID" \
+            > release-body.txt
+
+          ARTIFACT_IDS=(
+            "$(jq -r .candidate.metadataArtifactId approval/moor-release-qa-v1.json)"
+            "$(jq -r .candidate.candidateRecordArtifactId approval/moor-release-qa-v1.json)"
+            "$(jq -r .candidateQa.evidenceArtifactId approval/moor-release-qa-v1.json)"
+            "$QA_ARTIFACT_ID"
+          )
+          while IFS= read -r id; do
+            ARTIFACT_IDS+=("$id")
+          done < <(jq -r '.targets[].artifactId' approval/moor-release-qa-v1.json)
+          test "${#ARTIFACT_IDS[@]}" = 8
+
+          DIGEST_ARGS=()
+          mkdir promotion-artifact-metadata
+          for id in "${ARTIFACT_IDS[@]}"; do
+            case "$id" in ''|*[!0-9]*|0) exit 1 ;; esac
+            gh api "repos/${{ github.repository }}/actions/artifacts/$id" \
+              > "promotion-artifact-metadata/$id.json"
+            jq -e --argjson id "$id" '
+              .id == $id
+              and .expired == false
+              and (.digest | test("^sha256:[0-9a-f]{64}$"))
+            ' "promotion-artifact-metadata/$id.json" >/dev/null
+            DIGEST_ARGS+=(
+              --artifact-api-digest
+              "$id=$(jq -r .digest "promotion-artifact-metadata/$id.json")"
+            )
+          done
+
+          python3 scripts/release_promotion_record.py manifest create \
+            --repository "${{ github.repository }}" \
+            --promotion-run-id "${{ github.run_id }}" \
+            --promotion-run-attempt "${{ github.run_attempt }}" \
+            --head-sha "${{ github.sha }}" \
+            --mode promote \
+            --nonce "$PROMOTION_NONCE" \
+            --qa-run-id "$QA_RUN_ID" \
+            --qa-run-attempt "$QA_RUN_ATTEMPT" \
+            --qa-artifact-id "$QA_ARTIFACT_ID" \
+            --qa-record approval/moor-release-qa-v1.json \
+            --expected-assets expected-assets.json \
+            --release-body release-body.txt \
+            "${DIGEST_ARGS[@]}" \
+            --out promotion-manifest.json
+
+          mkdir -p promotion-bundle/release-files
+          cp promotion-manifest.json promotion-bundle/
+          cp release-files/* promotion-bundle/release-files/
+          test "$(find promotion-bundle -type f | wc -l | tr -d ' ')" = 7
+
+      - name: Upload the closed promotion bundle
+        if: inputs.mode == 'promote'
+        id: promotion_bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: moor-release-promotion-v1
+          path: promotion-bundle
+          compression-level: 0
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Authenticate the promotion artifact ID and API digest
+        if: inputs.mode == 'promote'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.promotion_bundle.outputs.artifact-id }}
+          ACTION_DIGEST: ${{ steps.promotion_bundle.outputs.artifact-digest }}
+        run: |
+          case "$ARTIFACT_ID" in ''|*[!0-9]*|0) exit 1 ;; esac
+          echo "$ACTION_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
+          API_DIGEST="sha256:$ACTION_DIGEST"
+          gh api "repos/${{ github.repository }}/actions/artifacts/$ARTIFACT_ID" \
+            > promotion-artifact.json
+          jq -e --argjson id "$ARTIFACT_ID" --argjson run "${{ github.run_id }}" \
+            --arg head "${{ github.sha }}" --arg digest "$API_DIGEST" '
+              .id == $id
+              and .name == "moor-release-promotion-v1"
+              and .expired == false
+              and .workflow_run.id == $run
+              and .workflow_run.head_sha == $head
+              and .digest == $digest
+            ' promotion-artifact.json >/dev/null
+          {
+            echo "PROMOTION_ARTIFACT_ID=$ARTIFACT_ID"
+            echo "PROMOTION_ARTIFACT_DIGEST=$API_DIGEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Open the local-administrator promotion gate
+        if: inputs.mode == 'promote'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.promotion_issue_number }}
+          PROMOTION_NONCE: ${{ inputs.promotion_nonce }}
+        run: |
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}" \
             > promotion-run.json
           jq -e --argjson id "${{ github.run_id }}" --arg head "${{ github.sha }}" '
             .id == $id
             and .run_attempt == 1
             and .event == "workflow_dispatch"
+            and .status == "in_progress"
             and .head_branch == "main"
             and .head_sha == $head
             and .path == ".github/workflows/release-promote.yml"
           ' promotion-run.json >/dev/null
           GATE_READY_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           echo "GATE_READY_AT=$GATE_READY_AT" >> "$GITHUB_ENV"
-          echo "::notice title=Immutable-settings attestation gate ready::repository=${{ github.repository }} run=${{ github.run_id }}/${{ github.run_attempt }} qa=$QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID nonce=$ATTESTATION_NONCE gateReadyAt=$GATE_READY_AT"
+          COMMAND="python3 scripts/release-admin-promote.py promote --repository '${{ github.repository }}' --promotion-run-id '${{ github.run_id }}' --promotion-run-attempt '1' --head-sha '${{ github.sha }}' --source-artifact-id '$PROMOTION_ARTIFACT_ID' --source-artifact-name 'moor-release-promotion-v1' --source-api-digest '$PROMOTION_ARTIFACT_DIGEST' --issue-number '$ISSUE_NUMBER' --dispatcher '${{ github.actor }}' --gate-ready-at '$GATE_READY_AT' --nonce '$PROMOTION_NONCE' --transaction-root \"\$HOME/.local/state/moor/release-${{ github.run_id }}-1\""
           {
-            echo "## Immutable-settings admin attestation required"
-            echo "- repository: \`${{ github.repository }}\`"
-            echo "- promotion run/attempt: \`${{ github.run_id }}/${{ github.run_attempt }}\`"
-            echo "- protected-main SHA: \`${{ github.sha }}\`"
-            echo "- QA run/attempt/artifact: \`$QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID\`"
-            echo "- issue: \`$ATTESTATION_ISSUE_NUMBER\`"
-            echo "- nonce: \`$ATTESTATION_NONCE\`"
-            echo "- gate ready at: \`$GATE_READY_AT\`"
+            echo "## Local administrator promotion command"
+            echo
+            echo "~~~bash"
+            echo "$COMMAND"
+            echo "~~~"
+            echo
+            echo "This workflow has read-only repository permissions and is waiting for the canonical preflight record."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Local administrator promotion gate ready::$COMMAND"
 
-      - name: Require a fresh run-bound immutable-settings admin attestation
+      - name: Wait for local administrator preflight
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
-          QA_RUN_ID: ${{ inputs.qa_run_id }}
-          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
-          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
+          ISSUE_NUMBER: ${{ inputs.promotion_issue_number }}
+          PROMOTION_NONCE: ${{ inputs.promotion_nonce }}
         run: |
-          ATTESTATION_ACCEPTED=false
-          for attempt in $(seq 1 60); do
+          MARKER='<!-- moor-release-preflight-v1 -->'
+          ACCEPTED=false
+          for attempt in $(seq 1 180); do
             gh api --paginate --slurp \
-              "repos/${{ github.repository }}/issues/${{ inputs.attestation_issue_number }}/comments?per_page=100" \
-              > attestation-comment-pages.json
-            jq '[.[][]]' attestation-comment-pages.json > attestation-comments.json
-            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            set +e
-            python3 scripts/release-admin-attestation.py verify \
-              --comments attestation-comments.json \
-              --expected-repository "${{ github.repository }}" \
-              --expected-head-sha "${{ github.sha }}" \
-              --expected-qa-run-id "$QA_RUN_ID" \
-              --expected-qa-run-attempt "$QA_RUN_ATTEMPT" \
-              --expected-qa-artifact-id "$QA_ARTIFACT_ID" \
-              --expected-run-id "${{ github.run_id }}" \
-              --expected-run-attempt "${{ github.run_attempt }}" \
-              --expected-nonce "${{ inputs.attestation_nonce }}" \
-              --expected-issue-number "${{ inputs.attestation_issue_number }}" \
-              --expected-actor "${{ github.actor }}" \
-              --gate-ready-at "$GATE_READY_AT" --now "$NOW" \
-              > immutable-settings-attestation.next.json
-            ATTESTATION_STATUS=$?
-            set -e
-            if test "$ATTESTATION_STATUS" = 0; then
-              mv immutable-settings-attestation.next.json immutable-settings-attestation.json
-              ATTESTATION_ACCEPTED=true
-              break
-            fi
-            if test "$ATTESTATION_STATUS" != 75; then
-              exit "$ATTESTATION_STATUS"
-            fi
-            if test "$attempt" != 60; then
-              sleep 10
-            fi
-          done
-          if test "$ATTESTATION_ACCEPTED" != true; then
-            echo "::error::immutable settings attestation timed out before mutation"
-            exit 1
-          fi
-          ATTESTATION_AUTHOR="$(jq -r .author immutable-settings-attestation.json)"
-          gh api "repos/${{ github.repository }}/collaborators/$ATTESTATION_AUTHOR/permission" \
-            > attestation-permission.json
-          jq -e --arg actor "${{ github.actor }}" '
-            .user.login == $actor and .permission == "admin"
-          ' attestation-permission.json >/dev/null
-          ATTESTATION_COMMENT_ID="$(jq -r .commentId immutable-settings-attestation.json)"
-          jq --argjson id "$ATTESTATION_COMMENT_ID" \
-            '[.[] | select(.id == $id)][0]' attestation-comments.json > attestation-comment.json
-          {
-            echo "- accepted attestation: $(jq -r .commentUrl immutable-settings-attestation.json)"
-            echo "- attestation body SHA-256: \`$(jq -r .bodySha256 immutable-settings-attestation.json)\`"
-            echo "- settings checked at: \`$(jq -r .attestation.immutableReleaseSettings.checkedAt immutable-settings-attestation.json)\`"
-            echo "- exact response SHA-256: \`$(jq -r .attestation.immutableReleaseSettings.responseSha256 immutable-settings-attestation.json)\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create or verify the exact tag and draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          QA_RUN_ID: ${{ inputs.qa_run_id }}
-          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
-          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
-        run: |
-          VERSION="$(jq -r .version approval/moor-release-qa-v1.json)"
-          COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
-          gh api "repos/${{ github.repository }}/git/matching-refs/tags/$VERSION" > matching-refs.json
-          jq --arg ref "refs/tags/$VERSION" '[.[] | select(.ref == $ref)]' matching-refs.json > exact-refs.json
-          test "$(jq length exact-refs.json)" -le 1
-          if test "$(jq length exact-refs.json)" = 0; then
-            jq -n --arg ref "refs/tags/$VERSION" --arg sha "$COMMIT" '{ref: $ref, sha: $sha}' > create-tag.json
-            gh api --method POST "repos/${{ github.repository }}/git/refs" --input create-tag.json > exact-tag.json
-          else
-            jq '.[0]' exact-refs.json > exact-tag.json
-          fi
-          jq -e --arg ref "refs/tags/$VERSION" --arg commit "$COMMIT" '
-            .ref == $ref and .object.type == "commit" and .object.sha == $commit
-          ' exact-tag.json >/dev/null
-
-          RELEASE_NAME="Moor $VERSION"
-          RELEASE_BODY="$(printf '%s\n%s\n%s' \
-            "Source-Commit: $COMMIT" \
-            "Candidate-Run: $(jq -r '.candidate.workflowRunId|tostring' approval/moor-release-qa-v1.json)/$(jq -r .candidate.workflowRunAttempt approval/moor-release-qa-v1.json)" \
-            "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID")"
-          gh api --paginate --slurp "repos/${{ github.repository }}/releases?per_page=100" \
-            | jq --arg version "$VERSION" '[.[][] | select(.tag_name == $version)]' > matching-releases.json
-          test "$(jq length matching-releases.json)" -le 1
-          if test "$(jq length matching-releases.json)" = 0; then
-            jq -n --arg tag "$VERSION" --arg commit "$COMMIT" --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
-              {"tag_name": $tag, "target_commitish": $commit, "name": $name, "body": $body,
-               "draft": true, "prerelease": false, "generate_release_notes": false}
-            ' > create-release.json
-            gh api --method POST "repos/${{ github.repository }}/releases" --input create-release.json > release.json
-          else
-            jq '.[0]' matching-releases.json > release.json
-          fi
-          jq -e --arg tag "$VERSION" --arg commit "$COMMIT" --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
-            .tag_name == $tag
-            and .target_commitish == $commit
-            and .name == $name
-            and .body == $body
-            and .prerelease == false
-            and (.draft == true or (.draft == false and .immutable == true))
-          ' release.json >/dev/null
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "RELEASE_ID=$(jq -r .id release.json)" >> "$GITHUB_ENV"
-          echo "RELEASE_DRAFT=$(jq -r .draft release.json)" >> "$GITHUB_ENV"
-
-      - name: Resume the no-overwrite draft asset transaction to completeness
-        env:
-          GH_TOKEN: ${{ github.token }}
-          QA_RUN_ID: ${{ inputs.qa_run_id }}
-          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
-          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
-        run: |
-          COMPLETE=false
-          printf '{}\n' > starter-deletions.json
-          for iteration in $(seq 1 20); do
-            gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-              | jq '[.[][] | {id, name, state, size}]' > "assets-$iteration.json"
-            mkdir "downloads-$iteration"
-            jq -r '.[] | select(.state == "uploaded") | .id' "assets-$iteration.json" | while read -r id; do
-              gh api -H 'Accept: application/octet-stream' \
-                "repos/${{ github.repository }}/releases/assets/$id" > "downloads-$iteration/$id"
-            done
-            python3 scripts/release-asset-transaction.py plan \
-              --release-files release-files --expected expected-assets.json \
-              --assets "assets-$iteration.json" --downloads "downloads-$iteration" \
-              --release-draft "$RELEASE_DRAFT" \
-              --starter-deletions starter-deletions.json > plan.json
-            if jq -e '.complete == true' plan.json >/dev/null; then
-              COMPLETE=true
-              FINAL_ITERATION="$iteration"
-              break
-            fi
-            test "$RELEASE_DRAFT" = true
-            KIND="$(jq -r .action.kind plan.json)"
-            NAME="$(jq -r .action.name plan.json)"
-            if test "$KIND" = upload; then
-              gh release upload "$VERSION" "release-files/$NAME" --repo "${{ github.repository }}"
+              "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              | jq '[.[][]]' > preflight-comments.json
+            MATCHES="$(jq --arg marker "$MARKER" --arg nonce "$PROMOTION_NONCE" '
+              [.[] |
+                select(.body | startswith($marker + "\n")) |
+                select(
+                  ((.body | ltrimstr($marker + "\n") | fromjson?) // {})
+                  .promotion.nonce == $nonce
+                )
+              ] | length
+            ' preflight-comments.json)"
+            if test "$MATCHES" = 0; then
+              if test "$attempt" != 180; then sleep 10; fi
               continue
             fi
-            test "$KIND" = delete-starter
-            STARTER_ID="$(jq -r .action.id plan.json)"
-            RELEASE_NAME="Moor $VERSION"
-            COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
-            RELEASE_BODY="$(printf '%s\n%s\n%s' \
-              "Source-Commit: $COMMIT" \
-              "Candidate-Run: $(jq -r '.candidate.workflowRunId|tostring' approval/moor-release-qa-v1.json)/$(jq -r .candidate.workflowRunAttempt approval/moor-release-qa-v1.json)" \
-              "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID")"
-            gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > release-before-delete.json
-            jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
-              --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
-                .id == $id
-                and .tag_name == $tag
-                and .target_commitish == $commit
-                and .name == $name
-                and .body == $body
-                and .draft == true
-                and .prerelease == false
-              ' release-before-delete.json >/dev/null
-            gh api "repos/${{ github.repository }}/releases/assets/$STARTER_ID" > asset-before-delete.json
-            jq -e --argjson id "$STARTER_ID" --arg name "$NAME" '
-              .id == $id and .name == $name and .state == "starter"
-            ' asset-before-delete.json >/dev/null
-            gh api --method DELETE "repos/${{ github.repository }}/releases/assets/$STARTER_ID"
-            jq --arg name "$NAME" '.[$name] = ((.[$name] // 0) + 1)' \
-              starter-deletions.json > starter-deletions.next.json
-            mv starter-deletions.next.json starter-deletions.json
-            continue
+            jq --arg marker "$MARKER" --arg nonce "$PROMOTION_NONCE" '
+              [.[] |
+                select(.body | startswith($marker + "\n")) |
+                select(
+                  ((.body | ltrimstr($marker + "\n") | fromjson?) // {})
+                  .promotion.nonce == $nonce
+                )
+              ][0].body | ltrimstr($marker + "\n") | fromjson
+            ' preflight-comments.json > preflight-record.json
+            jq -r .authority.immutableReleaseSettings.responseBase64 \
+              preflight-record.json | base64 --decode \
+              > preflight-settings-response.json
+            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            COMMENT_AUTHOR="$(jq -r .authority.administrator preflight-record.json)"
+            python3 scripts/release_promotion_record.py preflight verify \
+              --promotion-manifest promotion-manifest.json \
+              --issue-number "$ISSUE_NUMBER" \
+              --dispatcher "${{ github.actor }}" \
+              --administrator "$COMMENT_AUTHOR" \
+              --gate-ready-at "$GATE_READY_AT" \
+              --github-server-time "$(jq -r .authority.githubServerTime preflight-record.json)" \
+              --settings-checked-at "$(jq -r .authority.immutableReleaseSettings.checkedAt preflight-record.json)" \
+              --settings-response preflight-settings-response.json \
+              --helper-commit "${{ github.sha }}" \
+              --source-mode run-bundle \
+              --source-run-id "${{ github.run_id }}" \
+              --source-run-attempt "1" \
+              --source-artifact-id "$PROMOTION_ARTIFACT_ID" \
+              --source-artifact-name "moor-release-promotion-v1" \
+              --source-api-digest "$PROMOTION_ARTIFACT_DIGEST" \
+              --comments preflight-comments.json \
+              --expected-author "$COMMENT_AUTHOR" \
+              --now "$NOW" > preflight-accepted.json
+            gh api "repos/${{ github.repository }}/collaborators/$COMMENT_AUTHOR/permission" \
+              > preflight-permission.json
+            jq -e --arg author "$COMMENT_AUTHOR" '
+              .user.login == $author and .permission == "admin"
+            ' preflight-permission.json >/dev/null
+            PREFLIGHT_COMMENT_ID="$(jq -r .commentId preflight-accepted.json)"
+            PREFLIGHT_BODY_SHA="$(jq -r .bodySha256 preflight-accepted.json)"
+            gh api "repos/${{ github.repository }}/issues/comments/$PREFLIGHT_COMMENT_ID" \
+              | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+              > preflight-comment.json
+            jq -j .body preflight-comment.json > preflight-body.txt
+            test "$(sha256sum preflight-body.txt | cut -d' ' -f1)" = "$PREFLIGHT_BODY_SHA"
+            {
+              echo "PREFLIGHT_COMMENT_ID=$PREFLIGHT_COMMENT_ID"
+              echo "PREFLIGHT_BODY_SHA=$PREFLIGHT_BODY_SHA"
+            } >> "$GITHUB_ENV"
+            ACCEPTED=true
+            break
           done
-          test "$COMPLETE" = true
-          python3 scripts/release-asset-transaction.py verify-complete \
-            --release-files release-files --expected expected-assets.json \
-            --assets "assets-$FINAL_ITERATION.json" --downloads "downloads-$FINAL_ITERATION" \
-            --release-draft "$RELEASE_DRAFT" \
-            --starter-deletions starter-deletions.json
+          if test "$ACCEPTED" != true; then
+            echo "::error::preflight wait timed out"
+            exit 1
+          fi
 
-      - name: Publish the complete draft exactly once
+      - name: Wait for local administrator completion
+        if: inputs.mode == 'promote'
         env:
           GH_TOKEN: ${{ github.token }}
-          QA_RUN_ID: ${{ inputs.qa_run_id }}
-          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
-          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
+          ISSUE_NUMBER: ${{ inputs.promotion_issue_number }}
+          PROMOTION_NONCE: ${{ inputs.promotion_nonce }}
         run: |
-          COMMIT="$(jq -r .commit approval/moor-release-qa-v1.json)"
-          RELEASE_NAME="Moor $VERSION"
-          RELEASE_BODY="$(printf '%s\n%s\n%s' \
-            "Source-Commit: $COMMIT" \
-            "Candidate-Run: $(jq -r '.candidate.workflowRunId|tostring' approval/moor-release-qa-v1.json)/$(jq -r .candidate.workflowRunAttempt approval/moor-release-qa-v1.json)" \
-            "Promotion-Transaction: $QA_RUN_ID/$QA_RUN_ATTEMPT/$QA_ARTIFACT_ID")"
-          gh api "repos/${{ github.repository }}/git/ref/tags/$VERSION" > prepublish-tag.json
-          jq -e --arg ref "refs/tags/$VERSION" --arg commit "$COMMIT" '
-            .ref == $ref and .object.type == "commit" and .object.sha == $commit
-          ' prepublish-tag.json >/dev/null
-          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > prepublish-release.json
-          jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
-            --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
-              .id == $id
-              and .tag_name == $tag
-              and .target_commitish == $commit
-              and .name == $name
-              and .body == $body
-              and .prerelease == false
-              and (.draft == true or (.draft == false and .immutable == true))
-            ' prepublish-release.json >/dev/null
-          PREPUBLISH_DRAFT="$(jq -r .draft prepublish-release.json)"
-          gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-            | jq '[.[][] | {id, name, state, size}]' > prepublish-assets.json
-          mkdir prepublish-downloads
-          jq -r '.[] | select(.state == "uploaded") | .id' prepublish-assets.json | while read -r id; do
-            gh api -H 'Accept: application/octet-stream' \
-              "repos/${{ github.repository }}/releases/assets/$id" > "prepublish-downloads/$id"
+          MARKER='<!-- moor-release-completion-v1 -->'
+          ACCEPTED=false
+          for attempt in $(seq 1 360); do
+            gh api --paginate --slurp \
+              "repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments?per_page=100" \
+              | jq '[.[][]]' > completion-comments.json
+            MATCHES="$(jq --arg marker "$MARKER" --arg nonce "$PROMOTION_NONCE" '
+              [.[] |
+                select(.body | startswith($marker + "\n")) |
+                select(
+                  ((.body | ltrimstr($marker + "\n") | fromjson?) // {})
+                  .promotion.nonce == $nonce
+                )
+              ] | length
+            ' completion-comments.json)"
+            if test "$MATCHES" = 0; then
+              if test "$attempt" != 360; then sleep 10; fi
+              continue
+            fi
+            jq --arg marker "$MARKER" --arg nonce "$PROMOTION_NONCE" '
+              [.[] |
+                select(.body | startswith($marker + "\n")) |
+                select(
+                  ((.body | ltrimstr($marker + "\n") | fromjson?) // {})
+                  .promotion.nonce == $nonce
+                )
+              ][0].body | ltrimstr($marker + "\n") | fromjson
+            ' completion-comments.json > completion-record.json
+            jq -r .authority.immutableReleaseSettings.responseBase64 \
+              completion-record.json | base64 --decode \
+              > completion-settings-response.json
+            jq -cS .assets completion-record.json > completion-assets.json
+            NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            COMMENT_AUTHOR="$(jq -r .authority.administrator completion-record.json)"
+            python3 scripts/release_promotion_record.py completion verify \
+              --promotion-manifest promotion-manifest.json \
+              --issue-number "$ISSUE_NUMBER" \
+              --dispatcher "${{ github.actor }}" \
+              --administrator "$COMMENT_AUTHOR" \
+              --gate-ready-at "$GATE_READY_AT" \
+              --github-server-time "$(jq -r .authority.githubServerTime completion-record.json)" \
+              --settings-checked-at "$(jq -r .authority.immutableReleaseSettings.checkedAt completion-record.json)" \
+              --settings-response completion-settings-response.json \
+              --helper-commit "${{ github.sha }}" \
+              --source-mode run-bundle \
+              --source-run-id "${{ github.run_id }}" \
+              --source-run-attempt "1" \
+              --source-artifact-id "$PROMOTION_ARTIFACT_ID" \
+              --source-artifact-name "moor-release-promotion-v1" \
+              --source-api-digest "$PROMOTION_ARTIFACT_DIGEST" \
+              --authority-phase "$(jq -r .authority.phase completion-record.json)" \
+              --preflight-comment-id "$PREFLIGHT_COMMENT_ID" \
+              --preflight-comment-url "https://github.com/${{ github.repository }}/issues/$ISSUE_NUMBER#issuecomment-$PREFLIGHT_COMMENT_ID" \
+              --preflight-body-sha256 "$PREFLIGHT_BODY_SHA" \
+              --tag-ref "$(jq -r .tag.ref completion-record.json)" \
+              --tag-sha "$(jq -r .tag.targetSha completion-record.json)" \
+              --release-id "$(jq -r .release.id completion-record.json)" \
+              --release-url "$(jq -r .release.url completion-record.json)" \
+              --release-tag "$(jq -r .release.tag completion-record.json)" \
+              --release-name "$(jq -r .release.name completion-record.json)" \
+              --release-body-sha256 "$(jq -r .release.bodySha256 completion-record.json)" \
+              --release-draft false \
+              --release-immutable true \
+              --published-assets completion-assets.json \
+              --transaction-evidence-manifest-sha256 "$(jq -r .transactionEvidenceManifestSha256 completion-record.json)" \
+              --comments completion-comments.json \
+              --expected-author "$COMMENT_AUTHOR" \
+              --now "$NOW" > completion-accepted.json
+            gh api "repos/${{ github.repository }}/collaborators/$COMMENT_AUTHOR/permission" \
+              > completion-permission.json
+            jq -e --arg author "$COMMENT_AUTHOR" '
+              .user.login == $author and .permission == "admin"
+            ' completion-permission.json >/dev/null
+            COMPLETION_COMMENT_ID="$(jq -r .commentId completion-accepted.json)"
+            COMPLETION_BODY_SHA="$(jq -r .bodySha256 completion-accepted.json)"
+            gh api "repos/${{ github.repository }}/issues/comments/$COMPLETION_COMMENT_ID" \
+              | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+              > completion-comment.json
+            jq -j .body completion-comment.json > completion-body.txt
+            test "$(sha256sum completion-body.txt | cut -d' ' -f1)" = "$COMPLETION_BODY_SHA"
+            echo "COMPLETION_COMMENT_ID=$COMPLETION_COMMENT_ID" >> "$GITHUB_ENV"
+            ACCEPTED=true
+            break
           done
-          python3 scripts/release-asset-transaction.py verify-complete \
-            --release-files release-files --expected expected-assets.json \
-            --assets prepublish-assets.json --downloads prepublish-downloads \
-            --release-draft "$PREPUBLISH_DRAFT" \
-            --starter-deletions starter-deletions.json
-          if test "$PREPUBLISH_DRAFT" = true; then
-            jq -n '{"draft": false}' > publish-release.json
-            gh api --method PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" \
-              --input publish-release.json > published-release.json
-          else
-            gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > published-release.json
+          if test "$ACCEPTED" != true; then
+            echo "::error::completion wait timed out"
+            exit 1
           fi
-          jq -e --arg version "$VERSION" --arg commit "$COMMIT" '
-            .tag_name == $version
-            and .target_commitish == $commit
-            and .draft == false
-            and .prerelease == false
-            and .immutable == true
-          ' published-release.json >/dev/null
-          gh api "repos/${{ github.repository }}/git/ref/tags/$VERSION" > postpublish-tag.json
+
+      - name: Authenticate the prior promotion bundle and records
+        if: inputs.mode == 'verify-published'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_RUN_ID: ${{ inputs.original_promote_run_id }}
+          PREFLIGHT_COMMENT_ID: ${{ inputs.preflight_comment_id }}
+          COMPLETION_COMMENT_ID: ${{ inputs.completion_comment_id }}
+        run: |
+          COMPLETION_MARKER='<!-- moor-release-completion-v1 -->'
+          PREFLIGHT_MARKER='<!-- moor-release-preflight-v1 -->'
+          gh api "repos/${{ github.repository }}/issues/comments/$COMPLETION_COMMENT_ID" \
+            | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+            > completion-comment.json
+          jq --arg marker "$COMPLETION_MARKER" '
+            select(.body | startswith($marker + "\n")) |
+            .body | ltrimstr($marker + "\n") | fromjson
+          ' completion-comment.json > completion-record.json
+          jq -r .authority.immutableReleaseSettings.responseBase64 \
+            completion-record.json | base64 --decode \
+            > completion-settings-response.json
+          test "$(jq -r .kind completion-record.json)" = moor-release-completion-v1
+          test "$(jq -r .preflight.commentId completion-record.json)" = "$PREFLIGHT_COMMENT_ID"
+          test "$(jq -r .promotion.workflowRunId completion-record.json)" = "$ORIGINAL_RUN_ID"
+          test "$(jq -r .source.mode completion-record.json)" = run-bundle
+
+          ISSUE_NUMBER="$(jq -r .promotion.issueNumber completion-record.json)"
+          DISPATCHER="$(jq -r .dispatcher completion-record.json)"
+          HEAD_SHA="$(jq -r .promotion.headSha completion-record.json)"
+          PROMOTION_NONCE="$(jq -r .promotion.nonce completion-record.json)"
+          GATE_READY_AT="$(jq -r .promotion.gateReadyAt completion-record.json)"
+          SOURCE_ARTIFACT_ID="$(jq -r .source.artifactId completion-record.json)"
+          SOURCE_ARTIFACT_NAME="$(jq -r .source.artifactName completion-record.json)"
+          SOURCE_API_DIGEST="$(jq -r .source.apiDigest completion-record.json)"
+          test "$SOURCE_ARTIFACT_NAME" = moor-release-promotion-v1
+
+          gh api "repos/${{ github.repository }}/actions/runs/$ORIGINAL_RUN_ID/attempts/1" \
+            > original-promotion-run.json
+          jq -e --argjson id "$ORIGINAL_RUN_ID" --arg head "$HEAD_SHA" '
+            .id == $id
+            and .run_attempt == 1
+            and .event == "workflow_dispatch"
+            and .status == "completed"
+            and .head_branch == "main"
+            and .head_sha == $head
+            and .path == ".github/workflows/release-promote.yml"
+          ' original-promotion-run.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/runs/$ORIGINAL_RUN_ID/artifacts?per_page=100" \
+            > original-promotion-artifacts.json
+          jq -e --argjson id "$SOURCE_ARTIFACT_ID" --argjson run "$ORIGINAL_RUN_ID" \
+            --arg head "$HEAD_SHA" --arg name "$SOURCE_ARTIFACT_NAME" \
+            --arg digest "$SOURCE_API_DIGEST" '
+              [.artifacts[] |
+                select(
+                  .id == $id
+                  and .name == $name
+                  and .expired == false
+                  and .workflow_run.id == $run
+                  and .workflow_run.head_sha == $head
+                  and .digest == $digest
+                )
+              ] | length == 1
+            ' original-promotion-artifacts.json >/dev/null
+          gh api "repos/${{ github.repository }}/actions/artifacts/$SOURCE_ARTIFACT_ID/zip" \
+            > promotion-bundle.zip
+          python3 scripts/release-admin-promote.py inspect-bundle \
+            --archive promotion-bundle.zip \
+            --out promotion-bundle
+
+          MANIFEST_SHA="$(sha256sum promotion-bundle/promotion-manifest.json | cut -d' ' -f1)"
+          jq -e --argjson run "$ORIGINAL_RUN_ID" --arg head "$HEAD_SHA" \
+            --arg nonce "$PROMOTION_NONCE" '
+              .repository == "${{ github.repository }}"
+              and .promotion.workflowRunId == $run
+              and .promotion.workflowRunAttempt == 1
+              and .promotion.headSha == $head
+              and .promotion.mode == "promote"
+              and .promotion.nonce == $nonce
+            ' promotion-bundle/promotion-manifest.json >/dev/null
+          test "$(jq -r .manifestSha256 completion-record.json)" = "$MANIFEST_SHA"
+
+          gh api "repos/${{ github.repository }}/issues/comments/$PREFLIGHT_COMMENT_ID" \
+            | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+            > preflight-comment.json
+          jq --arg marker "$PREFLIGHT_MARKER" '
+            select(.body | startswith($marker + "\n")) |
+            .body | ltrimstr($marker + "\n") | fromjson
+          ' preflight-comment.json > preflight-record.json
+          jq -r .authority.immutableReleaseSettings.responseBase64 \
+            preflight-record.json | base64 --decode \
+            > preflight-settings-response.json
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          python3 scripts/release_promotion_record.py preflight verify \
+            --promotion-manifest promotion-bundle/promotion-manifest.json \
+            --issue-number "$ISSUE_NUMBER" \
+            --dispatcher "$DISPATCHER" \
+            --administrator "$(jq -r .authority.administrator preflight-record.json)" \
+            --gate-ready-at "$GATE_READY_AT" \
+            --github-server-time "$(jq -r .authority.githubServerTime preflight-record.json)" \
+            --settings-checked-at "$(jq -r .authority.immutableReleaseSettings.checkedAt preflight-record.json)" \
+            --settings-response preflight-settings-response.json \
+            --helper-commit "$HEAD_SHA" \
+            --source-mode run-bundle \
+            --source-run-id "$ORIGINAL_RUN_ID" \
+            --source-run-attempt "1" \
+            --source-artifact-id "$SOURCE_ARTIFACT_ID" \
+            --source-artifact-name "$SOURCE_ARTIFACT_NAME" \
+            --source-api-digest "$SOURCE_API_DIGEST" \
+            --comments preflight-comment.json \
+            --expected-author "$DISPATCHER" \
+            --now "$NOW" \
+            --expected-comment-id "$PREFLIGHT_COMMENT_ID" \
+            --expected-body-sha256 "$(jq -r .preflight.bodySha256 completion-record.json)" \
+            --final-recheck > preflight-accepted.json
+
+          jq -cS .assets completion-record.json > completion-assets.json
+          jq -j .body completion-comment.json > completion-body.txt
+          COMPLETION_BODY_SHA="$(sha256sum completion-body.txt | cut -d' ' -f1)"
+          python3 scripts/release_promotion_record.py completion verify \
+            --promotion-manifest promotion-bundle/promotion-manifest.json \
+            --issue-number "$ISSUE_NUMBER" \
+            --dispatcher "$DISPATCHER" \
+            --administrator "$(jq -r .authority.administrator completion-record.json)" \
+            --gate-ready-at "$GATE_READY_AT" \
+            --github-server-time "$(jq -r .authority.githubServerTime completion-record.json)" \
+            --settings-checked-at "$(jq -r .authority.immutableReleaseSettings.checkedAt completion-record.json)" \
+            --settings-response completion-settings-response.json \
+            --helper-commit "$HEAD_SHA" \
+            --source-mode run-bundle \
+            --source-run-id "$ORIGINAL_RUN_ID" \
+            --source-run-attempt "1" \
+            --source-artifact-id "$SOURCE_ARTIFACT_ID" \
+            --source-artifact-name "$SOURCE_ARTIFACT_NAME" \
+            --source-api-digest "$SOURCE_API_DIGEST" \
+            --authority-phase "$(jq -r .authority.phase completion-record.json)" \
+            --preflight-comment-id "$PREFLIGHT_COMMENT_ID" \
+            --preflight-comment-url "https://github.com/${{ github.repository }}/issues/$ISSUE_NUMBER#issuecomment-$PREFLIGHT_COMMENT_ID" \
+            --preflight-body-sha256 "$(jq -r .preflight.bodySha256 completion-record.json)" \
+            --tag-ref "$(jq -r .tag.ref completion-record.json)" \
+            --tag-sha "$(jq -r .tag.targetSha completion-record.json)" \
+            --release-id "$(jq -r .release.id completion-record.json)" \
+            --release-url "$(jq -r .release.url completion-record.json)" \
+            --release-tag "$(jq -r .release.tag completion-record.json)" \
+            --release-name "$(jq -r .release.name completion-record.json)" \
+            --release-body-sha256 "$(jq -r .release.bodySha256 completion-record.json)" \
+            --release-draft false \
+            --release-immutable true \
+            --published-assets completion-assets.json \
+            --transaction-evidence-manifest-sha256 "$(jq -r .transactionEvidenceManifestSha256 completion-record.json)" \
+            --comments completion-comment.json \
+            --expected-author "$DISPATCHER" \
+            --now "$NOW" \
+            --expected-comment-id "$COMPLETION_COMMENT_ID" \
+            --expected-body-sha256 "$COMPLETION_BODY_SHA" \
+            --final-recheck > completion-accepted.json
+
+          for COMMENT_AUTHOR in \
+            "$(jq -r .author preflight-accepted.json)" \
+            "$(jq -r .author completion-accepted.json)"; do
+            gh api "repos/${{ github.repository }}/collaborators/$COMMENT_AUTHOR/permission" \
+              > prior-comment-permission.json
+            jq -e --arg author "$COMMENT_AUTHOR" '
+              .user.login == $author and .permission == "admin"
+            ' prior-comment-permission.json >/dev/null
+          done
+          {
+            echo "ISSUE_NUMBER=$ISSUE_NUMBER"
+            echo "DISPATCHER=$DISPATCHER"
+            echo "HEAD_SHA=$HEAD_SHA"
+            echo "PROMOTION_NONCE=$PROMOTION_NONCE"
+            echo "GATE_READY_AT=$GATE_READY_AT"
+            echo "PROMOTION_ARTIFACT_ID=$SOURCE_ARTIFACT_ID"
+            echo "PROMOTION_ARTIFACT_DIGEST=$SOURCE_API_DIGEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Independently verify the immutable published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if test "${{ inputs.mode }}" = promote; then
+            PROMOTION_MANIFEST=promotion-manifest.json
+            RELEASE_FILES=release-files
+            EXPECTED_ASSETS=expected-assets.json
+            RELEASE_BODY=release-body.txt
+            DISPATCHER="${{ github.actor }}"
+          else
+            PROMOTION_MANIFEST=promotion-bundle/promotion-manifest.json
+            RELEASE_FILES=promotion-bundle/release-files
+            EXPECTED_ASSETS=promotion-bundle/expected-assets.json
+            RELEASE_BODY=promotion-bundle/release-body.txt
+          fi
+          test "$(jq length "$EXPECTED_ASSETS")" = 6
+          VERSION="$(jq -r .release.version "$PROMOTION_MANIFEST")"
+          COMMIT="$(jq -r .candidate.commit "$PROMOTION_MANIFEST")"
+          RELEASE_NAME="$(jq -r .release.name "$PROMOTION_MANIFEST")"
+          RELEASE_ID="$(jq -r .record.release.id completion-accepted.json)"
+
+          gh api "repos/${{ github.repository }}/git/ref/tags/$VERSION" > published-tag.json
           jq -e --arg ref "refs/tags/$VERSION" --arg commit "$COMMIT" '
             .ref == $ref and .object.type == "commit" and .object.sha == $commit
-          ' postpublish-tag.json >/dev/null
-          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > postpublish-release.json
-          jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" --arg commit "$COMMIT" \
-            --arg name "$RELEASE_NAME" --arg body "$RELEASE_BODY" '
+          ' published-tag.json >/dev/null
+
+          gh api "repos/${{ github.repository }}/releases/tags/$VERSION" \
+            > published-release.json
+          jq -e --argjson id "$RELEASE_ID" --arg tag "$VERSION" \
+            --arg commit "$COMMIT" --arg name "$RELEASE_NAME" \
+            --rawfile body "$RELEASE_BODY" '
               .id == $id
               and .tag_name == $tag
               and .target_commitish == $commit
@@ -590,59 +883,72 @@ jobs:
               and .draft == false
               and .prerelease == false
               and .immutable == true
-            ' postpublish-release.json >/dev/null
-          gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-            | jq '[.[][] | {id, name, state, size}]' > postpublish-assets.json
-          mkdir postpublish-downloads
-          jq -r '.[] | select(.state == "uploaded") | .id' postpublish-assets.json | while read -r id; do
-            gh api -H 'Accept: application/octet-stream' \
-              "repos/${{ github.repository }}/releases/assets/$id" > "postpublish-downloads/$id"
-          done
-          python3 scripts/release-asset-transaction.py verify-complete \
-            --release-files release-files --expected expected-assets.json \
-            --assets postpublish-assets.json --downloads postpublish-downloads \
-            --release-draft false --starter-deletions starter-deletions.json
+            ' published-release.json >/dev/null
 
-      - name: re-download the published release assets and verify exact bytes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          QA_RUN_ID: ${{ inputs.qa_run_id }}
-          QA_RUN_ATTEMPT: ${{ inputs.qa_run_attempt }}
-          QA_ARTIFACT_ID: ${{ inputs.qa_artifact_id }}
-        run: |
-          gh api --paginate --slurp "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
-            | jq '[.[][] | {id, name, state, size}]' > published-assets.json
+          gh api --paginate --slurp \
+            "repos/${{ github.repository }}/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq '[.[][] | {id,name,state,size}]' > published-assets.json
+          test "$(jq length published-assets.json)" = 6
           mkdir published-downloads
-          jq -r '.[] | select(.state == "uploaded") | .id' published-assets.json | while read -r id; do
+          jq -r '.[] | select(.state == "uploaded") | .id' published-assets.json |
+          while read -r id; do
             gh api -H 'Accept: application/octet-stream' \
-              "repos/${{ github.repository }}/releases/assets/$id" > "published-downloads/$id"
+              "repos/${{ github.repository }}/releases/assets/$id" \
+              > "published-downloads/$id"
           done
+          printf '%s\n' '{}' > no-starter-deletions.json
           python3 scripts/release-asset-transaction.py verify-complete \
-            --release-files release-files --expected expected-assets.json \
-            --assets published-assets.json --downloads published-downloads \
-            --release-draft false --starter-deletions starter-deletions.json
-          ATTESTATION_COMMENT_ID="$(jq -r .commentId immutable-settings-attestation.json)"
-          ATTESTATION_BODY_SHA="$(jq -r .bodySha256 immutable-settings-attestation.json)"
-          gh api "repos/${{ github.repository }}/issues/comments/$ATTESTATION_COMMENT_ID" \
-            > final-attestation-comment.json
-          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          python3 scripts/release-admin-attestation.py verify \
-            --comments final-attestation-comment.json \
-            --expected-repository "${{ github.repository }}" \
-            --expected-head-sha "${{ github.sha }}" \
-            --expected-qa-run-id "$QA_RUN_ID" \
-            --expected-qa-run-attempt "$QA_RUN_ATTEMPT" \
-            --expected-qa-artifact-id "$QA_ARTIFACT_ID" \
-            --expected-run-id "${{ github.run_id }}" \
-            --expected-run-attempt "${{ github.run_attempt }}" \
-            --expected-nonce "${{ inputs.attestation_nonce }}" \
-            --expected-issue-number "${{ inputs.attestation_issue_number }}" \
-            --expected-actor "${{ github.actor }}" \
-            --gate-ready-at "$GATE_READY_AT" --now "$NOW" \
-            --expected-comment-id "$ATTESTATION_COMMENT_ID" \
-            --expected-body-sha256 "$ATTESTATION_BODY_SHA" \
-            --postpublish-recheck > final-immutable-settings-attestation.json
-          cmp immutable-settings-attestation.json final-immutable-settings-attestation.json
-          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" > final-release.json
-          jq -e '.draft == false and .immutable == true' final-release.json >/dev/null
-          echo "Published immutable release: $(jq -r .html_url final-release.json)" >> "$GITHUB_STEP_SUMMARY"
+            --release-files "$RELEASE_FILES" \
+            --expected "$EXPECTED_ASSETS" \
+            --assets published-assets.json \
+            --downloads published-downloads \
+            --release-draft false \
+            --starter-deletions no-starter-deletions.json
+
+          : > observed-assets.tsv
+          jq -r '.[] | [.id,.name,.size] | @tsv' published-assets.json |
+          while IFS=$'\t' read -r id name size; do
+            printf '%s\t%s\t%s\t%s\n' \
+              "$id" "$name" "$size" \
+              "$(sha256sum "published-downloads/$id" | cut -d' ' -f1)" \
+              >> observed-assets.tsv
+          done
+          jq -Rn '
+            [inputs | split("\t") | {
+              id: (.[0] | tonumber),
+              name: .[1],
+              size: (.[2] | tonumber),
+              sha256: .[3]
+            }] | sort_by(.name)
+          ' < observed-assets.tsv | jq -cS . > observed-published-assets.json
+          jq -cS .record.assets completion-accepted.json > receipted-assets.json
+          cmp receipted-assets.json observed-published-assets.json
+
+          PREFLIGHT_COMMENT_ID="$(jq -r .commentId preflight-accepted.json)"
+          COMPLETION_COMMENT_ID="$(jq -r .commentId completion-accepted.json)"
+          gh api "repos/${{ github.repository }}/issues/comments/$PREFLIGHT_COMMENT_ID" \
+            | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+            > final-preflight-comment.json
+          cmp preflight-comment.json final-preflight-comment.json
+          gh api "repos/${{ github.repository }}/issues/comments/$COMPLETION_COMMENT_ID" \
+            | jq -cS '{id,html_url,issue_url,user,created_at,updated_at,body}' \
+            > final-completion-comment.json
+          cmp completion-comment.json final-completion-comment.json
+
+          for comment in final-preflight-comment.json final-completion-comment.json; do
+            COMMENT_AUTHOR="$(jq -r .user.login "$comment")"
+            test "$COMMENT_AUTHOR" = "$DISPATCHER"
+            gh api "repos/${{ github.repository }}/collaborators/$COMMENT_AUTHOR/permission" \
+              > final-comment-permission.json
+            jq -e --arg author "$COMMENT_AUTHOR" '
+              .user.login == $author and .permission == "admin"
+            ' final-comment-permission.json >/dev/null
+          done
+
+          gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" \
+            > final-release.json
+          jq -e --argjson id "$RELEASE_ID" '
+            .id == $id and .draft == false and .immutable == true
+          ' final-release.json >/dev/null
+          echo "Verified immutable release: $(jq -r .html_url final-release.json)" \
+            >> "$GITHUB_STEP_SUMMARY"
