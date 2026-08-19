@@ -110,6 +110,7 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "unrelated nonce with longer decoy": b"WAIT: no matching preflight comment yet",
     "unrelated nonce with raw key decoy": b"WAIT: no matching preflight comment yet",
     "unrelated nonce with escaped key decoy": b"WAIT: no matching preflight comment yet",
+    "unrelated parsed preflight with embedded comment decoy": b"WAIT: no matching preflight comment yet",
     "matching nonce hidden by duplicate promotion": b"duplicate JSON key 'promotion'",
     "same-nonce duplicate": b"expected exactly one matching preflight comment, found 2",
     "matching wrong author": b"preflight comment author differs",
@@ -122,10 +123,20 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "malformed matching preflight with escaped nonce": b"invalid preflight comment body:",
     "deeply nested matching preflight with escaped nonce": b"invalid preflight comment body:",
     "matching oversized JSON number preflight": b"invalid preflight comment body:",
+    "invalid token before matching preflight identity": b"invalid preflight comment body:",
+    "garbage before matching preflight root": b"invalid preflight comment body:",
+    "malformed oversized token before preflight identity": b"invalid preflight comment body:",
+    "missing colon before matching preflight promotion": b"invalid preflight comment body:",
     "malformed markerless preflight with escaped identity": b"does not begin with its exact marker at byte zero",
     "matching markerless preflight with escaped kind": b"does not begin with its exact marker at byte zero",
     "unrelated markerless same-nonce comment": b"WAIT: no matching preflight comment yet",
     "byte before marker": b"does not begin with its exact marker at byte zero",
+    "LF before marker": b"does not begin with its exact marker at byte zero",
+    "JSON string before marker": b"does not begin with its exact marker at byte zero",
+    "missing marker separator LF": b"does not begin with its exact marker at byte zero",
+    "CRLF marker separator": b"does not begin with its exact marker at byte zero",
+    "split preflight identity across payloads": b"WAIT: no matching preflight comment yet",
+    "matching malformed preflight suppressed by alternate payload": b"does not begin with its exact marker at byte zero",
     "wrong marker case": b"does not begin with its exact marker at byte zero",
     "wrong marker case with escaped kind": b"does not begin with its exact marker at byte zero",
     "missing final LF": b"is not canonical sorted compact JSON with one LF",
@@ -163,9 +174,20 @@ EXPECTED_REFUSAL_DIAGNOSTICS = {
     "unrelated completion nonce with escaped decoy": b"WAIT: no matching completion comment yet",
     "unrelated completion nonce with raw key decoy": b"WAIT: no matching completion comment yet",
     "unrelated completion nonce with escaped key decoy": b"WAIT: no matching completion comment yet",
+    "unrelated parsed completion with embedded comment decoy": b"WAIT: no matching completion comment yet",
     "malformed matching completion with escaped nonce": b"invalid completion comment body:",
     "deeply nested matching completion with escaped nonce": b"invalid completion comment body:",
+    "invalid token before matching completion identity": b"invalid completion comment body:",
+    "garbage before matching completion root": b"invalid completion comment body:",
+    "malformed oversized token before completion identity": b"invalid completion comment body:",
+    "missing colon before matching completion promotion": b"invalid completion comment body:",
     "malformed markerless completion with escaped identity": b"does not begin with its exact marker at byte zero",
+    "LF before completion marker": b"does not begin with its exact marker at byte zero",
+    "JSON string before completion marker": b"does not begin with its exact marker at byte zero",
+    "missing completion marker separator LF": b"does not begin with its exact marker at byte zero",
+    "CRLF completion marker separator": b"does not begin with its exact marker at byte zero",
+    "split completion identity across payloads": b"WAIT: no matching completion comment yet",
+    "matching malformed completion suppressed by alternate payload": b"does not begin with its exact marker at byte zero",
     "duplicate completion": b"expected exactly one matching completion comment, found 2",
     "completion preflight digest": b"completion record differs from the exact reconstructed record",
     "completion tag": b"completion tag targets another candidate",
@@ -1478,6 +1500,20 @@ def test_preflight_completion(tool):
             verify_record(fixture, "preflight", [comment(escaped_key_decoy)]),
             expected=75,
         )
+        embedded_comment_decoy = copy.deepcopy(other_value)
+        embedded_comment_decoy["decoy"] = (
+            '<!-- -->\n{"kind":"moor-release-preflight-v1",'
+            '"promotion":{"nonce":"' + NONCE + '"}}'
+        )
+        assert_record_rejected(
+            "unrelated parsed preflight with embedded comment decoy",
+            verify_record(
+                fixture,
+                "preflight",
+                [comment(canonical(embedded_comment_decoy).decode("ascii"))],
+            ),
+            expected=75,
+        )
         duplicate_promotion = other_nonce.replace(
             b'"promotion":{',
             b'"promotion":{"nonce":"' + NONCE.encode("ascii") + b'"},"promotion":{',
@@ -1601,6 +1637,56 @@ def test_preflight_completion(tool):
             "matching oversized JSON number preflight",
             verify_record(fixture, "preflight", [comment(oversized_number)]),
         )
+        preflight_identity = (
+            '"kind":"moor-release-preflight-v1",'
+            '"promotion":{"nonce":"' + NONCE + '"}}\n'
+        )
+        invalid_token_before_identity = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + '{"bad":@,'
+            + preflight_identity
+        )
+        assert_record_rejected(
+            "invalid token before matching preflight identity",
+            verify_record(
+                fixture, "preflight", [comment(invalid_token_before_identity)]
+            ),
+        )
+        garbage_before_root = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + "x{"
+            + preflight_identity
+        )
+        assert_record_rejected(
+            "garbage before matching preflight root",
+            verify_record(fixture, "preflight", [comment(garbage_before_root)]),
+        )
+        malformed_oversized_token = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + '{"bad":'
+            + "9" * 5000
+            + "x,"
+            + preflight_identity
+        )
+        assert_record_rejected(
+            "malformed oversized token before preflight identity",
+            verify_record(
+                fixture, "preflight", [comment(malformed_oversized_token)]
+            ),
+        )
+        missing_promotion_colon = (
+            PREFLIGHT_MARKER.decode("ascii")
+            + '{"kind":"moor-release-preflight-v1",'
+            + '"promotion" {"nonce":"'
+            + NONCE
+            + '"}}\n'
+        )
+        assert_record_rejected(
+            "missing colon before matching preflight promotion",
+            verify_record(
+                fixture, "preflight", [comment(missing_promotion_colon)]
+            ),
+        )
         markerless_escaped_kind = canonical(preflight).decode("ascii").replace(
             "moor-release-preflight-v1", "moor-release-preflight-v\\u0031"
         )
@@ -1623,9 +1709,39 @@ def test_preflight_completion(tool):
             ),
             expected=75,
         )
+        split_identity = (
+            '{"kind":"moor-release-preflight-v1"}<!-- -->\n'
+            '{"promotion":{"nonce":"' + NONCE + '"}\n'
+        )
+        assert_record_rejected(
+            "split preflight identity across payloads",
+            verify_record(fixture, "preflight", [comment(split_identity)]),
+            expected=75,
+        )
+        suppressed_matching = (
+            '{"kind":"moor-release-preflight-v1",'
+            '"promotion":{"nonce":"'
+            + NONCE
+            + '"}}<!-- -->\n{}\n'
+        )
+        assert_record_rejected(
+            "matching malformed preflight suppressed by alternate payload",
+            verify_record(fixture, "preflight", [comment(suppressed_matching)]),
+        )
 
         byte_mutations = {
             "byte before marker": b"x" + preflight_body,
+            "LF before marker": b"\n" + preflight_body,
+            "JSON string before marker": b'"prefix"' + preflight_body,
+            "missing marker separator LF": (
+                PREFLIGHT_MARKER.rstrip(b"\n")
+                + preflight_body[len(PREFLIGHT_MARKER) :]
+            ),
+            "CRLF marker separator": (
+                PREFLIGHT_MARKER.rstrip(b"\n")
+                + b"\r\n"
+                + preflight_body[len(PREFLIGHT_MARKER) :]
+            ),
             "wrong marker case": preflight_body.replace(b"moor", b"Moor", 1),
             "wrong marker case with escaped kind": preflight_body.replace(
                 b"<!-- moor", b"<!-- Moor", 1
@@ -2037,6 +2153,26 @@ def test_preflight_completion(tool):
             ),
             expected=75,
         )
+        embedded_completion_decoy = copy.deepcopy(unrelated_completion)
+        embedded_completion_decoy["decoy"] = (
+            '<!-- -->\n{"kind":"moor-release-completion-v1",'
+            '"promotion":{"nonce":"' + NONCE + '"}}'
+        )
+        assert_record_rejected(
+            "unrelated parsed completion with embedded comment decoy",
+            verify_record(
+                fixture,
+                "completion",
+                [
+                    comment(
+                        canonical(embedded_completion_decoy).decode("ascii"),
+                        completion=True,
+                    )
+                ],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
         escaped_nonce = "\\u0064" * len(NONCE)
         escaped_completion = completion_body.decode("ascii").replace(
             NONCE, escaped_nonce, 1
@@ -2083,6 +2219,121 @@ def test_preflight_completion(tool):
                 fixture,
                 "completion",
                 [comment(markerless_malformed_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        completion_identity = (
+            '"kind":"moor-release-completion-v1",'
+            '"promotion":{"nonce":"' + NONCE + '"}}\n'
+        )
+        invalid_token_before_completion = (
+            completion_marker_text + '{"bad":@,' + completion_identity
+        )
+        assert_record_rejected(
+            "invalid token before matching completion identity",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(invalid_token_before_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        garbage_before_completion = (
+            completion_marker_text + "x{" + completion_identity
+        )
+        assert_record_rejected(
+            "garbage before matching completion root",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(garbage_before_completion, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        malformed_completion_token = (
+            completion_marker_text
+            + '{"bad":'
+            + "9" * 5000
+            + "x,"
+            + completion_identity
+        )
+        assert_record_rejected(
+            "malformed oversized token before completion identity",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(malformed_completion_token, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        missing_completion_colon = (
+            completion_marker_text
+            + '{"kind":"moor-release-completion-v1",'
+            + '"promotion" {"nonce":"'
+            + NONCE
+            + '"}}\n'
+        )
+        assert_record_rejected(
+            "missing colon before matching completion promotion",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(missing_completion_colon, completion=True)],
+                preflight_body=preflight_body,
+            ),
+        )
+        completion_payload_bytes = completion_body[len(COMPLETION_MARKER) :]
+        completion_marker_without_lf = COMPLETION_MARKER.rstrip(b"\n")
+        for label, malformed_body in (
+            ("LF before completion marker", b"\n" + completion_body),
+            (
+                "JSON string before completion marker",
+                b'"prefix"' + completion_body,
+            ),
+            (
+                "missing completion marker separator LF",
+                completion_marker_without_lf + completion_payload_bytes,
+            ),
+            (
+                "CRLF completion marker separator",
+                completion_marker_without_lf + b"\r\n" + completion_payload_bytes,
+            ),
+        ):
+            assert_record_rejected(
+                label,
+                verify_record(
+                    fixture,
+                    "completion",
+                    [comment(malformed_body, completion=True)],
+                    preflight_body=preflight_body,
+                ),
+            )
+        split_completion_identity = (
+            '{"kind":"moor-release-completion-v1"}<!-- -->\n'
+            '{"promotion":{"nonce":"' + NONCE + '"}\n'
+        )
+        assert_record_rejected(
+            "split completion identity across payloads",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(split_completion_identity, completion=True)],
+                preflight_body=preflight_body,
+            ),
+            expected=75,
+        )
+        suppressed_completion = (
+            '{"kind":"moor-release-completion-v1",'
+            '"promotion":{"nonce":"'
+            + NONCE
+            + '"}}<!-- -->\n{}\n'
+        )
+        assert_record_rejected(
+            "matching malformed completion suppressed by alternate payload",
+            verify_record(
+                fixture,
+                "completion",
+                [comment(suppressed_completion, completion=True)],
                 preflight_body=preflight_body,
             ),
         )

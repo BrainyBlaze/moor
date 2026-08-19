@@ -1629,31 +1629,34 @@ def read_json_utf8(path, what):
 def loose_record(body, marker):
     if not isinstance(body, str):
         return None
-    _, value = loose_record_status(body, marker)
-    return value if isinstance(value, dict) else None
+    for payload in comment_payloads(body, marker):
+        parsed, value = loose_payload_status(payload)
+        if parsed and isinstance(value, dict):
+            return value
+    return None
 
 
 def comment_payloads(body, marker):
     marker_text = marker.decode("ascii")
-    payloads = [body[len(marker_text) :]] if body.startswith(marker_text) else [body]
-    if "\n" in body:
-        first_line, remainder = body.split("\n", 1)
-        if "<!--" in first_line and first_line.endswith("-->"):
-            payloads.append(remainder)
+    if body.startswith(marker_text):
+        return [body[len(marker_text) :]]
+    payloads = [body]
+    opener = body.find("<!--")
+    if opener != -1:
+        closer = body.find("-->", opener + len("<!--"))
+        if closer != -1:
+            remainder = body[closer + len("-->") :]
+            if remainder not in payloads:
+                payloads.append(remainder)
     return payloads
 
 
-def loose_record_status(body, marker):
-    if not isinstance(body, str):
+def loose_payload_status(payload):
+    try:
+        value = json.loads(payload, object_pairs_hook=duplicate_guard)
+    except (TypeError, ValueError, RecursionError, Invalid):
         return False, None
-    payloads = comment_payloads(body, marker)
-    for payload in payloads:
-        try:
-            value = json.loads(payload, object_pairs_hook=duplicate_guard)
-        except (TypeError, ValueError, RecursionError, Invalid):
-            continue
-        return True, value
-    return False, None
+    return True, value
 
 
 JSON_NUMBER_TOKEN = re.compile(
@@ -1675,25 +1678,28 @@ def partial_json_token(payload, offset):
     if character == '"':
         start = offset
         offset += 1
+        invalid_string = False
         while offset < length:
             character = payload[offset]
             if character == '"':
                 token = payload[start : offset + 1]
+                if invalid_string:
+                    return "invalid", None, offset + 1
                 try:
                     value = json.loads(token)
                 except (TypeError, ValueError, RecursionError):
-                    return None
+                    return "invalid", None, offset + 1
                 if not isinstance(value, str):
-                    return None
+                    return "invalid", None, offset + 1
                 return "string", value, offset + 1
             if character == "\\":
                 offset += 1
                 if offset == length:
-                    return None
+                    return "invalid", None, length
             elif ord(character) < 0x20:
-                return None
+                invalid_string = True
             offset += 1
-        return None
+        return "invalid", None, length
 
     end = offset
     while end < length and payload[end] not in " \t\r\n{}[],:\"":
@@ -1701,7 +1707,9 @@ def partial_json_token(payload, offset):
     token = payload[offset:end]
     if token in ("true", "false", "null") or JSON_NUMBER_TOKEN.fullmatch(token):
         return "atom", token, end
-    return None
+    if end == offset:
+        end += 1
+    return "invalid", None, end
 
 
 def partial_comment_identity(payload):
@@ -1715,9 +1723,16 @@ def partial_comment_identity(payload):
 
     kinds = set()
     nonces = set()
-    first = partial_json_token(payload, 0)
-    if first is None or first[0] != "{":
-        return kinds, nonces
+    offset = 0
+    while True:
+        first = partial_json_token(payload, offset)
+        if first is None:
+            return kinds, nonces
+        if first[0] == "{":
+            break
+        if first[0] != "invalid":
+            return kinds, nonces
+        offset = first[2]
     stack = [
         {
             "type": "object",
@@ -1738,6 +1753,7 @@ def partial_comment_identity(payload):
         frame["key"] = None
 
     while stack:
+        token_start = offset
         token = partial_json_token(payload, offset)
         if token is None:
             break
@@ -1751,12 +1767,23 @@ def partial_comment_identity(payload):
                 elif token_type == "string":
                     frame["key"] = token_value
                     frame["state"] = "colon"
+                elif token_type in (",", "invalid"):
+                    continue
                 else:
                     break
             elif frame["state"] == "colon":
-                if token_type != ":":
+                if token_type == ":":
+                    frame["state"] = "value"
+                elif token_type == ",":
+                    frame["state"] = "key_or_end"
+                    frame["key"] = None
+                elif token_type == "invalid":
+                    continue
+                elif token_type in ("string", "atom", "{", "["):
+                    frame["state"] = "value"
+                    offset = token_start
+                else:
                     break
-                frame["state"] = "value"
             elif frame["state"] == "value":
                 if token_type in ("string", "atom"):
                     finish_value(frame, token_type, token_value)
@@ -1778,6 +1805,13 @@ def partial_comment_identity(payload):
                 elif token_type == "[":
                     finish_value(frame, token_type, token_value)
                     stack.append({"type": "array", "state": "value_or_end"})
+                elif token_type == "invalid":
+                    finish_value(frame, token_type, token_value)
+                elif token_type == ",":
+                    frame["state"] = "key_or_end"
+                    frame["key"] = None
+                elif token_type == "}":
+                    stack.pop()
                 else:
                     break
             else:
@@ -1785,6 +1819,11 @@ def partial_comment_identity(payload):
                     frame["state"] = "key_or_end"
                 elif token_type == "}":
                     stack.pop()
+                elif token_type == "invalid":
+                    continue
+                elif token_type == "string":
+                    frame["key"] = token_value
+                    frame["state"] = "colon"
                 else:
                     break
         elif frame["state"] == "value_or_end":
@@ -1805,12 +1844,16 @@ def partial_comment_identity(payload):
             elif token_type == "[":
                 frame["state"] = "comma_or_end"
                 stack.append({"type": "array", "state": "value_or_end"})
+            elif token_type == "invalid":
+                frame["state"] = "comma_or_end"
             else:
                 break
         elif token_type == ",":
             frame["state"] = "value_or_end"
         elif token_type == "]":
             stack.pop()
+        elif token_type == "invalid":
+            continue
         else:
             break
     return kinds, nonces
@@ -1823,26 +1866,30 @@ def candidate_comments(comments, marker, kind, expected_nonce):
         if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
             continue
         body = comment["body"]
-        parsed, value = loose_record_status(body, marker)
-        if parsed:
-            if not isinstance(value, dict):
-                continue
-            promotion = value.get("promotion")
-            matches = (
-                isinstance(promotion, dict)
-                and promotion.get("nonce") == expected_nonce
-                and (value.get("kind") == kind or body.startswith(marker_text))
-            )
-        else:
-            kinds = set()
-            nonces = set()
-            for payload in comment_payloads(body, marker):
+        exact_marker = body.startswith(marker_text)
+        matches = False
+        for payload_index, payload in enumerate(comment_payloads(body, marker)):
+            parsed, value = loose_payload_status(payload)
+            if parsed:
+                if isinstance(value, dict):
+                    promotion = value.get("promotion")
+                    payload_matches = (
+                        isinstance(promotion, dict)
+                        and promotion.get("nonce") == expected_nonce
+                        and (value.get("kind") == kind or exact_marker)
+                    )
+                else:
+                    payload_matches = False
+            else:
                 payload_kinds, payload_nonces = partial_comment_identity(payload)
-                kinds.update(payload_kinds)
-                nonces.update(payload_nonces)
-            matches = expected_nonce in nonces and (
-                kind in kinds or body.startswith(marker_text)
-            )
+                payload_matches = expected_nonce in payload_nonces and (
+                    kind in payload_kinds or exact_marker
+                )
+            if payload_matches:
+                matches = True
+                break
+            if payload_index == 0 and parsed:
+                break
         if matches:
             candidates.append(comment)
     return candidates
