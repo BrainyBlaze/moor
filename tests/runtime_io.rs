@@ -308,7 +308,7 @@ fn idle_viewer_renews_then_releases_its_lease() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 4, &status(1, 0, 0, 0, 1));
         peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
@@ -397,7 +397,7 @@ fn viewer_allows_only_one_input_until_its_exact_receipt() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 4, &status(1, 0, 0, 0, 1));
         peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
@@ -677,11 +677,14 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                     assert_eq!(&message.payload[13..], b"a");
                     saw[1] = true;
                 }
-                0x0b => match message.payload.as_ref() {
-                    [3, 0, 0, 0, 80, 0, 24, 0] => saw[2] = true,
-                    [3, 0, 0, 0, 100, 0, 30, 0] => saw[3] = true,
-                    payload => panic!("unexpected initial viewer resize {payload:?}"),
-                },
+                0x1b => {
+                    assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 80, 0, 24, 0]);
+                    saw[2] = true;
+                }
+                0x0b => {
+                    assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 100, 0, 30, 0]);
+                    saw[3] = true;
+                }
                 kind => panic!("unexpected initial viewer frame {kind}"),
             }
         }
@@ -741,7 +744,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
         second.send(7, 4, &status(1, 2, 0, 2, 1));
         // v4 fence: the resumed adoption may not release ANYTHING between the
         // descriptor and the mandatory terminal state — no queued INPUT (9),
-        // no RESIZE (0x0b), no mutation at all escapes mid-prefix. The
+        // no REDRAW (0x1b), no mutation at all escapes mid-prefix. The
         // descriptor is the FIRST prefix item now, so a gate that fires on it
         // would emit exactly here.
         second
@@ -785,7 +788,7 @@ fn viewer_resumes_pending_input_and_replay_without_duplicate_output() {
                             .unwrap(),
                     );
                 }
-                0x0b => {
+                0x1b => {
                     assert!(!redrawn, "resumed viewer redrew more than once");
                     assert_eq!(message.payload.as_ref(), &[3, 0, 0, 0, 100, 0, 30, 0]);
                     redrawn = true;
@@ -876,7 +879,7 @@ fn transport_loss_after_release_request_is_not_a_successful_detach() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 4, &status(1, 0, 0, 0, 1));
         peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
@@ -938,7 +941,7 @@ fn viewer_quiesces_commands_while_release_is_awaiting_acknowledgement() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 4, &status(1, 0, 0, 0, 1));
         peer.send(7, 5, &[0, 0]);
         peer.send(
             7,
@@ -1046,7 +1049,7 @@ fn wakeups_do_not_postpone_the_viewer_heartbeat_deadline() {
             &wire::controller_hello_ack(7, [9; 16], b"\x01/session").unwrap(),
         );
         assert_eq!(peer.recv().kind, 3);
-        peer.send(7, 4, &status(0, 0, 0, 0, 1));
+        peer.send(7, 4, &status(1, 0, 0, 0, 1));
         peer.send(7, 5, &[0, 0]);
         peer.send(
             7,

@@ -42,7 +42,7 @@ EVIDENCE_LINK = f"https://github.com/BrainyBlaze/moor/actions/runs/{CANDIDATE_QA
 CHECKLIST = [
     "candidate-install",
     "binary-identity",
-    "v4-dialect",
+    "v5-dialect",
     "session-create",
     "provider-identity",
     "resume-argv",

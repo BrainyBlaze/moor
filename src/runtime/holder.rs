@@ -79,16 +79,14 @@ impl<N: Native> Runtime<N> {
                     // the attach closed. A viewer whose size the platform
                     // refused must not be attached under a descriptor that
                     // would claim a size the pty does not have.
-                    if let Some((rows, columns)) = resize {
-                        if !self.resize(rows, columns, false) {
-                            rollback(&mut self.machine);
-                            self.disconnect(id);
-                            continue;
-                        }
-                        // ATTACH has no redraw bit; winch is its matching RESIZE.
-                        self.redraw = Some((id, rows, columns));
+                    if let Some((rows, columns)) = resize
+                        && !self.resize(rows, columns, false)
+                    {
+                        rollback(&mut self.machine);
+                        self.disconnect(id);
+                        continue;
                     }
-                    // v4 status-first: ATTACH_ACK opens the prefix, so the
+                    // Schema-5 status-first: ATTACH_ACK opens the prefix, so the
                     // viewer learns the authoritative geometry and replay
                     // window before a single terminal byte.
                     if !self.send_status(id, true, snapshot, deadline, clock) {
@@ -120,9 +118,11 @@ impl<N: Native> Runtime<N> {
                         }
                     }
                 }
-                PolicyEffect::Resize(id, rows, columns) => {
-                    let redraw = self.redraw.take() == Some((id, rows, columns));
-                    self.resize(rows, columns, redraw);
+                PolicyEffect::Resize(_, rows, columns) => {
+                    self.resize(rows, columns, false);
+                }
+                PolicyEffect::Redraw(_, rows, columns) => {
+                    self.resize(rows, columns, true);
                 }
                 PolicyEffect::Write(ticket, bytes) => self.write(ticket, bytes),
                 PolicyEffect::CommitSources(ticket, changes, mandatory) => {
@@ -355,7 +355,7 @@ pub trait Native {
 }
 
 schema!(struct pub HolderConfig<N> pub fields; core: CoreConfig, pty: Duplex, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N);
-schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, Option<[u8; 16]>));
+schema!(enum Descriptor; Status, Attach(u16, u16, bool, bool, crate::session::ReplayPolicy, Option<[u8; 16]>));
 schema!(struct Peer fields; pipe: Duplex, codec: Option<Codec>, preface: Vec<u8>, scope: u32, handshaking: bool, deadline: u64, pid: Option<u32>, refusal: Option<Refusal>);
 
 impl Peer {
@@ -368,7 +368,7 @@ impl Peer {
     }
 }
 
-schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool, peers: HashMap<u64, Peer>, recipients: Vec<u64>, frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), redraw: Option<(ConnId, u16, u16)>, storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N, heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
+schema!(struct pub Runtime<N> fields; config: CoreConfig, pty: Duplex, pty_open: bool, child_running: bool, peers: HashMap<u64, Peer>, recipients: Vec<u64>, frames: Vec<Message>, buffered: usize, next_peer: u64, scanner: Scanner, geometry: (u16, u16), storage: SessionStorage, status: Vec<u8>, commit_at: usize, synthetic: u8, native: N, heartbeat_at: u64, heartbeat_flags: u8, descriptors: VecDeque<(ConnId, Descriptor)>, machine: Machine);
 
 impl<N: Native> Runtime<N> {
     pub fn output(&mut self, bytes: Vec<u8>) {
@@ -422,7 +422,6 @@ impl<N: Native> Runtime<N> {
             next_peer: 1,
             scanner: Scanner::new(24),
             geometry: (24, 80),
-            redraw: None,
             storage: config.storage,
             status: config.status,
             commit_at: config.commit_at,
@@ -754,10 +753,6 @@ impl<N: Native> Runtime<N> {
             self.refuse(id, (11, 4, b"holder is an ancestor of attaching process"));
             return Ok(());
         }
-        // Any other request closes the immediate attach-redraw window.
-        if message.kind != 0x0b && self.redraw.is_some_and(|redraw| redraw.0 == id) {
-            self.redraw = None;
-        }
         match request {
             ControllerRequest::Hello(identity) => {
                 if message.scope != 0 && message.scope != self.config.generation {
@@ -786,11 +781,12 @@ impl<N: Native> Runtime<N> {
                 rows,
                 lease,
                 non_vt,
+                replay,
                 token,
             )) => self.queue_descriptor(
                 id,
                 time,
-                Descriptor::Attach(columns, rows, lease, non_vt, token),
+                Descriptor::Attach(columns, rows, lease, non_vt, replay, token),
             ),
             ControllerRequest::Policy(request) => {
                 let resumed_viewer = matches!(
@@ -1047,14 +1043,14 @@ impl<N: Native> Runtime<N> {
                         peer.deadline = 0;
                     }
                 }
-                Descriptor::Attach(columns, rows, lease, non_vt, token) => {
+                Descriptor::Attach(columns, rows, lease, non_vt, replay, token) => {
                     // The copied store frontier is the descriptor's storage
                     // linearization point. Release before policy materializes
                     // a potentially large replay effect list.
                     match self.machine.transition(Transition::Peer(
                         now,
                         peer,
-                        PolicyRequest::Attach(columns, rows, lease, non_vt, token),
+                        PolicyRequest::Attach(columns, rows, lease, non_vt, replay, token),
                     )) {
                         Ok(effects) => {
                             self.apply_with(effects, clock, Some((snapshot, deadline)));

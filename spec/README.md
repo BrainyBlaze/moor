@@ -13,8 +13,8 @@ If the two artifacts disagree, the behavioural specification wins and the wire
 schema must be reported as defective. This README defines the handoff procedure
 only; it adds no behavioural requirements.
 
-`wire-schema-4` and `event-schema-2` are the current revisions; `wire-schema-3` received one in-place amendment before any
-conforming implementation existed. No mixed old/amended dialect is supported.
+`wire-schema-5` and `event-schema-2` are the current revisions. Wire schema 5 adds the explicit `LIVE_ONLY` attach policy and the lease-authorized `REDRAW` request;
+schema-4 peers are refused rather than reinterpreting that formerly reserved bit. No mixed dialect is supported.
 A later platform amendment narrowed the supported families to Linux and macOS: identity tag `01` is the only rendezvous
 identity, and `path_encoding` is `posix-bytes` only.
 Every later change to a frozen layout requires the corresponding version

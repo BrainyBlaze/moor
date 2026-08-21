@@ -73,7 +73,7 @@ checklist, also in exact order, is:
    manifest and target tuple rather than compiling Moor.
 2. `binary-identity` — each installed asset returns the expected basename and
    version from `moor --version`.
-3. `v4-dialect` — a CRC-valid HELLO dialect `03` is refused and dialect `04` is
+3. `v5-dialect` — a CRC-valid HELLO dialect `04` is refused and dialect `05` is
    accepted, without replacing the tested holder bytes.
 4. `session-create` — provision and initial attach succeed against the real
    candidate holder.
@@ -89,7 +89,7 @@ checklist, also in exact order, is:
 11. `input-path` — input reaches the current lease holder exactly once.
 12. `restart-geometry` — restart/adoption preserves geometry and applies the
     latest commanded resize once.
-13. `restart-adoption` — Desk adopts the real restarted holder through the v4
+13. `restart-adoption` — Desk adopts the real restarted holder through the v5
     observer/authority path.
 
 Each item must be `passed` and cite a hosted Actions run or job URL. One hosted
@@ -138,7 +138,7 @@ duplicate, failed, or reordered entries are rejected.
   "checklist": [
     {"id": "candidate-install", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
     {"id": "binary-identity", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
-    {"id": "v4-dialect", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
+    {"id": "v5-dialect", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
     {"id": "session-create", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
     {"id": "provider-identity", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},
     {"id": "resume-argv", "verdict": "passed", "evidence": "https://github.com/BrainyBlaze/moor/actions/runs/CANDIDATE_QA_RUN_ID"},

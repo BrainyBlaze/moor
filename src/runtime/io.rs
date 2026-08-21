@@ -27,7 +27,7 @@ type SharedState = Arc<Mutex<State>>;
 
 pub struct Duplex<T = Event>(SharedState, pub Receiver<T>, pub Receiver<WriteResult>);
 
-schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Keepalive, Release(SyncSender<bool>), Abort);
+schema!(enum Command; Input(Vec<u8>), Resize(u16, u16), Redraw(u16, u16), Keepalive, Release(SyncSender<bool>), Abort);
 schema!(tuple pub ViewerSender [Clone]; fields; Sender<Command>);
 schema!(enum ViewerPhase<'a>; Starting(&'a mut dyn FnMut(ViewerSender)), Attached, Reattaching);
 
@@ -77,7 +77,7 @@ impl Viewer<'_> {
                 if self.options.reset == Reset::Move {
                     self.write(b"\x1b[H")?;
                 }
-                // v4 status-first: the descriptor OPENS the prefix, so a
+                // Schema-5 status-first: the descriptor OPENS the prefix, so a
                 // resuming viewer adopts — releases its redraw and queued
                 // input — only on the mandatory TERMINAL_STATE that closes
                 // the preamble. Adopting on the descriptor would mutate the
@@ -87,7 +87,7 @@ impl Viewer<'_> {
                     self.phase = ViewerPhase::Attached;
                     if self.options.redraw == Redraw::Winch {
                         let (rows, columns) = self.size.unwrap();
-                        self.command(Command::Resize(rows, columns))?;
+                        self.command(Command::Redraw(rows, columns))?;
                     }
                     self.advance(vec![])?;
                 }
@@ -116,7 +116,7 @@ impl Viewer<'_> {
                             Redraw::CtrlL => self.advance(b"\x0c".to_vec())?,
                             Redraw::Winch => {
                                 let (rows, columns) = self.size.unwrap();
-                                self.command(Command::Resize(rows, columns))?;
+                                self.command(Command::Redraw(rows, columns))?;
                             }
                             Redraw::None => {}
                         }
@@ -164,6 +164,11 @@ impl Viewer<'_> {
                 self.size = Some((rows, columns));
                 if let Some(lease) = &self.lease {
                     lease.resize(self.client, rows, columns)?;
+                }
+            }
+            Command::Redraw(rows, columns) => {
+                if let Some(lease) = &self.lease {
+                    lease.redraw(self.client, rows, columns)?;
                 }
             }
             Command::Keepalive => {

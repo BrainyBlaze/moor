@@ -525,7 +525,7 @@ fn attach_fences_gap_duplicates_offsets_and_empty_output() {
     codec
         .encode(7, 2, &ack(7, [9; 16], &identity), &mut inbound)
         .unwrap();
-    // v4 status-first attach prefix: the descriptor opens the exchange and
+    // Schema-5 status-first attach prefix: the descriptor opens the exchange and
     // the terminal preamble follows it.
     codec
         .encode(7, 4, &status(2, 3, 4, 8, 2), &mut inbound)

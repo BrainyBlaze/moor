@@ -1,8 +1,8 @@
-# Wire schema and conformance vectors — version 4
+# Wire schema and conformance vectors — version 5
 
 **Companion artefact to [moor-spec.md](./moor-spec.md).** §10.2 of that document fixes what this schema must satisfy; this file fixes the shapes. Where the two disagree the specification wins and this file is a defect.
 
-**Version:** `wire-schema-4`. Revision 4 increments the controller version byte to `04` because it changes frozen layouts: the status descriptor gains a mandatory geometry pair, the superseded event layout `01` is refused, and the reference tool's legacy command grammar is gone. There is no `03` decoder — a v3 peer is refused as an unknown version, which is precisely what a version increment buys over another in-place amendment. The schema label and controller version byte are `04`, and the published document digest identifies this amended dialect. No mixed old/new dialect is supported. Every later frozen-layout change requires a version increment rather than another in-place edit. Semantic-producer frames use their separately versioned `MOOS` header (§14). Integer layouts are portable, and native paths are raw POSIX bytes. This revision freezes the portable event/log/lifecycle commit record (§13), and private launch records (§15). It is referenced by the specification as *the accompanying vectors* (§0.2).
+**Version:** `wire-schema-5`. Revision 5 increments the controller version byte to `05` because `ATTACH` gains the frozen `LIVE_ONLY` replay-policy bit and the controller gains the explicit lease-authorized `REDRAW` request. A schema-4 controller is refused as an unknown version; there is no mixed-dialect decoder or in-place reinterpretation of its reserved bit. Revision 5 preserves revision 4's status-first prefix, mandatory descriptor geometry, portable committed-store record, refusal of event layout `01`, and removal of the reference tool's legacy command grammar. The schema label and controller version byte are `05`, and the published document digest identifies this dialect. Every later frozen-layout change requires a version increment rather than another in-place edit. Semantic-producer frames use their separately versioned `MOOS` header (§14). Integer layouts are portable, and native paths are raw POSIX bytes. This file is referenced by the specification as *the accompanying vectors* (§0.2).
 
 **Integer encoding:** all multi-byte integers are unsigned, **little-endian**, of the stated width. There is no variable-length encoding anywhere.
 
@@ -15,7 +15,7 @@ Every frame begins with a fixed 24-byte header.
 | offset | width | field | value / notes |
 |---|---|---|---|
 | 0 | 4 | magic | the four bytes `4D 4F 4F 52` in file order, in that order — the program's name in ASCII. It is a **byte sequence, not an integer**, so it is unaffected by byte order |
-| 4 | 1 | version | `04` for this schema |
+| 4 | 1 | version | `05` for this schema |
 | 5 | 1 | type | §2 |
 | 6 | 1 | flags | bit 0 = `MORE` (continued, §10.2.2); bits 1–7 reserved, must be `0` |
 | 7 | 1 | reserved | must be `00` |
@@ -72,7 +72,7 @@ Tag `01` is the only identity tag. An unknown tag or a wrong fixed length is `ID
 |---|---|---|---|
 | `01` | `HELLO` | controller → holder | §3.1 |
 | `02` | `HELLO_ACK` | holder → controller | §3.2 |
-| `03` | `ATTACH` | controller → holder | geometry (§4), then 1 byte flags: bit 0 = request a fresh viewer lease, bit 1 = `NON_VT`, bits 2..7 zero |
+| `03` | `ATTACH` | controller → holder | geometry (§4), then 1 byte flags: bit 0 = request a fresh viewer lease, bit 1 = `NON_VT`, bit 2 = `LIVE_ONLY`, bits 3..7 zero |
 | `04` | `ATTACH_ACK` | holder → controller | the status descriptor, §5 |
 | `05` | `TERMINAL_STATE` | holder → controller | the preamble, §6 |
 | `06` | `OUTPUT` | holder → controller | 8 bytes record sequence, 8 bytes byte offset, then the raw bytes to end of payload |
@@ -96,10 +96,11 @@ Tag `01` is the only identity tag. An unknown tag or a wrong fixed length is `ID
 | `18` | `LEASE_KEEPALIVE` | controller → holder | 20 bytes, §7.4 |
 | `19` | `LOG_CLEAR` | controller → holder | 24 bytes, §7.6 |
 | `1A` | `LOG_CLEAR_RESULT` | holder → controller | 32 bytes, §7.6 |
+| `1B` | `REDRAW` | controller → holder | 4 bytes lease epoch, then geometry (§4) |
 
 An unknown type closes the connection with `UNKNOWN_TYPE`. It is never skipped.
 
-Every unassigned payload flag bit and enum value is reserved. A controller frame carrying one is `MALFORMED_FRAME`; it is never ignored as a forward-compatible extension. In particular, termination containment bits 4–7 are zero. Controller types `15..1A` forbid `MORE`; any fragmentation or payload length other than the exact value above is `MALFORMED_FRAME`.
+Every unassigned payload flag bit and enum value is reserved. A controller frame carrying one is `MALFORMED_FRAME`; it is never ignored as a forward-compatible extension. In particular, termination containment bits 4–7 are zero. Controller types `15..1B` forbid `MORE`; any fragmentation or payload length other than the exact value above is `MALFORMED_FRAME`.
 
 ## 3. The identity exchange
 
@@ -136,6 +137,8 @@ A mismatch between the two identities is `IDENTITY_MISMATCH` and the connection 
 
 Both dimensions zero (`0 x 0`) mean *preserve both* (OB-19). Exactly one zero is `HALF_SPECIFIED_GEOMETRY` and changes nothing. A real geometry has columns and rows independently in `1..32767`; both operands are widened before multiplication and their product must be at most `2,000,000`. A value outside either per-dimension range or above the product bound is `MALFORMED_FRAME`.
 
+`RESIZE` and `REDRAW` carry the same lease epoch and geometry layout but have different effects. `RESIZE` changes native geometry only when the validated real geometry differs from the stored value. `REDRAW` applies the validated geometry and emits one native resize notification even when it is unchanged; `0 x 0` preserves geometry and emits no notification. Both requests require the current attached viewer lease, refresh its deadline, and never replay retained output.
+
 ---
 
 ## 5. The status descriptor
@@ -162,8 +165,8 @@ Carried by `ATTACH_ACK` and `STATUS_REPLY` (OB-39).
 | 16 | **child birth token** — an opaque value derived at child creation, not reused when a process identifier is | OB-35 |
 | 2 | **terminal columns** — the holder's stored geometry, mandatory and nonzero | §4 |
 | 2 | **terminal rows** — the holder's stored geometry, mandatory and nonzero | §4 |
-| 8 | retained history, first output record sequence present; zero iff empty | — |
-| 8 | retained history, last output record sequence present, inclusive; zero iff empty | — |
+| 8 | retained history, first output record sequence present; for an empty window, the next output sequence | — |
+| 8 | retained history, last output record sequence present, inclusive; for an empty window, `first - 1` | — |
 | 8 | retained history, first byte offset still present | — |
 | 8 | retained history, exclusive end byte offset | — |
 | 1 | flags: bit 0 = retained raw output is complete from record 1/byte 0; bit 1 = tracked terminal-mode state exact; bits 2–3 zero; bit 4 = this controller owns the input lease; bit 5 = at least one fully attached viewer exists; bit 6 = requested child running; bit 7 = configured event store writable | §6.7, OB-39 |
@@ -188,7 +191,7 @@ Linux carries the 16 parsed UUID bytes from `/proc/sys/kernel/random/boot_id`; m
 
 `TERMINAL_STATE` carries a plain length-prefixed run of raw bytes that a viewer writes into its own emulator. It is sent **exactly once per attaching connection, immediately after `ATTACH_ACK`**, and **carries the connection's own generation** like every other frame — the header rule of §1 admits no exception. Its connection-locality is expressed by the fact that it carries **no record sequence and no byte offset**, so it cannot advance any output cursor and is never logged (§10.2.6). A zero-length run is legal in exactly two branches: tracked-mode exactness is false, in which case the ACK that preceded it already cleared its mode-exact bit; or the attach set `NON_VT`, in which case the ACK retains the actual exactness bit but no terminal controls are sent. A probe or input-only connection receives no preamble.
 
-Attach output order is exact and is revision 4's status-first sequence: `ATTACH_ACK`; `TERMINAL_STATE`; `LEASE_RESULT` when the attach requested a fresh viewer lease; the frozen `GAP`/`OUTPUT` replay baseline; then live output. The descriptor opens the prefix so the viewer holds the authoritative geometry and replay window before a single terminal byte arrives; a decoder MUST refuse a descriptor after terminal state, which was the retired v3 order. The requested attach geometry is applied to the native pty BEFORE the descriptor is built, and a native refusal fails the attach closed — the holder closes the link rather than attach a viewer under a descriptor claiming a size the pty does not have. The attach/grant transaction is atomic, and it COMMITS on the successful enqueue of the token-bearing `LEASE_RESULT` — the last prefix frame the grant owes. Any earlier failure — the deadline, the native resize, or any prefix frame that cannot enqueue, the token frame itself included — rolls the fresh grant back entirely, reservation and epoch allocation both. The token is the only way to exercise an epoch and it never left the holder, so the epoch was never consumed: the next fresh controller receives that very number, even though a failed prefix may already have shown it inside a descriptor to a link the holder then closed. A resumed viewer's failure instead preserves its known epoch/token reservation exactly as ordinary link loss does. The native geometry is the honest exception to the unwinding: once the native resize has succeeded, a later prefix failure may leave that geometry applied — a native effect may already be visible and is never guessed back with a compensating resize — and the next status descriptor reports the geometry actually in force. Prefix followers are fenced symmetrically on the decode side: after the descriptor, a viewer MUST refuse `OUTPUT`, `GAP`, `INPUT_RECEIPT`, `QUERY`, and `LEASE_RESULT` until the mandatory `TERMINAL_STATE` has arrived. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
+Attach output order is exact and preserves the status-first prefix introduced by revision 4: `ATTACH_ACK`; `TERMINAL_STATE`; `LEASE_RESULT` when the attach requested a fresh viewer lease. With `LIVE_ONLY` clear, the frozen `GAP`/`OUTPUT` replay baseline follows that prefix and live output follows the baseline. With `LIVE_ONLY` set, no retained `GAP` or `OUTPUT` is emitted: the descriptor's `last` and `end` fields establish the controller's starting frontier, and the next possible `OUTPUT` is a later live record at sequence `last + 1` and byte offset `end`. The descriptor opens the prefix so the viewer holds the authoritative geometry and frontier before a single terminal byte arrives; a decoder MUST refuse a descriptor after terminal state, which was the retired v3 order. The requested attach geometry is applied to the native pty BEFORE the descriptor is built, and a native refusal fails the attach closed — the holder closes the link rather than attach a viewer under a descriptor claiming a size the pty does not have. The attach/grant transaction is atomic, and it COMMITS on the successful enqueue of the token-bearing `LEASE_RESULT` — the last prefix frame the grant owes. Any earlier failure — the deadline, the native resize, or any prefix frame that cannot enqueue, the token frame itself included — rolls the fresh grant back entirely, reservation and epoch allocation both. The token is the only way to exercise an epoch and it never left the holder, so the epoch was never consumed: the next fresh controller receives that very number, even though a failed prefix may already have shown it inside a descriptor to a link the holder then closed. A resumed viewer's failure instead preserves its known epoch/token reservation exactly as ordinary link loss does. The native geometry is the honest exception to the unwinding: once the native resize has succeeded, a later prefix failure may leave that geometry applied — a native effect may already be visible and is never guessed back with a compensating resize — and the next status descriptor reports the geometry actually in force. Prefix followers are fenced symmetrically on the decode side: after the descriptor, a viewer MUST refuse `OUTPUT`, `GAP`, `INPUT_RECEIPT`, `QUERY`, and `LEASE_RESULT` until the mandatory `TERMINAL_STATE` has arrived. The attach becomes fully attached before the first item is queued, so its own ACK already reflects viewer presence. A busy lease leaves it attached as an observer and still returns the refused result in that position. No replay or live output may overtake this prefix.
 
 **The tracked mode set is exactly twelve, and their canonical bytes are frozen.** All twelve are emitted on every attach, in the order below — see the note after the table for why never only the deviations.
 
@@ -226,11 +229,11 @@ Nothing outside this table is tracked. A mode not listed is the child's business
 
 ### 6.1 Output record coordinates
 
-An `OUTPUT` message is nonempty. Its record sequence starts at `1` for the holder incarnation and increases by exactly one per complete reassembled output message. Its byte offset is the zero-based absolute offset of the payload's first byte in that incarnation's child-output stream. The next output offset is exactly `offset + payload_length`; gaps and overlaps are malformed at the producer and detectable by the consumer. The status descriptor's retained byte range is half-open `[first, end)`, while its record range is inclusive. Empty history is encoded only as record range `0,0` and equal byte endpoints. Nonempty history has `1 <= first_record <= last_record` and `first_byte < end_byte`. V2's two bytes occupy offsets 4096 and 4097 with exclusive end 4098. A `GAP` names a nonempty **inclusive** range of lost record sequences (`first <= last`, neither zero); it never pretends to name byte offsets that are no longer known.
+An `OUTPUT` message is nonempty. Its record sequence starts at `1` for the holder incarnation and increases by exactly one per complete reassembled output message. Its byte offset is the zero-based absolute offset of the payload's first byte in that incarnation's child-output stream. The next output offset is exactly `offset + payload_length`; gaps and overlaps are malformed at the producer and detectable by the consumer. The status descriptor's retained byte range is half-open `[start, end)`, while its nonempty record range is inclusive. An empty retained window is encoded canonically as `first_record = last_record + 1` and `start = end`: `first_record` is the next output sequence, `last_record` is the last sequence already discarded (zero before any output), and the equal byte endpoints are the next output offset. Nonempty history has `1 <= first_record <= last_record` and `start < end`. V2's two bytes occupy offsets 4096 and 4097 with exclusive end 4098. A `GAP` names a nonempty **inclusive** range of lost record sequences (`first <= last`, neither zero); it never pretends to name byte offsets that are no longer known.
 
 Both coordinates are unsigned u64 and never wrap. Record sequence `FFFFFFFFFFFFFFFF` may name the final output record. An output is admitted only when its exclusive end is representable as u64. If another child byte would require a successor after the maximum sequence or an end above `FFFFFFFFFFFFFFFF`, the holder sends `RESOURCE_EXHAUSTED` to every authenticated controller, marks the output path failed, and terminates its owned session through §12.4 of the specification rather than silently dropping or misnumbering output. `OUTPUT_ACK` value zero means no output record consumed; any acknowledgement above the highest record sent is `BAD_SEQUENCE`.
 
-Each `OUTPUT` payload carries 1–65536 child bytes. The holder retains complete newest records up to 4 MiB of payload per holder incarnation. After `ATTACH_ACK`, `TERMINAL_STATE`, and the optional attach-requested `LEASE_RESULT`, every attach receives a frozen baseline: `GAP{1, first_retained-1}` when `first_retained > 1`, then every record from the ACK's inclusive first/last range, then later live records. Empty history emits neither. The connection serialises output that arrives during replay after that baseline. A controller with an existing cursor discards duplicate record sequences; a new controller applies all of them. Bit 0 in the ACK is set exactly when the empty history is still at byte offset zero or the nonempty retained range begins at record 1/byte 0. This is raw replay only: there is no checkpoint frame in revision 4.
+Each `OUTPUT` payload carries 1–65536 child bytes. The holder retains complete newest records up to 4 MiB of payload per holder incarnation. After `ATTACH_ACK`, `TERMINAL_STATE`, and the optional attach-requested `LEASE_RESULT`, a retained attach (`LIVE_ONLY` clear) receives a frozen baseline: `GAP{1, first_retained-1}` when `first_retained > 1`, then every record from the ACK's inclusive first/last range, then later live records. Empty history emits neither. The connection serialises output that arrives during replay after that baseline. A controller with an existing cursor discards duplicate record sequences; a new controller applies all of them. A live-only attach receives none of those retained frames and adopts the ACK's `last,end` frontier before consuming later live output. Bit 0 in the ACK is set exactly when the empty history is still at byte offset zero or the nonempty retained range begins at record 1/byte 0. This is raw replay only: there is no checkpoint frame in revision 5.
 
 ## 7. `INPUT` and `INPUT_RECEIPT` — the transport receipt
 
@@ -311,7 +314,7 @@ Grant/resume has reason zero, a nonzero epoch, and a fresh nonzero token. Releas
 
 The holder starts with allocated epoch zero and no owner. A fresh grant is the only transition that allocates `previous epoch + 1` and resets input-request high-water to zero. Release and deadline expiry invalidate the token without incrementing the allocated epoch. Epoch `FFFFFFFF` may be granted once; after its release or expiry every fresh request refuses/exhausted and the counter never wraps. Fresh-decision order is active or reserved owner → busy; otherwise epoch exhausted → exhausted; otherwise allocate → granted. There is no queue or forced steal.
 
-Every valid owner `INPUT`, `RESIZE`, `QUERY_REPLY`, or `LEASE_KEEPALIVE` refreshes the ten-second responsiveness deadline. An idle client sends keepalive every three seconds. A valid keepalive has no response. An invalid one receives `ERROR(LEASE_NOT_HELD)` and only that connection closes. `LEASE_RELEASE` always receives a result: an exact tuple releases; a mismatch refuses/not-held without mutation. Transport loss reserves role, epoch, token, request high-water, complete cached request, and cached receipt only until the original deadline. Exact resume before expiry preserves epoch/request state and rotates the token atomically.
+Every valid owner `INPUT`, `RESIZE`, `REDRAW`, `QUERY_REPLY`, or `LEASE_KEEPALIVE` refreshes the ten-second responsiveness deadline. An idle client sends keepalive every three seconds. A valid keepalive has no response. An invalid one receives `ERROR(LEASE_NOT_HELD)` and only that connection closes. `LEASE_RELEASE` always receives a result: an exact tuple releases; a mismatch refuses/not-held without mutation. Transport loss reserves role, epoch, token, request high-water, complete cached request, and cached receipt only until the original deadline. Exact resume before expiry preserves epoch/request state and rotates the token atomically.
 
 Each authenticated controller connection is in exactly one phase:
 
@@ -321,7 +324,7 @@ Each authenticated controller connection is in exactly one phase:
 | `I` input-only | no | yes | `INPUT`, `LEASE_KEEPALIVE`, `LEASE_RELEASE` |
 | `R` resumed viewer, attach pending | no | yes | `ATTACH` without request bit, `LEASE_KEEPALIVE`, `LEASE_RELEASE` |
 | `O` attached observer | yes | no | fresh viewer `LEASE_REQUEST`, `LOG_CLEAR` |
-| `V` attached lease viewer | yes | yes | `INPUT`, `RESIZE`, `QUERY_REPLY`, `LEASE_KEEPALIVE`, `LEASE_RELEASE`, `LOG_CLEAR` |
+| `V` attached lease viewer | yes | yes | `INPUT`, `RESIZE`, `REDRAW`, `QUERY_REPLY`, `LEASE_KEEPALIVE`, `LEASE_RELEASE`, `LOG_CLEAR` |
 | `C` closing | no | no | none |
 
 `STATUS` is legal only in `U`, `O`, and `V`; `OUTPUT_ACK` only in `O` and `V`; authenticated termination retains §9's rules. Any other phase/frame combination is `MALFORMED_FRAME` and changes no state. A fresh viewer lease is requested only by `ATTACH` shorthand in `U` or a fresh viewer request in `O`; a viewer-role fresh request in `U` is malformed. A fresh/resumed input-only grant enters `I`. Viewer resume enters `R`; its request-bit-clear `ATTACH` within the two-second identity deadline enters `V` and produces the normal ACK/preamble/baseline without a second lease result. `ATTACH` is illegal in `I`.
@@ -759,8 +762,8 @@ Byte-exact records an implementation must produce and accept. Every checksum is 
 **V1** — side-effect-free `HELLO`, exact generation 7, sequence 1; hello flags are reserved zero
 
 ```
-4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
-21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
+4D 4F 4F 52 05 01 00 00 07 00 00 00 01 00 00 00
+21 00 00 00 C0 C5 FD D6 4D 4F 4F 52 05 00 00 16
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
 30 30 30 2F 62 75 69 6C 64
 ```
@@ -768,54 +771,54 @@ Byte-exact records an implementation must produce and accept. Every checksum is 
 **V2** — `OUTPUT`, record sequence 42, byte offset 4096, payload `hi`
 
 ```
-4D 4F 4F 52 04 06 00 00 07 00 00 00 09 00 00 00
-12 00 00 00 9D 65 ED 09 2A 00 00 00 00 00 00 00
+4D 4F 4F 52 05 06 00 00 07 00 00 00 09 00 00 00
+12 00 00 00 63 68 E1 FB 2A 00 00 00 00 00 00 00
 00 10 00 00 00 00 00 00 68 69
 ```
 
 **V3** — `ATTACH` with geometry 0×0 — *preserve both* (OB-19) — requesting the lease
 
 ```
-4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
-05 00 00 00 2D 90 AF 9C 00 00 00 00 01
+4D 4F 4F 52 05 03 00 00 07 00 00 00 02 00 00 00
+05 00 00 00 D3 9D A3 6E 00 00 00 00 01
 ```
 
 **V4** — `RESIZE`, lease epoch 3, geometry 80×24 — payload is 8 bytes: epoch then geometry
 
 ```
-4D 4F 4F 52 04 0B 00 00 07 00 00 00 0B 00 00 00
-08 00 00 00 66 62 C8 F5 03 00 00 00 50 00 18 00
+4D 4F 4F 52 05 0B 00 00 07 00 00 00 0B 00 00 00
+08 00 00 00 98 6F C4 07 03 00 00 00 50 00 18 00
 ```
 
 **V5** — `RESIZE` with 80×0 — half-specified, MUST be refused with `HALF_SPECIFIED_GEOMETRY`
 
 ```
-4D 4F 4F 52 04 0B 00 00 07 00 00 00 0C 00 00 00
-08 00 00 00 62 67 91 0F 03 00 00 00 50 00 00 00
+4D 4F 4F 52 05 0B 00 00 07 00 00 00 0C 00 00 00
+08 00 00 00 9C 6A 9D FD 03 00 00 00 50 00 00 00
 ```
 
 **V6** — any frame with generation 0 — MUST be refused; shown as `OUTPUT_ACK`
 
 ```
-4D 4F 4F 52 04 07 00 00 00 00 00 00 03 00 00 00
-08 00 00 00 C2 BB 32 88 01 00 00 00 00 00 00 00
+4D 4F 4F 52 05 07 00 00 00 00 00 00 03 00 00 00
+08 00 00 00 3C B6 3E 7A 01 00 00 00 00 00 00 00
 ```
 
 **V7** — a `MORE` run of two `INPUT` frames. The first carries lease epoch 3, request id 1 and flags `00`, then `AAAA`; the continuation carries `BB` and no metadata. They reassemble to one request whose data is `AAAABB`
 
 ```
-4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
-11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
-00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
-06 42 42
+4D 4F 4F 52 05 09 01 00 07 00 00 00 14 00 00 00
+11 00 00 00 D5 B0 AF 62 03 00 00 00 01 00 00 00
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 05 09 00
+00 07 00 00 00 15 00 00 00 02 00 00 00 B0 A0 D2
+F4 42 42
 ```
 
 **V8** — the `INPUT_RECEIPT` answering V7: lease epoch 3, request id 1, 6 bytes written, status `00`, result code zero. This is the receipt payload the holder caches
 
 ```
-4D 4F 4F 52 04 0A 00 00 07 00 00 00 0A 00 00 00
-2B 00 00 00 F2 7F 7D 6E 03 00 00 00 01 00 00 00
+4D 4F 4F 52 05 0A 00 00 07 00 00 00 0A 00 00 00
+2B 00 00 00 0C 72 71 9C 03 00 00 00 01 00 00 00
 00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
 00 00 00
@@ -824,24 +827,24 @@ Byte-exact records an implementation must produce and accept. Every checksum is 
 **V9** — **a replay of V7** — same lease epoch 3, same request id 1, identical bytes. The holder MUST write nothing and return the cached V8 receipt payload in a newly sequenced frame (V18)
 
 ```
-4D 4F 4F 52 04 09 00 00 07 00 00 00 16 00 00 00
-13 00 00 00 A2 31 BB E9 03 00 00 00 01 00 00 00
+4D 4F 4F 52 05 09 00 00 07 00 00 00 16 00 00 00
+13 00 00 00 5C 3C B7 1B 03 00 00 00 01 00 00 00
 00 00 00 00 00 41 41 41 41 42 42
 ```
 
 **V10** — **same request id, different bytes** — lease epoch 3, request id 1, payload `DIFFERENT`. MUST be refused with `BAD_SEQUENCE` and **nothing written**
 
 ```
-4D 4F 4F 52 04 09 00 00 07 00 00 00 17 00 00 00
-16 00 00 00 CE D7 E0 06 03 00 00 00 01 00 00 00
+4D 4F 4F 52 05 09 00 00 07 00 00 00 17 00 00 00
+16 00 00 00 30 DA EC F4 03 00 00 00 01 00 00 00
 00 00 00 00 00 44 49 46 46 45 52 45 4E 54
 ```
 
 **V11** — `ERROR` carrying `GENERATION_MISMATCH` (9)
 
 ```
-4D 4F 4F 52 04 13 00 00 07 00 00 00 0D 00 00 00
-1E 00 00 00 27 2C 49 3D 09 00 1A 00 67 65 6E 65
+4D 4F 4F 52 05 13 00 00 07 00 00 00 0D 00 00 00
+1E 00 00 00 D9 21 45 CF 09 00 1A 00 67 65 6E 65
 72 61 74 69 6F 6E 20 33 20 69 73 20 73 75 70 65
 72 73 65 64 65 64
 ```
@@ -887,8 +890,8 @@ D6 A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39
 **V16** — controller `INPUT` requiring a receipt from source `claude`, application id `20..2F`, data `hello`
 
 ```
-4D 4F 4F 52 04 09 00 00 07 00 00 00 1E 00 00 00
-2A 00 00 00 90 59 C0 BE 03 00 00 00 02 00 00 00
+4D 4F 4F 52 05 09 00 00 07 00 00 00 1E 00 00 00
+2A 00 00 00 6E 54 CC 4C 03 00 00 00 02 00 00 00
 00 00 00 00 01 20 21 22 23 24 25 26 27 28 29 2A
 2B 2C 2D 2E 2F 06 00 63 6C 61 75 64 65 68 65 6C
 6C 6F
@@ -908,8 +911,8 @@ D6 A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39
 **V18** — the replay response to V9. Its payload is byte-identical to V8, while its holder-to-controller frame sequence advances from 10 to 11
 
 ```
-4D 4F 4F 52 04 0A 00 00 07 00 00 00 0B 00 00 00
-2B 00 00 00 D5 02 41 27 03 00 00 00 01 00 00 00
+4D 4F 4F 52 05 0A 00 00 07 00 00 00 0B 00 00 00
+2B 00 00 00 2B 0F 4D D5 03 00 00 00 01 00 00 00
 00 00 00 00 07 00 00 00 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 06 00 00 00 00 00 00 00
 00 00 00
@@ -984,11 +987,11 @@ D0 AB E5 FE 84 63 80 34 09 E5 0E C8 3F 2C F5 79
 {"v":2,"type":"header","ts":0,"session":"AS90bXAvLm1vb3ItMTAwMC9idWlsZA==","generation":7,"epoch":0,"next_seq":0,"first_retained":0}
 ```
 
-Start wall/monotonic are `1/2`, boot identity is `03` repeated 16, working directory `/tmp`, PID `0x1234`, containment token `0x5678`, birth token `10..1F`, geometry `80x24` (columns then rows, per the mandatory revision-4 pair), and retained output is empty at coordinate zero. Main flags are `E3` (complete, tracked exact, viewer present, child running, event writable), lease epoch is 3, semantic flags/count are zero, health flags are `0F`, and selected log epoch/index/range are `1/1/[0,0)`. The frame uses generation 7, sequence 1, and this exact 248-byte status payload:
+Start wall/monotonic are `1/2`, boot identity is `03` repeated 16, working directory `/tmp`, PID `0x1234`, containment token `0x5678`, birth token `10..1F`, geometry `80x24` (columns then rows, per the mandatory revision-4 pair), and retained output is the initial empty interval `first=1,last=0,start=end=0`. Main flags are `E3` (complete, tracked exact, viewer present, child running, event writable), lease epoch is 3, semantic flags/count are zero, health flags are `0F`, and selected log epoch/index/range are `1/1/[0,0)`. The frame uses generation 7, sequence 1, and this exact 248-byte status payload:
 
 ```
-4D 4F 4F 52 04 0E 00 00 07 00 00 00 01 00 00 00
-F8 00 00 00 68 D0 95 1E 16 00 00 00 01 2F 74 6D
+4D 4F 4F 52 05 0E 00 00 07 00 00 00 01 00 00 00
+F8 00 00 00 96 DD 99 EC 16 00 00 00 01 2F 74 6D
 70 2F 2E 6D 6F 6F 72 2D 31 30 30 30 2F 62 75 69
 6C 64 07 00 00 00 00 01 02 03 04 05 06 07 08 09
 0A 0B 0C 0D 0E 0F 02 0B 00 00 00 2F 74 6D 70 2F
@@ -999,32 +1002,32 @@ A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
 00 00 00 00 00 00 00 03 03 03 03 03 03 03 03 03
 03 03 03 03 03 03 03 04 00 00 00 2F 74 6D 70 34
 12 00 00 78 56 00 00 10 11 12 13 14 15 16 17 18
-19 1A 1B 1C 1D 1E 1F 50 00 18 00 00 00 00 00 00
+19 1A 1B 1C 1D 1E 1F 50 00 18 00 01 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 E3 03 00 00 00
 00 00 00 0F 01 00 00 00 01 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
-**V26** — `NON_VT` attach and its required empty preamble. The attach preserves geometry and sets only flag bit 1. The preamble payload is the plain u16 zero length, not an absent frame; tracked exactness may remain set in the ACK. The attach uses controller-direction sequence 2; under revision 4's status-first prefix the empty preamble FOLLOWS the sequence-2 `ATTACH_ACK`, so it carries holder-direction sequence 3:
+**V26** — `NON_VT` attach and its required empty preamble. The attach preserves geometry and sets only flag bit 1. The preamble payload is the plain u16 zero length, not an absent frame; tracked exactness may remain set in the ACK. The attach uses controller-direction sequence 2; under the status-first prefix the empty preamble FOLLOWS the sequence-2 `ATTACH_ACK`, so it carries holder-direction sequence 3:
 
 ```
-4D 4F 4F 52 04 03 00 00 07 00 00 00 02 00 00 00
-05 00 00 00 2D 90 AF 9C 00 00 00 00 02
+4D 4F 4F 52 05 03 00 00 07 00 00 00 02 00 00 00
+05 00 00 00 D3 9D A3 6E 00 00 00 00 02
 
-4D 4F 4F 52 04 05 00 00 07 00 00 00 03 00 00 00
-02 00 00 00 37 2D 59 98 00 00
+4D 4F 4F 52 05 05 00 00 07 00 00 00 03 00 00 00
+02 00 00 00 C9 20 55 6A 00 00
 ```
 
 **V27** — private-mode query/reply with correlation `0102030405060708`, lease epoch 3, echoed class `04`, and plain u16 byte lengths. The query is `CSI7 ?2004$p`; the accepted reply is `CSI7 ?2004;1$y`. Both directions use frame sequence 3:
 
 ```
-4D 4F 4F 52 04 14 00 00 07 00 00 00 03 00 00 00
-18 00 00 00 5A C7 16 3B 08 07 06 05 04 03 02 01
+4D 4F 4F 52 05 14 00 00 07 00 00 00 03 00 00 00
+18 00 00 00 A4 CA 1A C9 08 07 06 05 04 03 02 01
 03 00 00 00 04 09 00 1B 5B 3F 32 30 30 34 24 70
 
-4D 4F 4F 52 04 0C 00 00 07 00 00 00 03 00 00 00
-1A 00 00 00 F6 71 B4 D2 08 07 06 05 04 03 02 01
+4D 4F 4F 52 05 0C 00 00 07 00 00 00 03 00 00 00
+1A 00 00 00 08 7C B8 20 08 07 06 05 04 03 02 01
 03 00 00 00 04 0B 00 1B 5B 3F 32 30 30 34 3B 31
 24 79
 ```
@@ -1032,70 +1035,70 @@ A3 A6 BD 7C BD B7 BE 29 42 D6 DA DD C7 33 39 54
 **V28** — expanded `HEARTBEAT`, generation 7/sequence 4, monotonic value `0102030405060708`, with all five defined health bits set and reserved bits clear:
 
 ```
-4D 4F 4F 52 04 12 00 00 07 00 00 00 04 00 00 00
-09 00 00 00 2C A1 A4 A1 08 07 06 05 04 03 02 01
+4D 4F 4F 52 05 12 00 00 07 00 00 00 04 00 00 00
+09 00 00 00 D2 AC A8 53 08 07 06 05 04 03 02 01
 1F
 ```
 
 **V29** — fresh viewer lease grant followed by explicit release. The fresh request carries operation/role zero and 36 zero freshness bytes; the grant allocates epoch 3 and token `00..0F`; release echoes that tuple; released result carries outcome `02`, epoch 3, and zero token. Controller sequences are 4 then 5; holder sequences are 5 then 6:
 
 ```
-4D 4F 4F 52 04 15 00 00 07 00 00 00 04 00 00 00
-28 00 00 00 E9 9A 80 98 00 00 00 00 00 00 00 00
+4D 4F 4F 52 05 15 00 00 07 00 00 00 04 00 00 00
+28 00 00 00 17 97 8C 6A 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 16 00 00 07 00 00 00 05 00 00 00
-18 00 00 00 7B 45 6E 47 00 00 00 00 03 00 00 00
+4D 4F 4F 52 05 16 00 00 07 00 00 00 05 00 00 00
+18 00 00 00 85 48 62 B5 00 00 00 00 03 00 00 00
 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
 
-4D 4F 4F 52 04 17 00 00 07 00 00 00 05 00 00 00
-14 00 00 00 6F EA 86 AD 03 00 00 00 00 01 02 03
+4D 4F 4F 52 05 17 00 00 07 00 00 00 05 00 00 00
+14 00 00 00 91 E7 8A 5F 03 00 00 00 00 01 02 03
 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
 
-4D 4F 4F 52 04 16 00 00 07 00 00 00 06 00 00 00
-18 00 00 00 12 C2 2A 9C 02 00 00 00 03 00 00 00
+4D 4F 4F 52 05 16 00 00 07 00 00 00 06 00 00 00
+18 00 00 00 EC CF 26 6E 02 00 00 00 03 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
 **V30** — ordered clear request and every `LOG_CLEAR_RESULT` row. The request uses incarnation `00..0F`, observed index `P=5`, generation 7, controller sequence 6:
 
 ```
-4D 4F 4F 52 04 19 00 00 07 00 00 00 06 00 00 00
-18 00 00 00 FF 34 2D 9D 00 01 02 03 04 05 06 07
+4D 4F 4F 52 05 19 00 00 07 00 00 00 06 00 00 00
+18 00 00 00 01 39 21 6F 00 01 02 03 04 05 06 07
 08 09 0A 0B 0C 0D 0E 0F 05 00 00 00 00 00 00 00
 ```
 
 The six independent result fixtures are, in order: cleared (`epoch=3,P=5,index=7,E=9`); already empty (`epoch=2,P=5,index=6,E=9`); disabled (`epoch=0,P=0,index=0,end=0`); stale status (`epoch=2,P=5,index=6,current-end=8`); unavailable (`P=5`, other numeric fields zero); corrupt (`P=5`, other numeric fields zero). Holder sequences are 7 through 12:
 
 ```
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 07 00 00 00
-20 00 00 00 8B 88 87 B4 00 00 00 00 03 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 07 00 00 00
+20 00 00 00 75 85 8B 46 00 00 00 00 03 00 00 00
 05 00 00 00 00 00 00 00 07 00 00 00 00 00 00 00
 09 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 08 00 00 00
-20 00 00 00 55 89 E5 0C 01 00 00 00 02 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 08 00 00 00
+20 00 00 00 AB 84 E9 FE 01 00 00 00 02 00 00 00
 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00
 09 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 09 00 00 00
-20 00 00 00 72 F4 D9 45 01 00 00 00 00 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 09 00 00 00
+20 00 00 00 8C F9 D5 B7 01 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 0A 00 00 00
-20 00 00 00 1B 73 9D 9E 02 01 00 00 02 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 0A 00 00 00
+20 00 00 00 E5 7E 91 6C 02 01 00 00 02 00 00 00
 05 00 00 00 00 00 00 00 06 00 00 00 00 00 00 00
 08 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 0B 00 00 00
-20 00 00 00 3C 0E A1 D7 02 02 00 00 00 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 0B 00 00 00
+20 00 00 00 C2 03 AD 25 02 02 00 00 00 00 00 00
 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 
-4D 4F 4F 52 04 1A 00 00 07 00 00 00 0C 00 00 00
-20 00 00 00 38 0B F8 2D 02 03 00 00 00 00 00 00
+4D 4F 4F 52 05 1A 00 00 07 00 00 00 0C 00 00 00
+20 00 00 00 C6 06 F4 DF 02 03 00 00 00 00 00 00
 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00
 ```
@@ -1138,16 +1141,25 @@ CLI numeric fixtures are byte strings, parsed without locale:
 | `01k`, `1kb` | `-C` | invalid spelling |
 | `1k` | `tail -n` | invalid because tail counts are unsuffixed u32 |
 
-For the same-size redraw fixture, current and requested geometry are both `80 × 24`, the attach wins its lease, and redraw is `winch`: after the ACK/terminal-state/lease-result/replay prefix, exactly one platform resize notification is issued even though stored geometry remains `80 × 24`. Redraw `none` issues none; `ctrl_l` writes exactly byte `0C` instead of issuing a resize. No other unchanged geometry causes a notification.
+For the same-size redraw fixture, current and requested geometry are both `80 × 24`, the attach wins its lease, and the controller sends `REDRAW` after the ACK/terminal-state/lease-result/replay prefix: exactly one platform resize notification is issued even though stored geometry remains `80 × 24`. Redraw `none` issues none; `ctrl_l` writes exactly byte `0C` instead of sending `REDRAW`. An ordinary same-size `RESIZE` remains a no-op.
 
 **V33** — `WAKEUP` interposed between `HELLO_ACK` and `ATTACH_ACK`. `WAKEUP` is legal at EVERY post-`HELLO_ACK` phase (§7), and this is the exceptional pre-attach window an independent implementer would otherwise guess about. The sequence numbers are the real ones: `HELLO_ACK` consumed holder-direction sequence 1, so the interposed `WAKEUP` carries sequence 2, the `ATTACH_ACK` that follows carries sequence 3, and the terminal-state preamble carries sequence 4. The frame is header-only — kind `11`, generation 7, zero payload — and its CRC-32C covers the twenty header bytes:
 
 ```
-4D 4F 4F 52 04 11 00 00 07 00 00 00 02 00 00 00
-00 00 00 00 52 17 53 91
+4D 4F 4F 52 05 11 00 00 07 00 00 00 02 00 00 00
+00 00 00 00 AC 1A 5F 63
 ```
 
 A controller receiving this frame before its `ATTACH_ACK` continues its handshake unchanged: the frame creates no attach state, and the prefix that follows is byte-identical to the one an uninterrupted attach would deliver, at sequence numbers shifted by exactly one.
+
+**V34** — schema-5 `LIVE_ONLY` attach. Geometry is `0 × 0`, lease and `NON_VT` are clear, and only flag bit 2 is set. The controller-direction sequence is 2, generation is 7, and the five-byte payload is `00 00 00 00 04`:
+
+```
+4D 4F 4F 52 05 03 00 00 07 00 00 00 02 00 00 00
+05 00 00 00 D3 9D A3 6E 00 00 00 00 04
+```
+
+The holder sends the normal status-first prefix and no retained `GAP` or `OUTPUT`. A frame with attach flag bit 3 or above is malformed; bit 2 is never ignored or treated as a schema-4 reserved bit.
 
 ---
 
@@ -1161,13 +1173,13 @@ Beyond the serialized frames above, each case below is a vector the shipped bina
 
 **Private launch channels:** supervised allocation starting at 2 and a discriminator carrying generation 1 refused; missing discriminator with inherited generation variables producing an unsupervised holder with those variables stripped; every selector grammar boundary; exact V21/V22 records; each short prefix, one extra byte, missing EOF, duplicated inherited writer and deadline; wrong magic/format/flags/reserved/generation; instrumentation wrong/zero PID or nonce; selector handles outside the explicit inheritance list; launch selector absent from the requested child; instrumentation selector/nonce present only for that child and removed before its first application instruction; POSIX constructor ACK, descendant preload with no ACK variables, Linux `LD_PRELOAD` colon/dollar/whitespace path refusal, and macOS `DYLD_INSERT_LIBRARIES` colon path refusal. V31 covers every `MORR` state, wrong magic/format/state, nonzero success result, zero generation, short/long record, failed before adoption, ready before adoption, loss before adoption, and loss after adoption. Every failure leaves no published rendezvous or running requested child, and no private channel substitutes for another.
 
-**Geometry and CLI numeric fixtures:** V32's preserve pair, both mixed-zero orders, `1`, `32767`, and `32768` per-dimension edges, exact `2,000,000` product, one product above, and widened `32767×61/62` pair; ASCII-case-insensitive `k/m/g` and uppercase forms, maximum u64 unsuffixed value, maximum nonoverflowing suffixed value, multiplication overflow, leading zero, trailing byte, and suffix refusal by `tail -n`. The same-size `winch` fixture issues exactly one notification after the frozen attach prefix; ordinary unchanged geometry does not.
+**Geometry and CLI numeric fixtures:** V32's preserve pair, both mixed-zero orders, `1`, `32767`, and `32768` per-dimension edges, exact `2,000,000` product, one product above, and widened `32767×61/62` pair; ASCII-case-insensitive `k/m/g` and uppercase forms, maximum u64 unsuffixed value, maximum nonoverflowing suffixed value, multiplication overflow, leading zero, trailing byte, and suffix refusal by `tail -n`. A lease-authorized same-size `REDRAW` issues exactly one notification after the frozen attach prefix; an ordinary same-size `RESIZE` does not.
 
-**Preamble and replay:** all twelve mode groups emitted for exact tracked state in the exact order of §6; alternate-buffer selection preceding scroll-region restoration; arbitrary pre-existing combinations of mouse bits cleared before tracked bits are set; invalid/abandoned state clearing exactness and producing exactly one plain-zero-length preamble before an ACK whose mode-exact bit is clear; V26 `NON_VT` producing the same empty payload while the ACK retains actual exactness; RIS restoring exactness; no cursor position present anywhere in the payload; every representable tracked mode set by the child and restated on attach; a missing, second or pre-`ATTACH_ACK` preamble refused; probes/input-only connections receiving none; exact ACK/preamble/optional-result/replay/live ordering; preamble bytes absent from output/offset arithmetic; empty replay; complete replay from record 1; a 4 MiB whole-record retention boundary; discarded-prefix `GAP` then retained records; output arriving during replay ordered afterwards; a reconnecting controller discarding duplicates; main status bits 2–3 rejected when nonzero; no checkpoint frame or buffer-exactness claim.
+**Preamble and replay:** all twelve mode groups emitted for exact tracked state in the exact order of §6; alternate-buffer selection preceding scroll-region restoration; arbitrary pre-existing combinations of mouse bits cleared before tracked bits are set; invalid/abandoned state clearing exactness and producing exactly one plain-zero-length preamble after an ACK whose mode-exact bit is clear; V26 `NON_VT` producing the same empty payload while the ACK retains actual exactness; RIS restoring exactness; no cursor position present anywhere in the payload; every representable tracked mode set by the child and restated on attach; a missing, second or pre-`ATTACH_ACK` preamble refused; probes/input-only connections receiving none; exact ACK/preamble/optional-result prefix in both replay policies; retained-mode replay/live ordering; V34 live-only attach producing no retained `GAP` or `OUTPUT` and accepting the first later live record exactly at the descriptor frontier; preamble bytes absent from output/offset arithmetic; empty replay; complete replay from record 1; a 4 MiB whole-record retention boundary; discarded-prefix `GAP` then retained records; output arriving during replay ordered afterwards; a reconnecting retained controller discarding duplicates; attach bits 3–7 and main status bits 2–3 rejected when nonzero; no checkpoint frame or buffer-exactness claim.
 
 **Arbitration:** all five numeric classes in both CSI7/C1 forms, every query/reply grammar edge, private-mode exact byte echo, matched/mixed DCS/ST, cursor viewer-only silence, and V27's u64 correlation/u32 epoch/echoed class/plain-u16 lengths; a `QUERY` queued before its raw bytes; every candidate split at every boundary; 32-byte and 50 ms recognition edges; valid viewer reply at/beyond 250 ms; at most one answer; eligible synthesis and every silence branch; `NON_VT`/observer/no-viewer without identifier allocation; 64-outstanding overload precedence; final u64 id once and permanent exhaustion; cancellation order on disconnect/release; unsolicited, duplicate, expired, malformed, class-mismatched, wrong-generation/epoch and superseded replies discarded; OB-20 suppressing synthesis only; partial child-input write completed; every frozen reply byte-compared with no trailing NUL.
 
-**Lease, phases, and ordered clear:** every `15..1A` exact length/direction and `MORE` refusal; fresh viewer/input-only grant, busy, resume with atomic token rotation, mismatch reasons without token disclosure, explicit release result, valid/invalid keepalive, connected deadline transitions, transport reservation/expiry, epoch `FFFFFFFF` once then permanent exhaustion, random-token failure without epoch consumption, every legal/illegal connection-phase frame, attach shorthand/busy observer/observer upgrade/viewer resume/push, query cancellation before owner state removal, and V29's exact sequence. V30 covers clear admission precedence, all six outcome/reason rows, earlier work advancing the selected index, disabled `P==0`, clear barrier ordering, and missing/ambiguous result without retry.
+**Lease, phases, redraw, and ordered clear:** every `15..1B` exact length/direction and `MORE` refusal; fresh viewer/input-only grant, busy, resume with atomic token rotation, mismatch reasons without token disclosure, explicit release result, valid/invalid keepalive, connected deadline transitions, transport reservation/expiry, epoch `FFFFFFFF` once then permanent exhaustion, random-token failure without epoch consumption, every legal/illegal connection-phase frame, attach shorthand/busy observer/observer upgrade/viewer resume/push, same-size `REDRAW` distinct from change-only `RESIZE`, query cancellation before owner state removal, and V29's exact sequence. V30 covers clear admission precedence, all six outcome/reason rows, earlier work advancing the selected index, disabled `P==0`, clear barrier ordering, and missing/ambiguous result without retry.
 
 **Receipts and replay:** a fully written input; a pre-write refusal and partial-write refusal; a receipt whose incarnation does not match; replay of each written/refused outcome at exactly the high-water mark with identical flags/correlation/source/bytes returning the cached receipt payload in a newly sequenced frame **with no re-evaluation or second write**; the same id with any metadata or byte difference refused as `BAD_SEQUENCE`; an id below or more than one above refused; request-id exhaustion without wrap; lease-epoch reset and exhaustion without wrap; superseded lease refused. Receipt-required input covers unavailable/edge/wrong-capability source, notice refusal/timeout, producer replacement after prepared ACK, no PTY write before a still-current prepared ACK, write failure plus cancel, application-id conflict while a binding is retained, safe id reuse after resolution under a later never-reused tuple, and a normal transport receipt remaining distinct from the later application event.
 
