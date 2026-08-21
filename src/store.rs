@@ -55,11 +55,12 @@ impl Commit {
         out[9..12].copy_from_slice(&[self.slot, self.body, self.kind as u8]);
         out[12..16].copy_from_slice(&self.generation.to_le_bytes());
         out[16..20].copy_from_slice(&self.epoch.to_le_bytes());
-        for (field, value) in
-            out[24..56]
-                .chunks_exact_mut(8)
-                .zip([self.index, self.length, self.start, self.end])
-        {
+        for (field, value) in out[24..56].as_chunks_mut::<8>().0.iter_mut().zip([
+            self.index,
+            self.length,
+            self.start,
+            self.end,
+        ]) {
             field.copy_from_slice(&value.to_le_bytes());
         }
         out[56..88].copy_from_slice(&self.hash);
