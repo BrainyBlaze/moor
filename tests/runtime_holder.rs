@@ -352,7 +352,7 @@ fn live_holder_ancestry_refuses_attach_before_any_attach_state_change() {
 
     let mut malformed = connect_as_with(&mut runtime, Profile::Controller, true, Some(41));
     hello(&mut malformed, &mut runtime);
-    malformed.send(7, 3, &[0, 0, 0, 0, 4]);
+    malformed.send(7, 3, &[0, 0, 0, 0, 8]);
     assert_eq!(malformed.recv_kind(&mut runtime, 0x13).kind, 0x13);
     assert_eq!(checks.load(Ordering::Relaxed), 0);
 
@@ -386,7 +386,7 @@ fn live_holder_ancestry_refuses_attach_before_any_attach_state_change() {
         24u16.to_le_bytes().as_slice(),
     ]
     .concat();
-    unrelated.send(7, 0x0b, &resize);
+    unrelated.send(7, 0x1b, &resize);
     unrelated.send(7, 13, &[]);
     unrelated.recv_kind(&mut runtime, 14);
     assert_eq!(checks.load(Ordering::Relaxed), 2);
@@ -803,9 +803,9 @@ fn hello_mismatches_and_trailing_codec_faults_are_encoded_before_close() {
 
 #[test]
 fn a_foreign_wire_version_closes_only_its_own_connection_and_leaves_the_session_unchanged() {
-    // OB-43 leans on this: a controller of a retired dialect meets a live v4
-    // holder and must be refused deterministically without disturbing anything
-    // the holder already serves or will serve to a compatible controller.
+    // OB-43 leans on this: a controller of a retired dialect meets a live
+    // schema-5 holder and must be refused deterministically without disturbing
+    // anything the holder already serves or will serve to a compatible controller.
     let (mut runtime, root) = fixture();
 
     // An incumbent compatible controller is adopted on its exact allocated
@@ -850,14 +850,15 @@ fn a_foreign_wire_version_closes_only_its_own_connection_and_leaves_the_session_
             &mut bytes,
         )
         .unwrap();
-    assert_eq!(bytes[4], 4, "the frozen v4 header version byte moved");
-    bytes[4] = 3;
+    assert_eq!(bytes[4], 5, "the frozen schema-5 header version byte moved");
+    bytes[4] = 4;
     let checksum = wire::crc32c(&bytes[..20]);
     bytes[20..24].copy_from_slice(&checksum.to_le_bytes());
     foreign.raw(&bytes);
 
-    // The refusal is framed in the holder's own v4 dialect (this peer's v4
-    // codec decodes it; a real v3 peer could not) and names UNKNOWN_VERSION.
+    // The refusal is framed in the holder's own schema-5 dialect (this peer's
+    // current codec decodes it; a real schema-4 peer could not) and names
+    // UNKNOWN_VERSION.
     let error = foreign.recv_kind(&mut runtime, 0x13);
     let (code, text) = wire::decode_error_payload(&error.payload).unwrap();
     assert_eq!(code, 1, "controller error code 1 is UNKNOWN_VERSION");
@@ -1413,6 +1414,44 @@ fn non_vt_attach_omits_terminal_bytes_without_erasing_tracked_exactness() {
     let status = peer.recv_kind(&mut runtime, 4);
     assert_eq!(status.payload[36] & 2, 2);
     assert_eq!(peer.recv_kind(&mut runtime, 5).payload.as_ref(), [0, 0]);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn live_only_attach_skips_retained_frames_and_accepts_live_output() {
+    let (mut runtime, root) = fixture();
+    runtime.output(b"retained".to_vec());
+
+    let mut peer = connect(&mut runtime);
+    hello(&mut peer, &mut runtime);
+    peer.send(7, 3, &[0, 0, 0, 0, 0b0000_0101]);
+    peer.recv_kind(&mut runtime, 4);
+    peer.recv_kind(&mut runtime, 5);
+    peer.recv_kind(&mut runtime, 0x16);
+
+    for _ in 0..4 {
+        runtime.poll();
+    }
+    while let Some(message) = peer.try_recv(&mut runtime) {
+        assert!(
+            !matches!(message.kind, 6 | 8),
+            "live-only attach replayed retained output"
+        );
+    }
+
+    runtime.output(b"live".to_vec());
+    let output = peer.recv_kind(&mut runtime, 6);
+    assert_eq!(
+        u64::from_le_bytes(output.payload[..8].try_into().unwrap()),
+        2
+    );
+    assert_eq!(
+        u64::from_le_bytes(output.payload[8..16].try_into().unwrap()),
+        8
+    );
+    assert_eq!(&output.payload[16..], b"live");
+
     drop(runtime);
     fs::remove_dir_all(root).unwrap();
 }
@@ -2715,7 +2754,7 @@ fn failed_resume_lease_reply_send_restores_the_entire_prior_reservation() {
 }
 
 #[test]
-fn geometry_notifications_are_change_only_with_one_attach_redraw() {
+fn geometry_notifications_are_change_only_and_redraw_is_explicit() {
     use std::sync::{Arc, Mutex};
 
     struct CountResize(Arc<Mutex<Vec<(bool, u16, u16)>>>);
@@ -2830,7 +2869,15 @@ fn geometry_notifications_are_change_only_with_one_attach_redraw() {
         24u16.to_le_bytes().as_slice(),
     ]
     .concat();
-    redraw_owner.send(7, 0x0b, &resize);
+    redraw_owner.send(7, 0x1b, &resize);
+    redraw_owner.send(7, 13, &[]);
+    let response = redraw_owner.recv(&mut runtime);
+    assert_eq!(
+        response.kind,
+        14,
+        "{:?}",
+        wire::decode_error_payload(&response.payload)
+    );
     redraw_owner.send(7, 0x0b, &resize);
     for (rows, columns) in [(30u16, 100u16), (30, 100), (40, 120), (40, 120), (30, 100)] {
         let resize = [

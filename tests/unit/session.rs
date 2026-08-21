@@ -10,6 +10,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_only_attach_skips_retained_output_without_disabling_live_output() {
+        let mut machine = Machine::new(7, [1; 16], [2; 16]);
+        let retained = machine
+            .transition(Transition::Output(1, b"retained".to_vec()))
+            .unwrap();
+        assert!(retained.iter().any(|effect| matches!(effect, Effect::Output(None, _))));
+
+        machine.register_controller(7);
+        let attached = machine
+            .transition(Transition::Peer(
+                2,
+                7,
+                Request::Attach(
+                    0,
+                    0,
+                    true,
+                    false,
+                    ReplayPolicy::LiveOnly,
+                    Some([3; 16]),
+                ),
+            ))
+            .unwrap();
+        assert!(attached.iter().any(|effect| matches!(effect, Effect::Attached(7, false, Some(result), None) if result.outcome == ResultOutcome::Granted)));
+        assert!(!attached.iter().any(|effect| matches!(effect, Effect::Gap(7, _) | Effect::Output(Some(7), _))));
+
+        let input = machine
+            .transition(Transition::Peer(
+                2,
+                7,
+                Request::Input(plain_input(1, b"x"), None),
+            ))
+            .unwrap();
+        assert!(input.iter().any(|effect| matches!(effect, Effect::Write(_, bytes) if bytes == b"x")));
+
+        let live = machine
+            .transition(Transition::Output(3, b"live".to_vec()))
+            .unwrap();
+        assert!(live.iter().any(|effect| matches!(effect, Effect::Output(None, record) if record.bytes.as_ref() == b"live")));
+    }
+
+    #[test]
+    fn redraw_requires_the_current_viewer_lease_and_emits_a_distinct_effect() {
+        let mut machine = attached_viewer(1);
+
+        let redraw = machine
+            .transition(Transition::Peer(
+                1,
+                7,
+                Request::Redraw(1, 80, 24),
+            ))
+            .unwrap();
+        assert!(matches!(redraw.as_slice(), [Effect::Redraw(7, 24, 80)]));
+
+        machine.register_controller(8);
+        assert!(matches!(
+            machine.transition(Transition::Peer(
+                2,
+                8,
+                Request::Redraw(1, 80, 24),
+            )),
+            Err(WireError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn zero_replay_limit_exposes_an_empty_sequence_and_byte_frontier() {
+        let mut machine = Machine::new(7, [1; 16], [2; 16]);
+        machine.configure(b"session".to_vec(), 0);
+        machine
+            .transition(Transition::Output(1, b"discarded".to_vec()))
+            .unwrap();
+
+        assert_eq!(
+            machine.status(7).replay,
+            ReplayDescriptor {
+                first: 2,
+                last: 1,
+                start: 9,
+                end: 9,
+                complete: false,
+                modes_exact: false,
+            }
+        );
+
+        machine.register_controller(7);
+        let attached = machine
+            .transition(Transition::Peer(
+                2,
+                7,
+                Request::Attach(0, 0, false, false, ReplayPolicy::Retained, None),
+            ))
+            .unwrap();
+        assert!(attached.iter().any(|effect| matches!(effect, Effect::Gap(7, 1))));
+        assert!(!attached.iter().any(|effect| matches!(effect, Effect::Output(Some(7), _))));
+    }
+
+    #[test]
+    fn retained_attach_preserves_the_existing_replay_contract() {
+        let mut machine = Machine::new(7, [1; 16], [2; 16]);
+        machine
+            .transition(Transition::Output(1, b"retained".to_vec()))
+            .unwrap();
+        machine.register_controller(7);
+
+        let attached = machine
+            .transition(Transition::Peer(
+                2,
+                7,
+                Request::Attach(0, 0, false, false, ReplayPolicy::Retained, None),
+            ))
+            .unwrap();
+        assert!(attached.iter().any(|effect| matches!(effect, Effect::Output(Some(7), record) if record.bytes.as_ref() == b"retained")));
+    }
+
     fn attached_viewer(next: u64) -> Machine {
         let mut machine = Machine::new(7, [1; 16], [2; 16]);
         machine.query_next = next;
@@ -18,7 +133,7 @@ mod tests {
             .transition(Transition::Peer(
                 0,
                 7,
-                Request::Attach(0, 0, true, false, Some([3; 16])),
+                Request::Attach(0, 0, true, false, ReplayPolicy::Retained, Some([3; 16])),
             ))
             .unwrap();
         machine
@@ -47,7 +162,7 @@ mod tests {
             .transition(Transition::Peer(
                 4,
                 conn,
-                Request::Attach(0, 0, false, false, None),
+                Request::Attach(0, 0, false, false, ReplayPolicy::Retained, None),
             ))
             .unwrap();
     }

@@ -116,7 +116,16 @@ pub const fn legal_in_phase(phase: Phase, kind: u8) -> bool {
         1 << 9 | 1 << 23 | 1 << 24,
         1 << 3 | 1 << 23 | 1 << 24,
         1 << 7 | 1 << 13 | 1 << 15 | 1 << 21 | 1 << 25,
-        1 << 7 | 1 << 9 | 1 << 11 | 1 << 12 | 1 << 13 | 1 << 15 | 1 << 23 | 1 << 24 | 1 << 25,
+        1 << 7
+            | 1 << 9
+            | 1 << 11
+            | 1 << 12
+            | 1 << 13
+            | 1 << 15
+            | 1 << 23
+            | 1 << 24
+            | 1 << 25
+            | 1 << 27,
         0,
     ];
     kind < 32 && MASKS[phase as usize] & (1 << kind) != 0
@@ -348,9 +357,15 @@ schema!(struct pub ReceiptProjection pub fields; receipt: ApplicationReceipt, st
 schema!(struct pub PolicyStatus derive [Clone, Copy, Debug, Eq, PartialEq] pub fields; owns_lease: bool, viewers: bool, lease_epoch: u32, semantic_flags: u8, semantic_pending: u16, query_available: bool, replay: ReplayDescriptor);
 schema!(struct pub OutputRecord derive [Clone, Debug, Eq, PartialEq] pub fields; sequence: u64, offset: u64, bytes: Arc<[u8]>);
 schema!(enum pub Reply [Clone, Debug, Eq, PartialEq]; Lease(LeaseResult), Input(Vec<u8>), Notice(InputNotice), NoticeCancel(ApplicationReceipt), SemanticAck(SemanticAck), SemanticRefused(Option<SemanticEvent>, SemanticRefusal), SemanticHello(SemanticHelloAck), ControllerError(u16, &'static [u8]), Termination(u8, u8, u8, &'static [u8]));
-schema!(enum pub Effect; Send(ConnId, Reply), LeaseReply(ConnId, LeaseResult), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16), Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool), CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>), QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64), OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
+schema!(enum pub Effect; Send(ConnId, Reply), LeaseReply(ConnId, LeaseResult), Attached(ConnId, bool, Option<LeaseResult>, Option<(u16, u16)>), Resize(ConnId, u16, u16), Redraw(ConnId, u16, u16), Write(WriteTicket, Vec<u8>), CommitSources(CommitTicket, Vec<SemanticChange>, bool), CommitSemantic(CommitTicket, Vec<u8>, u32, [u8; 16], SemanticEvent, Option<ReceiptProjection>), QuerySend(ConnId, Query), Output(Option<ConnId>, OutputRecord), Gap(ConnId, u64), OutputExhausted, Terminate(bool), ReportTermination(ConnId), Flush(ConnId, u64), Close(ConnId), Replaced(ConnId));
 schema!(enum pub Completion; Write(u64, Option<u16>), Sources(bool), Semantic(Result<EventPosition, SemanticRefusal>));
-schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>), Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16), Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello), SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat, QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayPolicy {
+    Retained,
+    LiveOnly,
+}
+
+schema!(enum pub Request<'a>; Attach(u16, u16, bool, bool, ReplayPolicy, Option<[u8; 16]>), Lease(LeaseRequest, Option<[u8; 16]>), Release(u32, [u8; 16]), Keepalive(u32, [u8; 16]), Resize(u32, u16, u16), Redraw(u32, u16, u16), Input(OwnedInput, Option<ApplicationInput>), NoticeAck(InputNoticeAck), SemanticHello(SemanticHello), SemanticEvent(SemanticEvent, Option<ReceiptProjection>), SemanticHeartbeat, QueryReply(u64, u32, u8, &'a [u8]), OutputAck(u64), Terminate(&'a [u8], u32, [u8; 16], bool));
 schema!(enum pub Transition<'a>; Peer(u64, ConnId, Request<'a>), Complete(u64, CommitTicket, Completion), Query(u64, Arc<[u8]>, QueryShape, Option<Vec<u8>>), Output(u64, Vec<u8>), Shutdown(u64, bool), TerminationApplied(u8, bool), ReportTermination(ConnId), Retired(bool, bool), Tick(u64), Disconnect(ConnId), Writable(bool), Ending);
 pub type Effects = SmallVec<[Effect; 4]>;
 
@@ -684,8 +699,8 @@ impl Machine {
                 .count() as u16,
             query_available: self.query_next != 0,
             replay: ReplayDescriptor {
-                first: range.map_or(0, |records| records.0.sequence),
-                last: range.map_or(0, |records| records.1.sequence),
+                first: range.map_or(self.next_sequence, |records| records.0.sequence),
+                last: range.map_or(self.lost, |records| records.1.sequence),
                 start: range.map_or(self.next_offset, |records| records.0.offset),
                 end: self.next_offset,
                 complete: self.lost == 0,
@@ -1340,7 +1355,7 @@ impl Machine {
         request: Request<'a>,
     ) -> Result<(), WireError> {
         match request {
-            Request::Attach(columns, rows, lease, non_vt, token) => {
+            Request::Attach(columns, rows, lease, non_vt, replay, token) => {
                 return_if!(!self.geometry(conn, columns, rows), Ok(()));
                 let phase = self.phase(conn).ok_or(WireError::Malformed)?;
                 let resumed = phase == Phase::Resumed && !lease && self.lease.owner == Some(conn);
@@ -1360,15 +1375,17 @@ impl Machine {
                 let resize = (columns != 0 && owns).then_some((rows, columns));
                 self.effects
                     .push(Effect::Attached(conn, non_vt, result, resize));
-                if self.lost != 0 {
-                    self.effects.push(Effect::Gap(conn, self.lost));
+                if replay == ReplayPolicy::Retained {
+                    if self.lost != 0 {
+                        self.effects.push(Effect::Gap(conn, self.lost));
+                    }
+                    self.effects.extend(
+                        self.replay
+                            .iter()
+                            .cloned()
+                            .map(|record| Effect::Output(Some(conn), record)),
+                    );
                 }
-                self.effects.extend(
-                    self.replay
-                        .iter()
-                        .cloned()
-                        .map(|record| Effect::Output(Some(conn), record)),
-                );
             }
             Request::Lease(request, token) => {
                 let phase = self.phase(conn).ok_or(WireError::Malformed)?;
@@ -1395,6 +1412,14 @@ impl Machine {
                 require_policy(self.touch_lease(conn, epoch, None, now))?;
                 if columns != 0 {
                     self.effects.push(Effect::Resize(conn, rows, columns));
+                }
+            }
+            Request::Redraw(epoch, columns, rows) => {
+                return_if!(!self.geometry(conn, columns, rows), Ok(()));
+                self.expire_lease(now);
+                require_policy(self.touch_lease(conn, epoch, None, now))?;
+                if columns != 0 {
+                    self.effects.push(Effect::Redraw(conn, rows, columns));
                 }
             }
             Request::Input(input, application) => self.input(conn, now, input, application),

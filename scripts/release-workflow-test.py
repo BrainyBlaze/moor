@@ -319,7 +319,7 @@ def main():
     for item in (
         "candidate-install",
         "binary-identity",
-        "v4-dialect",
+        "v5-dialect",
         "session-create",
         "provider-identity",
         "resume-argv",

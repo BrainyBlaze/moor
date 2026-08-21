@@ -142,13 +142,14 @@ length_field!(
 );
 
 type ProfileRules = ([u8; 4], u8, usize, usize, u8, u32, &'static [(u8, usize)]);
+const CONTROLLER_VERSION: u8 = 5;
 const PROFILES: [ProfileRules; 2] = [
     (
         *b"MOOR",
-        4,
+        CONTROLLER_VERSION,
         1 << 20,
         16 << 20,
-        0x1a,
+        0x1b,
         1 << 1,
         &[
             (10, 43),
@@ -159,6 +160,7 @@ const PROFILES: [ProfileRules; 2] = [
             (0x18, 20),
             (0x19, 24),
             (0x1a, 32),
+            (0x1b, 8),
         ],
     ),
     (*b"MOOS", 1, 1 << 16, 1 << 20, 0x0a, 1 << 1 | 1 << 9, &[]),
@@ -343,6 +345,7 @@ pub fn log_clear_payload(incarnation: [u8; 16], observed: u64) -> Result<[u8; 24
 
 wire_rules!(pure pub fn input_payload(epoch: u32, request: u64, bytes: &[u8]) -> Vec<u8> = wire_rules!(write epoch.to_le_bytes(); request.to_le_bytes(); [0]; bytes));
 wire_rules!(pure pub fn resize_payload(epoch: u32, rows: u16, columns: u16) -> [u8; 8] = fixed_payload::<8>(&[(0, &epoch.to_le_bytes()), (4, &columns.to_le_bytes()), (6, &rows.to_le_bytes())]).expect("fixed resize layout"));
+wire_rules!(pure pub fn redraw_payload(epoch: u32, rows: u16, columns: u16) -> [u8; 8] = fixed_payload::<8>(&[(0, &epoch.to_le_bytes()), (4, &columns.to_le_bytes()), (6, &rows.to_le_bytes())]).expect("fixed redraw layout"));
 wire_rules!(pure pub(crate) fn attach_payload(size: (u16, u16), flags: u8) -> [u8; 5] = fixed_payload::<5>(&[(0, &size.1.to_le_bytes()), (2, &size.0.to_le_bytes()), (4, &[flags])]).expect("fixed attach layout"));
 wire_rules!(pure pub fn terminate_request_payload(identity: &[u8], generation: u32, incarnation: [u8; 16], force: bool) -> Result<Vec<u8>, WireError> = { let mut payload = Vec::with_capacity(identity.len() + 23); put_wide(&mut payload, identity)?; payload.extend_from_slice(&generation.to_le_bytes()); payload.extend_from_slice(&incarnation); payload.push(force.into()); Ok(payload) });
 
@@ -413,10 +416,10 @@ wire_rules!(pure pub fn encode_reply(reply: Reply, incarnation: [u8; 16]) -> Run
 wire_rules!(pure fn semantic_code(error: SemanticRefusal) -> u16 = [10, 5, 5, 6, 12, 7, 8, 11, 14, 6, 8, 9, 10, 15][error as usize]);
 wire_rules!(pure pub fn error_payload(code: u16, diagnostic: &[u8]) -> Vec<u8> = wire_rules!(write code.to_le_bytes(); (diagnostic.len() as u16).to_le_bytes(); diagnostic));
 wire_rules!(pure pub fn decode_error_payload(payload: &[u8]) -> Option<(u16, &[u8])> = { let code = u16::from_le_bytes(payload.get(..2)?.try_into().ok()?); get_compact(payload, 2, true).map(|text| (code, text)) });
-wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(b"MOOR\x04\0\0".to_vec(), identity));
+wire_rules!(pure pub fn controller_hello(identity: &[u8]) -> Result<Vec<u8>, WireError> = with_wide(wire_rules!(write *b"MOOR"; [CONTROLLER_VERSION]; [0; 2]), identity));
 
-wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [4]; generation.to_le_bytes(); incarnation), identity) });
-wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == 4 && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
+wire_rules!(pure pub fn controller_hello_ack(generation: u32, incarnation: [u8; 16], identity: &[u8]) -> Result<Vec<u8>, WireError> = { well_formed(generation != 0 && nonzero(&incarnation))?; with_wide(wire_rules!(write [CONTROLLER_VERSION]; generation.to_le_bytes(); incarnation), identity) });
+wire_rules!(pure pub fn decode_controller_hello_ack(scope: u32, payload: &[u8], identity: &[u8]) -> Option<(u32, [u8; 16])> = { let mut input = Reader(payload); let (accepted, generation, incarnation) = (input.byte().ok()?, input.u32().ok()?, input.identifier().ok()?); (accepted == CONTROLLER_VERSION && generation != 0 && scope == generation && input.wide().ok()? == identity && input.end().is_ok()).then_some((generation, incarnation)) });
 
 pub use crc32c::crc32c;
 
@@ -453,7 +456,7 @@ pub fn decode_viewer<'a>(
             let consistent = stream.next.is_none_or(|(sequence, offset)| if replay.first == 0 { offset == replay.end } else {
                 replay.first <= sequence && sequence <= replay.last.saturating_add(1) && (sequence != replay.first || offset == replay.start) && (sequence != replay.last.saturating_add(1) || offset == replay.end)
             });
-            // v4 status-first attach: the descriptor is the FIRST item of the
+            // Schema-5 status-first attach: the descriptor is the FIRST item of the
             // prefix, so the viewer knows the authoritative geometry and
             // replay window before any terminal bytes arrive. A descriptor
             // after terminal-state is the retired v3 order and is malformed.
@@ -511,8 +514,8 @@ pub fn decode_controller(
 ) -> Result<ControllerRequest<'_>, WireError> {
     use ControllerRequest::*;
     wire_rules!(bounded payload; input => match kind {
-        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x04\0\0")?; Hello(input.wide()?) },
-        3 => { let (columns, rows, flags) = (input.u16()?, input.u16()?, input.byte()?); well_formed(flags & !3 == 0)?; wire_rules!(controller Attach; columns; rows; flags & 1 != 0; flags & 2 != 0; token) },
+        1 => { well_formed(input.exact::<7>()? == *b"MOOR\x05\0\0")?; Hello(input.wide()?) },
+        3 => { let (columns, rows, flags) = (input.u16()?, input.u16()?, input.byte()?); well_formed(flags & !7 == 0)?; let replay = if flags & 4 == 0 { crate::session::ReplayPolicy::Retained } else { crate::session::ReplayPolicy::LiveOnly }; wire_rules!(controller Attach; columns; rows; flags & 1 != 0; flags & 2 != 0; replay; token) },
         7 => wire_rules!(controller OutputAck; input.u64()?),
         9 => { let (epoch, request_id, form) = (input.u32()?, input.u64()?, input.byte()?); let exact_payload = payload.into();
             let application = match form { 0 => { input.rest(); None }, 1 => {
@@ -530,6 +533,7 @@ pub fn decode_controller(
         0x17 => wire_rules!(controller Release; input.positive()?; input.identifier()?),
         0x18 => wire_rules!(controller Keepalive; input.positive()?; input.identifier()?),
         0x19 => LogClear(input.identifier()?, input.u64()?),
+        0x1b => wire_rules!(controller Redraw; input.u32()?; input.u16()?; input.u16()?),
         _ => return Err(WireError::Malformed),
     })
 }
@@ -572,7 +576,7 @@ binary_record!(RawStatusTail => TailRecord[69] error WireError = WireError::Malf
 
 impl StatusTail {
     wire_rules!(method fn valid(this: &Self) -> bool = { let replay = this.replay;
-        let range = replay.first == 0 && replay.last == 0 && replay.start == replay.end || replay.first != 0 && replay.first <= replay.last && replay.start < replay.end;
+        let range = replay.last.checked_add(1) == Some(replay.first) && replay.start == replay.end || replay.first != 0 && replay.first <= replay.last && replay.start < replay.end;
         range && replay.complete == (replay.first <= 1 && replay.start == 0) && this.semantic_flags & !7 == 0 && this.semantic_pending <= 512 && (!this.owns_lease || this.lease_epoch != 0) && valid_size((this.rows, this.columns))
     });
     wire_rules!(method pub fn encode(this: &Self) -> Result<[u8; 69], WireError> = { well_formed(this.valid())?;

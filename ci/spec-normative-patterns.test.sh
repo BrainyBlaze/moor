@@ -3,8 +3,9 @@
 # and PROVE the refusal works by injecting every retired concept into a
 # throwaway copy and requiring the guard to fail on it.
 #
-# Revision 4 retired a set of normative statements: wire-schema-3 naming and
-# self-naming, the terminal-state-before-ATTACH_ACK attach order, the v1
+# Revision 5 retains revision 4's retired surfaces and additionally retires
+# wire-schema-4 self-naming and controller byte 04. The forbidden set includes
+# the terminal-state-before-ATTACH_ACK attach order and the v1
 # lifecycle body, a normative `ended:"terminated"` branch, grammar rows for
 # the dash-spelled command tokens, the retired controller version byte in
 # frozen vectors, and the dual-carrier ancestry surface. Each of them was
@@ -33,16 +34,16 @@ check() {
         printf '%s\n' "$2" | sed 's/^/    /'
     }
 
-    # 1. The current revision is wire-schema-4; v3 naming and version-3
-    #    self-naming may survive only in spec/README.md's history note.
-    if hits=$(grep -nE 'wire v3|Wire v3|wire-schema-3|version 3|Version 3|[Ww]ire schema 3' $docs); then
+    # 1. The current revision is wire-schema-5. Current self-naming as v3 or
+    #    v4 is retired; historical prose uses "revision 4" or "schema-4".
+    if hits=$(grep -nE 'wire v[34]|Wire v[34]|wire-schema-[34]|version [34]|Version [34]|[Ww]ire schema [34]' $docs); then
         flag "retired revision naming:" "$hits"
     fi
 
-    # 2. The v4 attach prefix is status-first. Every retired spelling of the
+    # 2. The v5 attach prefix remains status-first. Every retired spelling of the
     #    old order is refused: the before-ATTACH_ACK phrase, the
     #    preamble-then-ACK sequence in prose or path form, and coverage rows
-    #    that refuse a POST-ACK preamble (v4 refuses a PRE-ACK one).
+    #    that refuse a POST-ACK preamble (v5 refuses a PRE-ACK one).
     if hits=$(grep -nE 'before `ATTACH_ACK`|before\*\* the attach acknowledgement|preamble/ACK|preamble.*, then `ATTACH_ACK`|post-`ATTACH_ACK` preamble|preamble was applied first|the following ACK' $docs); then
         flag "retired attach order:" "$hits"
     fi
@@ -67,8 +68,8 @@ check() {
         flag "retired dash-token grammar:" "$hits"
     fi
 
-    # 6. The controller version byte is 04 in every frozen hex vector.
-    if hits=$(grep -nE '4D 4F 4F 52 03|MOOR\\x03' $docs); then
+    # 6. The controller version byte is 05 in every frozen hex vector.
+    if hits=$(grep -nE '4D 4F 4F 52 0[34]|MOOR\\x0[34]' $docs); then
         flag "retired controller version byte:" "$hits"
     fi
 
@@ -96,6 +97,8 @@ trap 'rm -rf "$work"' EXIT
 
 injections="wire-schema-3 is the current revision
 the schema is at version 3 today
+wire-schema-4 is the current revision
+the schema is at version 4 today
 TERMINAL_STATE is sent before \`ATTACH_ACK\` on attach
 It is sent exactly once, and before** the attach acknowledgement.
 the viewer receives the ordinary preamble/ACK/baseline
@@ -108,6 +111,7 @@ the holder reports ended:\"terminated\" for a holder terminate
 | \`-A\` | attach or create | — |
 after a modern or legacy command token the options follow
 4D 4F 4F 52 03 01 00 00
+4D 4F 4F 52 04 01 00 00
 the program writes \`_SESSION\` for its ancestry
 current falls back to the legacy carrier
 the holder writes both carriers on every session

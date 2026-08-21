@@ -13,7 +13,8 @@ use crate::unix as platform;
 use crate::wire::{
     Codec, InputReceipt, Message, Profile, StatusTail, controller_hello,
     decode_controller_hello_ack, decode_error_payload, decode_log_clear_result,
-    decode_terminate_result, input_payload, resize_payload, terminate_request_payload,
+    decode_terminate_result, input_payload, redraw_payload, resize_payload,
+    terminate_request_payload,
 };
 use interprocess::TryClone;
 use std::ffi::OsStr;
@@ -347,6 +348,10 @@ impl InputLease {
 
     pub(crate) fn resize(&self, client: &mut Client, rows: u16, columns: u16) -> Result<()> {
         client.send(0x0b, &resize_payload(self.epoch, rows, columns))
+    }
+
+    pub(crate) fn redraw(&self, client: &mut Client, rows: u16, columns: u16) -> Result<()> {
+        client.send(0x1b, &redraw_payload(self.epoch, rows, columns))
     }
 
     pub(crate) fn control(&self, client: &mut Client, kind: u8) -> Result<()> {

@@ -1,6 +1,6 @@
 use moor::session::{
-    LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, Request as PolicyRequest, ResultOutcome,
-    ResultReason,
+    LeaseOperation, LeaseRequest, LeaseResult, LeaseRole, ReplayPolicy, Request as PolicyRequest,
+    ResultOutcome, ResultReason,
 };
 use moor::wire::{
     Codec, ControllerRequest, Heartbeat, InputReceipt, Message, Profile, Query, ReplayDescriptor,
@@ -8,8 +8,8 @@ use moor::wire::{
     controller_hello_ack, crc32c, decode_controller, decode_controller_hello_ack,
     decode_log_clear_result, decode_query, decode_semantic, decode_terminate_result, decode_viewer,
     get_wide, input_payload, lease_token_payload, log_clear_payload, log_clear_result_payload,
-    put_compact, put_wide, resize_payload, terminate_request_payload, terminate_result_payload,
-    validate_status_flags,
+    put_compact, put_wide, redraw_payload, resize_payload, terminate_request_payload,
+    terminate_result_payload, validate_status_flags,
 };
 
 fn progressed_codec(profile: Profile, next_in: u32, next_out: u32) -> Codec {
@@ -42,11 +42,11 @@ fn progressed_codec(profile: Profile, next_in: u32, next_out: u32) -> Codec {
 #[test]
 fn viewer_decoder_types_borrowed_stream_records_and_rejects_bad_boundaries() {
     let mut stream = ViewerStream {
-        // v4 status-first: terminal bytes are legal only after the
+        // Schema-5 status-first: terminal bytes are legal only after the
         // descriptor, so a terminal-typing fixture models a post-status
         // stream explicitly.
         replay: Some(ReplayDescriptor {
-            first: 0,
+            first: 1,
             last: 0,
             start: 0,
             end: 0,
@@ -89,7 +89,7 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         columns: 80,
         rows: 24,
         replay: ReplayDescriptor {
-            first: 0,
+            first: 1,
             last: 0,
             start: 0,
             end: 0,
@@ -119,7 +119,7 @@ fn viewer_decoder_accepts_contiguous_live_output_after_the_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &ack, expected), Ok(None));
-    // v4 status-first: the terminal preamble follows the descriptor.
+    // Schema-5 status-first: the terminal preamble follows the descriptor.
     assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     for (sequence, offset, bytes) in [(1_u64, 0_u64, b"a".as_slice()), (2, 1, b"bc".as_slice())] {
@@ -201,7 +201,7 @@ fn viewer_decoder_requires_the_new_connection_to_receive_its_frozen_baseline() {
         payload: payload.as_slice().into(),
     };
     assert_eq!(decode_viewer(&mut stream, &status, expected), Ok(None));
-    // v4 status-first: the terminal preamble follows the descriptor.
+    // Schema-5 status-first: the terminal preamble follows the descriptor.
     assert!(decode_viewer(&mut stream, &terminal, expected).is_ok());
 
     let live_payload = [&4_u64.to_le_bytes()[..], &3_u64.to_le_bytes(), b"x"].concat();
@@ -221,7 +221,7 @@ fn expected_identity() -> (&'static [u8], u32, [u8; 16]) {
 }
 
 /// A stream whose connection consumed the `ATTACH_ACK` descriptor but NOT yet
-/// the mandatory `TERMINAL_STATE`. Every v4 prefix follower fed to this stream
+/// the mandatory `TERMINAL_STATE`. Every schema-5 prefix follower fed to this stream
 /// is overtaking the frozen order.
 fn descriptor_only(first: u64) -> ViewerStream {
     let mut stream = ViewerStream::default();
@@ -460,6 +460,7 @@ fn inbound_fixed_size_kinds_admit_exactly_their_frozen_length() {
         (0x18, 20),
         (0x19, 24),
         (0x1a, 32),
+        (0x1b, 8),
     ];
     for &(kind, size) in FIXED {
         // Positive control: the exact frozen length passes the framing layer
@@ -639,17 +640,17 @@ fn decode_status(payload: &[u8]) -> Result<StatusTail, WireError> {
 }
 
 const V1: &str = "
-4D 4F 4F 52 04 01 00 00 07 00 00 00 01 00 00 00
-21 00 00 00 3E C8 F1 24 4D 4F 4F 52 04 00 00 16
+4D 4F 4F 52 05 01 00 00 07 00 00 00 01 00 00 00
+21 00 00 00 C0 C5 FD D6 4D 4F 4F 52 05 00 00 16
 00 00 00 01 2F 74 6D 70 2F 2E 6D 6F 6F 72 2D 31
 30 30 30 2F 62 75 69 6C 64";
 
 const V7: &str = "
-4D 4F 4F 52 04 09 01 00 07 00 00 00 14 00 00 00
-11 00 00 00 2B BD A3 90 03 00 00 00 01 00 00 00
-00 00 00 00 00 41 41 41 41 4D 4F 4F 52 04 09 00
-00 07 00 00 00 15 00 00 00 02 00 00 00 4E AD DE
-06 42 42";
+4D 4F 4F 52 05 09 01 00 07 00 00 00 14 00 00 00
+11 00 00 00 D5 B0 AF 62 03 00 00 00 01 00 00 00
+00 00 00 00 00 41 41 41 41 4D 4F 4F 52 05 09 00
+00 07 00 00 00 15 00 00 00 02 00 00 00 B0 A0 D2
+F4 42 42";
 
 const V14: &str = "
 4D 4F 4F 53 01 01 00 00 00 00 00 00 01 00 00 00
@@ -670,9 +671,16 @@ fn controller_identity_payloads_share_one_exact_codec() {
     let incarnation = [7; 16];
     let ack = controller_hello_ack(42, incarnation, identity).unwrap();
     assert_eq!(
+        ack[0], 5,
+        "HELLO_ACK must advertise the active controller schema"
+    );
+    assert_eq!(
         decode_controller_hello_ack(42, &ack, identity),
         Some((42, incarnation))
     );
+    let mut legacy = ack.clone();
+    legacy[0] = 4;
+    assert_eq!(decode_controller_hello_ack(42, &legacy, identity), None);
     assert_eq!(decode_controller_hello_ack(41, &ack, identity), None);
     assert_eq!(decode_controller_hello_ack(42, &ack, b"another"), None);
     assert!(controller_hello_ack(0, incarnation, identity).is_err());
@@ -801,7 +809,7 @@ fn status_rejects_the_superseded_event_layout_nobody_emits() {
             columns: 80,
             rows: 24,
             replay: ReplayDescriptor {
-                first: 0,
+                first: 1,
                 last: 0,
                 start: 0,
                 end: 0,
@@ -885,7 +893,7 @@ fn semantic_vector_uses_distinct_profile_and_round_trips() {
 }
 
 #[test]
-fn lease_and_log_payloads_are_exact_and_never_fragmented() {
+fn fixed_controller_payloads_are_exact_and_never_fragmented() {
     for (kind, size) in [
         (0x15, 40),
         (0x16, 24),
@@ -893,6 +901,7 @@ fn lease_and_log_payloads_are_exact_and_never_fragmented() {
         (0x18, 20),
         (0x19, 24),
         (0x1a, 32),
+        (0x1b, 8),
     ] {
         let mut bytes = Vec::new();
         Codec::new(Profile::Controller)
@@ -979,6 +988,13 @@ fn exact_controller_request_builders_round_trip_through_the_decoder() {
         decode_controller(0x0b, &resize, None),
         Ok(ControllerRequest::Policy(PolicyRequest::Resize(3, 80, 24)))
     ));
+    let redraw = redraw_payload(3, 24, 80);
+    assert!(matches!(
+        decode_controller(0x1b, &redraw, None),
+        Ok(ControllerRequest::Policy(PolicyRequest::Redraw(3, 80, 24)))
+    ));
+    assert!(decode_controller(0x1b, &redraw[..7], None).is_err());
+    assert!(decode_controller(0x1b, &[redraw.as_slice(), &[0]].concat(), None).is_err());
     let terminate = terminate_request_payload(b"session", 7, [8; 16], true).unwrap();
     assert!(matches!(
         decode_controller(15, &terminate, None),
@@ -986,6 +1002,48 @@ fn exact_controller_request_builders_round_trip_through_the_decoder() {
             b"session", 7, incarnation, true
         ))) if incarnation == [8; 16]
     ));
+}
+
+#[test]
+fn attach_live_only_flag_is_named_and_higher_bits_remain_malformed() {
+    let payload = [
+        80_u16.to_le_bytes().as_slice(),
+        24_u16.to_le_bytes().as_slice(),
+        &[0b0000_0100],
+    ]
+    .concat();
+    assert!(matches!(
+        decode_controller(3, &payload, None),
+        Ok(ControllerRequest::Policy(PolicyRequest::Attach(
+            80,
+            24,
+            false,
+            false,
+            ReplayPolicy::LiveOnly,
+            None
+        )))
+    ));
+
+    for reserved in 3..8 {
+        let mut malformed = payload.clone();
+        malformed[4] |= 1 << reserved;
+        assert!(matches!(
+            decode_controller(3, &malformed, None),
+            Err(WireError::Malformed)
+        ));
+    }
+}
+
+#[test]
+fn schema_five_identifies_both_frames_and_controller_hello() {
+    let hello = controller_hello(b"session").unwrap();
+    assert_eq!(&hello[..7], b"MOOR\x05\0\0");
+
+    let mut frame = Vec::new();
+    Codec::new(Profile::Controller)
+        .encode(0, 1, &hello, &mut frame)
+        .unwrap();
+    assert_eq!(frame[4], 5);
 }
 
 #[test]
@@ -1193,7 +1251,7 @@ fn configured_log_keeps_its_frontier_when_the_lane_is_unwritable() {
         columns: 80,
         rows: 24,
         replay: ReplayDescriptor {
-            first: 0,
+            first: 1,
             last: 0,
             start: 0,
             end: 0,

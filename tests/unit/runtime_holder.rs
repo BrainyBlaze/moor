@@ -129,7 +129,17 @@ mod descriptor_deadline_tests {
         runtime.peers.get_mut(&1).unwrap().deadline = now + 50;
         runtime.peers.get_mut(&2).unwrap().deadline = now + 50;
         runtime.descriptors.extend([
-            (1, Descriptor::Attach(81, 24, true, false, Some([3; 16]))),
+            (
+                1,
+                Descriptor::Attach(
+                    81,
+                    24,
+                    true,
+                    false,
+                    crate::session::ReplayPolicy::Retained,
+                    Some([3; 16]),
+                ),
+            ),
             (2, Descriptor::Status),
         ]);
 
@@ -186,7 +196,14 @@ mod descriptor_deadline_tests {
         runtime.peers.get_mut(&4).unwrap().deadline = now + 50;
         runtime.descriptors.push_back((
             4,
-            Descriptor::Attach(80, 24, true, false, Some([4; 16])),
+            Descriptor::Attach(
+                80,
+                24,
+                true,
+                false,
+                crate::session::ReplayPolicy::Retained,
+                Some([4; 16]),
+            ),
         ));
         let mut calls = 0;
         runtime.poll_descriptors_with(&mut || {

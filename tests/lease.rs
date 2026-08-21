@@ -340,7 +340,14 @@ fn machine_phase_table_fences_state_changing_frames() {
         &mut machine,
         0,
         2,
-        Request::Attach(0, 0, false, false, None),
+        Request::Attach(
+            0,
+            0,
+            false,
+            false,
+            moor::session::ReplayPolicy::Retained,
+            None,
+        ),
     );
     assert!(machine.legal(2, 0x15));
     assert!(!machine.legal(2, 0x09));

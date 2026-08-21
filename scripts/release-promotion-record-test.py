@@ -51,7 +51,7 @@ TARGETS = [
 CHECKLIST = [
     "candidate-install",
     "binary-identity",
-    "v4-dialect",
+    "v5-dialect",
     "session-create",
     "provider-identity",
     "resume-argv",

@@ -19,7 +19,7 @@ REPOSITORY = "https://github.com/BrainyBlaze/moor"
 CHECKLIST = [
     "candidate-install",
     "binary-identity",
-    "v4-dialect",
+    "v5-dialect",
     "session-create",
     "provider-identity",
     "resume-argv",
