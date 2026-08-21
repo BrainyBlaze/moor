@@ -42,8 +42,8 @@ The reviewed handoff artifacts have these SHA-256 digests:
 
 | file | SHA-256 |
 |---|---|
-| `moor-spec.md` | `7e08d9aab772a7c5319772b932e0710a9f6138aa0e93ef86361407735fdc63c9` |
-| `moor-wire-schema.md` | `72172e93da2032b33c7439f06998437265eb889346ddc724e4b6b7eee86c3f2b` |
+| `moor-spec.md` | `e159e6f522b70119a81188f685678117b5c262c070b16c0aaafd47a40cce80da` |
+| `moor-wire-schema.md` | `6388a6c0437fd43140c2d70674523ce3e3e390fb3a5833f68335b9e548059237` |
 
 Verify them from this directory with:
 
